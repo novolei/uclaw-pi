@@ -165,11 +165,19 @@ struct StreamErrorPayload {
     error: String,
 }
 
-/// Per-conversation ACL state: monotonic `seq`, accumulated assistant text, the
-/// one-shot `complete` latch, and tool start times for `durationMs`.
+/// Per-conversation ACL state: **independent** monotonic seq counters for the
+/// chunk and reasoning channels, accumulated assistant text, the one-shot
+/// `complete` latch, and tool start times for `durationMs`.
+///
+/// The two seq spaces are separate because `useGlobalAgentListeners.ts` tracks
+/// `lastChunkSeq` and `lastReasoningSeq` independently and treats `seq === 0` as
+/// "new stream" **per channel**. A shared counter would emit the second-started
+/// channel's first delta at seq > 0, defeating its new-stream reset (a
+/// thinks-then-speaks turn would append text onto a stale buffer).
 pub struct Acl {
     conv_id: String,
-    seq: u64,
+    chunk_seq: u64,
+    reasoning_seq: u64,
     acc_text: String,
     completed: bool,
     tool_starts: HashMap<String, Instant>,
@@ -180,16 +188,23 @@ impl Acl {
     pub fn new(conv_id: impl Into<String>) -> Self {
         Self {
             conv_id: conv_id.into(),
-            seq: 0,
+            chunk_seq: 0,
+            reasoning_seq: 0,
             acc_text: String::new(),
             completed: false,
             tool_starts: HashMap::new(),
         }
     }
 
-    fn next_seq(&mut self) -> u64 {
-        let s = self.seq;
-        self.seq += 1;
+    fn next_chunk_seq(&mut self) -> u64 {
+        let s = self.chunk_seq;
+        self.chunk_seq += 1;
+        s
+    }
+
+    fn next_reasoning_seq(&mut self) -> u64 {
+        let s = self.reasoning_seq;
+        self.reasoning_seq += 1;
         s
     }
 
@@ -199,7 +214,7 @@ impl Acl {
         match raw {
             RawEvt::TextDelta { delta } => {
                 self.acc_text.push_str(delta);
-                let seq = self.next_seq();
+                let seq = self.next_chunk_seq();
                 Some(FeEvent {
                     name: event::STREAM_CHUNK,
                     payload: to_value(&StreamDelta {
@@ -210,7 +225,7 @@ impl Acl {
                 })
             }
             RawEvt::ThinkingDelta { delta } => {
-                let seq = self.next_seq();
+                let seq = self.next_reasoning_seq();
                 Some(FeEvent {
                     name: event::STREAM_REASONING,
                     payload: to_value(&StreamDelta {
@@ -345,12 +360,15 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_shares_the_seq_space_with_chunks() {
+    fn chunk_and_reasoning_have_independent_seq_each_from_zero() {
+        // Mirrors useGlobalAgentListeners.ts: `lastChunkSeq` / `lastReasoningSeq`
+        // are tracked separately and `seq === 0` means "new stream" PER channel.
+        // So the first delta on EACH channel must be seq 0 — a thinks-then-speaks
+        // turn must not emit text at seq 1 (which would defeat the chunk channel's
+        // new-stream reset and append onto a stale buffer).
         let mut acl = Acl::new("c1");
         let r = acl
-            .translate(&RawEvt::ThinkingDelta {
-                delta: "hmm".into(),
-            })
+            .translate(&RawEvt::ThinkingDelta { delta: "hmm".into() })
             .expect("reasoning");
         assert_eq!(r.name, event::STREAM_REASONING);
         assert_eq!(r.payload["seq"], 0);
@@ -358,7 +376,18 @@ mod tests {
         let t = acl
             .translate(&RawEvt::TextDelta { delta: "x".into() })
             .expect("chunk");
-        assert_eq!(t.payload["seq"], 1, "seq must be monotonic across chunk+reasoning");
+        assert_eq!(
+            t.payload["seq"], 0,
+            "chunk seq is independent — first text delta is seq 0 even after reasoning"
+        );
+
+        // Each channel then advances on its own counter.
+        let r1 = acl
+            .translate(&RawEvt::ThinkingDelta { delta: "m".into() })
+            .unwrap();
+        assert_eq!(r1.payload["seq"], 1);
+        let t1 = acl.translate(&RawEvt::TextDelta { delta: "y".into() }).unwrap();
+        assert_eq!(t1.payload["seq"], 1);
     }
 
     #[test]
@@ -416,14 +445,16 @@ mod tests {
     }
 
     /// [R2 Done-when#4] Under a flood of interleaved chunk/reasoning/tool events,
-    /// the synthesized `seq` on every seq-bearing event must be strictly
-    /// monotonic with no gaps and no duplicates, and `complete` must fire exactly
-    /// once. Tool-activity events carry no `seq` (they're keyed by toolCallId), so
-    /// they're excluded from the seq stream — assert that explicitly too.
+    /// each channel's synthesized `seq` must be strictly monotonic with no gaps
+    /// and no duplicates (independently — chunk and reasoning have separate seq
+    /// spaces, matching the frontend's `lastChunkSeq`/`lastReasoningSeq`), and
+    /// `complete` must fire exactly once. Tool-activity carries no `seq` (keyed by
+    /// toolCallId) — assert that explicitly too.
     #[test]
-    fn flood_seq_strictly_monotonic_no_gap_no_dup() {
+    fn flood_per_channel_seq_contiguous_no_gap_no_dup() {
         let mut acl = Acl::new("flood");
-        let mut seqs: Vec<u64> = Vec::new();
+        let mut chunk_seqs: Vec<u64> = Vec::new();
+        let mut reasoning_seqs: Vec<u64> = Vec::new();
         let mut completes = 0;
 
         // 600 interleaved events: text, thinking, and tool start/end every 7th.
@@ -449,8 +480,11 @@ mod tests {
             };
             if let Some(fe) = acl.translate(&ev) {
                 match fe.name {
-                    event::STREAM_CHUNK | event::STREAM_REASONING => {
-                        seqs.push(fe.payload["seq"].as_u64().expect("seq present"));
+                    event::STREAM_CHUNK => {
+                        chunk_seqs.push(fe.payload["seq"].as_u64().expect("seq present"));
+                    }
+                    event::STREAM_REASONING => {
+                        reasoning_seqs.push(fe.payload["seq"].as_u64().expect("seq present"));
                     }
                     event::STREAM_TOOL_ACTIVITY => {
                         // Tool activity is keyed by toolCallId, not seq.
@@ -461,10 +495,13 @@ mod tests {
             }
         }
 
-        // Strictly monotonic, contiguous from 0: seqs == [0, 1, 2, ... n-1].
-        assert!(!seqs.is_empty());
-        for (i, s) in seqs.iter().enumerate() {
-            assert_eq!(*s, i as u64, "seq must be contiguous with no gap/dup/reorder");
+        // Each channel is independently contiguous from 0: [0, 1, 2, ... n-1].
+        assert!(!chunk_seqs.is_empty() && !reasoning_seqs.is_empty());
+        for (i, s) in chunk_seqs.iter().enumerate() {
+            assert_eq!(*s, i as u64, "chunk seq must be contiguous (no gap/dup/reorder)");
+        }
+        for (i, s) in reasoning_seqs.iter().enumerate() {
+            assert_eq!(*s, i as u64, "reasoning seq must be contiguous (no gap/dup/reorder)");
         }
 
         // Exactly one complete, regardless of how many terminal events arrive.
