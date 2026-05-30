@@ -30,6 +30,21 @@
 4. **校验** `grep -rl rusqlite src-tauri/src` 归零 → 删 `rusqlite` 依赖。
 5. **接线**（[`R1-wiring-plan.md`](./R1-wiring-plan.md) §2-4）：crates/pi+engine 转 member、`TauriEventSink`、命令路由。
 
+## 进度 + 关键发现（workflow 映射后，2026-05-30）
+
+**已删（增量验证，每步 cargo check 绿）**：`intent_classifier` ✅、`symphony_graph` ✅（-8 rusqlite，无 kept 依赖）、`eval` ✅（0 rusqlite，含 memory_policy dead edge）。**rusqlite 101 → 93**。
+
+**关键发现（workflow 揭示，改变剩余策略）**：
+1. **`providers` 与 `llm` 必须保留**（各 0 rusqlite）——`ProviderService`/`registry`/`types` 与 `LlmProvider`/`create_provider` 被 **6+ KEPT 模块**（memory_graph/proactive/automation/ingestion/api/config/channels）实代码依赖。删它们 = 迁移那些 kept 消费者，且**不减 rusqlite**。**故为 rusqlite 目标:保留 llm/providers**，留作后续纯清理。
+2. **核心 chat 命令是旧后端入口**：`send_message`/`send_agent_message`/`start_agent_teams` 被前端需要（不能删）但**使用被删的 agent dispatcher + llm + runtime + learning**（不能原样留）→ **必须重写到 `PiEngine`**。这是接线的真正内容，不是删除。
+3. **`learning` 与 kept 纠缠**：`memory_graph/profile_md.rs` 用 `FacetClass`/`FacetSnapshot`（需重定位）；`proactive/service.rs` 持 `learning_scheduler`/`facet_cache`（需剥离）；`send_message` 用 `facet_cache`（随 chat 命令重写处理）。
+4. **`runtime` 与 kept 纠缠**：`runtime::contracts`（HookDecision/TaskEvent/...）被 policy_eval/memory_policy/browser/automation 用；`runtime::rollout::RolloutWriter` 被 browser/automation **实时**用。→ 保留 runtime 或把 contracts+RolloutWriter 重定位到 kept home；其 1 个 rusqlite 文件(rollout.rs)迁 sqlmodel。
+
+**修正后的剩余路线（rusqlite=0 为目标）**：
+- **A. 删 `agent/`（-20 rusqlite，最大）+ stub 3 个 chat 命令**（暂返回「migrating」错误 = 用户可接受的中间态），剥离 learning 的 kept 纠缠（重定位 FacetClass/FacetSnapshot、剥 proactive scheduler）。这是一次**协调大改**。
+- **B. 迁移 ~70 个 kept-code rusqlite 文件 → sqlmodel-sqlite**（db/cost_store/memory*/mcp/skills/tauri_commands 残余）。**big-bang**：rusqlite 与 sqlmodel 不能共存，故迁完 + 删 agent + 换依赖后才能 build。可 workflow 并行产出迁移代码（worktree），我汇总 + 大爆炸验证。
+- **C. 换依赖**（去 rusqlite、加 sqlmodel/engine）→ build → **接线**（PiEngine + EventSink + 把 stub 的 chat 命令路由到 engine，蓝图 §3-4）。
+
 ## rusqlite → sqlmodel-sqlite API 映射（迁移参考）
 
 > 来源：pi 自身的 `crates/pi/src/session_sqlite.rs`（sqlmodel-sqlite 的规范用法）。迁移保留区的 63 文件时照此翻译。
