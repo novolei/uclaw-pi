@@ -284,6 +284,13 @@ pub struct SessionOptions {
     pub provider: Option<String>,
     pub model: Option<String>,
     pub api_key: Option<String>,
+    /// uclaw-patch(P0§4/F7): override the resolved model's endpoint + API shape
+    /// with the user's configured values (uClaw 服务商 tab: Base URL + API 类型),
+    /// so any OpenAI-compatible provider (DeepSeek, custom proxies, …) works with
+    /// exactly the user's config instead of pi's static metadata. Default `None`
+    /// keeps existing callers unchanged.
+    pub base_url: Option<String>,
+    pub api: Option<String>,
     pub thinking: Option<crate::model::ThinkingLevel>,
     pub system_prompt: Option<String>,
     pub append_system_prompt: Option<String>,
@@ -344,6 +351,8 @@ impl Default for SessionOptions {
             provider: None,
             model: None,
             api_key: None,
+            base_url: None, // uclaw-patch(P0§4/F7)
+            api: None,      // uclaw-patch(P0§4/F7)
             thinking: None,
             system_prompt: None,
             append_system_prompt: None,
@@ -1721,7 +1730,7 @@ pub async fn create_agent_session(options: SessionOptions) -> Result<AgentSessio
         app::resolve_model_scope(&scoped_patterns, &model_registry, cli.api_key.is_some())
     };
 
-    let selection = app::select_model_and_thinking(
+    let mut selection = app::select_model_and_thinking(
         &cli,
         &config,
         &session,
@@ -1730,6 +1739,15 @@ pub async fn create_agent_session(options: SessionOptions) -> Result<AgentSessio
         &global_dir,
     )
     .map_err(|err| Error::validation(err.to_string()))?;
+    // uclaw-patch(P0§4/F7): apply the user's Base URL + API 类型 (from uClaw's
+    // 服务商 config) onto the resolved model entry, so the provider talks to the
+    // exact endpoint/API the user configured (e.g. DeepSeek's /v1).
+    if let Some(base_url) = options.base_url.as_deref().filter(|s| !s.is_empty()) {
+        selection.model_entry.model.base_url = base_url.to_string();
+    }
+    if let Some(api) = options.api.as_deref().filter(|s| !s.is_empty()) {
+        selection.model_entry.model.api = api.to_string();
+    }
     app::update_session_for_selection(&mut session, &selection);
 
     let enabled_tools_owned = cli

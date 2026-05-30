@@ -53,6 +53,10 @@ pub struct ModelConfig {
     pub provider: Option<String>,
     pub model: Option<String>,
     pub api_key: Option<RedactedString>,
+    /// [F7] The user's Base URL + API 类型 (uClaw 服务商 tab) — lets pi reach any
+    /// OpenAI-compatible endpoint (DeepSeek, custom proxies) with the exact config.
+    pub base_url: Option<String>,
+    pub api: Option<String>,
 }
 
 /// Commands from the Tauri/tokio side into the engine thread.
@@ -65,6 +69,8 @@ pub enum EngineCmd {
         provider: Option<String>,
         model: Option<String>,
         api_key: Option<RedactedString>,
+        base_url: Option<String>,
+        api: Option<String>,
     },
     /// Drive one user prompt on `conv_id`'s session (lazily created).
     Prompt { conv_id: String, input: String },
@@ -228,13 +234,13 @@ async fn actor_loop(
     let mut model_config = ModelConfig {
         provider: config.provider.clone(),
         model: config.model.clone(),
-        api_key: None,
+        ..ModelConfig::default()
     };
 
     while let Ok(cmd) = cmd_rx.recv(&cx).await {
         match cmd {
-            EngineCmd::Configure { provider, model, api_key } => {
-                model_config = ModelConfig { provider, model, api_key };
+            EngineCmd::Configure { provider, model, api_key, base_url, api } => {
+                model_config = ModelConfig { provider, model, api_key, base_url, api };
             }
             EngineCmd::Prompt { conv_id, input } => {
                 start_run(&mut sessions, &rt, &sink, &cx, &config, &model_config, &approval_handler, &tool_factory, conv_id, RunKind::Prompt(input)).await;
@@ -307,6 +313,12 @@ async fn start_run(
         }
         if let Some(key) = &model_config.api_key {
             opts.api_key = Some(key.0.clone());
+        }
+        if model_config.base_url.is_some() {
+            opts.base_url = model_config.base_url.clone();
+        }
+        if model_config.api.is_some() {
+            opts.api = model_config.api.clone();
         }
         opts.tool_approval = Some(approval_handler.clone());
         opts.tool_factory = Some(tool_factory.clone());
@@ -413,6 +425,8 @@ mod tests {
             provider: Some("anthropic".into()),
             model: Some("claude-x".into()),
             api_key: Some(RedactedString("sk-leak-me".into())),
+            base_url: Some("https://api.deepseek.com/v1".into()),
+            api: Some("openai-completions".into()),
         };
         let dbg = format!("{cmd:?}");
         assert!(!dbg.contains("sk-leak-me"), "api key leaked: {dbg}");

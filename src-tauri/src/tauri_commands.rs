@@ -1526,12 +1526,20 @@ pub async fn send_message(
         } else {
             state.provider_service.get_chat_llm_config().await
         };
-        if let Some((provider, model, api_key, _base_url, _api)) = resolved {
+        if let Some((provider, model, api_key, base_url, api_type)) = resolved {
+            // uClaw ApiType's serde names (openai-completions / anthropic-messages /
+            // google-generative-ai) are identical to pi's `api` strings, so serialize
+            // straight through — no mapping table needed.
+            let api = api_type
+                .and_then(|t| serde_json::to_value(t).ok())
+                .and_then(|v| v.as_str().map(str::to_string));
             engine.send(uclaw_pi_engine::EngineCmd::Configure {
                 provider: Some(provider),
                 model: Some(model),
                 api_key: (!api_key.is_empty())
                     .then(|| uclaw_pi_engine::RedactedString(api_key)),
+                base_url: (!base_url.is_empty()).then_some(base_url),
+                api,
             });
         }
         engine.send(uclaw_pi_engine::EngineCmd::Prompt {
