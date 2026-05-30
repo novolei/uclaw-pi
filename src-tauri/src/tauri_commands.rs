@@ -1488,8 +1488,36 @@ pub async fn get_bootstrap_status(state: State<'_, AppState>) -> Result<Bootstra
 pub async fn send_message(
     state: State<'_, AppState>,
     app_handle: tauri::AppHandle,
+    engine: State<'_, std::sync::Arc<uclaw_pi_engine::PiEngine>>,
     input: SendMessageInput,
 ) -> Result<SendMessageResponse, Error> {
+    // ── [R1 Done-when#3] PiEngine route (gated; legacy stays for R2) ──
+    // When UCLAW_PI_ENGINE is set, drive the agent through pi (stateless):
+    // the ACL's chat:stream-* events reach the frontend via TauriEventSink.
+    // Streaming is async, so we return immediately with the conversation id
+    // + a fresh message id (rendering correctness is R2, not R1).
+    if crate::engine_sink::pi_engine_enabled() && input.content.trim() != "/compact" {
+        let conv_id = input.conversation_id.clone();
+        if let (Some(provider), Some(model)) =
+            (input.provider_id.clone(), input.model_id.clone())
+        {
+            engine.send(uclaw_pi_engine::EngineCmd::SetModel {
+                conv_id: conv_id.clone(),
+                provider,
+                model,
+            });
+        }
+        engine.send(uclaw_pi_engine::EngineCmd::Prompt {
+            conv_id: conv_id.clone(),
+            input: input.content.clone(),
+        });
+        return Ok(SendMessageResponse {
+            message_id: uuid::Uuid::new_v4().to_string(),
+            conversation_id: conv_id,
+            response: String::new(),
+        });
+    }
+
     // ── /compact intercept ─────────────────────────────────────────
     // User-triggered context compaction. Skips the entire LLM pipeline:
     // drains the session down to the last 10 turns + prepends a summary
@@ -11484,8 +11512,16 @@ pub async fn move_agent_session_to_workspace(
 #[tauri::command]
 pub async fn stop_agent(
     state: State<'_, AppState>,
+    engine: State<'_, std::sync::Arc<uclaw_pi_engine::PiEngine>>,
     session_id: String,
 ) -> Result<bool, Error> {
+    // [R1 Done-when#3] Fire the PiEngine abort for this conversation too
+    // (idempotent with the legacy cancellation token below).
+    if crate::engine_sink::pi_engine_enabled() {
+        engine.send(uclaw_pi_engine::EngineCmd::Stop {
+            conv_id: session_id.clone(),
+        });
+    }
     let mut sessions = state.running_sessions.lock().await;
     if let Some(token) = sessions.remove(&session_id) {
         token.cancel();

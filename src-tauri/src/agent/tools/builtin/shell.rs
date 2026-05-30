@@ -156,8 +156,11 @@ impl RollingTailBuffer {
     /// `temp_path` 有值时在截断头注中附加文件路径。
     fn to_truncated_string(&self, temp_path: Option<&std::path::Path>) -> String {
         let (a, b) = self.buf.as_slices();
-        let content = String::from_utf8_lossy(a).to_string()
-            + &String::from_utf8_lossy(b);
+        let content = format!(
+            "{}{}",
+            String::from_utf8_lossy(a),
+            String::from_utf8_lossy(b)
+        );
         if self.dropped > 0 {
             let path_note = temp_path
                 .map(|p| format!("，完整输出已保存至 {}", p.display()))

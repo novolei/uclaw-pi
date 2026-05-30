@@ -181,6 +181,24 @@ fn main() {
 
             app.manage(app_state);
 
+            // ─── [R1 接线] PiEngine — the new pi-based agent backend ──────────
+            // pi runs STATELESS (no_session=true): it pulls no sqlmodel-sqlite, so
+            // it coexists with uClaw's rusqlite (no F2 data migration — see
+            // docs/MIGRATION_GOALS.md §P0). The engine owns a dedicated asupersync
+            // thread; its chat:stream-* events reach the frontend via TauriEventSink.
+            {
+                let sink = uclaw_core::engine_sink::TauriEventSink::new(app.handle().clone());
+                let pi_engine = uclaw_pi_engine::PiEngine::spawn(
+                    sink,
+                    uclaw_pi_engine::EngineConfig {
+                        no_session: true,
+                        ..Default::default()
+                    },
+                );
+                app.manage(std::sync::Arc::new(pi_engine));
+                tracing::info!("[R1] PiEngine spawned (stateless) and managed");
+            }
+
             // ─── Debug 菜单（仅 debug 模式可见） ────────────────────
             #[cfg(debug_assertions)]
             {

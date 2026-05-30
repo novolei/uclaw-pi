@@ -6,6 +6,8 @@ pub mod ipc;
 pub mod settings;
 pub mod tauri_commands;
 pub mod cost_store;
+// [R1 接线] Tauri EventSink adapter for the new pi-based agent backend (PiEngine).
+pub mod engine_sink;
 
 pub mod agent;
 pub mod llm;
