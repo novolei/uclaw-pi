@@ -70,7 +70,9 @@ fn uclaw_home_from_env(env_override: Option<&str>) -> std::io::Result<AbsolutePa
                     "Could not find home directory",
                 )
             })?;
-            p.push(".uclaw");
+            // uclaw-pi fork: home is ~/.uclaw-pi (separate from the original uClaw's
+            // ~/.uclaw so the two never clobber each other's DB/config/skills).
+            p.push(".uclaw-pi");
             AbsolutePathBuf::from_absolute_path(p)
         }
     }
@@ -145,10 +147,10 @@ mod tests {
     }
 
     #[test]
-    fn no_env_uses_dot_uclaw_under_home() {
+    fn no_env_uses_dot_uclaw_pi_under_home() {
         let resolved = uclaw_home_from_env(/*env*/ None).expect("default UCLAW_HOME");
         let mut expected = home_dir().expect("home dir");
-        expected.push(".uclaw");
+        expected.push(".uclaw-pi");
         let expected = AbsolutePathBuf::from_absolute_path(expected).expect("absolute home");
         assert_eq!(resolved, expected);
     }

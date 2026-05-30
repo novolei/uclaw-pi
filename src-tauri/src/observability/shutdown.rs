@@ -66,10 +66,10 @@ pub enum PreviousShutdown {
     AnotherInstanceAlive(ProcessLock),
 }
 
-/// Default location of the process lock — `~/.uclaw/state/process.lock`.
+/// Default location of the process lock — `~/.uclaw-pi/state/process.lock`.
 pub fn default_lock_path() -> PathBuf {
     let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
-    home.join(".uclaw").join("state").join("process.lock")
+    home.join(".uclaw-pi").join("state").join("process.lock")
 }
 
 /// Atomic write of the lock file: tempfile in same dir → fsync → rename.

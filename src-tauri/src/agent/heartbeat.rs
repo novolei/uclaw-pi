@@ -426,12 +426,12 @@ impl Drop for HeartbeatSupervisor {
 // boot when Bundle 27-C reports Unclean shutdown)
 // ────────────────────────────────────────────────────────────────────────
 
-/// Default path: `~/.uclaw/state/last_active_run.json`.
+/// Default path: `~/.uclaw-pi/state/last_active_run.json`.
 pub fn default_flight_path() -> PathBuf {
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
-    home.join(".uclaw").join("state").join("last_active_run.json")
+    home.join(".uclaw-pi").join("state").join("last_active_run.json")
 }
 
 /// Atomic write — tempfile in same dir → fsync → rename.

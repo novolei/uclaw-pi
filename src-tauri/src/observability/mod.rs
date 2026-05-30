@@ -24,7 +24,7 @@ use tracing_subscriber::{fmt, prelude::*, EnvFilter, Registry};
 /// Resolve the log directory, creating it if needed.
 fn log_dir() -> PathBuf {
     let base = home_dir().unwrap_or_else(|| PathBuf::from("."));
-    let dir = base.join(".uclaw").join("logs");
+    let dir = base.join(".uclaw-pi").join("logs");
     let _ = std::fs::create_dir_all(&dir);
     dir
 }
