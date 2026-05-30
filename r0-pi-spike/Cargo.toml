@@ -1,0 +1,37 @@
+# R0 探针 crate —— 验证 pi 能否作为库依赖在 stable 1.85 编译,
+# 并演示 Engine Actor 跨线程桥(asupersync 线程 → 主线程通道)。
+#
+# 关键点:
+# - 本 crate 用 edition 2021(镜像 uClaw 现状),依赖 pi(edition 2024)。
+#   这正是要验证的"跨 edition 链接,只需 rustc ≥ 1.85"。
+# - 空 [workspace] 把本 crate 从 uclaw-pi 的工作区中"分离",避免被父
+#   工作区收编;同目录的 rust-toolchain.toml 钉死 stable 1.85,
+#   不继承 pi 仓库根的 nightly 钉。
+[package]
+name = "r0_pi_spike"
+version = "0.0.0"
+edition = "2021"
+publish = false
+# 声明 MSRV=1.85,启用 Cargo 1.85 的 MSRV-aware 依赖选择(配合
+# .cargo/config.toml 的 incompatible-rust-versions="fallback"),让解析器优先挑
+# rust-version ≤ 1.85 的依赖版本,而不是最新但需 1.86+ 的版本。
+rust-version = "1.85"
+
+[workspace]
+
+[dependencies]
+# 路径依赖:uclaw-pi/r0-pi-spike 与 pi_agent_rust 是 Documents 下的兄弟目录。
+# 注意:pi 仓库的 *package* 名是 `pi_agent_rust`(其 `[lib] name = "pi"` 只决定 crate 的
+# 导入名,不改包名),因此路径依赖必须显式 `package = "pi_agent_rust"`,否则 cargo 报
+# "no matching package named `pi`"。导入仍写 `use pi::...`(依赖键名 = 导入名)。
+pi = { package = "pi_agent_rust", path = "../../pi_agent_rust" }
+# pi 自己锁了 =0.3.2;此处显式引入,演示在专用线程上 bootstrap 它的 runtime。
+asupersync = { version = "=0.3.2", default-features = false, features = ["tls-native-roots"] }
+# 仅用于把 §3.3 ACL 翻译出的 payload 以正确 JSON 形状打印。
+# serde/serde_json 已在 pi 依赖图内,版本统一、增量成本≈0。
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.dev]
+# 探针只看"能不能编译/跑通",关优化加快首次编译。
+opt-level = 0

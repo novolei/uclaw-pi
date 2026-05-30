@@ -1,0 +1,14 @@
+# R0 结论(已实测修正两次,见 R0-VERDICT.md):
+# 核心赌注"pi(+asupersync)能在 **stable**(非 nightly)编译运行"= 成立(GO)。
+# 但**最低 stable 远高于计划假设的 1.85**,有两道台阶:
+#   台阶① 解析期 MSRV:pi build-dep `vergen-gix 9.1.0` + deps `sysinfo 0.38.4`/`time 0.3.47`/
+#          `cargo_metadata 0.23.1` 把下限抬到 1.88;1.85 在 cargo 解析期即被拒。
+#   台阶② 编译期 stable 新 API:`asupersync 0.3.2` 自身用了 `Duration::from_mins`
+#          (unstable feature `duration_constructors`, rust#120301),在 1.88 报 E0658;
+#          该 API 在更晚的 **stable** 才稳定(实测 1.95 可编译通过、可运行)。
+# 二者都不是 nightly 需求——故 F3 = GO(进程内、走 stable),只是 uClaw 须钉**较新的 stable**。
+# 这里用 channel="stable"(本机解析为 1.95.0,已实测 build+run 通过)。生产可钉具体版本
+# (≥ 稳定 `duration_constructors` 的那个 stable 发行;> 1.88,实测 1.95 可用)。
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]
