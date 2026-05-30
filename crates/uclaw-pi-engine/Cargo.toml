@@ -22,3 +22,5 @@ pi = { package = "pi_agent_rust", path = "../pi" }
 asupersync = { version = "=0.3.2", default-features = false, features = ["tls-native-roots"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# [R4] Tool trait is #[async_trait]; wrapped uClaw tools impl it.
+async-trait = "0.1"
