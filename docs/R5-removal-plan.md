@@ -40,6 +40,10 @@
 3. **`learning` 与 kept 纠缠**：`memory_graph/profile_md.rs` 用 `FacetClass`/`FacetSnapshot`（需重定位）；`proactive/service.rs` 持 `learning_scheduler`/`facet_cache`（需剥离）；`send_message` 用 `facet_cache`（随 chat 命令重写处理）。
 4. **`runtime` 与 kept 纠缠**：`runtime::contracts`（HookDecision/TaskEvent/...）被 policy_eval/memory_policy/browser/automation 用；`runtime::rollout::RolloutWriter` 被 browser/automation **实时**用。→ 保留 runtime 或把 contracts+RolloutWriter 重定位到 kept home；其 1 个 rusqlite 文件(rollout.rs)迁 sqlmodel。
 
+**⚠️ 决定性发现（agent 映射，改变整体定性）**：`agent/` **不是可干净删除的模块**——`crate::agent::types`（`ChatMessage`/`ContentBlock`/`MessageRole`/`ToolOutput`/`ToolError`/`calculate_cost`/`AgenticLoopConfig`/`ReasoningContext`/`Reflection*`…）是**全代码库共享的类型词汇**，被 **~40 个 KEPT 文件**实代码依赖：core 根（cost_store/ipc/error/mcp）+ api/ + browser/(5) + automation/runtime/(8) + channels/dispatcher + memory_graph/(3) + proactive/(6) + plugins/ + policy_eval/ + safety/ + ingestion/。此外 `agent::tools::tool`（Tool/ToolError/ToolOutput/ApprovalRequirement/ToolRegistry）被 error/mcp/safety/browser/automation 用；`agent::hook_bus` 被 policy_eval+app.rs 用；`agent::api::AgentApi` 被 plugins+app.rs 用；`agent::gep::*` 被 proactive+main.rs 用。
+
+→ **删 agent ⇒ 必须先把这套共享类型词汇重定位到 kept/pi 模块 + 改写 ~39 个 kept 消费者的 import + 把 chat 命令重写到 PiEngine**。这是**整个迁移的核心**（用 pi 的类型替换 uClaw 旧 agent 类型贯穿全库），是**多周级重构**，不是一次模块删除。**这正是「弃用旧后端、改用 pi」的真正工作量所在。**
+
 **修正后的剩余路线（rusqlite=0 为目标）**：
 - **A. 删 `agent/`（-20 rusqlite，最大）+ stub 3 个 chat 命令**（暂返回「migrating」错误 = 用户可接受的中间态），剥离 learning 的 kept 纠缠（重定位 FacetClass/FacetSnapshot、剥 proactive scheduler）。这是一次**协调大改**。
 - **B. 迁移 ~70 个 kept-code rusqlite 文件 → sqlmodel-sqlite**（db/cost_store/memory*/mcp/skills/tauri_commands 残余）。**big-bang**：rusqlite 与 sqlmodel 不能共存，故迁完 + 删 agent + 换依赖后才能 build。可 workflow 并行产出迁移代码（worktree），我汇总 + 大爆炸验证。
