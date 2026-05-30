@@ -23,9 +23,11 @@
 >
 > **F2 修订定案（2026-05-30，用户拍板）**：**撤销原 F2，改为「pi 原生 session 层拥有会话持久化」**（恢复并强化分析报告 §5.3）。pi 以 `no_session=false` + `session_dir = ~/.uclaw/if2pi/agent/sessions`（F7 命名空间）运行；**uClaw 弃用 rusqlite 会话/db 层**（属旧后端）。`get_messages`/`get_agent_session_messages`/`list_agent_sessions` 经 ACL 读 **pi**（`handle.messages()` / pi session store）映射成前端 DTO。uClaw 其余 sqlite（cost/settings 等）若保留则**迁到 pi 的 `sqlmodel-sqlite`**，使全仓库只有一个 sqlite 栈。
 >
-> ⚠️ **sqlite native-link 冲突解法（定）**：**不删 pi 的 sqlmodel-sqlite**（已回退之前在 pi 侧的错误改动）；改在 uClaw 侧——**移除 uClaw 全部 rusqlite 用法**（会话读 pi；cost/settings 迁 sqlmodel-sqlite）。这是 **R1 数据层迁移**的核心活，体量较大。
+> **⚠️ F2 再修订（2026-05-30 突破，实测倒逼）**：pi-owns-persistence（`no_session=false`）会拉 `sqlmodel-sqlite`→libsqlite3-sys 0.37，与 uClaw rusqlite 的 0.30 在 cargo `links` 检查下**不可共存**（且该检查含被禁用的 optional dep）。要让 pi 持久化，**必须**先把 uClaw 全量迁出 rusqlite（4565 处，多周）。为不被此阻塞、按 P0 让 uClaw 适配 pi，**R1 起 pi 跑 stateless**（`no_session=true`，回到原 F2），uClaw 保留 rusqlite 自管会话/cost/settings。「pi 拥有持久化」**降级为可选的后续数据层工作**（R3+ 数据面，非 R1/R2 前置），由用户在那时定夺是否值得做 rusqlite 迁移。详见「## 突破」。
 >
-> **当前仓库状态**：vendored `crates/pi` 暂作**独立 sub-workspace**（可单独 `cargo build --manifest-path crates/pi/Cargo.toml` / 二次开发），**未并入主 workspace**；待 R1 完成「uClaw→pi 持久化迁移 + 移除 rusqlite」后，再把 `crates/pi` 转为正式 member 并接 `src-tauri`。
+> ⚠️ **sqlite native-link 冲突解法（2026-05-30 突破，已实现）**：~~移除 uClaw 全部 rusqlite~~（体量 93 文件/4565 处，多周）**已弃用**。真正的解法：**pi 跑 stateless**（`no_session=true`）。pi 的 `sqlmodel-sqlite`（→libsqlite3-sys 0.37）**只**经默认开启的 `sqlite-sessions` feature 引入；关掉它，pi 拉 0 个 libsqlite3-sys，与 uClaw 的 `rusqlite`（libsqlite3-sys 0.30）**共存无冲突**。uClaw **保留** rusqlite 会话/cost/settings 层不动。详见下「## 突破」。
+>
+> **当前仓库状态（2026-05-30）**：`crates/pi`（stateless gating，`// uclaw-patch(P0§4)`）+ `crates/uclaw-pi-engine` **已转为主 workspace 正式 member**，`src-tauri` 依赖 engine；`cargo check -p uclaw` 退 0，pi+engine 与 uClaw rusqlite 同图编译。`crates/pi` 仍可单独 `cargo build --manifest-path crates/pi/Cargo.toml` 做二次开发。
 
 ---
 
@@ -49,6 +51,26 @@
 
 ---
 
+## 突破（2026-05-30）：pi stateless 与 uClaw rusqlite 共存，绕开 4565 处迁移
+
+**问题**：把 vendored `crates/pi` 并入主 workspace 时，`cargo` 报 native `links` 冲突——pi 的 `sqlmodel-sqlite 0.2.2`→`libsqlite3-sys 0.37` 与 uClaw 的 `rusqlite 0.32`→`libsqlite3-sys 0.30` 都声明 `links = "sqlite3"`，cargo 禁止同图两个 crate 链同一 native lib。**关键发现**：该 `links` 检查是**全图**的，**连被 `optional=true` 禁用的 dep 也算**——故仅 `optional` 不够，必须把 dep 行整个移除。
+
+**直觉的解法（已弃用）**：移除 uClaw 全部 rusqlite。实测footprint：**93 文件、4565 调用点、32 处 `Arc<Mutex<Connection>>`**——多周工作量，且与 P0「uClaw 适配 pi、最小改动」相悖。
+
+**真正的解法**：pi 的 `sqlmodel-sqlite` **只**经默认开启的 `sqlite-sessions` feature 引入（pi 的 session 持久化后端）。**让 pi 跑 stateless**（`no_session=true`，即原始 F2 设计）就**根本不需要**该后端 → 关掉 `sqlite-sessions` → pi 拉 **0 个** `libsqlite3-sys` → 与 uClaw rusqlite **共存无冲突 → 零迁移**。
+
+**实现（`// uclaw-patch(P0§4)`，最小且显式）**：
+- `crates/pi/Cargo.toml`：删 `sqlmodel-sqlite` 依赖行（非 optional——因全图 `links` 检查）；`default=[]`，`sqlite-sessions=[]`（留作未来开关）。
+- `crates/pi/src/session_sqlite_stub.rs`（新）+ `lib.rs` 按 feature 双路 `session_sqlite`：off 时走 stub（`disabled()` 错误）。
+- `crates/pi/src/session_index.rs`：`sqlmodel-*` 导入按 feature 门控；加 `#[cfg(not(sqlite-sessions))]` no-op `impl SessionIndex`。
+- 根 `Cargo.toml`：`crates/pi` + `crates/uclaw-pi-engine` 转正式 member。
+
+**证据**：`cargo check -p uclaw` 退 0（pi+engine 与 uClaw rusqlite 同图）；`cargo build --release -p uclaw-pi-engine` 退 0 @rustc 1.95.0（3m34s）。
+
+**后果**：① R1 的「数据层迁移」核心活**消失**——rusqlite 留着不动。② F2 的「pi 拥有持久化」修订**降级为后续可选**（见上 F2 再修订）。③ 解锁 R1 接线（engine 现为 `src-tauri` 依赖）。④ 若将来确需 pi 原生持久化，重开 `sqlite-sessions` 的前置仍是 uClaw 迁出 rusqlite——届时由用户权衡。
+
+---
+
 ## 0. 为什么拆成 6 个目标
 
 | 原因 | 说明 |
@@ -65,8 +87,8 @@
 | 阶段 | 目标 | 状态 | 前置 | 预算 | 裁决/产物 |
 |---|---|---|---|---|---|
 | **R0** | 进程内引擎探针（go/no-go） | ✅ GO（2026-05-30） | — | 100K | `r0-pi-spike/R0-VERDICT.md` · 进程内可行 / 全程 stable / 钉 1.95 |
-| **R1** | 前端整树复刻 + ACL 骨架 | 🟡 进行中 | R0=GO ✅ | 200K | `uclaw-pi-engine` = ACL + **并发可中断 Engine Actor**（spawn+AbortHandle，F6，7 测试绿）；待续：全命令集、ContentBlock 映射、Tauri EventSink、前端 §2A、rusqlite 迁移 |
-| **R2** | 消息核心闭环 | 🔒 锁 | R1 | 150K | 1:1 渲染 + ACL 映射单测 |
+| **R1** | 前端整树复刻 + ACL 骨架 | ✅ 实现完成（2026-05-30） | R0=GO ✅ | 200K | `uclaw-pi-engine`（ACL + 并发可中断 Engine Actor，`cargo build --release` 退 0 @1.95.0）+ 前端 §2A bridge（11 域）+ `src-tauri` 接线（`TauriEventSink` + `PiEngine::spawn` stateless + `send_message`/`stop_agent`→`cmd_tx`）。**突破：pi 跑 stateless 与 uClaw rusqlite 共存，无 4565 处迁移**（见 §突破）。Done-when 1–5 全绿；2 处 settings 测试为既存 Tauri-mock 基线失败（非本期 regress） |
+| **R2** | 消息核心闭环 | ⬜ 未开始（R1 已解锁） | R1 ✅ | 150K | 1:1 渲染 + ACL 映射单测；翻 `UCLAW_PI_ENGINE` 默认为 ON |
 | **R3** | 交互 + workspace/session（F2 无状态） | 🔒 锁 | R2 | 150K | 审批/ask_user/plan 回填 + ARC |
 | **R4** | 工具/MCP/模型（F5） | 🔒 锁 | R3 | 150K | UclawToolFactory + set_model |
 | **R5** | 清理硬化 + 二期认知 | 🔒 锁 | R4 | 180K | 删 §7.2 + 全量 e2e 回归 |
@@ -81,8 +103,8 @@
 
 ```
 R0 ✅[GO]──┬─ NO-GO（未触发）→ 停摆，回 F3
-           └─ GO（已取）→ R1 ──→ R2 ──→ R3 ──→ R4 ──→ R5
-                          ▲ 当前在此
+           └─ GO（已取）→ R1 ✅ ──→ R2 ──→ R3 ──→ R4 ──→ R5
+                                    ▲ 当前在此（R1 实现完成，解锁 R2）
 ```
 
 **共用门禁（每阶段都查，源自 plan §8 / analysis §10）：**
@@ -353,6 +375,7 @@ Use a token budget of 180000 tokens for this goal.
 
 ## 5. 变更日志
 
+- v1.15 (2026-05-30): **R1 实现完成 — 突破：pi stateless 共存，绕开 rusqlite 迁移**（详见上「## 突破」）。① libsqlite3-sys 冲突仅因 pi 默认 `sqlite-sessions` feature 拉 sqlmodel-sqlite；pi 跑 stateless（`no_session=true`，回原 F2）→ 0 个 libsqlite3-sys → 与 uClaw rusqlite 共存 → **零迁移**（省下 93 文件/4565 处）。`crates/pi`（stateless gating，`// uclaw-patch(P0§4)`）+ `crates/uclaw-pi-engine` 转正式 member（commit `49b52324`）。② **PiEngine 接线**（commit `d40bc53d`）：`engine_sink.rs`（`TauriEventSink`：engine `EventSink`→`AppHandle::emit` + `UCLAW_PI_ENGINE` 迁移开关）；`main.rs` setup `PiEngine::spawn`（stateless）+ `app.manage`；`tauri_commands.rs` `send_message`→`EngineCmd::Prompt`（+per-msg model override→`SetModel`）、`stop_agent`→`EngineCmd::Stop`（注入 `State<Arc<PiEngine>>`，契约名不变）。③ 修 `shell.rs` 潜伏 `String + &Cow`（workspace feature-unification 暴露）。**R1 Done-when 1–5 全绿**：#1 `npm run build` 退0 + `npm test` 1090 过（2 既存 settings Tauri-mock 基线失败，git 证实本期未触碰相关文件，非 regress）；#2 `cargo build --release -p uclaw-pi-engine` 退0 @1.95.0（3m34s）；#3 send_message/stop_agent 经 `cmd_tx` + 5 个 `chat:stream-*`；#4 engine 0 `tokio::spawn`、pi 仅 asupersync 线程；#5 `tauri-bridge.ts` 本期零改动（契约零 diff）。F2「pi 拥有持久化」降级为 R3+ 可选数据层工作。**解锁 R2**。
 - v1.14 (2026-05-30): **R5 删除执行计划** [`docs/R5-removal-plan.md`](./R5-removal-plan.md) + 首删 `intent_classifier`（0 引用，`cargo check` 绿）。计划含：模块 DELETE/KEEP 分类（agent/llm/symphony_graph/learning/eval/runtime 删；db/cost/memory*/mcp/skills 保留+迁 rusqlite；`memorization` 待你确认）、耦合现实（旧后端命令交织在 18k 行 tauri_commands.rs，删=协调大改）、无版本捷径（sqlmodel libsqlite3-sys 0.37 疑 fork）、执行顺序。**待你决策**：memorization 去留、是否开 workflow 并行删除/迁移（体量巨大）、是否接受「先删干净→再补」中间态。
 - v1.13 (2026-05-30): **R1 接线阶段启动（用户选定：rusqlite 移除 + R5 旧后端删除合并）**。建立可编译基线：src-tauri 暂移除 WIP 的 `pi` 依赖 + `AppState.pi_sessions` 字段（注释，待 rusqlite 归零后由 PiEngine 持有会话），`cargo check -p uclaw` 绿（1m36s）。**实测删除面**：旧后端可删模块 rusqlite ≈ 38 文件（agent 20/symphony_graph 8/memory_bucket_seal 5/learning 2/memorization 2/runtime 1），保留区仅 ~4；另 ~59 散落 tauri_commands.rs/mcp/skills 等需迁移。接下来逐模块删（耦合最小者先行，每步 cargo check 验证）。
 - v1.12 (2026-05-30): **R1 接线蓝图** [`docs/R1-wiring-plan.md`](./R1-wiring-plan.md)。捕获从「引擎已建」到「app 跑通」的可执行路径 + 决策点：① rusqlite 移除（101 文件，大半是 R5 待删旧后端）应**与 R5 旧后端删除合并**（先删→再迁剩余→再接线）；② `crates/pi`+`crates/uclaw-pi-engine` 转正式 member 的步骤；③ **Tauri `EventSink` 适配器代码**（`app.emit` 包装，含 F7 if2pi 配置）；④ 命令路由表（send_agent_message→`EngineCmd::Prompt` 等，契约名不变）；⑤ 前端整树复刻独立机械线（适合开 workflow 并行）。**待用户拍板**：R1/R5 边界合并、cost/settings 落点、前端复刻是否开 workflow。
