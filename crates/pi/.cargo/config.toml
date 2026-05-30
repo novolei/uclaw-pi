@@ -1,0 +1,12 @@
+# Platform-specific build configuration.
+#
+# FreeBSD installs third-party libraries (clang, openssl, sqlite, …) under
+# /usr/local via pkg(8). Rustc and pkg-config do not search there by default,
+# so we add the prefix to the native-library and pkg-config search paths.
+# These settings are inert on Linux/macOS/Windows.
+
+[target.'cfg(target_os = "freebsd")']
+rustflags = ["-L", "/usr/local/lib"]
+
+[env]
+PKG_CONFIG_PATH = { value = "/usr/local/libdata/pkgconfig", force = false }
