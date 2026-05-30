@@ -1,0 +1,8 @@
+# R0 探针:启用 Cargo 1.85 的 MSRV-aware 依赖解析"回退"模式。
+# 默认 "allow" 会挑最新版本(很多 pi 传递依赖的最新版把 rust-version 抬到 1.86~1.91),
+# 在 stable 1.85 上直接报 "rustc 1.85.0 is not supported by ..." 而拒绝解析。
+# "fallback" 让解析器在存在 ≤1.85 兼容版本时优先选它;只有当某依赖**没有**任何
+# ≤1.85 版本可满足语义约束时,才会暴露"该依赖强制更高 stable"的真实结论。
+# 这是纯 stable 机制,不涉及 nightly。
+[resolver]
+incompatible-rust-versions = "fallback"
