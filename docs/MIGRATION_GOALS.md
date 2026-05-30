@@ -11,6 +11,24 @@
 
 ---
 
+## P0 · 总体策略原则：pi 原生优先，uClaw 适配（Governing Principle）
+
+> **2026-05-30 用户定调（最高优先级，覆盖一切以「uClaw 为中心」的旧表述）：**
+> pi_agent_rust 是新 Agent 框架的**权威来源**。整个重构 = **弃用 uClaw 旧后端 Agent 框架，改用 pi 的服务与功能设计**。
+>
+> 1. **尽量保持 pi 原生代码不改** —— vendored 的 `crates/pi` 尽量镜像上游 pi；不 fork、不魔改 pi 的设计。
+> 2. **适配写在 uClaw 侧** —— 一切翻译/桥接/兼容（ACL、`services/`、`uclaw-pi-engine`）是**新增的 uClaw 代码**，或**改 uClaw 既有代码去贴合 pi**。
+> 3. **冲突一律改 uClaw，不改 pi** —— 当 uClaw 既有实现与 pi 设计冲突（依赖、数据层、契约、命名…），改 uClaw 去适配 pi，而非反向。
+> 4. **必要的 pi 改动需最小且显式记录** —— 仅当 SDK 与 uClaw 侧都无法绕开时，才做最小、可追溯（`// uclaw-patch:`）的 pi 改动，并在此登记。
+>
+> **F2 修订定案（2026-05-30，用户拍板）**：**撤销原 F2，改为「pi 原生 session 层拥有会话持久化」**（恢复并强化分析报告 §5.3）。pi 以 `no_session=false` + `session_dir = ~/.uclaw/if2pi/agent/sessions`（F7 命名空间）运行；**uClaw 弃用 rusqlite 会话/db 层**（属旧后端）。`get_messages`/`get_agent_session_messages`/`list_agent_sessions` 经 ACL 读 **pi**（`handle.messages()` / pi session store）映射成前端 DTO。uClaw 其余 sqlite（cost/settings 等）若保留则**迁到 pi 的 `sqlmodel-sqlite`**，使全仓库只有一个 sqlite 栈。
+>
+> ⚠️ **sqlite native-link 冲突解法（定）**：**不删 pi 的 sqlmodel-sqlite**（已回退之前在 pi 侧的错误改动）；改在 uClaw 侧——**移除 uClaw 全部 rusqlite 用法**（会话读 pi；cost/settings 迁 sqlmodel-sqlite）。这是 **R1 数据层迁移**的核心活，体量较大。
+>
+> **当前仓库状态**：vendored `crates/pi` 暂作**独立 sub-workspace**（可单独 `cargo build --manifest-path crates/pi/Cargo.toml` / 二次开发），**未并入主 workspace**；待 R1 完成「uClaw→pi 持久化迁移 + 移除 rusqlite」后，再把 `crates/pi` 转为正式 member 并接 `src-tauri`。
+
+---
+
 ## R0 结果（2026-05-30）：GO ✅ — 进程内可行，全程 stable，工具链下限修正
 
 > **裁决：GO。** 整条迁移可走进程内（专用 asupersync 线程 + `std::mpsc` 数据桥）；pi + asupersync 在 **stable** 完整编译并运行——F3 的 NO-GO 触发条件（只在 nightly / 需 `RUSTC_BOOTSTRAP`）**未发生**。无 `#![feature]`、无 nightly。
@@ -321,7 +339,7 @@ Use a token budget of 180000 tokens for this goal.
 | Fork | 定案 | 体现在 |
 |---|---|---|
 | **F1** | 原地于 `uclaw-pi` 仓库演进，复用现有 `ui/` 树，不另起 `desktop/` | R1 Scope |
-| **F2** | pi 无状态（`no_session=true`），uClaw SQLite 唯一事实源，每轮重喂全量历史 | R2/R3 Constraints + Stop-if |
+| **F2（已修订 2026-05-30，见 §P0）** | ~~pi 无状态~~ → **pi 原生 session 层拥有会话**（`no_session=false`，session_dir→`~/.uclaw/if2pi/agent/sessions`）；uClaw 弃用 rusqlite、经 ACL 读 pi；cost/settings 迁 sqlmodel-sqlite | R1 数据层迁移；R2/R3 约束已翻转 |
 | **F3** | 纯进程内，无 sidecar 对冲；R0 升为阻断式 go/no-go | R0 全程 |
 | **F4** | v1 必做 turn_cost / context_stats / skill+memory 召回 chip；其余认知 stub | R5 Constraints |
 | **F5** | 内置工具用 pi；仅浏览器/skill/MCP 包成 `impl pi::sdk::Tool` | R4 Constraints + Stop-if |
@@ -335,6 +353,7 @@ Use a token budget of 180000 tokens for this goal.
 
 ## 5. 变更日志
 
+- v1.4 (2026-05-30): 新增 **P0 治理原则（pi 原生优先，uClaw 适配）** + **F2 修订**（撤销原 F2 → pi 原生 session 层拥有会话持久化，uClaw 弃用 rusqlite、经 ACL 读 pi、cost/settings 迁 sqlmodel-sqlite）。起因：pi vendored 进 `crates/pi` 后接入主 workspace 触发 `libsqlite3-sys` native-link 冲突；按 P0 在 uClaw 侧解决（不改 pi）。当前 `crates/pi` 暂作独立 sub-workspace，主 workspace 接入 + uClaw 数据层迁移列为 R1。配套：P0/F2 已写入三份文档（tracker §P0 + §4 表、复刻计划 §0 横幅 + §0B F2 行、分析报告 §0 横幅 + §5.3）。
 - v1.3 (2026-05-30): **R0 完成 → GO**。整条迁移走进程内（asupersync 线程 + std::mpsc 桥），全程 stable，F3 NO-GO 未触发。**工具链下限修正：stable 1.85 → 较新 stable（>1.88，实测 1.95；R1+ 钉 1.95）**（1.85 被 pi build-dep MSRV 卡到 1.88、1.88 被 asupersync `Duration::from_mins` 卡，1.95 干净编译）。落到：顶部「R0 结果」callout、§1 表（R0=✅GO / R1 解锁）、§2 门禁图+共用门禁 3、R0 标注已完成、R1 Done-when 2 / R5 Done-when 5 钉 1.95。配套：复刻计划 §0B R0 结果 note / §8.1；分析报告 §0 note / §10。
 - v1.2 (2026-05-30): 新增 **F8 源码复用尺度（vendoring 允许）**。pi_agent_rust 为用户自有仓库，按用户指示**忽略许可证/第三方归属要求**——可直接复用甚至整段复制 pi 源码进 uClaw 树，不限于经 `pi::sdk` 消费；唯一可选纪律是优先 SDK、vendored 加来源标记便于升级 re-diff，且不改 pi 上游。落到：§4 红线表 + F8 note、R0 Constraint（copy-from vs 改上游澄清）、R1 Constraint、R4 Constraint。配套：复刻计划 §0B F8 / §2；分析报告 §2.1 / §7.1。
 - v1.1 (2026-05-30): 新增 **F7 配置命名空间隔离（pi → if2pi）**。嵌入 pi 经 `PI_CODING_AGENT_DIR`/`PI_CONFIG_PATH`(绝对)/`PI_SESSIONS_DIR` 把配置/数据重映射到 `~/.uclaw/if2pi/`，绕过硬编码项目级 `.pi`，与独立 pi CLI 隔离。落到：共用门禁 5、§4 红线表、R0（first-action 读 config.rs + Constraint/Done-when 7/Stop-if）、R4（Constraint + Done-when 5）。配套设计文档同步：复刻计划 §0B F7 / §3.5 / §7 R0·R4 / §8 门禁 6 / 附录A；分析报告 §3.7 / §5.3 注 / §9 / §10.6 / 附录A 代码。

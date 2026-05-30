@@ -12,6 +12,8 @@
 
 ## 0. 已锁定决策（收录 + 技术校正）
 
+> 🧭 **P0 · 治理原则（2026-05-30，最高优先级，覆盖全文）**：**pi 原生优先，uClaw 适配**——尽量不改 vendored `crates/pi` 的源码（镜像上游 pi），一切适配/桥接写在 uClaw 侧（ACL/services/engine 或改 uClaw 既有代码）；uClaw 与 pi 冲突时**改 uClaw 去贴合 pi，不改 pi**。本原则可**反向修订**本文以 uClaw 为中心的决策（尤其 **F2 持久化归属**）。详见执行追踪表 `docs/MIGRATION_GOALS.md` §P0。
+
 | # | 决策 | 状态 | 备注 |
 |---|---|---|---|
 | 1 | **桌面框架 = Tauri v2 + React + TS + Vite**；Rust-first，后端直接依赖 pi 的 crate；系统 WebView，二进制 ~15–30MB | ✅ 采纳 | 与现状一致,uClaw 本就是 Tauri v2 |
@@ -32,7 +34,7 @@
 | Fork | 议题 | 定案 | 覆盖/影响的章节 |
 |---|---|---|---|
 | **F1** | 交付形态 | **在现有 `uclaw-pi` 仓库内原地演进,直接复用现有 `ui/` 树,不另起 `desktop/` 工程。** §2A 结构路径去掉 `desktop/` 前缀(即 `ui/src/…`、`src-tauri/src/…`);前端模块化在 `ui/` 内**增量**进行,**复用优先于重写**。 | §2A.2/§2A.3 路径前缀;§2 |
-| **F2** | 会话持久化 | **pi 无状态(`no_session=true`),uClaw 为唯一事实源。** 每轮由 uClaw 把完整历史(经 ACL 转 pi `Message[]`)喂给 pi;**无迁移、无双写、无 split-brain**。pi 不落盘消息;uClaw 既有 `db/`+`session.rs` 保持为正文存储。 | **覆盖原 §3.4 持久化归属**;§7 R3 |
+| **F2** | 会话持久化 | ⚠️ **已于 2026-05-30 修订(P0)——本行原内容作废。** 原:pi 无状态、uClaw 为唯一事实源。**新:pi 原生 session 层拥有会话**(`no_session=false`,`session_dir=~/.uclaw/if2pi/agent/sessions`);**uClaw 弃用 rusqlite 会话/db 层**;`get_messages`/`list_agent_sessions` 经 ACL 读 pi;cost/settings 迁 `sqlmodel-sqlite`。详见 `docs/MIGRATION_GOALS.md` §P0「F2 修订定案」。 | 恢复并强化 §5.3;R1 数据层迁移 |
 | **F3** | 嵌入对冲 | **纯进程内,不做 sidecar 对冲。** 删除 `SessionTransport`/`RpcSubprocess` 回退。**代价:把"pi 能否在 stable 1.85 编译 + 运行稳定"变成不可回退的硬赌注**——R0 升为**阻断式 go/no-go 门禁**;若 pi 需 nightly,则 uClaw 全量工具链随之 nightly(已接受)。`panic="abort"` 单进程崩溃风险亦已接受。 | §1;§7 R0;§8 风险 |
 | **F4** | v1 认知红线 | **v1 必做:** `agent:turn_cost`(从 pi `Usage` 算)、`agent:context_stats`(从 usage 估算)、`agent:skill-recalled` + `agent:memory-recall` chip(由**保留的 uClaw memory/skill 服务**驱动:召回→注入 prompt→emit chip,正好契合 F2 的"uClaw 拥有一切")。**v1 stub/隐藏:** heartbeat、reflection、proactive-learning、symphony、gbrain、teams、GEP。 | §3.3;§4.4 🔵 项;**附录 B** |
 | **F5** | 工具与渲染器 | **采用 pi 内置工具**(read/bash/edit/write/grep/find/ls),在 ACL 把 pi `ToolOutput` 归一成 uClaw `tool-renderers/` 期望的形状;浏览器/skill/MCP 等 uClaw 独有工具才包成 `impl pi::sdk::Tool`。 | §3.4 DTO;§7 R4 |

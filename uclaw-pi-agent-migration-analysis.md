@@ -10,6 +10,8 @@
 
 ## 0. 执行摘要（TL;DR）
 
+> 🧭 **P0 · 治理原则（2026-05-30，最高优先级，覆盖全文）**：**pi 原生优先，uClaw 适配**——尽量不改 vendored `crates/pi` 的源码（镜像上游 pi），一切适配/桥接写在 uClaw 侧；uClaw 与 pi 设计冲突时**改 uClaw 去贴合 pi，不改 pi**。本原则可**反向修订**本文以 uClaw 为中心的结论（尤其 §0.4 / §5.3 持久化归属、F2）。详见 `docs/MIGRATION_GOALS.md` §P0。
+
 1. **可行性结论：可行，但不是"直接 link 调用"那么简单。** pi 提供了**明确、稳定、专为嵌入设计的库 API**（`pi::sdk`，含可运行示例 `examples/basic_sdk.rs`），Agent 循环（`Agent` / `AgentSession` / `AgentSessionHandle`）与 CLI/TUI 完全解耦。这是迁移能成立的前提。
 
 2. **最大障碍是异步运行时不兼容。** pi **不使用 tokio**，而是使用自研运行时 **`asupersync =0.3.2`** 作为执行器、`Mutex`、通道与定时器；其整个 `src/` 中只有 1 处无关紧要的 `tokio::` 引用。而 **Tauri 建立在 tokio 之上**。两个运行时在"执行器/poll"层面不可互通——**不能直接 `tokio::spawn` 一个 pi 的 SDK future**。这是决定集成形态的核心约束。
@@ -231,7 +233,7 @@ flowchart LR
 
 ### 5.3 持久化与状态归属
 
-> ⚠️ 本节为初版论证；**持久化归属以复刻计划 §0B F2 为准**（pi 无状态 `no_session=true`，uClaw 为唯一事实源，无 pi 会话存储/迁移）。**配置目录另见 F7**：无论会话是否落盘，pi 的全局/项目配置一律经环境覆盖重映射到 `~/.uclaw/if2pi/`，与独立 pi CLI 隔离。
+> ✅ **本节（pi 拥有会话存储）现为权威**：F2 已于 2026-05-30 **撤销**（见 `docs/MIGRATION_GOALS.md` §P0「F2 修订定案」+ 治理原则 P0）。pi 原生 session 层拥有会话（`no_session=false`），`session_dir` 指向 **`~/.uclaw/if2pi/agent/sessions`**（F7 命名空间，非旧文中的 `pi-sessions`）；uClaw 弃用 rusqlite，`get_messages` 经 ACL 读 pi；cost/settings 迁 `sqlmodel-sqlite`。**配置目录见 F7。**
 
 - **pi 拥有 agent 会话存储**：`SessionOptions.session_dir = ~/.uclaw/pi-sessions/<conv_id>`（SQLite 后端，feature `sqlite-sessions`）。
 - **uClaw SQLite 退化为索引**：保留 `conversations` 表（标题/时间/模型/成本聚合）与现有"会话列表/重命名/删除"命令；消息正文不再双写——`get_messages` 命令改为经适配层从 pi `handle.messages()` 拉取并映射到前端期望的 `ChatMessage` DTO。
