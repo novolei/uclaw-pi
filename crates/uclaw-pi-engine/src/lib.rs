@@ -30,6 +30,6 @@ pub mod events;
 
 pub use acl::{demux, Acl, FeEvent, RawEvt};
 pub use approval::{make_approval_handler, ApprovalRegistry, PendingTicket};
-pub use dto::{content_block_to_fe, message_to_chat_message};
+pub use dto::{content_block_to_fe, message_to_chat_message, tool_output_to_result};
 pub use engine::{EngineCmd, EngineConfig, PiEngine};
 pub use events::{event, EventSink};

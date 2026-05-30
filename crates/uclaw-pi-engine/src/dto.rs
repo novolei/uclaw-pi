@@ -15,7 +15,30 @@
 //! on the exact strings.
 
 use pi::model::{ContentBlock, Message, UserContent};
+use pi::tools::ToolOutput;
 use serde_json::{json, Value};
+
+/// [R4 F5] Normalize a pi [`ToolOutput`] into the `result` shape uClaw's
+/// `tool-renderers/` consume — the flattened **text** of the output's content
+/// blocks. `bash-result.tsx` / `read-result.tsx` / … read `activity.result` as a
+/// string (e.g. `result.replace(/\\n/g, '\n')`); emitting the raw `ToolOutput`
+/// object instead blanks the card (R4 Stop-if: "ToolOutput 形状不符致渲染器空白").
+///
+/// Built-in tools (read/bash/edit/write/grep/find/ls) stay pi's (F5) — only their
+/// output shape is mapped here, never reimplemented.
+#[must_use]
+pub fn tool_output_to_result(output: &ToolOutput) -> Value {
+    let text: String = output
+        .content
+        .iter()
+        .filter_map(|b| match b {
+            ContentBlock::Text(t) => Some(t.text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("");
+    Value::String(text)
+}
 
 /// Map one pi [`ContentBlock`] to the frontend snake_case ContentBlock JSON.
 /// `None` = no frontend representation (e.g. inline images, which the frontend
@@ -254,6 +277,31 @@ mod tests {
             mime_type: "image/png".into(),
         }))
         .is_none());
+    }
+
+    /// [R4 F5] A pi ToolOutput must flatten to the **string** `result` the
+    /// renderers consume — never the raw `{content,…}` object (which blanks the
+    /// card). Mirrors the bash/read/write/edit/screenshot renderer expectation.
+    #[test]
+    fn tool_output_flattens_to_renderer_result_string() {
+        let output = ToolOutput {
+            content: vec![
+                ContentBlock::Text(TextContent {
+                    text: "line1\n".into(),
+                    text_signature: None,
+                }),
+                // A non-text block (e.g. an image) is dropped from the text result.
+                ContentBlock::Text(TextContent {
+                    text: "line2".into(),
+                    text_signature: None,
+                }),
+            ],
+            details: None,
+            is_error: false,
+        };
+        let result = tool_output_to_result(&output);
+        assert!(result.is_string(), "renderers read result as a string");
+        assert_eq!(result, json!("line1\nline2"));
     }
 
     /// The single tool_result block produced by a `Message::ToolResult`.

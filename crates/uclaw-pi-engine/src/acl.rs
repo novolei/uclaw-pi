@@ -95,7 +95,9 @@ pub fn demux(ev: &AgentEvent) -> RawEvt {
         } => RawEvt::ToolEnd {
             tool_name: tool_name.clone(),
             tool_call_id: tool_call_id.clone(),
-            result: serde_json::to_value(result).unwrap_or(Value::Null),
+            // [R4 F5] Normalize pi's ToolOutput → the flattened text string the
+            // tool-renderers read, not the raw ToolOutput object.
+            result: crate::dto::tool_output_to_result(result),
             is_error: *is_error,
         },
         AgentEvent::TurnEnd { .. } => RawEvt::TurnEnd,
