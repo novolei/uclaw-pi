@@ -351,11 +351,7 @@ pub struct AppState {
     /// populated asynchronously in main.rs Stage 3 via interior RwLock).
     pub proactive_service: Arc<tokio::sync::RwLock<Option<Arc<ProactiveService>>>>,
 
-    /// SymphonyService — third parallel runtime (DAG-of-agent-runs).
-    /// `None` until main.rs Stage 3 wires it (gated on
-    /// `memubot_config.symphony.enabled`). Follows the same lazy-init shape
-    /// as `proactive_service` so Tauri commands can borrow it via `RwLock`.
-    pub symphony_service: Arc<tokio::sync::RwLock<Option<Arc<crate::symphony_graph::runtime::service::SymphonyService>>>>,
+    // [R5] symphony_service 字段已删（symphony_graph 旧后端删除）。
 
     /// App launch instant — used to compute uptime_secs in diagnostics.
     pub boot_time: std::time::Instant,
@@ -1054,7 +1050,6 @@ impl AppState {
             files_rail_service,
             runtime_service,
             proactive_service: Arc::new(tokio::sync::RwLock::new(None)),
-            symphony_service: Arc::new(tokio::sync::RwLock::new(None)),
             boot_time: std::time::Instant::now(),
             ingestion,
             gbrain_mcp_id: Arc::new(std::sync::Mutex::new(None)),

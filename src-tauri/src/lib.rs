@@ -74,7 +74,7 @@ pub mod browser;
 pub mod automation;
 
 // Phase 4: Symphony — DAG-of-agent-runs runtime (parallel to Chat/Agent/Automation).
-pub mod symphony_graph;
+// [R5] symphony_graph 已删（旧后端多-agent 编排，无 kept 依赖，-8 rusqlite）。
 
 // Phase 3: Files Rail
 pub mod files_rail;
