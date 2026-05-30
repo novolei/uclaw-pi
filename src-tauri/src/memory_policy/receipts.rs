@@ -102,20 +102,4 @@ pub fn receipt_to_task_event(receipt: &MemoryPolicyExecutionReceipt) -> TaskEven
     }
 }
 
-pub fn receipt_to_eval_event(
-    receipt: &MemoryPolicyExecutionReceipt,
-) -> crate::eval::trace::EvalEvent {
-    let target = match receipt.target {
-        MemoryPolicyTarget::Gbrain => crate::eval::trace::MemoryEvalTarget::Gbrain,
-        MemoryPolicyTarget::Memu
-        | MemoryPolicyTarget::BrowserArtifact
-        | MemoryPolicyTarget::MemoryGraph => {
-            crate::eval::trace::MemoryEvalTarget::MemorySystem
-        }
-    };
-    crate::eval::trace::EvalEvent::MemoryWrite {
-        ts: receipt.created_at.clone(),
-        target,
-        artifact_ref: receipt_artifact_ref(receipt),
-    }
-}
+// [R5] receipt_to_eval_event 已删（eval 模块删除；唯一调用者在 eval/ 内，已 dead）。

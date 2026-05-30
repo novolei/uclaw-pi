@@ -1,8 +1,0 @@
-{
-  "id": "memory.dual_inventory.health",
-  "title": "memU and gbrain inventory agree on health",
-  "target": "both",
-  "prompt": "Verify the app can classify memU and gbrain as pass, empty, unavailable, or error without hallucinating memory contents.",
-  "allowEmpty": true,
-  "requireConnected": true
-}

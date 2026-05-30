@@ -1135,11 +1135,7 @@ fn main() {
             uclaw_core::tauri_commands::apply_skill_consolidation,
             // System Diagnostics
             uclaw_core::tauri_commands::get_system_diagnostics,
-            uclaw_core::tauri_commands::run_memory_inventory_smoke,
-            uclaw_core::tauri_commands::run_memory_gbrain_eval,
-            uclaw_core::tauri_commands::run_browser_parity_eval,
-            uclaw_core::tauri_commands::run_agent_control_plane_eval,
-            uclaw_core::tauri_commands::run_self_improvement_gate_eval,
+            // [R5] eval 命令注册已删。
             uclaw_core::tauri_commands::restart_memu_bridge,
             uclaw_core::tauri_commands::get_embedding_config,
             uclaw_core::tauri_commands::set_embedding_config,

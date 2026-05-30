@@ -1,8 +1,0 @@
-{
-  "id": "memory.gbrain.inventory",
-  "title": "gbrain inventory is reachable",
-  "target": "gbrain",
-  "prompt": "Verify gbrain knowledge inventory can be reached and truthfully reports empty vs populated state.",
-  "allowEmpty": true,
-  "requireConnected": true
-}

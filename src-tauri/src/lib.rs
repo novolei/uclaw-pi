@@ -84,7 +84,7 @@ pub mod git;
 pub mod tauri_commands_git;
 
 // Offline eval
-pub mod eval;
+// [R5] eval 已删（旧后端评测 harness，0 rusqlite）。
 
 // Sub-project B: knowledge ingestion pipeline
 pub mod ingestion;

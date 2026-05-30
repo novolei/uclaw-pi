@@ -1,9 +1,0 @@
-{
-  "id": "memory.gbrain.tooling",
-  "title": "gbrain MCP tools are exposed",
-  "target": "gbrain",
-  "prompt": "Verify the gbrain MCP server exposes the minimum tool surface required for agent recall and page reads.",
-  "allowEmpty": true,
-  "requireConnected": true,
-  "minToolCount": 4
-}

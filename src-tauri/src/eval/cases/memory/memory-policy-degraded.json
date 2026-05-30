@@ -1,8 +1,0 @@
-{
-  "id": "memory.policy.degraded",
-  "title": "Memory Policy records degraded auxiliary memory",
-  "target": "memu",
-  "prompt": "Run a memU auxiliary write with memU unavailable and verify the degraded receipt.",
-  "requireWriteReceipt": true,
-  "expectedFacts": ["degraded"]
-}

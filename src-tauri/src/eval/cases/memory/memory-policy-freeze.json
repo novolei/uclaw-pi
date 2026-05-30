@@ -1,8 +1,0 @@
-{
-  "id": "memory.policy.freeze",
-  "title": "Memory Policy rejects memory_graph writes",
-  "target": "gbrain",
-  "prompt": "Attempt a memory_graph write through Memory Policy and verify it is rejected.",
-  "requireWriteReceipt": true,
-  "expectedFacts": ["memory_graph_frozen"]
-}

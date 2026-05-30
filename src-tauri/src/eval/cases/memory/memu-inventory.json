@@ -1,8 +1,0 @@
-{
-  "id": "memory.memu.inventory",
-  "title": "memU inventory is reachable",
-  "target": "memu",
-  "prompt": "Verify memU memory inventory can be reached and truthfully reports empty vs populated state.",
-  "allowEmpty": true,
-  "requireConnected": true
-}
