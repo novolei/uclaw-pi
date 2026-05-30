@@ -316,6 +316,12 @@ pub struct SessionOptions {
     /// the options struct.
     pub tool_factory: Option<Arc<dyn ToolFactory>>,
 
+    /// uclaw-patch(P0§4): optional global tool-approval gate threaded into the
+    /// session's [`AgentConfig::tool_approval`]. `create_agent_session` otherwise
+    /// hardcodes `None`; uClaw's engine sets this to surface approval dialogs
+    /// (R3). Additive — existing callers default to `None`, behavior unchanged.
+    pub tool_approval: Option<crate::agent::ToolApprovalHandler>,
+
     /// Session-level event listener invoked for every [`AgentEvent`].
     ///
     /// Unlike the per-prompt callback passed to [`AgentSessionHandle::prompt`],
@@ -352,6 +358,7 @@ impl Default for SessionOptions {
             include_cwd_in_prompt: true,
             max_tool_iterations: crate::agent::resolved_max_tool_iterations_default(),
             tool_factory: None,
+            tool_approval: None, // uclaw-patch(P0§4)
             on_event: None,
             on_tool_start: None,
             on_tool_end: None,
@@ -1762,7 +1769,7 @@ pub async fn create_agent_session(options: SessionOptions) -> Result<AgentSessio
         stream_options,
         block_images: config.image_block_images(),
         fail_closed_hooks: config.fail_closed_hooks(),
-        tool_approval: None,
+        tool_approval: options.tool_approval.clone(), // uclaw-patch(P0§4)
     };
 
     let tools = options.tool_factory.as_ref().map_or_else(

@@ -18,14 +18,17 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 use asupersync::channel::mpsc;
 use asupersync::runtime::{reactor::create_reactor, RuntimeBuilder, RuntimeHandle};
 use asupersync::sync::Mutex as AMutex;
+use pi::agent::{ToolApprovalDecision, ToolApprovalHandler};
 use pi::agent_cx::AgentCx;
 use pi::sdk::{create_agent_session, AbortHandle, AgentEvent, AgentSessionHandle, SessionOptions};
 
 use crate::acl::{demux, Acl};
+use crate::approval::{make_approval_handler, ApprovalRegistry};
 use crate::events::{event, EventSink};
 
 /// Commands from the Tauri/tokio side into the engine thread.
@@ -45,6 +48,13 @@ pub enum EngineCmd {
     Stop { conv_id: String },
     /// Forget `conv_id`'s in-memory session handle.
     Drop { conv_id: String },
+    /// [R3 交互] Resolve a pending approval / ask_user / exit_plan request (from
+    /// the `respond_*` tauri commands). `allow=false` denies with `reason`.
+    Respond {
+        request_id: String,
+        allow: bool,
+        reason: Option<String>,
+    },
 }
 
 /// How a streaming run is driven (shared spawn path for `Prompt`/`FollowUp`).
@@ -63,6 +73,9 @@ pub struct EngineConfig {
     pub session_dir: Option<PathBuf>,
     /// `true` = ephemeral (no disk). Default `false`: pi owns sessions (F2).
     pub no_session: bool,
+    /// [R3 Piece E] The active workspace's cwd → pi `working_directory`.
+    /// `None` keeps pi's default (process cwd).
+    pub working_directory: Option<PathBuf>,
 }
 
 impl EngineConfig {
@@ -72,6 +85,7 @@ impl EngineConfig {
             model: self.model.clone(),
             session_dir: self.session_dir.clone(),
             no_session: self.no_session,
+            working_directory: self.working_directory.clone(),
             ..Default::default()
         }
     }
@@ -142,14 +156,19 @@ async fn actor_loop(
 ) {
     let cx = AgentCx::for_current_or_request();
     let mut sessions: HashMap<String, SessionEntry> = HashMap::new();
+    // [R3 交互] One approval registry + handler shared across all sessions; each
+    // session's `SessionOptions.tool_approval` points at the handler, and
+    // `EngineCmd::Respond` resolves the pending request through the same registry.
+    let approval = ApprovalRegistry::new(cx.clone(), Duration::from_secs(300));
+    let approval_handler = make_approval_handler(approval.clone(), Arc::clone(&sink));
 
     while let Ok(cmd) = cmd_rx.recv(&cx).await {
         match cmd {
             EngineCmd::Prompt { conv_id, input } => {
-                start_run(&mut sessions, &rt, &sink, &cx, &config, conv_id, RunKind::Prompt(input)).await;
+                start_run(&mut sessions, &rt, &sink, &cx, &config, &approval_handler, conv_id, RunKind::Prompt(input)).await;
             }
             EngineCmd::FollowUp { conv_id } => {
-                start_run(&mut sessions, &rt, &sink, &cx, &config, conv_id, RunKind::FollowUp).await;
+                start_run(&mut sessions, &rt, &sink, &cx, &config, &approval_handler, conv_id, RunKind::FollowUp).await;
             }
             EngineCmd::SetModel { conv_id, provider, model } => {
                 if let Some(entry) = sessions.get(&conv_id) {
@@ -169,6 +188,15 @@ async fn actor_loop(
             EngineCmd::Drop { conv_id } => {
                 sessions.remove(&conv_id);
             }
+            EngineCmd::Respond { request_id, allow, reason } => {
+                let decision = if allow {
+                    ToolApprovalDecision::Allow
+                } else {
+                    ToolApprovalDecision::deny(reason.unwrap_or_else(|| "denied by user".into()))
+                };
+                // No waiter (stale/duplicate respond) is a harmless no-op.
+                approval.respond(&request_id, decision);
+            }
         }
     }
 }
@@ -181,11 +209,16 @@ async fn start_run(
     sink: &Arc<dyn EventSink>,
     cx: &AgentCx,
     config: &EngineConfig,
+    approval_handler: &ToolApprovalHandler,
     conv_id: String,
     kind: RunKind,
 ) {
     if !sessions.contains_key(&conv_id) {
-        match create_agent_session(config.to_session_options()).await {
+        // [R3 交互] Inject the global approval gate (sdk hardcodes None) so pi
+        // surfaces every tool through uClaw's approval dialog.
+        let mut opts = config.to_session_options();
+        opts.tool_approval = Some(approval_handler.clone());
+        match create_agent_session(opts).await {
             Ok(h) => {
                 sessions.insert(
                     conv_id.clone(),
@@ -367,10 +400,12 @@ mod tests {
             model: Some("claude-x".into()),
             session_dir: Some(PathBuf::from("/tmp/if2pi/sessions")),
             no_session: false,
+            working_directory: Some(PathBuf::from("/work/ws-1")),
         };
         let opts = cfg.to_session_options();
         assert_eq!(opts.provider.as_deref(), Some("anthropic"));
         assert_eq!(opts.model.as_deref(), Some("claude-x"));
         assert!(!opts.no_session);
+        assert_eq!(opts.working_directory.as_deref(), Some(std::path::Path::new("/work/ws-1")));
     }
 }
