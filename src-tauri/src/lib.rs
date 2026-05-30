@@ -8,6 +8,8 @@ pub mod tauri_commands;
 pub mod cost_store;
 // [R1 接线] Tauri EventSink adapter for the new pi-based agent backend (PiEngine).
 pub mod engine_sink;
+// [R2 消息核心闭环] Backend-only persistence of the PiEngine chat path → uClaw SQLite.
+pub mod engine_persist;
 
 pub mod agent;
 pub mod llm;

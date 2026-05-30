@@ -794,7 +794,7 @@ mod tool_intent_tests {
 
     #[test]
     fn long_responses_dont_trigger() {
-        let long = "我来更新".to_string() + &"这是一段很长的描述文本，".repeat(50);
+        let long = format!("我来更新{}", "这是一段很长的描述文本，".repeat(50));
         assert!(long.len() >= 600);
         // Long replies are usually completion summaries, not pre-action — skip nudge.
         assert!(!llm_signals_tool_intent(&long));

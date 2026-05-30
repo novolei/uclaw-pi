@@ -1498,6 +1498,22 @@ pub async fn send_message(
     // + a fresh message id (rendering correctness is R2, not R1).
     if crate::engine_sink::pi_engine_enabled() && input.content.trim() != "/compact" {
         let conv_id = input.conversation_id.clone();
+        // [R2 闭环] Persist the user message to uClaw SQLite (F2 source of truth)
+        // before driving pi; the assistant half is persisted by the EventSink on
+        // chat:stream-complete, so get_messages renders the full turn 1:1.
+        let user_msg_id = uuid::Uuid::new_v4().to_string();
+        if let Ok(conn) = state.db.lock() {
+            if let Err(e) = crate::engine_persist::persist_chat_text_message(
+                &conn,
+                &user_msg_id,
+                &conv_id,
+                "user",
+                &input.content,
+                None,
+            ) {
+                tracing::warn!("PiEngine user-message persist failed: {e}");
+            }
+        }
         if let (Some(provider), Some(model)) =
             (input.provider_id.clone(), input.model_id.clone())
         {
@@ -1512,7 +1528,7 @@ pub async fn send_message(
             input: input.content.clone(),
         });
         return Ok(SendMessageResponse {
-            message_id: uuid::Uuid::new_v4().to_string(),
+            message_id: user_msg_id,
             conversation_id: conv_id,
             response: String::new(),
         });
