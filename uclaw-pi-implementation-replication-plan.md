@@ -41,6 +41,8 @@
 | **F8** | 源码复用尺度 | **允许直接复用、甚至整段复制 pi_agent_rust 源码进 uClaw 树(vendoring),不限于经 `pi::sdk` 稳定面消费。pi 为用户自有仓库,按用户指示忽略许可证/第三方归属要求,可直接复制使用(无需 NOTICE/THIRD_PARTY 登记)。** 动机:pi 绝大多数模块 `#[doc(hidden)]`+声明不稳定,仅 `pi::sdk`+`error` 稳定;直接复制可取用 SDK 未暴露的内部(`Config::global_dir`、provider、sse 解析、`tool_approval` 装配等),并在 pi 升级破坏 SDK 时就地 fork。**唯一(可选)纪律**:优先用稳定 SDK、SDK 不足才复制;vendored 处加 `// from pi@<rev>:<path>` 标记便于 pi 升级 re-diff;复制≠改 pi 上游仓库(只读不变)。 | §2;§7.2;红线表 |
 
 > ⚠️ **F3 放大的风险(必须直说):** 因为放弃了 sidecar 对冲,整条路线的可行性**完全押在 R0 探针上**——"pi(+`asupersync`)能在 stable rustc 1.85 编译,且单进程内长时运行稳定"。R0 失败时没有就地回退,只能要么接受 uClaw 转 nightly、要么回到本日志重开 F3。**因此 R0 必须最先做,且其结论是后续一切的前置条件。**
+>
+> ✅ **R0 已完成（2026-05-30）：GO（权威覆盖)。** 进程内嵌入可行,全程 **stable**,F3 的 NO-GO 触发条件(只在 nightly / 需 `RUSTC_BOOTSTRAP`)**未发生**(无 nightly、无 `#![feature]`)。**工具链下限修正:不是 1.85,而是较新 stable（>1.88,实测 1.95.0；R1+ 工具链/CI 钉 `1.95`）——本文凡出现「stable 1.85」均以此为准。** 三级台阶(皆 stable 版本下限,非 nightly):`1.85`❌(pi build-dep vergen-gix/sysinfo/time/cargo_metadata 把 MSRV 抬到 1.88)、`1.88`❌(asupersync 0.3.2 用 unstable `Duration::from_mins`)、`1.95`✅(pi+asupersync+556 crate 干净编译)。§3.3 seam(seq 单调、text 累积)与运行时隔离(无 tokio、std::mpsc 桥、主线程零 `.await`)已端到端验证。**这是 stable 内部调整,不触发 F3 的 nightly 对冲分支——无需重开 F3、无需 sidecar。** 详见 `r0-pi-spike/R0-VERDICT.md` 与执行追踪表 `docs/MIGRATION_GOALS.md`。
 
 ---
 
@@ -394,7 +396,7 @@ ARC 式切换 = **左栏整屏在 workspace 之间横向滑动切换**,有手势
 - **R2 · 消息核心闭环**：`AgentView`/`AgentMessages`/`NativeBlockRenderer` 跑通真实 pi 流;`get_messages` 读 uClaw SQLite(F2);每轮历史经 ACL→pi `Message[]`;`ContentBlock` snake_case 映射;seq 合成。
 - **R3 · 交互 + workspace/session(F2 无状态)**：审批/ask_user/plan 回填;workspace CRUD(保留 uClaw 实现)+ ARC 切换跑通;`list_agent_sessions` 合成 `WorkspaceSession[]`;**持久化保持 uClaw 为唯一事实源**——`agent_service` 每轮从 uClaw 取全量历史经 ACL 喂 pi(`run_with_messages`),pi `no_session=true`,**不引入 pi 存储/迁移**。
 - **R4 · 工具/MCP/模型(F5)**：`UclawToolFactory` 注入——**内置工具用 pi**,ACL 把 pi `ToolOutput` 归一成 `tool-renderers/` 期望形状;MCP/浏览器/skill 包成 `impl pi::sdk::Tool`;`set_model`/provider 配置对接,**key 解析对齐 if2pi(F7):auth 经 `SessionOptions.api_key` 注入,pi 配置/models 全在 `~/.uclaw/if2pi/`,不读共享 `~/.pi/agent/auth.json`**。**形态自始至终是进程内**(F3,无 `SessionTransport` 切换动作)。
-- **R5 · 清理硬化 + 二期认知**：删除 uClaw 旧 agent **执行层**(agentic_loop/dispatcher/llm/providers 等,分析报告 §7.2),但**保留 memory/skill 服务**(F4:它们驱动 v1 召回 chip,移入 `services/memory_service`、`services/skill_service`);二期再议 heartbeat/reflection/proactive 等 stub 项;CI 工具链定基线(1.85 或 nightly,取决 R0);成本/中止/压缩/会话切换/召回 chip 全量回归。
+- **R5 · 清理硬化 + 二期认知**：删除 uClaw 旧 agent **执行层**(agentic_loop/dispatcher/llm/providers 等,分析报告 §7.2),但**保留 memory/skill 服务**(F4:它们驱动 v1 召回 chip,移入 `services/memory_service`、`services/skill_service`);二期再议 heartbeat/reflection/proactive 等 stub 项;CI 工具链定基线(stable **1.95**,R0 裁决:较新 stable 非 nightly);成本/中止/压缩/会话切换/召回 chip 全量回归。
 
 ---
 
@@ -405,7 +407,7 @@ ARC 式切换 = **左栏整屏在 workspace 之间横向滑动切换**,有手势
 2. **事件契约回归**:断言后端按 §3.3 形状 emit 5 个 `chat:stream-*` + `agent:need_approval`/`ask_user_request`/`exit_plan_request`/`turn_cost`/`stream-reset` + `session:title-*`。
 3. **交互 e2e**:流式回显(文本/思考/工具)、审批通过/拒绝、ask_user、`stop_agent` 中止、`/compact`、成本累计(或归零占位)、workspace 切换(ARC)、tab/session 增删改、会话标题。
 4. **运行时隔离审计**:grep 确认无"tokio 任务直接 await pi future";pi 仅在专用 asupersync 线程构造/驱动。
-5. **构建门禁**:stable rustc 1.85+ 全量 `cargo build --release` 通过,单二进制可启动并完成一次完整对话。
+5. **构建门禁**:stable rustc **1.95**(R0 实测下限,非 nightly)全量 `cargo build --release` 通过,单二进制可启动并完成一次完整对话。
 6. **配置隔离审计(F7)**:运行一轮完整对话后 `~/.pi/agent/` 与任意 `<cwd>/.pi/` **零新增/零改写**;所有 pi 配置/数据落 `~/.uclaw/if2pi/`(确认 `PI_CODING_AGENT_DIR`/`PI_CONFIG_PATH`/`PI_SESSIONS_DIR` 已在构造会话前生效)。
 
 ### 8.2 风险与缓解(复刻特有,补充分析报告 §9)

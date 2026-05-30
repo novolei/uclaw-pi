@@ -1,6 +1,6 @@
 # uClaw × pi_agent_rust 迁移目标链（Codex `/goal` 序列）
 
-> 版本 v1.0 · 2026-05-30 · 作者 Ryan Liu
+> 版本 v1.3 · 2026-05-30 · 作者 Ryan Liu
 >
 > 配套设计文档：
 > - [`uclaw-pi-implementation-replication-plan.md`](../uclaw-pi-implementation-replication-plan.md)（落地：逐文件复刻清单 + ACL 设计 + R0–R5）
@@ -8,6 +8,26 @@
 >
 > 本文是**执行追踪表**：把整条迁移拆成 6 个独立、可审计的 Codex `/goal`，按门禁顺序解锁。
 > **规则：一次只跑一个目标；跑完→过该阶段门禁→再粘下一个。** 单一巨目标（全 R0–R5）会超出可审计上限（>300K token）并必然 false-completion，已弃用。
+
+---
+
+## R0 结果（2026-05-30）：GO ✅ — 进程内可行，全程 stable，工具链下限修正
+
+> **裁决：GO。** 整条迁移可走进程内（专用 asupersync 线程 + `std::mpsc` 数据桥）；pi + asupersync 在 **stable** 完整编译并运行——F3 的 NO-GO 触发条件（只在 nightly / 需 `RUSTC_BOOTSTRAP`）**未发生**。无 `#![feature]`、无 nightly。
+>
+> **⚠️ 工具链下限修正（覆盖全文所有「stable 1.85」）：真实下限不是 1.85，而是较新 stable（>1.88，实测 1.95.0 可用）。R1+ 工具链 / CI 钉 `1.95`。** 三级台阶（皆为「stable 版本下限」问题，非 nightly 原因）：
+>
+> | rustc | 结果 | 卡点 |
+> |---|---|---|
+> | 1.85.0 | ❌ 解析期拒 | pi build-dep（vergen-gix 9.1.0 + sysinfo 0.38.4 / time 0.3.47 / cargo_metadata 0.23.1）把 MSRV 抬到 1.88，无 ≤1.85 版本可用 |
+> | 1.88.0 | ❌ 编译期 E0658 | asupersync 0.3.2 用了 unstable `Duration::from_mins`（duration_constructors, rust#120301），1.88 尚未稳定 |
+> | 1.95.0 | ✅ 退出 0 | pi + asupersync + 556 crate 干净编译（冷构建 ~2.6 min，增量 4.2s） |
+>
+> **端到端证据（stable 1.95，`cargo run` 退出 0）**：事件桥 `AgentStart→MessageUpdate(TextDelta)×2→TurnEnd→AgentEnd`；§3.3 seam `chat:stream-chunk{seq:0}→{seq:1}→chat:stream-complete{text:"pong from the void",truncated:false}`（seq 单调、text 累积）；运行时隔离——无 tokio 依赖/`tokio::spawn`，桥为 `std::mpsc`，主线程零 `.await`（`.await` 仅在 asupersync `block_on` 驱动的 `engine_async` 内）。
+>
+> **诚实标注**：① 本机无 API key（无 `~/.config/pi/auth.json`），`create_agent_session` 真实在 `resolve_api_key` 失败——故事件序列由注入**真实 pi `AgentEvent` 类型**（非 mock）经同一 demux→桥→ACL 路径产生；`MODE=live` 真流式分支已实现并编译通过，设 `ANTHROPIC_API_KEY` 后 `cargo run` 即走真流。② `panic="abort"` 仅在 pi release profile，探针走 dev(unwind)，F3 既定的崩溃风险不变。
+>
+> 完整裁决见 `r0-pi-spike/R0-VERDICT.md`。**这是 stable 内部调整，不触发 F3 的 nightly 对冲分支——无需重开 F3、无需 sidecar。** R1+ 凡引用「stable 1.85」一律以钉 `1.95` 为准。
 
 ---
 
@@ -26,8 +46,8 @@
 
 | 阶段 | 目标 | 状态 | 前置 | 预算 | 裁决/产物 |
 |---|---|---|---|---|---|
-| **R0** | 进程内引擎探针（go/no-go） | ⬜ 未开始 | — | 100K | `r0-pi-spike/R0-VERDICT.md` |
-| **R1** | 前端整树复刻 + ACL 骨架 | 🔒 锁（待 R0=GO） | R0=GO | 200K | `crates/uclaw-pi-engine` 骨架 |
+| **R0** | 进程内引擎探针（go/no-go） | ✅ GO（2026-05-30） | — | 100K | `r0-pi-spike/R0-VERDICT.md` · 进程内可行 / 全程 stable / 钉 1.95 |
+| **R1** | 前端整树复刻 + ACL 骨架 | ⬜ 未开始（已解锁） | R0=GO ✅ | 200K | `crates/uclaw-pi-engine` 骨架 |
 | **R2** | 消息核心闭环 | 🔒 锁 | R1 | 150K | 1:1 渲染 + ACL 映射单测 |
 | **R3** | 交互 + workspace/session（F2 无状态） | 🔒 锁 | R2 | 150K | 审批/ask_user/plan 回填 + ARC |
 | **R4** | 工具/MCP/模型（F5） | 🔒 锁 | R3 | 150K | UclawToolFactory + set_model |
@@ -42,14 +62,15 @@
 ## 2. 门禁顺序（每阶段必过才解锁下一阶段）
 
 ```
-R0 ──[GO?]──┬─ NO-GO → 停摆，回 F3（uClaw 转 nightly / 重开 sidecar 对冲）
-            └─ GO   → R1 ──→ R2 ──→ R3 ──→ R4 ──→ R5
+R0 ✅[GO]──┬─ NO-GO（未触发）→ 停摆，回 F3
+           └─ GO（已取）→ R1 ──→ R2 ──→ R3 ──→ R4 ──→ R5
+                          ▲ 当前在此
 ```
 
 **共用门禁（每阶段都查，源自 plan §8 / analysis §10）：**
 1. 前端零功能 diff：`tauri-bridge.ts` 的 226 invoke + 18 listen 名称/payload 不变。
 2. 运行时隔离审计：grep 确认无「tokio 任务直接 await/spawn pi future」；pi 仅在专用 asupersync 线程构造。
-3. 构建门禁：目标工具链（R0 裁决定，1.85 或 nightly）下 `cargo build --release` 过 + 单二进制可启动并完成一次完整对话。
+3. 构建门禁：目标工具链 **stable 1.95**（R0 裁决：较新 stable，非 nightly）下 `cargo build --release` 过 + 单二进制可启动并完成一次完整对话。
 4. 无 test-rewriting：现有 vitest/cargo 测试 regress 时不靠改测试过。
 5. 配置隔离审计（F7）：跑完一轮对话后 `~/.pi/agent/` 与 `<cwd>/.pi/` 零新增/改写；pi 配置/数据全部落 `~/.uclaw/if2pi/`（`PI_CODING_AGENT_DIR`/`PI_CONFIG_PATH` 绝对/`PI_SESSIONS_DIR` 在构造会话前已生效）。
 
@@ -58,6 +79,8 @@ R0 ──[GO?]──┬─ NO-GO → 停摆，回 F3（uClaw 转 nightly / 重�
 ## 3. 目标全文（按序粘进 Codex `/goal`）
 
 ### R0 · 进程内引擎探针（blocking go/no-go）
+
+> ✅ **已完成 2026-05-30 — GO。** 见顶部「R0 结果」callout 与 `r0-pi-spike/R0-VERDICT.md`。下方 goal 文本保留为历史记录;其中「stable 1.85」一律以顶部修正（钉 **1.95**）为准。
 
 ```
 /goal 验证 pi + asupersync 能否在 stable rustc 1.85 编译,并在 r0-pi-spike/ 内用一个最小 Engine Actor 端到端打通 prompt→流式→complete,最后产出书面 go/no-go 裁决——此裁决是整条迁移路线(R1–R5)的前置闸门(F3)。
@@ -126,7 +149,7 @@ Constraints:
 
 Done when:
   1. `cd ui && npm run build` 退出 0;`npm test` 退出 0(粘 summary)。
-  2. crates/uclaw-pi-engine 存在,stable 1.85 下 `cargo build --release` 过,导出 PiEngine + EngineCmd + 事件翻译器。
+  2. crates/uclaw-pi-engine 存在,stable 1.95 下 `cargo build --release` 过,导出 PiEngine + EngineCmd + 事件翻译器。
   3. send_message/stop_agent 经 pi_engine.cmd_tx 路由;5 个 chat:stream-* 按 §3.3 payload 形状 emit(脚本/测试断言)。
   4. grep 审计:无 tokio::spawn/await pi future;pi 仅在专用 asupersync 线程构造。
   5. 契约测试:226 invoke + 18 listen 名称相对 uClaw 基线不变。
@@ -278,7 +301,7 @@ Done when:
   2. v1 认知:turn_cost 累计(或置零)、context ring 渲染、skill+memory 召回 chip 从保留服务可见;附证据。
   3. 被 stub 事件 no-op(面板休眠、无 console 报错)。
   4. 全量 e2e 回归:流式/审批/ask_user/stop/compact/cost/workspace-ARC/tab-session/标题——全过;粘矩阵。
-  5. CI 钉定工具链(1.85 或 nightly,取决 R0 裁决)。
+  5. CI 钉定工具链 stable 1.95(R0 裁决:较新 stable,非 nightly)。
 
 Stop if:
   - §7.3 保留清单任一模块被删。
@@ -312,6 +335,7 @@ Use a token budget of 180000 tokens for this goal.
 
 ## 5. 变更日志
 
+- v1.3 (2026-05-30): **R0 完成 → GO**。整条迁移走进程内（asupersync 线程 + std::mpsc 桥），全程 stable，F3 NO-GO 未触发。**工具链下限修正：stable 1.85 → 较新 stable（>1.88，实测 1.95；R1+ 钉 1.95）**（1.85 被 pi build-dep MSRV 卡到 1.88、1.88 被 asupersync `Duration::from_mins` 卡，1.95 干净编译）。落到：顶部「R0 结果」callout、§1 表（R0=✅GO / R1 解锁）、§2 门禁图+共用门禁 3、R0 标注已完成、R1 Done-when 2 / R5 Done-when 5 钉 1.95。配套：复刻计划 §0B R0 结果 note / §8.1；分析报告 §0 note / §10。
 - v1.2 (2026-05-30): 新增 **F8 源码复用尺度（vendoring 允许）**。pi_agent_rust 为用户自有仓库，按用户指示**忽略许可证/第三方归属要求**——可直接复用甚至整段复制 pi 源码进 uClaw 树，不限于经 `pi::sdk` 消费；唯一可选纪律是优先 SDK、vendored 加来源标记便于升级 re-diff，且不改 pi 上游。落到：§4 红线表 + F8 note、R0 Constraint（copy-from vs 改上游澄清）、R1 Constraint、R4 Constraint。配套：复刻计划 §0B F8 / §2；分析报告 §2.1 / §7.1。
 - v1.1 (2026-05-30): 新增 **F7 配置命名空间隔离（pi → if2pi）**。嵌入 pi 经 `PI_CODING_AGENT_DIR`/`PI_CONFIG_PATH`(绝对)/`PI_SESSIONS_DIR` 把配置/数据重映射到 `~/.uclaw/if2pi/`，绕过硬编码项目级 `.pi`，与独立 pi CLI 隔离。落到：共用门禁 5、§4 红线表、R0（first-action 读 config.rs + Constraint/Done-when 7/Stop-if）、R4（Constraint + Done-when 5）。配套设计文档同步：复刻计划 §0B F7 / §3.5 / §7 R0·R4 / §8 门禁 6 / 附录A；分析报告 §3.7 / §5.3 注 / §9 / §10.6 / 附录A 代码。
 - v1.0 (2026-05-30): 初稿。6 目标链 + 门禁顺序 + 进度表。R0 状态：未开始（`r0-pi-spike/` 脚手架已存在，待打通）。

@@ -23,6 +23,8 @@
 
 6. **迁移的"不变量"是前端契约**：新后端必须继续 `emit` 这组事件并保留这组命令名/入参形状（详见 §6）。整个契约集中在 `ui/src/lib/tauri-bridge.ts`，**前端零改动**的关键就是适配层 1:1 复刻这些字符串与 payload。
 
+> ✅ **R0 已完成（2026-05-30）：GO（权威覆盖本文工具链表述）。** 进程内嵌入可行、全程 **stable**、F3 NO-GO 未触发（无 nightly / 无 `#![feature]`）。**工具链下限修正：不是 1.85，而是较新 stable（>1.88，实测 1.95.0；R1+ 钉 `1.95`）——本文凡「stable ≥1.85 / rust 1.85」均以此为准。** 卡点三级台阶（皆 stable 版本下限，非 nightly）：1.85❌（pi build-dep `vergen-gix`/`sysinfo`/`time`/`cargo_metadata` MSRV→1.88）、1.88❌（`asupersync 0.3.2` 用 unstable `Duration::from_mins`）、1.95✅。§6.1 流式 seam 与运行时隔离已端到端验证。详见 `r0-pi-spike/R0-VERDICT.md`、复刻计划 §0B、执行追踪表 `docs/MIGRATION_GOALS.md`。
+
 ---
 
 ## 1. 现状盘点：uClaw 后端 Agent 架构
@@ -363,7 +365,7 @@ flowchart LR
 2. **契约回归**：脚本断言 `chat:stream-chunk/reasoning/tool-activity/complete/error` 与 `agent:turn_cost/need_approval/ask_user_request` 等按既有 payload 形状 emit。
 3. **交互 e2e**：流式回显、工具审批通过/拒绝、`stop_generation` 中止、`/compact` 压缩、成本累计、会话切换/重命名/删除。
 4. **运行时隔离审计**：grep 确认无"tokio 任务直接 await pi future"；pi 仅在专用线程构造/驱动。
-5. **构建门禁**：stable rustc 1.85+ 全量 `cargo build --release` 通过；二进制可启动并完成一次完整对话。
+5. **构建门禁**：stable rustc **1.95**（R0 实测下限，非 nightly）全量 `cargo build --release` 通过；二进制可启动并完成一次完整对话。
 6. **配置隔离审计（F7）**：跑完一轮对话后 `~/.pi/agent/` 与 `<cwd>/.pi/` 无新增/改写；pi 配置/数据全部落 `~/.uclaw/if2pi/`。
 
 ---
