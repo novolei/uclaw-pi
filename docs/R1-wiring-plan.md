@@ -1,8 +1,10 @@
 # R1 接线蓝图：从「引擎已建」到「app 跑通」
 
+> ✅ **已实现（2026-05-30）—— 本蓝图的核心阻塞前提已被推翻**。「接线**必须**在 rusqlite 移除之后」是**错的**：`libsqlite3-sys` 冲突仅因 pi 默认 `sqlite-sessions` feature；**pi 跑 stateless 即 0 个 libsqlite3-sys，与 uClaw rusqlite 共存，无需任何迁移**。接线已完成（`TauriEventSink` + `PiEngine::spawn` + `send_message`/`stop_agent`→`cmd_tx`），见 `MIGRATION_GOALS.md`「## 突破」+ v1.15。本文档保留作历史；§3 的 `TauriEventSink` 代码仍准确。
+>
 > 2026-05-30 · 配套 [`MIGRATION_GOALS.md`](./MIGRATION_GOALS.md) §P0/§R1
 >
-> 后端 ACL 骨架（`crates/uclaw-pi-engine`，12 测试绿）+ 前端 §2A bridge 地基（`ui/src/lib/bridge/`）已就绪。本文是把它们接进 uClaw 主体、让 app 端到端跑通的**可执行蓝图 + 决策点**。**关键阻塞**：src-tauri 依赖 engine→pi 会触发 `libsqlite3-sys` native-link 冲突（与 uClaw `rusqlite`）。故接线**必须**在 rusqlite 移除之后。
+> 后端 ACL 骨架（`crates/uclaw-pi-engine`，12 测试绿）+ 前端 §2A bridge 地基（`ui/src/lib/bridge/`）已就绪。本文是把它们接进 uClaw 主体、让 app 端到端跑通的**可执行蓝图 + 决策点**。~~**关键阻塞**：src-tauri 依赖 engine→pi 会触发 `libsqlite3-sys` native-link 冲突（与 uClaw `rusqlite`）。故接线**必须**在 rusqlite 移除之后。~~（**已推翻——见顶部 ✅ 横幅**）
 
 ---
 

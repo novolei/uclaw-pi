@@ -1,8 +1,10 @@
 # R5 旧后端删除 + rusqlite 移除：执行计划
 
-> 2026-05-30 · 配套 [`R1-wiring-plan.md`](./R1-wiring-plan.md) · 目标：src-tauri 的 `rusqlite` 归零 → pi(`sqlmodel-sqlite`) 可入 workspace → 接线。
+> ⚠️ **前提已变（2026-05-30 突破）——「rusqlite 移除」不再是接线/入 workspace 的前置**。pi 跑 stateless 即与 uClaw rusqlite 共存，`crates/pi` 已入 workspace、engine 已接线，**全程未动 rusqlite**（见 `MIGRATION_GOALS.md`「## 突破」+ v1.15）。本文档的「rusqlite 归零」目标**降级为可选**：仅当将来要让 pi 原生持有持久化（F2 修订）才需要；否则旧后端删除（R5）只需删**死代码模块**，rusqlite 数据层**保留**。下方「旧后端模块删除分类」仍有效；「rusqlite→sqlmodel 迁移映射」仅在选择 pi-owns-persistence 时才执行。
 >
-> **基线已建**（`cargo check -p uclaw` 绿，无 pi 依赖）。`intent_classifier` 已删（0 引用，proven 流程）。
+> 2026-05-30 · 配套 [`R1-wiring-plan.md`](./R1-wiring-plan.md) · ~~目标：src-tauri 的 `rusqlite` 归零 → pi(`sqlmodel-sqlite`) 可入 workspace → 接线。~~（**已推翻，见顶部 ⚠️**）
+>
+> **基线已建**（`cargo check -p uclaw` 绿）。`intent_classifier` 已删（0 引用，proven 流程）。
 
 ## 现实校正（实测）
 
