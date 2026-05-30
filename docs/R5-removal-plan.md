@@ -30,6 +30,24 @@
 4. **校验** `grep -rl rusqlite src-tauri/src` 归零 → 删 `rusqlite` 依赖。
 5. **接线**（[`R1-wiring-plan.md`](./R1-wiring-plan.md) §2-4）：crates/pi+engine 转 member、`TauriEventSink`、命令路由。
 
+## rusqlite → sqlmodel-sqlite API 映射（迁移参考）
+
+> 来源：pi 自身的 `crates/pi/src/session_sqlite.rs`（sqlmodel-sqlite 的规范用法）。迁移保留区的 63 文件时照此翻译。
+
+| rusqlite | sqlmodel-sqlite |
+|---|---|
+| `Connection::open(path)` | `SqliteConnection::open(&SqliteConfig::file(path.to_string_lossy()).flags(OpenFlags::create_read_write()))` |
+| 只读 | `…flags(OpenFlags::read_only())` |
+| `conn.execute_batch(ddl)` / 无参 DDL | `conn.execute_raw(sql)` |
+| `conn.execute(sql, params![a,b])` | `conn.execute_sync(sql, &[val_a, val_b])` |
+| `conn.prepare(sql)?.query_map(p, |r| …)?` | `conn.query_sync(sql, &params)?`（返回 `Vec<Row>`），再 `for row in rows { row.get_named::<T>("col")? }` |
+| `row.get::<_,String>(0)` / `row.get("c")` | `row.get_named::<String>("c")`（按列名） |
+| `params![…]`(ToSql) | `&[sqlmodel_core::Value::…]`（需把 rusqlite 参数转 sqlmodel `Value`） |
+| 事务 | `conn.execute_raw("BEGIN IMMEDIATE")` … `"COMMIT"` / `"ROLLBACK"` |
+| 错误 | `map_err(|e| Error::…(format!("…: {e}")))`（自定义包装，仿 `map_sqlite_result`） |
+
+**难点（迁移时注意）**：① rusqlite 常用 `Arc<Mutex<Connection>>` 共享连接（uClaw `db/` 即如此）→ sqlmodel `SqliteConnection` 的共享/Send 模型需确认（可能每次开或池化）；② `params!` 宏 → sqlmodel `Value` 数组需逐参转换；③ `query_map`/`prepare_cached` 等 rusqlite 习语无直接对应，改 `query_sync` + 手动行迭代。
+
 ## 给你的决策点
 
 1. `memorization` keep（迁移）还是 delete？
