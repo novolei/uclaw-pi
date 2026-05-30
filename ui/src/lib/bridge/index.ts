@@ -10,4 +10,8 @@
 export * as agent from './agent'
 export * as chat from './chat'
 export * as models from './models'
+export * as session from './session'
+export * as skills from './skills'
+export * as memory from './memory'
+export * as mcp from './mcp'
 export * as events from './events'
