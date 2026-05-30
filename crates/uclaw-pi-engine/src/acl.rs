@@ -433,6 +433,78 @@ mod tests {
         assert!(e.payload["activity"]["durationMs"].is_u64());
     }
 
+    /// [R2 Done-when#1] A whole realistic turn — think, speak, call a tool, speak
+    /// again, finish — produces exactly the frontend-render event sequence:
+    /// reasoning deltas (own seq space), chunk deltas (own seq space), a
+    /// tool_start + tool_result card, and one terminal `complete` carrying the
+    /// full accumulated text. This is the scripted proof that "一整段对话渲染"
+    /// 1:1; the live screenshot with an API key is the remaining manual check.
+    #[test]
+    fn full_turn_renders_text_thinking_and_tool_card() {
+        let mut acl = Acl::new("conv");
+        let feed = [
+            RawEvt::AgentStart {
+                session_id: "s".into(),
+            },
+            RawEvt::ThinkingDelta {
+                delta: "let me ".into(),
+            },
+            RawEvt::ThinkingDelta {
+                delta: "think".into(),
+            },
+            RawEvt::TextDelta {
+                delta: "Running ".into(),
+            },
+            RawEvt::TextDelta { delta: "ls.".into() },
+            RawEvt::ToolStart {
+                tool_name: "bash".into(),
+                tool_call_id: "t1".into(),
+                input: json!({ "cmd": "ls" }),
+            },
+            RawEvt::ToolEnd {
+                tool_name: "bash".into(),
+                tool_call_id: "t1".into(),
+                result: json!({ "content": [{ "type": "text", "text": "a.txt" }] }),
+                is_error: false,
+            },
+            RawEvt::TextDelta {
+                delta: " Done.".into(),
+            },
+            RawEvt::TurnEnd,
+        ];
+        let events: Vec<FeEvent> = feed.iter().filter_map(|ev| acl.translate(ev)).collect();
+
+        // AgentStart yields nothing; the rest map 1:1 in order.
+        let names: Vec<&str> = events.iter().map(|e| e.name).collect();
+        assert_eq!(
+            names,
+            vec![
+                event::STREAM_REASONING,
+                event::STREAM_REASONING,
+                event::STREAM_CHUNK,
+                event::STREAM_CHUNK,
+                event::STREAM_TOOL_ACTIVITY,
+                event::STREAM_TOOL_ACTIVITY,
+                event::STREAM_CHUNK,
+                event::STREAM_COMPLETE,
+            ]
+        );
+        // Independent seq spaces: reasoning 0,1 — chunk 0,1,2.
+        assert_eq!(events[0].payload["seq"], 0);
+        assert_eq!(events[1].payload["seq"], 1);
+        assert_eq!(events[2].payload["seq"], 0);
+        assert_eq!(events[3].payload["seq"], 1);
+        assert_eq!(events[6].payload["seq"], 2);
+        // Tool card shapes (start + result).
+        assert_eq!(events[4].payload["activity"]["type"], "tool_start");
+        assert_eq!(events[4].payload["activity"]["toolName"], "bash");
+        assert_eq!(events[5].payload["activity"]["type"], "tool_result");
+        assert_eq!(events[5].payload["activity"]["isError"], false);
+        // Complete carries the full accumulated assistant text (chunks only).
+        assert_eq!(events[7].payload["text"], "Running ls. Done.");
+        assert_eq!(events[7].payload["truncated"], false);
+    }
+
     #[test]
     fn complete_emits_once_from_agent_end_when_no_turn_end() {
         let mut acl = Acl::new("c1");
