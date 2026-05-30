@@ -33,10 +33,24 @@ use crate::events::{event, EventSink};
 pub enum EngineCmd {
     /// Drive one user prompt on `conv_id`'s session (lazily created).
     Prompt { conv_id: String, input: String },
+    /// Continue `conv_id`'s loop without a new user message (steer/retry flows).
+    FollowUp { conv_id: String },
+    /// Switch the model for `conv_id`'s session.
+    SetModel {
+        conv_id: String,
+        provider: String,
+        model: String,
+    },
     /// Abort `conv_id`'s in-flight run (via its stored [`AbortHandle`]).
     Stop { conv_id: String },
     /// Forget `conv_id`'s in-memory session handle.
     Drop { conv_id: String },
+}
+
+/// How a streaming run is driven (shared spawn path for `Prompt`/`FollowUp`).
+enum RunKind {
+    Prompt(String),
+    FollowUp,
 }
 
 /// Base session configuration. Per F2 (reversed), pi owns persistence, so
@@ -132,58 +146,16 @@ async fn actor_loop(
     while let Ok(cmd) = cmd_rx.recv(&cx).await {
         match cmd {
             EngineCmd::Prompt { conv_id, input } => {
-                // Ensure the session exists (lazy create on the engine thread).
-                if !sessions.contains_key(&conv_id) {
-                    match create_agent_session(config.to_session_options()).await {
-                        Ok(h) => {
-                            sessions.insert(
-                                conv_id.clone(),
-                                SessionEntry {
-                                    handle: Arc::new(AMutex::new(h)),
-                                    abort: Arc::new(AMutex::new(None)),
-                                },
-                            );
-                        }
-                        Err(e) => {
-                            emit_error(&sink, &conv_id, format!("session create failed: {e:?}"));
-                            continue;
-                        }
-                    }
+                start_run(&mut sessions, &rt, &sink, &cx, &config, conv_id, RunKind::Prompt(input)).await;
+            }
+            EngineCmd::FollowUp { conv_id } => {
+                start_run(&mut sessions, &rt, &sink, &cx, &config, conv_id, RunKind::FollowUp).await;
+            }
+            EngineCmd::SetModel { conv_id, provider, model } => {
+                if let Some(entry) = sessions.get(&conv_id) {
+                    let handle = Arc::clone(&entry.handle);
+                    set_model_run(handle, &cx, &sink, &conv_id, &provider, &model).await;
                 }
-                let entry = sessions.get(&conv_id).expect("session present");
-                let handle = Arc::clone(&entry.handle);
-                let abort_slot = Arc::clone(&entry.abort);
-
-                // Create + register this run's abort handle before spawning, so a
-                // Stop arriving mid-prompt finds it.
-                let (abort_h, abort_sig) = AgentSessionHandle::new_abort_handle();
-                if let Ok(mut slot) = abort_slot.lock(&cx).await {
-                    *slot = Some(abort_h);
-                }
-
-                let sink_task = Arc::clone(&sink);
-                let cx_task = cx.clone();
-                rt.spawn(async move {
-                    let acl = StdMutex::new(Acl::new(conv_id.clone()));
-                    let sink_cb = Arc::clone(&sink_task);
-                    let on_event = move |ev: AgentEvent| {
-                        let raw = demux(&ev);
-                        if let Ok(mut a) = acl.lock() {
-                            if let Some(fe) = a.translate(&raw) {
-                                sink_cb.emit(fe.name, fe.payload);
-                            }
-                        }
-                    };
-
-                    match handle.lock(&cx_task).await {
-                        Ok(mut guard) => {
-                            if let Err(e) = guard.prompt_with_abort(input, abort_sig, on_event).await {
-                                emit_error(&sink_task, &conv_id, format!("prompt failed: {e:?}"));
-                            }
-                        }
-                        Err(e) => emit_error(&sink_task, &conv_id, format!("session lock failed: {e:?}")),
-                    }
-                });
             }
             EngineCmd::Stop { conv_id } => {
                 if let Some(entry) = sessions.get(&conv_id) {
@@ -198,6 +170,96 @@ async fn actor_loop(
                 sessions.remove(&conv_id);
             }
         }
+    }
+}
+
+/// Ensure `conv_id`'s session exists, register a fresh abort handle, and spawn
+/// the streaming run (prompt or continue) as its own asupersync task.
+async fn start_run(
+    sessions: &mut HashMap<String, SessionEntry>,
+    rt: &RuntimeHandle,
+    sink: &Arc<dyn EventSink>,
+    cx: &AgentCx,
+    config: &EngineConfig,
+    conv_id: String,
+    kind: RunKind,
+) {
+    if !sessions.contains_key(&conv_id) {
+        match create_agent_session(config.to_session_options()).await {
+            Ok(h) => {
+                sessions.insert(
+                    conv_id.clone(),
+                    SessionEntry {
+                        handle: Arc::new(AMutex::new(h)),
+                        abort: Arc::new(AMutex::new(None)),
+                    },
+                );
+            }
+            Err(e) => {
+                emit_error(sink, &conv_id, format!("session create failed: {e:?}"));
+                return;
+            }
+        }
+    }
+    let entry = sessions.get(&conv_id).expect("session present");
+    let handle = Arc::clone(&entry.handle);
+    let abort_slot = Arc::clone(&entry.abort);
+
+    // Register this run's abort handle before spawning, so a Stop arriving
+    // mid-run finds it.
+    let (abort_h, abort_sig) = AgentSessionHandle::new_abort_handle();
+    if let Ok(mut slot) = abort_slot.lock(cx).await {
+        *slot = Some(abort_h);
+    }
+
+    let sink_task = Arc::clone(sink);
+    let cx_task = cx.clone();
+    rt.spawn(async move {
+        let acl = StdMutex::new(Acl::new(conv_id.clone()));
+        let sink_cb = Arc::clone(&sink_task);
+        let on_event = move |ev: AgentEvent| {
+            let raw = demux(&ev);
+            if let Ok(mut a) = acl.lock() {
+                if let Some(fe) = a.translate(&raw) {
+                    sink_cb.emit(fe.name, fe.payload);
+                }
+            }
+        };
+
+        match handle.lock(&cx_task).await {
+            Ok(mut guard) => {
+                let res = match kind {
+                    RunKind::Prompt(input) => {
+                        guard.prompt_with_abort(input, abort_sig, on_event).await
+                    }
+                    RunKind::FollowUp => guard.continue_turn_with_abort(abort_sig, on_event).await,
+                };
+                if let Err(e) = res {
+                    emit_error(&sink_task, &conv_id, format!("run failed: {e:?}"));
+                }
+            }
+            Err(e) => emit_error(&sink_task, &conv_id, format!("session lock failed: {e:?}")),
+        }
+    });
+}
+
+/// Switch a session's model. Takes the handle by value so the lock guard's
+/// temporary cannot outlive it.
+async fn set_model_run(
+    handle: Arc<AMutex<AgentSessionHandle>>,
+    cx: &AgentCx,
+    sink: &Arc<dyn EventSink>,
+    conv_id: &str,
+    provider: &str,
+    model: &str,
+) {
+    match handle.lock(cx).await {
+        Ok(mut guard) => {
+            if let Err(e) = guard.set_model(provider, model).await {
+                emit_error(sink, conv_id, format!("set_model failed: {e:?}"));
+            }
+        }
+        Err(e) => emit_error(sink, conv_id, format!("session lock failed: {e:?}")),
     }
 }
 
