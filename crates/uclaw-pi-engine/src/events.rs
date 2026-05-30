@@ -19,6 +19,17 @@ pub mod event {
     pub const STREAM_COMPLETE: &str = "chat:stream-complete";
     /// `{conversationId, error}` — provider/agent error or user abort.
     pub const STREAM_ERROR: &str = "chat:stream-error";
+
+    // ── [R3 交互] interaction-backfill request names ────────────────────────
+    /// `{requestId, toolCallId, toolName, arguments}` — a tool needs approval
+    /// before it runs; answered by `approve_tool_call`.
+    pub const NEED_APPROVAL: &str = "agent:need_approval";
+    /// `{requestId, …}` — the agent asks the user a question; answered by
+    /// `respond_ask_user`.
+    pub const ASK_USER_REQUEST: &str = "agent:ask_user_request";
+    /// `{requestId, …}` — the agent requests to exit plan mode; answered by
+    /// `respond_exit_plan_mode`.
+    pub const EXIT_PLAN_REQUEST: &str = "agent:exit_plan_request";
 }
 
 /// Abstracts Tauri's `AppHandle::emit` so the engine/ACL stays testable and
