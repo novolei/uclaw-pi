@@ -6101,6 +6101,7 @@ pub async fn update_append_setting(
 pub async fn approve_tool_call(
     state: State<'_, AppState>,
     _app_handle: tauri::AppHandle,
+    engine: State<'_, std::sync::Arc<uclaw_pi_engine::PiEngine>>,
     input: ApproveToolCallInput,
 ) -> Result<ApproveToolCallResponse, Error> {
     tracing::info!(
@@ -6111,6 +6112,17 @@ pub async fn approve_tool_call(
         tool_name = ?input.tool_name,
         "Tool approval response received"
     );
+
+    // [R3 交互] Resolve the PiEngine's pending approval keyed by tool_call_id.
+    // Idempotent with the legacy uClaw approval flow below — the engine registry
+    // only holds this request when the pi path raised it (UCLAW_PI_ENGINE on).
+    if crate::engine_sink::pi_engine_enabled() {
+        engine.send(uclaw_pi_engine::EngineCmd::Respond {
+            request_id: input.tool_id.clone(),
+            allow: input.approved,
+            reason: None,
+        });
+    }
 
     // If approved with always_allow, add tool to auto-approved whitelist immediately
     if input.approved {
