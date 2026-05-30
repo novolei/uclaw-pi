@@ -35,7 +35,7 @@ gbrain as primary long-term knowledge, harness-gated self-evolution.
 Tauri orchestrates dev/build via `src-tauri/tauri.conf.json`, which calls the
 `ui/` npm scripts itself. From `src-tauri/`:
 
-- `cargo tauri dev` — runs `cd ../ui && npm run dev` (Vite at `:5173`) and starts the Rust app pointed at `devUrl`.
+- `cargo tauri dev` — runs `cd ../ui && npm run dev` (Vite at `:9527`) and starts the Rust app pointed at `devUrl`.
 - `cargo tauri build` — runs `cd ../ui && npm run build` (outputs to `../static`) and produces a release bundle.
 - `cargo build` / `cargo build --release` — Rust-only build of the `uclaw` binary and `uclaw_core` library.
 - `cargo test [-- <filter>]` — runs Rust unit tests (defined inline with `#[cfg(test)]`).
@@ -185,7 +185,7 @@ Two PRs reusing the same V-number is the most common merge accident in this repo
 
 ## Frontend Architecture (`ui/src/`)
 
-- React 18 + TypeScript, Vite (port `5173`, strict), Tailwind, Radix UI, Jotai for state, `react-markdown` + `shiki` for rendering, `sonner` for toasts.
+- React 18 + TypeScript, Vite (port `9527`, strict), Tailwind, Radix UI, Jotai for state, `react-markdown` + `shiki` for rendering, `sonner` for toasts.
 - `@/*` path alias maps to `ui/src/*` (see `vite.config.ts` and `tsconfig.json`).
 - Build output goes to `../static`, which Tauri serves as `frontendDist`.
 - Manual chunk splitting in `vite.config.ts`: `react`, `tauri`, `vendor`.

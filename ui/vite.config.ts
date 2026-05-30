@@ -31,7 +31,8 @@ export default defineConfig({
     },
   },
   server: {
-    port: 5173,
+    // 9527 — 致敬《监狱风云》/周星驰的经典囚号。
+    port: 9527,
     strictPort: true,
     fs: {
       // node_modules is a symlink to the parent project; Vite resolves symlinks
