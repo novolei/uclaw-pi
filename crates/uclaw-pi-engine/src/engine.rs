@@ -1,26 +1,29 @@
 //! The **Engine Actor**: a dedicated OS thread running pi's `asupersync` runtime,
-//! driven by [`EngineCmd`]s sent from the Tauri/tokio side over a plain
-//! `std::sync::mpsc` channel (data only — never a future crosses the boundary).
+//! driven by [`EngineCmd`]s from the Tauri/tokio side. Data only crosses the
+//! boundary — never a future.
 //!
-//! ## R1 status — SERIAL actor
-//! This slice processes commands **one at a time**: a `Prompt` is fully awaited
-//! (streaming events out through the [`EventSink`] as they arrive) before the
-//! next command is read. This wires the complete command → pi → stream → ACL →
-//! emit path end-to-end and compiles on the verified spike APIs.
+//! ## Concurrency (F6)
+//! The actor loop awaits commands on an `asupersync` mpsc channel and **spawns**
+//! each `Prompt` as its own task (`RuntimeHandle::spawn`), so:
+//! - multiple conversations (tabs) stream concurrently, and
+//! - the loop keeps reading commands while prompts run — so `Stop` can abort an
+//!   in-flight prompt via its stored [`AbortHandle`].
 //!
-//! `Stop` cannot interrupt an in-flight prompt in the serial model. The next
-//! slice upgrades the loop to spawn each prompt as an `asupersync` task
-//! (`RuntimeHandle::spawn`) and store its [`pi::sdk::AbortHandle`] so `Stop`
-//! (and per-tab concurrency, F6) work. The public surface ([`PiEngine`],
-//! [`EngineCmd`]) is unchanged by that upgrade.
+//! Per-session a single [`AgentSessionHandle`] sits behind an async `Mutex`, so
+//! two prompts on the *same* conversation serialize (you cannot prompt a busy
+//! session) while *different* conversations proceed in parallel.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::thread::JoinHandle;
 
-use pi::sdk::{create_agent_session, AgentEvent, SessionOptions};
+use asupersync::channel::mpsc;
+use asupersync::runtime::{reactor::create_reactor, RuntimeBuilder, RuntimeHandle};
+use asupersync::sync::Mutex as AMutex;
+use pi::agent_cx::AgentCx;
+use pi::sdk::{create_agent_session, AbortHandle, AgentEvent, AgentSessionHandle, SessionOptions};
 
 use crate::acl::{demux, Acl};
 use crate::events::{event, EventSink};
@@ -30,8 +33,7 @@ use crate::events::{event, EventSink};
 pub enum EngineCmd {
     /// Drive one user prompt on `conv_id`'s session (lazily created).
     Prompt { conv_id: String, input: String },
-    /// Request cancellation of `conv_id`'s current run (effective once the
-    /// concurrent slice lands; serial loop records intent only).
+    /// Abort `conv_id`'s in-flight run (via its stored [`AbortHandle`]).
     Stop { conv_id: String },
     /// Forget `conv_id`'s in-memory session handle.
     Drop { conv_id: String },
@@ -39,7 +41,7 @@ pub enum EngineCmd {
 
 /// Base session configuration. Per F2 (reversed), pi owns persistence, so
 /// `no_session` is `false` and `session_dir` points under the if2pi namespace
-/// (`~/.uclaw/if2pi/agent/sessions`) — set by the caller.
+/// (`~/.uclaw/if2pi/agent/sessions`).
 #[derive(Clone, Debug, Default)]
 pub struct EngineConfig {
     pub provider: Option<String>,
@@ -61,6 +63,14 @@ impl EngineConfig {
     }
 }
 
+/// Per-conversation engine state, held on the engine thread and shared with the
+/// spawned prompt task by `Arc`.
+struct SessionEntry {
+    handle: Arc<AMutex<AgentSessionHandle>>,
+    /// The current run's abort handle (if any). `Stop` takes + fires it.
+    abort: Arc<AMutex<Option<AbortHandle>>>,
+}
+
 /// Tokio-side handle to the engine. Holds the command sender and keeps the
 /// engine thread alive.
 pub struct PiEngine {
@@ -72,7 +82,7 @@ impl PiEngine {
     /// Spawn the dedicated asupersync engine thread.
     #[must_use]
     pub fn spawn(sink: Arc<dyn EventSink>, config: EngineConfig) -> Self {
-        let (cmd_tx, cmd_rx) = mpsc::channel::<EngineCmd>();
+        let (cmd_tx, cmd_rx) = mpsc::channel::<EngineCmd>(1024);
         let thread = std::thread::Builder::new()
             .name("pi-engine".into())
             .spawn(move || run_engine_thread(cmd_rx, sink, config))
@@ -84,53 +94,55 @@ impl PiEngine {
     }
 
     /// Send a command to the engine (sync; callable from any thread incl. tokio).
-    /// Returns `false` if the engine thread has gone away.
+    /// Returns `false` if the channel is full or the engine is gone.
     pub fn send(&self, cmd: EngineCmd) -> bool {
-        self.cmd_tx.send(cmd).is_ok()
+        self.cmd_tx.try_send(cmd).is_ok()
     }
 }
 
-/// Engine-thread entry: bootstrap pi's asupersync runtime, then run the actor
-/// loop. (pi uses asupersync, not tokio — see spike / examples/basic_sdk.rs.)
+/// Engine-thread entry: bootstrap pi's asupersync runtime, then run the actor loop.
 fn run_engine_thread(cmd_rx: mpsc::Receiver<EngineCmd>, sink: Arc<dyn EventSink>, config: EngineConfig) {
-    let reactor = match asupersync::runtime::reactor::create_reactor() {
+    let reactor = match create_reactor() {
         Ok(r) => r,
         Err(e) => {
-            sink.emit(
-                event::STREAM_ERROR,
-                serde_json::json!({ "conversationId": "", "error": format!("engine reactor init failed: {e:?}") }),
-            );
+            emit_error(&sink, "", format!("engine reactor init failed: {e:?}"));
             return;
         }
     };
-    let runtime = match asupersync::runtime::RuntimeBuilder::current_thread()
-        .with_reactor(reactor)
-        .build()
-    {
+    let runtime = match RuntimeBuilder::current_thread().with_reactor(reactor).build() {
         Ok(r) => r,
         Err(e) => {
-            sink.emit(
-                event::STREAM_ERROR,
-                serde_json::json!({ "conversationId": "", "error": format!("engine runtime init failed: {e:?}") }),
-            );
+            emit_error(&sink, "", format!("engine runtime init failed: {e:?}"));
             return;
         }
     };
-    runtime.block_on(actor_loop(cmd_rx, sink, config));
+    let handle = runtime.handle();
+    runtime.block_on(actor_loop(cmd_rx, handle, sink, config));
 }
 
-/// Serial command loop. Blocking `recv()` between commands is fine: nothing else
-/// runs on this runtime while idle, and each prompt's `.await` drives streaming.
-async fn actor_loop(cmd_rx: mpsc::Receiver<EngineCmd>, sink: Arc<dyn EventSink>, config: EngineConfig) {
-    let mut sessions: HashMap<String, pi::sdk::AgentSessionHandle> = HashMap::new();
+async fn actor_loop(
+    mut cmd_rx: mpsc::Receiver<EngineCmd>,
+    rt: RuntimeHandle,
+    sink: Arc<dyn EventSink>,
+    config: EngineConfig,
+) {
+    let cx = AgentCx::for_current_or_request();
+    let mut sessions: HashMap<String, SessionEntry> = HashMap::new();
 
-    while let Ok(cmd) = cmd_rx.recv() {
+    while let Ok(cmd) = cmd_rx.recv(&cx).await {
         match cmd {
             EngineCmd::Prompt { conv_id, input } => {
+                // Ensure the session exists (lazy create on the engine thread).
                 if !sessions.contains_key(&conv_id) {
                     match create_agent_session(config.to_session_options()).await {
                         Ok(h) => {
-                            sessions.insert(conv_id.clone(), h);
+                            sessions.insert(
+                                conv_id.clone(),
+                                SessionEntry {
+                                    handle: Arc::new(AMutex::new(h)),
+                                    abort: Arc::new(AMutex::new(None)),
+                                },
+                            );
                         }
                         Err(e) => {
                             emit_error(&sink, &conv_id, format!("session create failed: {e:?}"));
@@ -138,29 +150,49 @@ async fn actor_loop(cmd_rx: mpsc::Receiver<EngineCmd>, sink: Arc<dyn EventSink>,
                         }
                     }
                 }
-                let handle = sessions.get_mut(&conv_id).expect("session present");
+                let entry = sessions.get(&conv_id).expect("session present");
+                let handle = Arc::clone(&entry.handle);
+                let abort_slot = Arc::clone(&entry.abort);
 
-                // The ACL lives behind a Mutex so the (Fn + Send + Sync) callback
-                // can mutate it on each streamed event. Sink is cloned in.
-                let acl = Mutex::new(Acl::new(conv_id.clone()));
-                let sink_cb = Arc::clone(&sink);
-                let on_event = move |ev: AgentEvent| {
-                    let raw = demux(&ev);
-                    if let Ok(mut a) = acl.lock() {
-                        if let Some(fe) = a.translate(&raw) {
-                            sink_cb.emit(fe.name, fe.payload);
-                        }
-                    }
-                };
-
-                if let Err(e) = handle.prompt(input, on_event).await {
-                    emit_error(&sink, &conv_id, format!("prompt failed: {e:?}"));
+                // Create + register this run's abort handle before spawning, so a
+                // Stop arriving mid-prompt finds it.
+                let (abort_h, abort_sig) = AgentSessionHandle::new_abort_handle();
+                if let Ok(mut slot) = abort_slot.lock(&cx).await {
+                    *slot = Some(abort_h);
                 }
+
+                let sink_task = Arc::clone(&sink);
+                let cx_task = cx.clone();
+                rt.spawn(async move {
+                    let acl = StdMutex::new(Acl::new(conv_id.clone()));
+                    let sink_cb = Arc::clone(&sink_task);
+                    let on_event = move |ev: AgentEvent| {
+                        let raw = demux(&ev);
+                        if let Ok(mut a) = acl.lock() {
+                            if let Some(fe) = a.translate(&raw) {
+                                sink_cb.emit(fe.name, fe.payload);
+                            }
+                        }
+                    };
+
+                    match handle.lock(&cx_task).await {
+                        Ok(mut guard) => {
+                            if let Err(e) = guard.prompt_with_abort(input, abort_sig, on_event).await {
+                                emit_error(&sink_task, &conv_id, format!("prompt failed: {e:?}"));
+                            }
+                        }
+                        Err(e) => emit_error(&sink_task, &conv_id, format!("session lock failed: {e:?}")),
+                    }
+                });
             }
             EngineCmd::Stop { conv_id } => {
-                // Serial loop: a prompt is never in flight here. Recorded for the
-                // concurrent slice (which stores an AbortHandle per session).
-                let _ = conv_id;
+                if let Some(entry) = sessions.get(&conv_id) {
+                    if let Ok(mut slot) = entry.abort.lock(&cx).await {
+                        if let Some(h) = slot.take() {
+                            h.abort();
+                        }
+                    }
+                }
             }
             EngineCmd::Drop { conv_id } => {
                 sessions.remove(&conv_id);
@@ -182,10 +214,10 @@ mod tests {
     use serde_json::Value;
 
     /// Test EventSink that records every (name, payload) emitted.
-    struct RecordingSink(Mutex<Vec<(String, Value)>>);
+    struct RecordingSink(StdMutex<Vec<(String, Value)>>);
     impl RecordingSink {
         fn new() -> Arc<Self> {
-            Arc::new(Self(Mutex::new(Vec::new())))
+            Arc::new(Self(StdMutex::new(Vec::new())))
         }
         fn recorded(&self) -> Vec<(String, Value)> {
             self.0.lock().unwrap().clone()
@@ -197,10 +229,8 @@ mod tests {
         }
     }
 
-    /// End-to-end: build a one-turn sequence of REAL pi `AgentEvent`s (the same
-    /// shape a live prompt streams) and run it through demux → ACL → EventSink,
-    /// exactly as `actor_loop`'s callback does. Proves demux handles real events
-    /// and the emit path produces the frontend contract.
+    /// End-to-end: a one-turn sequence of REAL pi `AgentEvent`s through
+    /// demux → ACL → EventSink, exactly as the spawned prompt callback does.
     #[test]
     fn demux_acl_emit_pipeline_produces_frontend_events() {
         use pi::model::{AssistantMessage, AssistantMessageEvent, Message};
@@ -242,8 +272,7 @@ mod tests {
         ];
 
         let sink = RecordingSink::new();
-        // Mirror actor_loop's per-prompt callback.
-        let acl = Mutex::new(Acl::new("c1"));
+        let acl = StdMutex::new(Acl::new("c1"));
         let sink_cb: Arc<dyn EventSink> = sink.clone();
         let on_event = move |ev: AgentEvent| {
             let raw = demux(&ev);

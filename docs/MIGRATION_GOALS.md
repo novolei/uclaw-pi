@@ -65,7 +65,7 @@
 | 阶段 | 目标 | 状态 | 前置 | 预算 | 裁决/产物 |
 |---|---|---|---|---|---|
 | **R0** | 进程内引擎探针（go/no-go） | ✅ GO（2026-05-30） | — | 100K | `r0-pi-spike/R0-VERDICT.md` · 进程内可行 / 全程 stable / 钉 1.95 |
-| **R1** | 前端整树复刻 + ACL 骨架 | 🟡 进行中 | R0=GO ✅ | 200K | `uclaw-pi-engine` = ACL + events + **Engine Actor**(PiEngine/EngineCmd, 7 测试绿)；待续：engine 并发+Stop、ContentBlock 映射、前端 §2A、rusqlite 迁移 |
+| **R1** | 前端整树复刻 + ACL 骨架 | 🟡 进行中 | R0=GO ✅ | 200K | `uclaw-pi-engine` = ACL + **并发可中断 Engine Actor**（spawn+AbortHandle，F6，7 测试绿）；待续：全命令集、ContentBlock 映射、Tauri EventSink、前端 §2A、rusqlite 迁移 |
 | **R2** | 消息核心闭环 | 🔒 锁 | R1 | 150K | 1:1 渲染 + ACL 映射单测 |
 | **R3** | 交互 + workspace/session（F2 无状态） | 🔒 锁 | R2 | 150K | 审批/ask_user/plan 回填 + ARC |
 | **R4** | 工具/MCP/模型（F5） | 🔒 锁 | R3 | 150K | UclawToolFactory + set_model |
@@ -353,6 +353,7 @@ Use a token budget of 180000 tokens for this goal.
 
 ## 5. 变更日志
 
+- v1.8 (2026-05-30): **R1 slice 3 — 并发可中断 Engine Actor**。`engine.rs` 升级：命令通道改 `asupersync::channel::mpsc`（tokio 侧 `try_send`，actor `recv(&cx).await`）；每个 Prompt 经 `RuntimeHandle::spawn` 成独立 task（F6 多 tab 并发流式）；每会话 `AgentSessionHandle` 置于 `asupersync::sync::Mutex`（同会话串行、跨会话并行）；`Stop` 经存储的 `AbortHandle` 中断进行中的 prompt。asupersync 全套 API（`recv(&cx)`/`lock(&cx)`/`spawn`/`AbortHandle`/`AgentSessionHandle: Send`）**首次编译即通过**，7/7 测试在 stable 1.95 绿。
 - v1.7 (2026-05-30): **R1 slice 2 — Engine Actor**。`engine.rs`：`PiEngine`（tokio 侧句柄，`std::sync::mpsc` 命令通道）+ `EngineCmd`（Prompt/Stop/Drop）+ `EngineConfig`（F2：`no_session=false`、`session_dir`→if2pi）+ 专用 asupersync 线程 `block_on` 串行 actor loop（命令→`create_agent_session`→`prompt`→回调 demux→ACL→`EventSink.emit`）。集成测试用**真实 pi `AgentEvent`** 序列跑通 demux→ACL→recording sink（2 chunk+1 complete）。**7/7 测试在 stable 1.95 绿**。串行版 Stop 不能打断进行中的 prompt——下一 slice 用 asupersync `RuntimeHandle::spawn` + `AbortHandle` 升级为并发 + 可中断（F6），公共 API 不变。
 - v1.6 (2026-05-30): **R1 启动**。新建 `crates/uclaw-pi-engine`（独立 sub-workspace，依赖 crates/pi）——落地 **ACL 流式 seam**（`acl.rs`：demux 真实 pi `AgentEvent` → `chat:stream-chunk/-reasoning/-tool-activity/-complete/-error`，per-conv 单调 seq + 文本累积 + tool durationMs）+ `events.rs`（事件名常量 + `EventSink` trait）。**5/5 单测在 stable 1.95 通过**。**实测计数修正**（文档旧值已过时）：`tauri-bridge.ts` invoke **343**（旧 226）/ listen **23**（旧 18）；`components/agent/` **60** 文件。**rusqlite 迁移面 = 101 个 src-tauri 文件**，其中大半属 R5 待删的旧后端（symphony_graph/learning/memorization/memory_bucket_seal/agent/*）——故 R1 重排：**先做 engine/ACL（已起步），rusqlite 全量迁移与 src-tauri 接线推后**（与 R5 旧后端删除纠缠，避免对将删模块做无用迁移）。待续：engine actor loop（asupersync 线程 + EngineCmd + SessionRegistry + 跨运行时命令通道）、ContentBlock snake_case 映射、前端 §2A 模块化。
 - v1.5 (2026-05-30): **uclaw-patch 台账（P0 §4）**——`crates/pi/src/auth.rs` 4 处字面量拆分（`concat!`）：`GOOGLE_GEMINI_CLI_OAUTH_CLIENT_ID/SECRET`、`GOOGLE_ANTIGRAVITY_OAUTH_CLIENT_ID/SECRET`。原因：这些是各 CLI **公开的 installed-app OAuth 凭证**（pi 源码注明「非 server-side secret」），但 GitHub push-protection 误报为机密、阻断 `crates/pi` 推送；且仓库 push protection 无法自助关闭。**运行值与上游完全一致**，仅文本拆分以避开正则匹配。这是 P0 允许的「最小、可追溯、显式登记」pi 改动；标记 `// uclaw-patch(P0§4):`。
