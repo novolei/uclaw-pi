@@ -23,7 +23,9 @@
 #![forbid(unsafe_code)]
 
 pub mod acl;
+pub mod engine;
 pub mod events;
 
 pub use acl::{demux, Acl, FeEvent, RawEvt};
+pub use engine::{EngineCmd, EngineConfig, PiEngine};
 pub use events::{event, EventSink};

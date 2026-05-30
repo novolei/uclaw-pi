@@ -19,5 +19,8 @@ license = "Apache-2.0"
 
 [dependencies]
 pi = { package = "pi_agent_rust", path = "../pi" }
+# Same runtime pi uses; the engine bootstraps a dedicated asupersync runtime on
+# its own OS thread (never tokio). Pinned =0.3.2 to match pi (shared types).
+asupersync = { version = "=0.3.2", default-features = false, features = ["tls-native-roots"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
