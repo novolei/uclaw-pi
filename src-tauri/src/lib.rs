@@ -20,8 +20,7 @@ pub mod runtime;
 
 // M4-T1 — World projection types skeleton.
 pub mod world;
-// M3-T5 — Intent classifier (rule-based, risk + autonomy + capabilities).
-pub mod intent_classifier;
+// [R5] intent_classifier 已删（旧后端认知层，0 外部引用）。
 // M3-T7 — IM channel adapter types (Slack/Discord/Telegram/...).
 pub mod im_channels;
 // Agent OS Memory Policy spine.
