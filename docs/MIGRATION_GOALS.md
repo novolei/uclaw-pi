@@ -88,8 +88,8 @@
 |---|---|---|---|---|---|
 | **R0** | 进程内引擎探针（go/no-go） | ✅ GO（2026-05-30） | — | 100K | `r0-pi-spike/R0-VERDICT.md` · 进程内可行 / 全程 stable / 钉 1.95 |
 | **R1** | 前端整树复刻 + ACL 骨架 | ✅ 实现完成（2026-05-30） | R0=GO ✅ | 200K | `uclaw-pi-engine`（ACL + 并发可中断 Engine Actor，`cargo build --release` 退 0 @1.95.0）+ 前端 §2A bridge（11 域）+ `src-tauri` 接线（`TauriEventSink` + `PiEngine::spawn` stateless + `send_message`/`stop_agent`→`cmd_tx`）。**突破：pi 跑 stateless 与 uClaw rusqlite 共存，无 4565 处迁移**（见 §突破）。Done-when 1–5 全绿；2 处 settings 测试为既存 Tauri-mock 基线失败（非本期 regress） |
-| **R2** | 消息核心闭环 | ⬜ 未开始（R1 已解锁） | R1 ✅ | 150K | 1:1 渲染 + ACL 映射单测；翻 `UCLAW_PI_ENGINE` 默认为 ON |
-| **R3** | 交互 + workspace/session（F2 无状态） | 🔒 锁 | R2 | 150K | 审批/ask_user/plan 回填 + ARC |
+| **R2** | 消息核心闭环 | ✅ 实现完成（2026-05-30） | R1 ✅ | 150K | **per-channel seq 修复**（thinks-then-speaks 1:1）+ ContentBlock chat-types.ts 一致性 + flood/dedup + 全回合渲染脚本测试（15 引擎测试绿）+ **闭环持久化**（user/assistant→`messages` 表，2 持久化测试，gated）。Done-when 2/4 测试绿、1/3/5 路径+脚本验证；live 截图（#1）+ 翻 `UCLAW_PI_ENGINE` 默认需 API key（与 R1 同口径） |
+| **R3** | 交互 + workspace/session（F2 无状态） | ⬜ 未开始（R2 已解锁） | R2 ✅ | 150K | 审批/ask_user/plan 回填 + ARC + 历史持久化/重喂（agent 路径 send_agent_message→engine、reasoning/tool-card 入库、list_agent_sessions 由 uClaw SQLite 合成） |
 | **R4** | 工具/MCP/模型（F5） | 🔒 锁 | R3 | 150K | UclawToolFactory + set_model |
 | **R5** | 清理硬化 + 二期认知 | 🔒 锁 | R4 | 180K | 删 §7.2 + 全量 e2e 回归 |
 
@@ -103,8 +103,8 @@
 
 ```
 R0 ✅[GO]──┬─ NO-GO（未触发）→ 停摆，回 F3
-           └─ GO（已取）→ R1 ✅ ──→ R2 ──→ R3 ──→ R4 ──→ R5
-                                    ▲ 当前在此（R1 实现完成，解锁 R2）
+           └─ GO（已取）→ R1 ✅ ──→ R2 ✅ ──→ R3 ──→ R4 ──→ R5
+                                            ▲ 当前在此（R2 实现完成，解锁 R3）
 ```
 
 **共用门禁（每阶段都查，源自 plan §8 / analysis §10）：**
@@ -375,6 +375,7 @@ Use a token budget of 180000 tokens for this goal.
 
 ## 5. 变更日志
 
+- v1.16 (2026-05-30): **R2 消息核心闭环 实现完成**（按 R1 节奏，4 slice，引擎 15 测试 + 持久化 2 测试绿）。① **Slice 1**（`5cd32d2b`）：ContentBlock 对 `chat-types.ts` 精确线缆一致性测试（4 变体 + `is_error` + Image→None）+ flood/dedup seq 测试（Done-when #2/#4）。② **Slice 2**（`771ee783`）：**发现并修复 1:1 渲染 bug** —— R1 的 ACL 用单一 shared seq，但 `useGlobalAgentListeners.ts` 按 channel 分别跟踪 `lastChunkSeq`/`lastReasoningSeq` 且 `seq===0` 触发「新流」；thinks-then-speaks turn 会让 text 落在 seq=1、毁掉 chunk 新流复位（接到陈旧缓冲）。改 ACL 为 **per-channel seq**（chunk/reasoning 各自从 0），按 Stop-if「修映射不修 renderer」。校验 5 个 chat:stream-* payload 形状全部与前端契约一致。③ **Slice 3**（`e8ac96d5`）：**闭环持久化** `engine_persist.rs`（`persist_chat_text_message` 把文本编码成 get_messages 解析的 `Option<Vec<ContentBlock>>` 形状，uClaw `ContentBlock` 的 `#[serde(tag=type,snake_case)]` 保证线缆吻合，2 round-trip 测试）；send_message（gated）存 user、`TauriEventSink` 在 chat:stream-complete 存 assistant（**后端 only，UI 只读**，F2 uClaw SQLite 唯一事实源、pi 无存储）。④ **Slice 4**（`551adf6e`）：全回合渲染脚本测试（think→speak→bash→speak→complete 的精确 FeEvent 序列，Done-when #1 自动化 proxy）；验证 stop（`EngineCmd::Stop`→`AbortHandle.abort()`）、/compact（gate 排除→legacy）、reasoning（ACL）路径（Done-when #5）。修 `agent/types.rs` 测试潜伏 `String + &String`（feature-unification 暴露）。**Done-when 2/4 测试绿、1/3/5 路径+脚本验证**；live 截图（#1）+ 翻 `UCLAW_PI_ENGINE` 默认本机无 API key 待验（与 R1 同口径）。F2 历史持久化/重喂（agent 路径 + reasoning/tool-card 入库）归 R3。**解锁 R3**。
 - v1.15 (2026-05-30): **R1 实现完成 — 突破：pi stateless 共存，绕开 rusqlite 迁移**（详见上「## 突破」）。① libsqlite3-sys 冲突仅因 pi 默认 `sqlite-sessions` feature 拉 sqlmodel-sqlite；pi 跑 stateless（`no_session=true`，回原 F2）→ 0 个 libsqlite3-sys → 与 uClaw rusqlite 共存 → **零迁移**（省下 93 文件/4565 处）。`crates/pi`（stateless gating，`// uclaw-patch(P0§4)`）+ `crates/uclaw-pi-engine` 转正式 member（commit `49b52324`）。② **PiEngine 接线**（commit `d40bc53d`）：`engine_sink.rs`（`TauriEventSink`：engine `EventSink`→`AppHandle::emit` + `UCLAW_PI_ENGINE` 迁移开关）；`main.rs` setup `PiEngine::spawn`（stateless）+ `app.manage`；`tauri_commands.rs` `send_message`→`EngineCmd::Prompt`（+per-msg model override→`SetModel`）、`stop_agent`→`EngineCmd::Stop`（注入 `State<Arc<PiEngine>>`，契约名不变）。③ 修 `shell.rs` 潜伏 `String + &Cow`（workspace feature-unification 暴露）。**R1 Done-when 1–5 全绿**：#1 `npm run build` 退0 + `npm test` 1090 过（2 既存 settings Tauri-mock 基线失败，git 证实本期未触碰相关文件，非 regress）；#2 `cargo build --release -p uclaw-pi-engine` 退0 @1.95.0（3m34s）；#3 send_message/stop_agent 经 `cmd_tx` + 5 个 `chat:stream-*`；#4 engine 0 `tokio::spawn`、pi 仅 asupersync 线程；#5 `tauri-bridge.ts` 本期零改动（契约零 diff）。F2「pi 拥有持久化」降级为 R3+ 可选数据层工作。**解锁 R2**。
 - v1.14 (2026-05-30): **R5 删除执行计划** [`docs/R5-removal-plan.md`](./R5-removal-plan.md) + 首删 `intent_classifier`（0 引用，`cargo check` 绿）。计划含：模块 DELETE/KEEP 分类（agent/llm/symphony_graph/learning/eval/runtime 删；db/cost/memory*/mcp/skills 保留+迁 rusqlite；`memorization` 待你确认）、耦合现实（旧后端命令交织在 18k 行 tauri_commands.rs，删=协调大改）、无版本捷径（sqlmodel libsqlite3-sys 0.37 疑 fork）、执行顺序。**待你决策**：memorization 去留、是否开 workflow 并行删除/迁移（体量巨大）、是否接受「先删干净→再补」中间态。
 - v1.13 (2026-05-30): **R1 接线阶段启动（用户选定：rusqlite 移除 + R5 旧后端删除合并）**。建立可编译基线：src-tauri 暂移除 WIP 的 `pi` 依赖 + `AppState.pi_sessions` 字段（注释，待 rusqlite 归零后由 PiEngine 持有会话），`cargo check -p uclaw` 绿（1m36s）。**实测删除面**：旧后端可删模块 rusqlite ≈ 38 文件（agent 20/symphony_graph 8/memory_bucket_seal 5/learning 2/memorization 2/runtime 1），保留区仅 ~4；另 ~59 散落 tauri_commands.rs/mcp/skills 等需迁移。接下来逐模块删（耦合最小者先行，每步 cargo check 验证）。
