@@ -414,4 +414,68 @@ mod tests {
         // A later TurnEnd must not double-emit.
         assert!(acl.translate(&RawEvt::TurnEnd).is_none());
     }
+
+    /// [R2 Done-when#4] Under a flood of interleaved chunk/reasoning/tool events,
+    /// the synthesized `seq` on every seq-bearing event must be strictly
+    /// monotonic with no gaps and no duplicates, and `complete` must fire exactly
+    /// once. Tool-activity events carry no `seq` (they're keyed by toolCallId), so
+    /// they're excluded from the seq stream — assert that explicitly too.
+    #[test]
+    fn flood_seq_strictly_monotonic_no_gap_no_dup() {
+        let mut acl = Acl::new("flood");
+        let mut seqs: Vec<u64> = Vec::new();
+        let mut completes = 0;
+
+        // 600 interleaved events: text, thinking, and tool start/end every 7th.
+        for i in 0..600u64 {
+            let ev = match i % 7 {
+                0 => RawEvt::ThinkingDelta {
+                    delta: format!("r{i}"),
+                },
+                3 => RawEvt::ToolStart {
+                    tool_name: "bash".into(),
+                    tool_call_id: format!("t{i}"),
+                    input: json!({}),
+                },
+                4 => RawEvt::ToolEnd {
+                    tool_name: "bash".into(),
+                    tool_call_id: format!("t{}", i - 1),
+                    result: json!({}),
+                    is_error: false,
+                },
+                _ => RawEvt::TextDelta {
+                    delta: format!("c{i}"),
+                },
+            };
+            if let Some(fe) = acl.translate(&ev) {
+                match fe.name {
+                    event::STREAM_CHUNK | event::STREAM_REASONING => {
+                        seqs.push(fe.payload["seq"].as_u64().expect("seq present"));
+                    }
+                    event::STREAM_TOOL_ACTIVITY => {
+                        // Tool activity is keyed by toolCallId, not seq.
+                        assert!(fe.payload.get("seq").is_none());
+                    }
+                    other => panic!("unexpected event during flood: {other}"),
+                }
+            }
+        }
+
+        // Strictly monotonic, contiguous from 0: seqs == [0, 1, 2, ... n-1].
+        assert!(!seqs.is_empty());
+        for (i, s) in seqs.iter().enumerate() {
+            assert_eq!(*s, i as u64, "seq must be contiguous with no gap/dup/reorder");
+        }
+
+        // Exactly one complete, regardless of how many terminal events arrive.
+        for _ in 0..3 {
+            if acl.translate(&RawEvt::TurnEnd).is_some() {
+                completes += 1;
+            }
+            if acl.translate(&RawEvt::AgentEnd { error: None }).is_some() {
+                completes += 1;
+            }
+        }
+        assert_eq!(completes, 1, "complete is one-shot under terminal-event flood");
+    }
 }

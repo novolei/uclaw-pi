@@ -184,4 +184,94 @@ mod tests {
         assert_eq!(cm["content"], "ping");
         assert_eq!(cm["contentBlocks"][0]["text"], "ping");
     }
+
+    /// [R2 Done-when#2] Pin the EXACT wire shape of every `ContentBlock` variant
+    /// against `ui/src/lib/chat-types.ts`. `NativeBlockRenderer` switches on
+    /// `block.type` (snake_case) and reads the sibling fields by name, so any
+    /// drift here misaligns rendering. This test is the contract.
+    #[test]
+    fn content_block_wire_shapes_match_chat_types_ts() {
+        use pi::model::{ImageContent, TextContent, ThinkingContent, ToolCall};
+        use std::collections::BTreeSet;
+
+        let keys = |v: &Value| -> BTreeSet<String> {
+            v.as_object()
+                .map(|o| o.keys().cloned().collect())
+                .unwrap_or_default()
+        };
+
+        // {type:'text', text}
+        let text = content_block_to_fe(&text_block("hi")).unwrap();
+        assert_eq!(text["type"], "text");
+        assert_eq!(
+            keys(&text),
+            ["text", "type"].iter().map(|s| s.to_string()).collect()
+        );
+
+        // {type:'thinking', thinking}
+        let think = content_block_to_fe(&ContentBlock::Thinking(ThinkingContent {
+            thinking: "t".into(),
+            thinking_signature: None,
+        }))
+        .unwrap();
+        assert_eq!(think["type"], "thinking");
+        assert_eq!(
+            keys(&think),
+            ["thinking", "type"].iter().map(|s| s.to_string()).collect()
+        );
+
+        // {type:'tool_use', id, name, input}
+        let tool_use = content_block_to_fe(&ContentBlock::ToolCall(ToolCall {
+            id: "id1".into(),
+            name: "bash".into(),
+            arguments: json!({ "cmd": "ls" }),
+            thought_signature: None,
+        }))
+        .unwrap();
+        assert_eq!(tool_use["type"], "tool_use");
+        assert_eq!(
+            keys(&tool_use),
+            ["id", "input", "name", "type"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect()
+        );
+
+        // {type:'tool_result', tool_use_id, content, is_error} — via Message::ToolResult.
+        let tr = tool_result_block(true);
+        assert_eq!(tr["type"], "tool_result");
+        assert_eq!(
+            keys(&tr),
+            ["content", "is_error", "tool_use_id", "type"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect()
+        );
+
+        // Image has no frontend ContentBlock representation → None (filtered out).
+        assert!(content_block_to_fe(&ContentBlock::Image(ImageContent {
+            data: String::new(),
+            mime_type: "image/png".into(),
+        }))
+        .is_none());
+    }
+
+    /// The single tool_result block produced by a `Message::ToolResult`.
+    fn tool_result_block(is_error: bool) -> Value {
+        use pi::model::ToolResultMessage;
+        use std::sync::Arc;
+        let trm = ToolResultMessage {
+            tool_call_id: "tc1".into(),
+            tool_name: "bash".into(),
+            content: vec![ContentBlock::Text(TextContent {
+                text: "out".into(),
+                text_signature: None,
+            })],
+            details: None,
+            is_error,
+            timestamp: 0,
+        };
+        let cm = message_to_chat_message(&Message::ToolResult(Arc::new(trm)), "r1");
+        cm["contentBlocks"][0].clone()
+    }
 }
