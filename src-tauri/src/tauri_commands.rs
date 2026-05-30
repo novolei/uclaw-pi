@@ -15047,9 +15047,21 @@ pub async fn respond_ask_user(
 #[tauri::command]
 pub async fn respond_exit_plan_mode(
     state: State<'_, AppState>,
+    engine: State<'_, std::sync::Arc<uclaw_pi_engine::PiEngine>>,
     input: crate::ipc::RespondExitPlanInput,
 ) -> Result<(), Error> {
     use crate::app::{ExitPlanDecision, ExitPlanResult};
+
+    // [R4 cross-runtime bridge] Resolve the PiEngine's pending exit_plan request
+    // (raised by the wrapped ExitPlanTool's execute() on the asupersync side).
+    // Idempotent with the legacy uClaw exit-plan flow below; gated.
+    if crate::engine_sink::pi_engine_enabled() {
+        engine.send(uclaw_pi_engine::EngineCmd::Respond {
+            request_id: input.request_id.clone(),
+            allow: input.decision != "reject",
+            reason: input.feedback.clone(),
+        });
+    }
     use crate::ipc::CreatePermissionRuleInput;
 
     let decision = match input.decision.as_str() {
