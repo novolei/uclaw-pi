@@ -30,6 +30,7 @@ use pi::sdk::{create_agent_session, AbortHandle, AgentEvent, AgentSessionHandle,
 use crate::acl::{demux, Acl};
 use crate::approval::{make_approval_handler, ApprovalRegistry};
 use crate::events::{event, EventSink};
+use crate::tool_bridge::{tool_output_text, ToolRequestSink, ToolResultRegistry};
 use crate::tool_factory::UclawToolFactory;
 
 /// Commands from the Tauri/tokio side into the engine thread.
@@ -55,6 +56,14 @@ pub enum EngineCmd {
         request_id: String,
         allow: bool,
         reason: Option<String>,
+    },
+    /// [R4 IO 桥] Resolve a pending IO-tool execution (from uClaw's tokio executor
+    /// after it ran the real MCP/browser/skill tool). `text` becomes the tool's
+    /// `ToolOutput` the awaiting `BridgedIoTool::execute()` returns.
+    ToolResult {
+        request_id: String,
+        text: String,
+        is_error: bool,
     },
 }
 
@@ -110,11 +119,15 @@ pub struct PiEngine {
 impl PiEngine {
     /// Spawn the dedicated asupersync engine thread.
     #[must_use]
-    pub fn spawn(sink: Arc<dyn EventSink>, config: EngineConfig) -> Self {
+    pub fn spawn(
+        sink: Arc<dyn EventSink>,
+        tool_request_sink: Option<Arc<dyn ToolRequestSink>>,
+        config: EngineConfig,
+    ) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::channel::<EngineCmd>(1024);
         let thread = std::thread::Builder::new()
             .name("pi-engine".into())
-            .spawn(move || run_engine_thread(cmd_rx, sink, config))
+            .spawn(move || run_engine_thread(cmd_rx, sink, tool_request_sink, config))
             .expect("spawn pi-engine thread");
         Self {
             cmd_tx,
@@ -130,7 +143,12 @@ impl PiEngine {
 }
 
 /// Engine-thread entry: bootstrap pi's asupersync runtime, then run the actor loop.
-fn run_engine_thread(cmd_rx: mpsc::Receiver<EngineCmd>, sink: Arc<dyn EventSink>, config: EngineConfig) {
+fn run_engine_thread(
+    cmd_rx: mpsc::Receiver<EngineCmd>,
+    sink: Arc<dyn EventSink>,
+    tool_request_sink: Option<Arc<dyn ToolRequestSink>>,
+    config: EngineConfig,
+) {
     let reactor = match create_reactor() {
         Ok(r) => r,
         Err(e) => {
@@ -146,13 +164,14 @@ fn run_engine_thread(cmd_rx: mpsc::Receiver<EngineCmd>, sink: Arc<dyn EventSink>
         }
     };
     let handle = runtime.handle();
-    runtime.block_on(actor_loop(cmd_rx, handle, sink, config));
+    runtime.block_on(actor_loop(cmd_rx, handle, sink, tool_request_sink, config));
 }
 
 async fn actor_loop(
     mut cmd_rx: mpsc::Receiver<EngineCmd>,
     rt: RuntimeHandle,
     sink: Arc<dyn EventSink>,
+    tool_request_sink: Option<Arc<dyn ToolRequestSink>>,
     config: EngineConfig,
 ) {
     let cx = AgentCx::for_current_or_request();
@@ -162,9 +181,18 @@ async fn actor_loop(
     // `EngineCmd::Respond` resolves the pending request through the same registry.
     let approval = ApprovalRegistry::new(cx.clone(), Duration::from_secs(300));
     let approval_handler = make_approval_handler(approval.clone(), Arc::clone(&sink));
+    // [R4 IO 桥] Resolves IO-tool executions; `EngineCmd::ToolResult` (from uClaw's
+    // tokio executor) fires it, the awaiting BridgedIoTool returns the output.
+    let tool_results = ToolResultRegistry::new(cx.clone(), Duration::from_secs(300));
     // [R4 F5] One UclawToolFactory shared across sessions: pi built-ins verbatim +
-    // uClaw tools layered on top. Set on each session's SessionOptions.tool_factory.
-    let tool_factory = UclawToolFactory::new(approval.clone(), Arc::clone(&sink));
+    // uClaw tools (ExitPlanTool + BridgedIoTools from the executor's specs). Set on
+    // each session's SessionOptions.tool_factory.
+    let tool_factory = UclawToolFactory::new(
+        approval.clone(),
+        Arc::clone(&sink),
+        tool_results.clone(),
+        tool_request_sink,
+    );
 
     while let Ok(cmd) = cmd_rx.recv(&cx).await {
         match cmd {
@@ -200,6 +228,11 @@ async fn actor_loop(
                 };
                 // No waiter (stale/duplicate respond) is a harmless no-op.
                 approval.respond(&request_id, decision);
+            }
+            EngineCmd::ToolResult { request_id, text, is_error } => {
+                // Resolve the awaiting BridgedIoTool::execute() with the executor's
+                // output. No waiter (stale/timed-out) is a harmless no-op.
+                tool_results.respond(&request_id, tool_output_text(text, is_error));
             }
         }
     }

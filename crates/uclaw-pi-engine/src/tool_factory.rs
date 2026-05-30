@@ -32,6 +32,7 @@ use serde_json::{json, Value};
 
 use crate::approval::ApprovalRegistry;
 use crate::events::{event, EventSink};
+use crate::tool_bridge::{BridgedIoTool, ToolRequestSink, ToolResultRegistry};
 
 /// pi's built-in tool names, inherited verbatim (F5). Mirrors
 /// `pi::sdk::BUILTIN_TOOL_NAMES`; kept here as documentation of the F5 boundary.
@@ -52,12 +53,27 @@ pub const PI_BUILTIN_TOOLS: &[&str] = &[
 pub struct UclawToolFactory {
     approval: ApprovalRegistry,
     sink: Arc<dyn EventSink>,
+    /// Resolves IO-tool executions (tokio-resolver variant).
+    tool_results: ToolResultRegistry,
+    /// uClaw's tokio executor; `None` = no IO tools wired (interaction tools still
+    /// work). Declares its tools via `io_tool_specs()`.
+    tool_request_sink: Option<Arc<dyn ToolRequestSink>>,
 }
 
 impl UclawToolFactory {
     #[must_use]
-    pub fn new(approval: ApprovalRegistry, sink: Arc<dyn EventSink>) -> Arc<Self> {
-        Arc::new(Self { approval, sink })
+    pub fn new(
+        approval: ApprovalRegistry,
+        sink: Arc<dyn EventSink>,
+        tool_results: ToolResultRegistry,
+        tool_request_sink: Option<Arc<dyn ToolRequestSink>>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            approval,
+            sink,
+            tool_results,
+            tool_request_sink,
+        })
     }
 }
 
@@ -76,6 +92,22 @@ impl ToolFactory for UclawToolFactory {
             self.approval.clone(),
             Arc::clone(&self.sink),
         )));
+
+        // IO tools (tokio-resolver): one BridgedIoTool per spec uClaw's executor
+        // declares. execute() round-trips through the ToolRequestSink + the
+        // ToolResultRegistry (resolved by EngineCmd::ToolResult).
+        if let Some(req_sink) = &self.tool_request_sink {
+            for spec in req_sink.io_tool_specs() {
+                reg.push(Box::new(BridgedIoTool::new(
+                    spec.name,
+                    spec.label,
+                    spec.description,
+                    spec.parameters,
+                    self.tool_results.clone(),
+                    Arc::clone(req_sink),
+                )));
+            }
+        }
 
         reg
     }

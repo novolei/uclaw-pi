@@ -67,6 +67,28 @@ impl EventSink for TauriEventSink {
     }
 }
 
+/// [R4 IO 桥 — stub] The uClaw side of the IO-tool bridge seam. The engine calls
+/// `request(...)` when pi invokes a wrapped IO tool; the real executor will
+/// dispatch to `mcp.rs` / browser / skills (on tokio) and reply via
+/// `EngineCmd::ToolResult`. This stub declares **no** IO tools yet (so only pi
+/// built-ins + `ExitPlanTool` are active) and logs any request — the seam is
+/// connected and ready for the real executor.
+pub struct StubToolRequestSink;
+
+impl uclaw_pi_engine::ToolRequestSink for StubToolRequestSink {
+    fn io_tool_specs(&self) -> Vec<uclaw_pi_engine::IoToolSpec> {
+        Vec::new()
+    }
+
+    fn request(&self, request_id: &str, tool_name: &str, _input: &serde_json::Value) {
+        tracing::warn!(
+            request_id,
+            tool_name,
+            "PiEngine IO tool requested but the tokio executor is not wired yet (stub)"
+        );
+    }
+}
+
 /// [R1 Done-when#3] Whether the agent chat commands (`send_message`/`stop_agent`)
 /// route through `PiEngine`.
 ///

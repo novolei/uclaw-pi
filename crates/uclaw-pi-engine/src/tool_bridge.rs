@@ -26,11 +26,26 @@ use pi::model::{ContentBlock, TextContent};
 use pi::tools::{Tool, ToolEffects, ToolOutput, ToolUpdate};
 use serde_json::Value;
 
+/// One uClaw IO tool the executor can run, as pi tool metadata. The factory turns
+/// each spec into a [`BridgedIoTool`]. Keeping the list on the uClaw-provided sink
+/// keeps the engine ignorant of uClaw's specific tools.
+#[derive(Clone, Debug)]
+pub struct IoToolSpec {
+    pub name: String,
+    pub label: String,
+    pub description: String,
+    pub parameters: Value,
+}
+
 /// Engine → tokio: ask uClaw to execute a wrapped tool. uClaw provides the impl
 /// (a channel to a tokio executor that runs MCP/browser/skill and replies via
 /// `EngineCmd::ToolResult`). Abstracted like `EventSink` so the engine stays
 /// runtime-agnostic and testable.
 pub trait ToolRequestSink: Send + Sync + 'static {
+    /// The IO tools this executor can run (name + schema). The factory wraps each
+    /// as a `pi::sdk::Tool`. May be empty (no IO tools wired yet).
+    fn io_tool_specs(&self) -> Vec<IoToolSpec>;
+
     /// Dispatch `tool_name`(`input`) for `request_id`. Non-blocking: the result
     /// arrives later as `EngineCmd::ToolResult { request_id, .. }`.
     fn request(&self, request_id: &str, tool_name: &str, input: &Value);
@@ -48,6 +63,13 @@ fn text_output(text: impl Into<String>, is_error: bool) -> ToolOutput {
         details: None,
         is_error,
     }
+}
+
+/// Build a [`ToolOutput`] from plain text + error flag — used by the engine to
+/// resolve `EngineCmd::ToolResult` into the value the awaiting tool returns.
+#[must_use]
+pub fn tool_output_text(text: impl Into<String>, is_error: bool) -> ToolOutput {
+    text_output(text, is_error)
 }
 
 /// RAII: drop the pending slot on every exit path (resolve / cancel / timeout).

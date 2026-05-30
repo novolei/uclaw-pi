@@ -188,8 +188,15 @@ fn main() {
             // thread; its chat:stream-* events reach the frontend via TauriEventSink.
             {
                 let sink = uclaw_core::engine_sink::TauriEventSink::new(app.handle().clone());
+                // [R4 IO 桥] Pass the uClaw tool-request seam. The stub declares no
+                // IO tools yet (built-ins + ExitPlanTool only); the real tokio
+                // executor (mcp.rs/browser/skill dispatch → EngineCmd::ToolResult)
+                // is the integration that replaces it.
+                let tool_request_sink: std::sync::Arc<dyn uclaw_pi_engine::ToolRequestSink> =
+                    std::sync::Arc::new(uclaw_core::engine_sink::StubToolRequestSink);
                 let pi_engine = uclaw_pi_engine::PiEngine::spawn(
                     sink,
+                    Some(tool_request_sink),
                     uclaw_pi_engine::EngineConfig {
                         no_session: true,
                         ..Default::default()
