@@ -320,7 +320,12 @@ async fn start_run(
         if model_config.api.is_some() {
             opts.api = model_config.api.clone();
         }
-        opts.tool_approval = Some(approval_handler.clone());
+        // [R3] Tool-approval gate — opt-in via UCLAW_PI_APPROVAL. The
+        // approve_tool_call → EngineCmd::Respond round-trip isn't yet aligned with
+        // the frontend's tool-approval modal, so a set gate blocks pi waiting for a
+        // reply that never lands. Default off = pi auto-runs tools (matches a yolo
+        // safety mode); flip on once the round-trip is wired.
+        opts.tool_approval = std::env::var_os("UCLAW_PI_APPROVAL").map(|_| approval_handler.clone());
         opts.tool_factory = Some(tool_factory.clone());
         match create_agent_session(opts).await {
             Ok(h) => {

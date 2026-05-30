@@ -61,6 +61,14 @@ pub fn persist_agent_text_message(
     text: &str,
     reasoning: Option<&str>,
 ) -> rusqlite::Result<()> {
+    // The Agent renderer (NativeBlockRenderer) parses `content` as a JSON array of
+    // ContentBlocks — exactly the legacy backend's shape. Plain text fails to parse
+    // and renders empty (the "messages disappear after complete" bug). Encode the
+    // same `[{"type":"text","text":…}]` shape here.
+    let blocks: Option<Vec<ContentBlock>> = Some(vec![ContentBlock::Text {
+        text: text.to_owned(),
+    }]);
+    let content = serde_json::to_string(&blocks).unwrap_or_else(|_| "[]".into());
     conn.execute(
         "INSERT INTO agent_messages (id, session_id, role, content, created_at, reasoning) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -68,7 +76,7 @@ pub fn persist_agent_text_message(
             id,
             session_id,
             role,
-            text,
+            content,
             chrono::Utc::now().to_rfc3339(),
             reasoning,
         ],
