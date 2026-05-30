@@ -669,6 +669,12 @@ export function LeftSidebar({ width }: LeftSidebarProps): React.ReactElement {
   const handleNewAgentSession = async (): Promise<void> => {
     try {
       const meta = await createAgentSession(undefined, agentChannelId || undefined, currentWorkspaceId || undefined)
+      // Guard against a null/invalid meta so it never enters agentSessions —
+      // a null session crashes working-atoms `sessions.map(s => [s.id, …])`.
+      if (!meta?.id) {
+        console.error('[侧边栏] createAgentSession 返回空 meta，跳过创建')
+        return
+      }
       setAgentSessions((prev: any) => [meta, ...prev])
       if (agentChannelId) setSessionChannelMap((prev) => { const map = new Map(prev); map.set(meta.id, agentChannelId); return map })
       if (agentModelId) setSessionModelMap((prev) => { const map = new Map(prev); map.set(meta.id, agentModelId); return map })

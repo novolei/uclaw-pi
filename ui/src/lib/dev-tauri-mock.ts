@@ -347,6 +347,19 @@ export function createUclawMockIpcHandler(): MockHandler {
         return { mode: 'yolo', tool_overrides: [] }
       case 'get_default_prompts':
         return { prompts: [] }
+      case 'create_agent_session': {
+        // Return a valid AgentSessionMeta so the new-session flow doesn't push a
+        // null into agentSessions (which crashes working-atoms `sessions.map`).
+        // `updatedAt`/`createdAt` are ms — WelcomeView formats them (else "Invalid Date").
+        const now = Date.now()
+        const id = `mock-agent-${now}`
+        return { id, title: '新会话', archived: false, pinned: false, messageCount: 0, updatedAt: now, createdAt: now }
+      }
+      case 'create_conversation': {
+        const now = Date.now()
+        const id = `mock-conv-${now}`
+        return { id, title: 'New Conversation', archived: false, updatedAt: now, createdAt: now }
+      }
       default:
         console.warn(`[uClaw mock Tauri IPC] unhandled command: ${cmd}`)
         return null
