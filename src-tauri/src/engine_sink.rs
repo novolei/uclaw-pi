@@ -43,9 +43,22 @@ impl TauriEventSink {
         };
         let Ok(conn) = state.db.lock() else { return };
         let id = uuid::Uuid::new_v4().to_string();
-        if let Err(e) = crate::engine_persist::persist_chat_text_message(
-            &conn, &id, conv, "assistant", text, None,
-        ) {
+        // Route to the conversation's actual table: an Agent-view session lives in
+        // agent_messages (read by get_agent_session_messages); a chat conversation
+        // lives in messages (read by get_messages).
+        let is_agent_session = conn
+            .query_row(
+                "SELECT 1 FROM agent_sessions WHERE id = ?1",
+                [conv],
+                |_| Ok(()),
+            )
+            .is_ok();
+        let result = if is_agent_session {
+            crate::engine_persist::persist_agent_text_message(&conn, &id, conv, "assistant", text, None)
+        } else {
+            crate::engine_persist::persist_chat_text_message(&conn, &id, conv, "assistant", text, None)
+        };
+        if let Err(e) = result {
             tracing::warn!("PiEngine assistant persist failed: {e}");
         }
     }

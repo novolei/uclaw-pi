@@ -9906,6 +9906,51 @@ pub async fn send_agent_message(
         "send_agent_message ENTRY",
     );
 
+    // ── [Agent 路径接 pi] When UCLAW_PI_ENGINE is set, drive the AGENT view's
+    // conversation through pi (the Agent view uses this command). Resolve the
+    // user's 服务商 config, persist the user turn to agent_messages, then
+    // Configure + Prompt the engine; chat:stream-* render in AgentView and the
+    // EventSink persists the assistant back to agent_messages. /compact stays legacy.
+    if crate::engine_sink::pi_engine_enabled() && input.user_message.trim() != "/compact" {
+        let engine =
+            tauri::Manager::state::<std::sync::Arc<uclaw_pi_engine::PiEngine>>(&app_handle);
+        let conv_id = input.session_id.clone();
+        let user_msg_id = uuid::Uuid::new_v4().to_string();
+        if let Ok(conn) = state.db.lock() {
+            if let Err(e) = crate::engine_persist::persist_agent_text_message(
+                &conn,
+                &user_msg_id,
+                &conv_id,
+                "user",
+                &input.user_message,
+                None,
+            ) {
+                tracing::warn!("PiEngine agent user-message persist failed: {e}");
+            }
+        }
+        // Active provider/model/key/base_url/api from provider_service (服务商 tab).
+        if let Some((provider, model, api_key, base_url, api_type)) =
+            state.provider_service.get_chat_llm_config().await
+        {
+            let api = api_type
+                .and_then(|t| serde_json::to_value(t).ok())
+                .and_then(|v| v.as_str().map(str::to_string));
+            engine.send(uclaw_pi_engine::EngineCmd::Configure {
+                provider: Some(provider),
+                model: Some(model),
+                api_key: (!api_key.is_empty())
+                    .then(|| uclaw_pi_engine::RedactedString(api_key)),
+                base_url: (!base_url.is_empty()).then_some(base_url),
+                api,
+            });
+        }
+        engine.send(uclaw_pi_engine::EngineCmd::Prompt {
+            conv_id,
+            input: input.user_message.clone(),
+        });
+        return Ok(());
+    }
+
     // ── Plan-mode auto-suggest (high-recall keyword detector) ─────────
     // Disabled patterns come from the calibration scenario (Task 10);
     // stubbed to empty until then. Settings toggle lands in Task 11 —

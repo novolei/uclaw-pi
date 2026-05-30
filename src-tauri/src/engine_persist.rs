@@ -49,6 +49,33 @@ pub fn persist_chat_text_message(
     Ok(())
 }
 
+/// [R3 agent path] Persist into `agent_messages` (the Agent view's table, read by
+/// `get_agent_session_messages`). Unlike the chat `messages` table, its `content`
+/// is **plain text** (read straight as a String), so no ContentBlock encoding.
+/// `session_id` must reference an existing `agent_sessions` row (FK).
+pub fn persist_agent_text_message(
+    conn: &Connection,
+    id: &str,
+    session_id: &str,
+    role: &str,
+    text: &str,
+    reasoning: Option<&str>,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO agent_messages (id, session_id, role, content, created_at, reasoning) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        rusqlite::params![
+            id,
+            session_id,
+            role,
+            text,
+            chrono::Utc::now().to_rfc3339(),
+            reasoning,
+        ],
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
