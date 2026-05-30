@@ -1,0 +1,417 @@
+//! ACL: translate pi [`AgentEvent`]s into uClaw frontend `chat:stream-*` payloads.
+//!
+//! Two halves:
+//! 1. [`demux`] projects a real pi [`AgentEvent`] into [`RawEvt`] — owned data
+//!    safe to cross the tokio↔asupersync boundary (never a future). Sharing this
+//!    with the live callback means "we can handle real AgentEvents" is checked at
+//!    compile time, not guessed.
+//! 2. [`Acl`] consumes [`RawEvt`]s and emits [`FeEvent`]s whose JSON shape matches
+//!    `ui/src/lib/chat-types.ts`. It owns the per-conversation `seq` counter
+//!    (pi does not provide one) and accumulates assistant text for `complete`.
+
+use std::collections::HashMap;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+use pi::model::AssistantMessageEvent;
+use pi::sdk::AgentEvent;
+use serde::Serialize;
+use serde_json::{json, Value};
+
+use crate::events::event;
+
+/// Boundary data projected from a real pi [`AgentEvent`]. Only owned values
+/// cross the runtime boundary.
+#[derive(Debug, Clone)]
+pub enum RawEvt {
+    AgentStart { session_id: String },
+    TextDelta { delta: String },
+    ThinkingDelta { delta: String },
+    ToolStart {
+        tool_name: String,
+        tool_call_id: String,
+        input: Value,
+    },
+    /// Streaming partial tool output (drives `liveOutput` — wired in a later slice).
+    ToolUpdate {
+        tool_call_id: String,
+        partial: Value,
+    },
+    ToolEnd {
+        tool_name: String,
+        tool_call_id: String,
+        result: Value,
+        is_error: bool,
+    },
+    TurnEnd,
+    AgentEnd { error: Option<String> },
+    /// Any event the ACL does not (yet) project to a frontend event.
+    Other { name: String },
+}
+
+/// Project a real pi [`AgentEvent`] into [`RawEvt`]. The live prompt callback and
+/// any replay path share this function.
+#[must_use]
+pub fn demux(ev: &AgentEvent) -> RawEvt {
+    match ev {
+        AgentEvent::AgentStart { session_id } => RawEvt::AgentStart {
+            session_id: session_id.to_string(),
+        },
+        AgentEvent::MessageUpdate {
+            assistant_message_event,
+            ..
+        } => match assistant_message_event {
+            AssistantMessageEvent::TextDelta { delta, .. } => RawEvt::TextDelta {
+                delta: delta.clone(),
+            },
+            AssistantMessageEvent::ThinkingDelta { delta, .. } => RawEvt::ThinkingDelta {
+                delta: delta.clone(),
+            },
+            other => RawEvt::Other {
+                name: format!("MessageUpdate:{}", amev_tag(other)),
+            },
+        },
+        AgentEvent::ToolExecutionStart {
+            tool_call_id,
+            tool_name,
+            args,
+        } => RawEvt::ToolStart {
+            tool_name: tool_name.clone(),
+            tool_call_id: tool_call_id.clone(),
+            input: args.clone(),
+        },
+        AgentEvent::ToolExecutionUpdate {
+            tool_call_id,
+            partial_result,
+            ..
+        } => RawEvt::ToolUpdate {
+            tool_call_id: tool_call_id.clone(),
+            partial: serde_json::to_value(partial_result).unwrap_or(Value::Null),
+        },
+        AgentEvent::ToolExecutionEnd {
+            tool_call_id,
+            tool_name,
+            result,
+            is_error,
+        } => RawEvt::ToolEnd {
+            tool_name: tool_name.clone(),
+            tool_call_id: tool_call_id.clone(),
+            result: serde_json::to_value(result).unwrap_or(Value::Null),
+            is_error: *is_error,
+        },
+        AgentEvent::TurnEnd { .. } => RawEvt::TurnEnd,
+        AgentEvent::AgentEnd { error, .. } => RawEvt::AgentEnd {
+            error: error.clone(),
+        },
+        other => RawEvt::Other {
+            name: agentevent_tag(other),
+        },
+    }
+}
+
+/// Short label for an [`AssistantMessageEvent`] (readable `Other` logging only).
+fn amev_tag(e: &AssistantMessageEvent) -> &'static str {
+    match e {
+        AssistantMessageEvent::Start { .. } => "start",
+        AssistantMessageEvent::TextStart { .. } => "text_start",
+        AssistantMessageEvent::TextDelta { .. } => "text_delta",
+        AssistantMessageEvent::TextEnd { .. } => "text_end",
+        AssistantMessageEvent::ThinkingStart { .. } => "thinking_start",
+        AssistantMessageEvent::ThinkingDelta { .. } => "thinking_delta",
+        AssistantMessageEvent::ThinkingEnd { .. } => "thinking_end",
+        AssistantMessageEvent::ToolCallStart { .. } => "toolcall_start",
+        AssistantMessageEvent::ToolCallDelta { .. } => "toolcall_delta",
+        AssistantMessageEvent::ToolCallEnd { .. } => "toolcall_end",
+        _ => "other",
+    }
+}
+
+/// Short label for an [`AgentEvent`] via its serde `type` tag (no per-variant hardcode).
+fn agentevent_tag(e: &AgentEvent) -> String {
+    serde_json::to_value(e)
+        .ok()
+        .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(str::to_owned))
+        .unwrap_or_else(|| "unknown".into())
+}
+
+/// A translated frontend event: the `listen()` name + its JSON payload.
+#[derive(Debug, Clone)]
+pub struct FeEvent {
+    pub name: &'static str,
+    pub payload: Value,
+}
+
+// ── camelCase wire DTOs (must match ui/src/lib/chat-types.ts) ───────────────
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StreamDelta {
+    conversation_id: String,
+    delta: String,
+    seq: u64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StreamComplete {
+    conversation_id: String,
+    text: String,
+    truncated: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StreamErrorPayload {
+    conversation_id: String,
+    error: String,
+}
+
+/// Per-conversation ACL state: monotonic `seq`, accumulated assistant text, the
+/// one-shot `complete` latch, and tool start times for `durationMs`.
+pub struct Acl {
+    conv_id: String,
+    seq: u64,
+    acc_text: String,
+    completed: bool,
+    tool_starts: HashMap<String, Instant>,
+}
+
+impl Acl {
+    #[must_use]
+    pub fn new(conv_id: impl Into<String>) -> Self {
+        Self {
+            conv_id: conv_id.into(),
+            seq: 0,
+            acc_text: String::new(),
+            completed: false,
+            tool_starts: HashMap::new(),
+        }
+    }
+
+    fn next_seq(&mut self) -> u64 {
+        let s = self.seq;
+        self.seq += 1;
+        s
+    }
+
+    /// Translate one boundary event into a frontend event. `None` = this event
+    /// produces no frontend event.
+    pub fn translate(&mut self, raw: &RawEvt) -> Option<FeEvent> {
+        match raw {
+            RawEvt::TextDelta { delta } => {
+                self.acc_text.push_str(delta);
+                let seq = self.next_seq();
+                Some(FeEvent {
+                    name: event::STREAM_CHUNK,
+                    payload: to_value(&StreamDelta {
+                        conversation_id: self.conv_id.clone(),
+                        delta: delta.clone(),
+                        seq,
+                    }),
+                })
+            }
+            RawEvt::ThinkingDelta { delta } => {
+                let seq = self.next_seq();
+                Some(FeEvent {
+                    name: event::STREAM_REASONING,
+                    payload: to_value(&StreamDelta {
+                        conversation_id: self.conv_id.clone(),
+                        delta: delta.clone(),
+                        seq,
+                    }),
+                })
+            }
+            RawEvt::ToolStart {
+                tool_name,
+                tool_call_id,
+                input,
+            } => {
+                self.tool_starts.insert(tool_call_id.clone(), Instant::now());
+                Some(FeEvent {
+                    name: event::STREAM_TOOL_ACTIVITY,
+                    payload: json!({
+                        "conversationId": self.conv_id,
+                        "activity": {
+                            "type": "tool_start",
+                            "toolName": tool_name,
+                            "toolCallId": tool_call_id,
+                            "input": input,
+                            "timestamp": now_ms(),
+                        }
+                    }),
+                })
+            }
+            RawEvt::ToolEnd {
+                tool_name,
+                tool_call_id,
+                result,
+                is_error,
+            } => {
+                let duration_ms = self
+                    .tool_starts
+                    .remove(tool_call_id)
+                    .map(|s| u64::try_from(s.elapsed().as_millis()).unwrap_or(u64::MAX));
+                Some(FeEvent {
+                    name: event::STREAM_TOOL_ACTIVITY,
+                    payload: json!({
+                        "conversationId": self.conv_id,
+                        "activity": {
+                            "type": "tool_result",
+                            "toolName": tool_name,
+                            "toolCallId": tool_call_id,
+                            "result": result,
+                            "isError": is_error,
+                            "durationMs": duration_ms,
+                            "timestamp": now_ms(),
+                        }
+                    }),
+                })
+            }
+            RawEvt::AgentEnd { error: Some(e) } => Some(FeEvent {
+                name: event::STREAM_ERROR,
+                payload: to_value(&StreamErrorPayload {
+                    conversation_id: self.conv_id.clone(),
+                    error: e.clone(),
+                }),
+            }),
+            // TurnEnd or AgentEnd{error:None}, whichever arrives FIRST, emits one
+            // `complete` (§3.3 lists both as sources). `truncated` is false here;
+            // a real run sets it when uClaw-side compaction drops history.
+            RawEvt::TurnEnd | RawEvt::AgentEnd { error: None } if !self.completed => {
+                self.completed = true;
+                Some(FeEvent {
+                    name: event::STREAM_COMPLETE,
+                    payload: to_value(&StreamComplete {
+                        conversation_id: self.conv_id.clone(),
+                        text: self.acc_text.clone(),
+                        truncated: false,
+                    }),
+                })
+            }
+            // ToolUpdate (liveOutput), AgentStart, duplicate completes → no FE event yet.
+            _ => None,
+        }
+    }
+}
+
+fn to_value<T: Serialize>(v: &T) -> Value {
+    serde_json::to_value(v).unwrap_or(Value::Null)
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chunk_seq_is_monotonic_and_text_accumulates() {
+        let mut acl = Acl::new("c1");
+        // AgentStart produces no frontend event.
+        assert!(acl
+            .translate(&RawEvt::AgentStart {
+                session_id: "s".into()
+            })
+            .is_none());
+
+        let e0 = acl
+            .translate(&RawEvt::TextDelta {
+                delta: "pong".into(),
+            })
+            .expect("chunk");
+        assert_eq!(e0.name, event::STREAM_CHUNK);
+        assert_eq!(e0.payload["conversationId"], "c1");
+        assert_eq!(e0.payload["delta"], "pong");
+        assert_eq!(e0.payload["seq"], 0);
+
+        let e1 = acl
+            .translate(&RawEvt::TextDelta {
+                delta: " from the void".into(),
+            })
+            .expect("chunk");
+        assert_eq!(e1.payload["seq"], 1);
+
+        let c = acl.translate(&RawEvt::TurnEnd).expect("complete");
+        assert_eq!(c.name, event::STREAM_COMPLETE);
+        assert_eq!(c.payload["text"], "pong from the void");
+        assert_eq!(c.payload["truncated"], false);
+
+        // A trailing AgentEnd{None} must NOT re-emit complete (one-shot latch).
+        assert!(acl.translate(&RawEvt::AgentEnd { error: None }).is_none());
+    }
+
+    #[test]
+    fn reasoning_shares_the_seq_space_with_chunks() {
+        let mut acl = Acl::new("c1");
+        let r = acl
+            .translate(&RawEvt::ThinkingDelta {
+                delta: "hmm".into(),
+            })
+            .expect("reasoning");
+        assert_eq!(r.name, event::STREAM_REASONING);
+        assert_eq!(r.payload["seq"], 0);
+
+        let t = acl
+            .translate(&RawEvt::TextDelta { delta: "x".into() })
+            .expect("chunk");
+        assert_eq!(t.payload["seq"], 1, "seq must be monotonic across chunk+reasoning");
+    }
+
+    #[test]
+    fn agent_end_with_error_maps_to_stream_error() {
+        let mut acl = Acl::new("c1");
+        let e = acl
+            .translate(&RawEvt::AgentEnd {
+                error: Some("boom".into()),
+            })
+            .expect("error");
+        assert_eq!(e.name, event::STREAM_ERROR);
+        assert_eq!(e.payload["conversationId"], "c1");
+        assert_eq!(e.payload["error"], "boom");
+    }
+
+    #[test]
+    fn tool_activity_start_and_result_shapes() {
+        let mut acl = Acl::new("c1");
+        let s = acl
+            .translate(&RawEvt::ToolStart {
+                tool_name: "bash".into(),
+                tool_call_id: "t1".into(),
+                input: json!({ "cmd": "ls" }),
+            })
+            .expect("tool_start");
+        assert_eq!(s.name, event::STREAM_TOOL_ACTIVITY);
+        assert_eq!(s.payload["activity"]["type"], "tool_start");
+        assert_eq!(s.payload["activity"]["toolName"], "bash");
+        assert_eq!(s.payload["activity"]["toolCallId"], "t1");
+        assert_eq!(s.payload["activity"]["input"]["cmd"], "ls");
+
+        let e = acl
+            .translate(&RawEvt::ToolEnd {
+                tool_name: "bash".into(),
+                tool_call_id: "t1".into(),
+                result: json!({ "content": [] }),
+                is_error: false,
+            })
+            .expect("tool_result");
+        assert_eq!(e.payload["activity"]["type"], "tool_result");
+        assert_eq!(e.payload["activity"]["isError"], false);
+        // durationMs present (resolved from the matching start).
+        assert!(e.payload["activity"]["durationMs"].is_u64());
+    }
+
+    #[test]
+    fn complete_emits_once_from_agent_end_when_no_turn_end() {
+        let mut acl = Acl::new("c1");
+        let c = acl
+            .translate(&RawEvt::AgentEnd { error: None })
+            .expect("complete from AgentEnd");
+        assert_eq!(c.name, event::STREAM_COMPLETE);
+        // A later TurnEnd must not double-emit.
+        assert!(acl.translate(&RawEvt::TurnEnd).is_none());
+    }
+}
