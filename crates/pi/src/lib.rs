@@ -194,6 +194,14 @@ pub mod session_picker;
 #[cfg(feature = "sqlite-sessions")]
 #[doc(hidden)]
 pub mod session_sqlite;
+// uclaw-patch(P0§4): when sqlite-sessions is OFF (uClaw runs pi stateless to
+// avoid sqlmodel-sqlite/libsqlite3-sys conflict with uClaw rusqlite), a
+// same-signature stub keeps the un-gated `crate::session_sqlite::*` callers
+// compiling. Unreachable under no_session; returns a clear error if hit.
+#[cfg(not(feature = "sqlite-sessions"))]
+#[doc(hidden)]
+#[path = "session_sqlite_stub.rs"]
+pub mod session_sqlite;
 #[doc(hidden)]
 pub mod session_store_v2;
 #[doc(hidden)]

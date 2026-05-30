@@ -1,9 +1,5 @@
-# [vendored] Standalone sub-workspace: pi lives in-tree (crates/pi) and is
-# editable for 二次开发, but is NOT yet a member of uClaw's main workspace.
-# That wiring waits on R1 — migrate uClaw off rusqlite (F2 reversal / P0), then
-# delete this [workspace] table and add "crates/pi" to the root members.
-# Build standalone:  cargo build --manifest-path crates/pi/Cargo.toml
-[workspace]
+# [R1 接线] crates/pi 现为 uClaw 主 workspace 正式 member。pi 跑 stateless
+# (sqlite-sessions off → 无 sqlmodel-sqlite → 不与 uClaw rusqlite 的 libsqlite3-sys 冲突)。
 
 [package]
 name = "pi_agent_rust"
@@ -192,7 +188,10 @@ fs4 = "0.13"
 glob = "0.3"
 ignore = "0.4"
 crossbeam-queue = "0.3"
-sqlmodel-sqlite = { version = "0.2.2" }
+# uclaw-patch(P0§4): sqlmodel-sqlite REMOVED — its libsqlite3-sys 0.37 conflicts with
+# uClaw rusqlite's (cargo `links` uniqueness is graph-wide, incl. disabled optional deps).
+# pi runs stateless in uClaw (sqlite-sessions off). Re-add this dep to use the SQLite
+# session backend standalone. All sqlite code is cfg(feature="sqlite-sessions")-gated.
 sqlmodel-core = { version = "0.2.2" }
 
 # Time
@@ -284,20 +283,20 @@ rquickjs = { version = "0.11", features = ["futures", "loader", "bindgen"] }
 rquickjs = { version = "0.11", features = ["futures", "loader", "bindgen"] }
 
 [features]
-default = ["sqlite-sessions"]
+# uclaw-patch(P0§4): default OFF — pi runs stateless in uClaw (no sqlmodel-sqlite).
+default = []
 full = [
     "image-resize",
     "jemalloc",
     "clipboard",
     "wasm-host",
-    "sqlite-sessions",
     "syntax-highlighting",
     "rich_rust/full",
 ]
 image-resize = ["image"]
 clipboard = ["dep:arboard"]
 wasm-host = ["dep:wasmtime"]
-sqlite-sessions = []
+sqlite-sessions = []  # uclaw-patch(P0§4): sqlmodel-sqlite dep removed; re-add it to enable
 syntax-highlighting = ["rich_rust/syntax"]
 ext-conformance = []
 fuzzing = []

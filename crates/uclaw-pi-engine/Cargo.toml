@@ -8,8 +8,6 @@
 #   cargo test  --manifest-path crates/uclaw-pi-engine/Cargo.toml
 # R1 promotes this (and crates/pi) into the main workspace once uClaw is off
 # rusqlite. See docs/MIGRATION_GOALS.md §P0.
-[workspace]
-
 [package]
 name = "uclaw-pi-engine"
 version = "0.1.0"

@@ -5,7 +5,10 @@ use crate::error::{Error, Result};
 use crate::session::{Session, SessionEntry, SessionHeader};
 use fs4::fs_std::FileExt;
 use serde::Deserialize;
+// uclaw-patch(P0§4): sqlmodel imports gated — pi runs stateless in uClaw (sqlite off).
+#[cfg(feature = "sqlite-sessions")]
 use sqlmodel_core::Value;
+#[cfg(feature = "sqlite-sessions")]
 use sqlmodel_sqlite::{OpenFlags, SqliteConfig, SqliteConnection};
 use std::borrow::Borrow;
 use std::collections::{HashMap, HashSet};
@@ -43,6 +46,55 @@ pub struct SessionIndex {
     lock_path: PathBuf,
 }
 
+// uclaw-patch(P0§4): no-op SessionIndex when sqlite off (pi stateless; uClaw owns sessions).
+#[cfg(not(feature = "sqlite-sessions"))]
+impl SessionIndex {
+    pub fn new() -> Self {
+        Self::for_sessions_root(&Config::sessions_dir())
+    }
+    pub fn for_sessions_root(root: &Path) -> Self {
+        Self {
+            db_path: root.join("session-index.sqlite"),
+            lock_path: root.join("session-index.lock"),
+        }
+    }
+    pub fn index_session(&self, _session: &Session) -> Result<()> {
+        Ok(())
+    }
+    pub fn index_session_snapshot(
+        &self,
+        _path: &Path,
+        _header: &SessionHeader,
+        _message_count: u64,
+        _name: Option<String>,
+    ) -> Result<()> {
+        Ok(())
+    }
+    pub fn list_sessions(&self, _cwd: Option<&str>) -> Result<Vec<SessionMeta>> {
+        Ok(Vec::new())
+    }
+    pub fn delete_session_path(&self, _path: &Path) -> Result<()> {
+        Ok(())
+    }
+    pub fn reindex_all(&self) -> Result<()> {
+        Ok(())
+    }
+    pub fn should_reindex(&self, _max_age: Duration) -> bool {
+        false
+    }
+    pub fn reindex_if_stale(&self, _max_age: Duration) -> Result<bool> {
+        Ok(false)
+    }
+    pub fn refresh_incremental(&self) -> Result<SessionIndexRefreshSummary> {
+        Ok(SessionIndexRefreshSummary::default())
+    }
+    pub(crate) fn upsert_session_meta(&self, _meta: SessionMeta) -> Result<()> {
+        Ok(())
+    }
+}
+
+// uclaw-patch(P0§4): real sqlite-backed SessionIndex gated behind sqlite-sessions.
+#[cfg(feature = "sqlite-sessions")]
 impl SessionIndex {
     pub fn new() -> Self {
         let root = Config::sessions_dir();
@@ -463,6 +515,7 @@ pub(crate) fn enqueue_session_index_snapshot_update(
     }
 }
 
+#[cfg(feature = "sqlite-sessions")]
 fn init_schema(conn: &SqliteConnection) -> Result<()> {
     conn.execute_raw(
         "CREATE TABLE IF NOT EXISTS sessions (
@@ -489,6 +542,7 @@ fn init_schema(conn: &SqliteConnection) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "sqlite-sessions")]
 fn upsert_meta_row(conn: &SqliteConnection, meta: SessionMeta) -> Result<()> {
     let message_count = sqlite_i64_from_u64("message_count", meta.message_count)?;
     let size_bytes = sqlite_i64_from_u64("size_bytes", meta.size_bytes)?;
@@ -518,6 +572,7 @@ fn upsert_meta_row(conn: &SqliteConnection, meta: SessionMeta) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "sqlite-sessions")]
 fn store_sync_epoch(conn: &SqliteConnection) -> Result<()> {
     conn.execute_sync(
         "INSERT INTO meta (key,value) VALUES ('last_sync_epoch_ms', ?1)
@@ -541,6 +596,7 @@ fn sqlite_u64_from_i64(field: &str, value: i64) -> Result<u64> {
     })
 }
 
+#[cfg(feature = "sqlite-sessions")]
 fn row_to_meta(row: &sqlmodel_core::Row) -> Result<SessionMeta> {
     let message_count = row
         .get_named::<i64>("message_count")
@@ -716,6 +772,7 @@ fn build_meta_from_jsonl(path: &Path) -> Result<SessionMeta> {
     })
 }
 
+#[cfg(feature = "sqlite-sessions")]
 #[cfg(feature = "sqlite-sessions")]
 fn build_meta_from_sqlite(path: &Path) -> Result<SessionMeta> {
     let meta = futures::executor::block_on(crate::session_sqlite::load_session_meta(path))?;
@@ -900,6 +957,7 @@ fn epoch_ms_is_stale_at(now_epoch_ms: i64, epoch_ms: i64, max_age: Duration) -> 
     u128::try_from(age_ms).unwrap_or(u128::MAX) >= max_age.as_millis()
 }
 
+#[cfg(feature = "sqlite-sessions")]
 fn load_last_sync_epoch_ms(conn: &SqliteConnection) -> Result<Option<i64>> {
     let rows = conn
         .query_sync(

@@ -40,9 +40,9 @@ members = [
     "crates/uclaw-protocol-types",
     "crates/uclaw-provider-core",
     # T5b/T6 crates land here.
-    # NOTE: pi_agent_rust is vendored at crates/pi as a STANDALONE sub-workspace
-    # (not a member yet). R1 will migrate uClaw off rusqlite, then promote it to
-    # a member here. See docs/MIGRATION_GOALS.md §P0.
+    # [R1 接线] pi (stateless, no sqlmodel) + engine 现为正式 member，与 uClaw rusqlite 共存。
+    "crates/pi",
+    "crates/uclaw-pi-engine",
 ]
 # Exclude any temporary or in-progress trees. Keeping this explicit lets
 # `cargo metadata` stay deterministic while crates/ is still empty.
