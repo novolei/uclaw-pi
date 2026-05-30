@@ -23,9 +23,11 @@
 #![forbid(unsafe_code)]
 
 pub mod acl;
+pub mod dto;
 pub mod engine;
 pub mod events;
 
 pub use acl::{demux, Acl, FeEvent, RawEvt};
+pub use dto::{content_block_to_fe, message_to_chat_message};
 pub use engine::{EngineCmd, EngineConfig, PiEngine};
 pub use events::{event, EventSink};
