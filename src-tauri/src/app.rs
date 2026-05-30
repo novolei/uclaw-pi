@@ -388,6 +388,11 @@ pub struct AppState {
     /// Populated at `send_message`/`send_agent_message` entry; fired by
     /// the `cancel_conversation` Tauri command.
     pub cancellation_registry: Arc<crate::agent::cancellation_registry::CancellationRegistry>,
+
+    // [R1 接线] pi_sessions WIP 暂移除：rusqlite 归零、pi 接入 workspace 后，
+    // 会话句柄改由 crates/uclaw-pi-engine 的 PiEngine/SessionRegistry 持有，
+    // 不再直接放 AppState。见 docs/R1-wiring-plan.md。
+    // pub pi_sessions: Arc<tokio::sync::Mutex<std::collections::HashMap<String, pi::sdk::AgentSessionHandle>>>,
 }
 
 /// 启动默认 Hook 策略。本 slice 为 Allow-all(空 rules)—— 行为零变化。
@@ -1061,6 +1066,8 @@ impl AppState {
             cancellation_registry: Arc::new(
                 crate::agent::cancellation_registry::CancellationRegistry::new(),
             ),
+            // [R1 接线] pi_sessions WIP 暂移除（见上方字段注释 / R1-wiring-plan.md）。
+            // pi_sessions: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         })
     }
 

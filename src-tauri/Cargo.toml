@@ -21,6 +21,10 @@ path = "src/main.rs"
 tauri-build = { version = "2.0.0", features = [] }
 
 [dependencies]
+# [R1 接线] pi 依赖暂移除：src-tauri 仍用 rusqlite，与 pi 的 sqlmodel-sqlite
+# (libsqlite3-sys 0.37) 冲突。删旧后端 + 迁 rusqlite 归零后再启用：
+#   pi/uclaw-pi-engine = { path = "../crates/..." }。见 docs/R1-wiring-plan.md。
+# pi = { package = "pi_agent_rust", path = "../crates/pi" }
 # Phase 0.5-T6 — canonical resolver for ~/.uclaw (sweep target)
 uclaw-utils-home = { path = "../crates/uclaw-utils-home", version = "0.1" }
 # M1-T2a — OrCancelExt for cancellation-aware async
@@ -69,7 +73,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 # Database
-rusqlite = { version = "0.31", features = ["bundled"] }
+rusqlite = { version = "0.32.0", features = ["bundled"] }
 
 # Error handling
 thiserror = "2"
