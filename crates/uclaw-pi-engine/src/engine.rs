@@ -30,6 +30,7 @@ use pi::sdk::{create_agent_session, AbortHandle, AgentEvent, AgentSessionHandle,
 use crate::acl::{demux, Acl};
 use crate::approval::{make_approval_handler, ApprovalRegistry};
 use crate::events::{event, EventSink};
+use crate::tool_factory::UclawToolFactory;
 
 /// Commands from the Tauri/tokio side into the engine thread.
 #[derive(Debug)]
@@ -161,14 +162,17 @@ async fn actor_loop(
     // `EngineCmd::Respond` resolves the pending request through the same registry.
     let approval = ApprovalRegistry::new(cx.clone(), Duration::from_secs(300));
     let approval_handler = make_approval_handler(approval.clone(), Arc::clone(&sink));
+    // [R4 F5] One UclawToolFactory shared across sessions: pi built-ins verbatim +
+    // uClaw tools layered on top. Set on each session's SessionOptions.tool_factory.
+    let tool_factory = UclawToolFactory::new(approval.clone(), Arc::clone(&sink));
 
     while let Ok(cmd) = cmd_rx.recv(&cx).await {
         match cmd {
             EngineCmd::Prompt { conv_id, input } => {
-                start_run(&mut sessions, &rt, &sink, &cx, &config, &approval_handler, conv_id, RunKind::Prompt(input)).await;
+                start_run(&mut sessions, &rt, &sink, &cx, &config, &approval_handler, &tool_factory, conv_id, RunKind::Prompt(input)).await;
             }
             EngineCmd::FollowUp { conv_id } => {
-                start_run(&mut sessions, &rt, &sink, &cx, &config, &approval_handler, conv_id, RunKind::FollowUp).await;
+                start_run(&mut sessions, &rt, &sink, &cx, &config, &approval_handler, &tool_factory, conv_id, RunKind::FollowUp).await;
             }
             EngineCmd::SetModel { conv_id, provider, model } => {
                 if let Some(entry) = sessions.get(&conv_id) {
@@ -210,14 +214,17 @@ async fn start_run(
     cx: &AgentCx,
     config: &EngineConfig,
     approval_handler: &ToolApprovalHandler,
+    tool_factory: &Arc<UclawToolFactory>,
     conv_id: String,
     kind: RunKind,
 ) {
     if !sessions.contains_key(&conv_id) {
         // [R3 交互] Inject the global approval gate (sdk hardcodes None) so pi
         // surfaces every tool through uClaw's approval dialog.
+        // [R4 F5] Inject the tool factory: pi built-ins verbatim + uClaw tools.
         let mut opts = config.to_session_options();
         opts.tool_approval = Some(approval_handler.clone());
+        opts.tool_factory = Some(tool_factory.clone());
         match create_agent_session(opts).await {
             Ok(h) => {
                 sessions.insert(
