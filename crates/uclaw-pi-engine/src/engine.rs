@@ -33,9 +33,39 @@ use crate::events::{event, EventSink};
 use crate::tool_bridge::{tool_output_text, ToolRequestSink, ToolResultRegistry};
 use crate::tool_factory::UclawToolFactory;
 
+/// An API key string that never appears in `Debug` output (so it can ride inside
+/// a `#[derive(Debug)]` command without leaking into logs).
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct RedactedString(pub String);
+
+impl std::fmt::Debug for RedactedString {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0.is_empty() { "\"\"" } else { "\"<redacted>\"" })
+    }
+}
+
+/// [R4/F7] Dynamic provider / model / key for new pi sessions, sourced from
+/// uClaw's `provider_service` (the Settings → 服务商 tab). Threaded into each new
+/// session's `SessionOptions`, so pi uses the user's configured key
+/// (`SessionOptions.api_key`) rather than `~/.pi/auth.json`.
+#[derive(Clone, Default, PartialEq)]
+pub struct ModelConfig {
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub api_key: Option<RedactedString>,
+}
+
 /// Commands from the Tauri/tokio side into the engine thread.
 #[derive(Debug)]
 pub enum EngineCmd {
+    /// [R4/F7] Set the provider/model/api_key for **new** sessions, sourced from
+    /// uClaw's `provider_service` (Settings 服务商). Applied at session creation;
+    /// existing sessions keep their config (start a new conversation to re-key).
+    Configure {
+        provider: Option<String>,
+        model: Option<String>,
+        api_key: Option<RedactedString>,
+    },
     /// Drive one user prompt on `conv_id`'s session (lazily created).
     Prompt { conv_id: String, input: String },
     /// Continue `conv_id`'s loop without a new user message (steer/retry flows).
@@ -193,14 +223,24 @@ async fn actor_loop(
         tool_results.clone(),
         tool_request_sink,
     );
+    // [R4/F7] Current provider/model/key for new sessions — seeded from EngineConfig,
+    // updated by `EngineCmd::Configure` (from uClaw's provider_service / 服务商 tab).
+    let mut model_config = ModelConfig {
+        provider: config.provider.clone(),
+        model: config.model.clone(),
+        api_key: None,
+    };
 
     while let Ok(cmd) = cmd_rx.recv(&cx).await {
         match cmd {
+            EngineCmd::Configure { provider, model, api_key } => {
+                model_config = ModelConfig { provider, model, api_key };
+            }
             EngineCmd::Prompt { conv_id, input } => {
-                start_run(&mut sessions, &rt, &sink, &cx, &config, &approval_handler, &tool_factory, conv_id, RunKind::Prompt(input)).await;
+                start_run(&mut sessions, &rt, &sink, &cx, &config, &model_config, &approval_handler, &tool_factory, conv_id, RunKind::Prompt(input)).await;
             }
             EngineCmd::FollowUp { conv_id } => {
-                start_run(&mut sessions, &rt, &sink, &cx, &config, &approval_handler, &tool_factory, conv_id, RunKind::FollowUp).await;
+                start_run(&mut sessions, &rt, &sink, &cx, &config, &model_config, &approval_handler, &tool_factory, conv_id, RunKind::FollowUp).await;
             }
             EngineCmd::SetModel { conv_id, provider, model } => {
                 if let Some(entry) = sessions.get(&conv_id) {
@@ -246,6 +286,7 @@ async fn start_run(
     sink: &Arc<dyn EventSink>,
     cx: &AgentCx,
     config: &EngineConfig,
+    model_config: &ModelConfig,
     approval_handler: &ToolApprovalHandler,
     tool_factory: &Arc<UclawToolFactory>,
     conv_id: String,
@@ -256,6 +297,17 @@ async fn start_run(
         // surfaces every tool through uClaw's approval dialog.
         // [R4 F5] Inject the tool factory: pi built-ins verbatim + uClaw tools.
         let mut opts = config.to_session_options();
+        // [R4/F7] Apply the user's configured provider/model/key (provider_service
+        // / 服务商 tab). pi uses SessionOptions.api_key, not ~/.pi/auth.json.
+        if model_config.provider.is_some() {
+            opts.provider = model_config.provider.clone();
+        }
+        if model_config.model.is_some() {
+            opts.model = model_config.model.clone();
+        }
+        if let Some(key) = &model_config.api_key {
+            opts.api_key = Some(key.0.clone());
+        }
         opts.tool_approval = Some(approval_handler.clone());
         opts.tool_factory = Some(tool_factory.clone());
         match create_agent_session(opts).await {
@@ -347,6 +399,25 @@ fn emit_error(sink: &Arc<dyn EventSink>, conv_id: &str, error: String) {
 mod tests {
     use super::*;
     use serde_json::Value;
+
+    /// [R4/F7] The api_key must NEVER appear in Debug output — not as a bare
+    /// RedactedString, nor inside an EngineCmd::Configure (which derives Debug and
+    /// could otherwise leak the key into a log line).
+    #[test]
+    fn api_key_never_leaks_in_debug() {
+        let k = RedactedString("sk-super-secret-123".into());
+        assert_eq!(format!("{k:?}"), "\"<redacted>\"");
+        assert_eq!(format!("{:?}", RedactedString(String::new())), "\"\"");
+
+        let cmd = EngineCmd::Configure {
+            provider: Some("anthropic".into()),
+            model: Some("claude-x".into()),
+            api_key: Some(RedactedString("sk-leak-me".into())),
+        };
+        let dbg = format!("{cmd:?}");
+        assert!(!dbg.contains("sk-leak-me"), "api key leaked: {dbg}");
+        assert!(dbg.contains("<redacted>") && dbg.contains("anthropic"));
+    }
 
     /// Test EventSink that records every (name, payload) emitted.
     struct RecordingSink(StdMutex<Vec<(String, Value)>>);

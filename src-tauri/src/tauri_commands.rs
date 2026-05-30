@@ -1514,13 +1514,24 @@ pub async fn send_message(
                 tracing::warn!("PiEngine user-message persist failed: {e}");
             }
         }
-        if let (Some(provider), Some(model)) =
-            (input.provider_id.clone(), input.model_id.clone())
+        // [R4/F7] Source pi's provider/model/api_key from provider_service — the
+        // SAME resolution the legacy path uses (per-msg override → role → active →
+        // fallback), i.e. whatever the user configured in Settings → 服务商. pi
+        // consumes SessionOptions.api_key, not ~/.pi/auth.json. Sent before Prompt
+        // so the lazily-created session picks it up.
+        let resolved = if let (Some(pid), Some(mid)) =
+            (input.provider_id.as_deref(), input.model_id.as_deref())
         {
-            engine.send(uclaw_pi_engine::EngineCmd::SetModel {
-                conv_id: conv_id.clone(),
-                provider,
-                model,
+            state.provider_service.get_provider_llm_config(pid, mid).await
+        } else {
+            state.provider_service.get_chat_llm_config().await
+        };
+        if let Some((provider, model, api_key, _base_url, _api)) = resolved {
+            engine.send(uclaw_pi_engine::EngineCmd::Configure {
+                provider: Some(provider),
+                model: Some(model),
+                api_key: (!api_key.is_empty())
+                    .then(|| uclaw_pi_engine::RedactedString(api_key)),
             });
         }
         engine.send(uclaw_pi_engine::EngineCmd::Prompt {
