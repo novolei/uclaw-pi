@@ -49,7 +49,7 @@ exclude = []
 edition       = "2021"
 license       = "Apache-2.0"
 authors       = ["Ryan Liu <ryanclaudemax@gmail.com>"]
-repository    = "https://github.com/novolei/uclaw-new"
+repository    = "https://github.com/novolei/uclaw-pi"
 rust-version  = "1.78"
 
 # Release profile lives at the workspace root (Cargo emits a warning if it's in
