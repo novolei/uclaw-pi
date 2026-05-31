@@ -183,3 +183,20 @@ export const onPlanModeSuggest = <P>(
   handler: (payload: P) => void,
 ): Promise<UnlistenFn> =>
   listen<P>('agent:plan_mode_suggest', (e) => handler(e.payload))
+
+// ── Live plan-file updates (was `@tauri-apps/api/event` `listen('plan:updated')`
+// directly inside PlanViewer). The migrated PlanViewer subscribes through this
+// wrapper so no `features/agent` component imports `@tauri-apps/api`. The
+// backend emits `{ filename, content }` from the plan_write tool. ──
+
+/** Payload emitted on `plan:updated` when the agent rewrites a plan file. */
+export interface PlanUpdatedPayload {
+  filename: string
+  content: string
+}
+
+/** Subscribe to live plan-file rewrites for the open plan. */
+export const onPlanUpdated = (
+  handler: (payload: PlanUpdatedPayload) => void,
+): Promise<UnlistenFn> =>
+  listen<PlanUpdatedPayload>('plan:updated', (e) => handler(e.payload))

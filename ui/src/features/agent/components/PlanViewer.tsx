@@ -1,5 +1,5 @@
 import * as React from 'react'
-import { listen } from '@tauri-apps/api/event'
+import { useLivePlanContent } from '../hooks/useLivePlanContent'
 
 interface PlanStep {
   text: string
@@ -78,48 +78,15 @@ export function parsePlanMarkdown(content: string): ParsedPlan {
   return { title, goal, steps, notes }
 }
 
-interface PlanUpdatedPayload {
-  filename: string
-  content: string
-}
-
 interface PlanViewerProps {
   planContent: string
   planFilename: string
 }
 
 export function PlanViewer({ planContent, planFilename }: PlanViewerProps): React.ReactElement {
-  const [liveContent, setLiveContent] = React.useState(planContent)
-
-  // Track latest planContent in a ref so the filename-change effect can read it
-  // without being re-triggered whenever planContent changes for the same file
-  const planContentRef = React.useRef(planContent)
-  planContentRef.current = planContent
-
-  // Reset local content when the user switches to a different plan file
-  React.useEffect(() => {
-    setLiveContent(planContentRef.current)
-  }, [planFilename])
-
-  // Subscribe to live plan:updated events
-  React.useEffect(() => {
-    let cancelled = false
-    let unlisten: (() => void) | null = null
-
-    listen<PlanUpdatedPayload>('plan:updated', ({ payload }) => {
-      if (payload.filename === planFilename) {
-        setLiveContent(payload.content)
-      }
-    }).then((fn) => {
-      if (cancelled) fn()
-      else unlisten = fn
-    })
-
-    return () => {
-      cancelled = true
-      unlisten?.()
-    }
-  }, [planFilename])
+  // Live plan content — seeds from props, resets on file switch, and follows
+  // `plan:updated` events (subscription + reset logic in the hook).
+  const liveContent = useLivePlanContent(planContent, planFilename)
 
   const plan = parsePlanMarkdown(liveContent)
   const total = plan.steps.length

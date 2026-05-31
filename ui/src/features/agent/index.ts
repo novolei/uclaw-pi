@@ -81,3 +81,12 @@ export { AskUserBanner } from './components/AskUserBanner'
 // event/IPC wiring (heartbeat/stall/recovery subscriptions, consume/interrupt/
 // dismiss) in useAgentHeartbeat, all routed through the agent bridge.
 export { AgentHeartbeatBanner } from './components/AgentHeartbeatBanner'
+
+// ── Third migration batch (3a — mid-leaves). Side-effects/subscriptions
+// extracted into hooks/; raw `@tauri-apps/api` routed through the agent bridge. ──
+
+// PlanViewer — live plan-file viewer (title/progress/steps/notes). The
+// `plan:updated` subscription + reset-on-file-switch live in useLivePlanContent
+// (routed through the agent bridge's onPlanUpdated wrapper). `parsePlanMarkdown`
+// is re-exported for tests.
+export { PlanViewer, parsePlanMarkdown } from './components/PlanViewer'

@@ -1,5 +1,12 @@
-import { describe, it, expect } from 'vitest'
-import { parsePlanMarkdown } from './PlanViewer'
+import { describe, it, expect, vi } from 'vitest'
+import { renderWithProviders } from '@/test-utils/render'
+import { parsePlanMarkdown, PlanViewer } from './PlanViewer'
+
+// The live-content hook subscribes through the agent bridge; stub it so the
+// render test never reaches `@tauri-apps/api`.
+vi.mock('@/lib/bridge/agent', () => ({
+  onPlanUpdated: vi.fn().mockResolvedValue(() => {}),
+}))
 
 // The backend (src-tauri/src/agent/tools/builtin/plan.rs) writes
 // `task: "{title}"` in the YAML frontmatter — NOT `title:`. The parser must
@@ -60,5 +67,17 @@ status: in_progress
     expect(parsed.steps).toHaveLength(3)
     expect(parsed.steps[0].done).toBe(false)
     expect(parsed.steps[2].done).toBe(true)
+  })
+})
+
+describe('PlanViewer (render)', () => {
+  it('renders the plan title, filename, and steps', () => {
+    const { getByText, getAllByText } = renderWithProviders(
+      <PlanViewer planContent={BACKEND_WRITTEN_PLAN} planFilename="plan.md" />,
+    )
+    // Title appears in both the header and the Goal section of this fixture.
+    expect(getAllByText('网页五子棋小游戏开发计划').length).toBeGreaterThan(0)
+    expect(getByText('plan.md')).toBeTruthy()
+    expect(getByText(/构建棋盘组件/)).toBeTruthy()
   })
 })
