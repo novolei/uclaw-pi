@@ -944,11 +944,11 @@ fn main() {
             }
         })
         .invoke_handler(tauri::generate_handler![
-            // Bootstrap
-            uclaw_core::tauri_commands::get_settings,
+            // Bootstrap → commands::bootstrap (slice 12)
+            uclaw_core::commands::bootstrap::get_settings,
             uclaw_core::commands::settings::get_http_api_enabled,
             uclaw_core::commands::settings::set_http_api_enabled,
-            uclaw_core::tauri_commands::patch_settings,
+            uclaw_core::commands::bootstrap::patch_settings,
             uclaw_core::browser::runtime_pack_ipc::get_browser_runtime_status,
             uclaw_core::browser::runtime_pack_ipc::get_browser_runtime_control_center,
             uclaw_core::browser::runtime_pack_ipc::set_browser_runtime_provider_enabled,

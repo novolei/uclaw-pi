@@ -11,6 +11,7 @@
 pub mod artifact;
 pub mod automation;
 pub mod background_task;
+pub mod bootstrap;
 pub mod browser_cmds;
 pub mod channel;
 pub mod conversation;

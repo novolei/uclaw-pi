@@ -97,41 +97,10 @@ fn build_gene_retriever(
     Some(std::sync::Arc::new(retriever))
 }
 
-// ─── Bootstrap Commands ────────────────────────────────────────────────
-// NOTE: the HTTP-API toggle commands moved to `commands::settings` +
+// ─── Bootstrap Commands → moved to commands::bootstrap (thin move, slice 12) ──
+// NOTE: the HTTP-API toggle commands earlier moved to `commands::settings` +
 // `services::settings_service` (code-organization ADR 2026-05-31). New domains
-// go there, not here.
-
-#[tauri::command]
-pub async fn get_settings(state: State<'_, AppState>) -> Result<GetSettingsResponse, Error> {
-    let settings = state.settings.read().await;
-    Ok(GetSettingsResponse {
-        language: settings.language.clone(),
-        theme: settings.theme.clone(),
-        config_path: state.config_path.to_string_lossy().into(),
-        data_path: state.data_dir.to_string_lossy().into(),
-        monthly_budget_usd: settings.monthly_budget_usd,
-    })
-}
-
-#[tauri::command]
-pub async fn patch_settings(state: State<'_, AppState>, input: PatchSettingsInput) -> Result<GetSettingsResponse, Error> {
-    let mut settings = state.settings.write().await;
-    if let Some(lang) = input.language {
-        settings.language = lang;
-    }
-    if let Some(theme) = input.theme {
-        settings.theme = theme;
-    }
-    // Outer Some = field was present in the JSON; inner is the new value (or None to clear).
-    if let Some(budget) = input.monthly_budget_usd {
-        // Clamp negatives/zero to None — belt-and-suspenders for IPC robustness.
-        settings.monthly_budget_usd = budget.filter(|&b| b > 0.0);
-    }
-    settings.save(&state.config_path)?;
-    drop(settings);
-    get_settings(state).await
-}
+// go in `commands::`, not here.
 
 // ─── Memory Recall Config Commands ──────────────────────────────────────
 
