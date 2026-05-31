@@ -12,3 +12,8 @@ export * from '../../lib/bridge/agent'
 
 // TaskBadge — single running background-task pill. Pure presentation (no IPC).
 export { TaskBadge } from './components/TaskBadge'
+
+// TaskProgressCard — inline aggregated task/todo progress card. Pure
+// presentation (no IPC). `TASK_TOOL_NAMES` is re-exported for the renderers
+// that gate on it (ToolActivityItem / SDKMessageRenderer).
+export { TaskProgressCard, TASK_TOOL_NAMES } from './components/TaskProgressCard'

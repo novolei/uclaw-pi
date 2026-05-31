@@ -32,7 +32,7 @@ import {
   groupActivities,
   isActivityGroup,
 } from '@/atoms/agent-atoms'
-import { TaskProgressCard, TASK_TOOL_NAMES } from './TaskProgressCard'
+import { TaskProgressCard, TASK_TOOL_NAMES } from '@/features/agent'
 import { readAttachment, saveImageAs } from '@/lib/tauri-bridge'
 import { BashStreamView } from './tool-renderers/BashStreamView'
 import { openPreviewTabAction } from '@/atoms/preview-panel-atoms'
