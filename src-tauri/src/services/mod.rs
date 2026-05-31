@@ -11,6 +11,7 @@ pub use types::*;
 // Tauri-independent, unit-testable `trait` + impl. Command bodies in
 // `crate::commands` call into these; logic is extracted here out of the legacy
 // `tauri_commands.rs` god file and out of bridges like `engine_sink.rs`.
+pub mod conversation_service;
 pub mod cost_service;
 pub mod settings_service;
 pub mod space_service;

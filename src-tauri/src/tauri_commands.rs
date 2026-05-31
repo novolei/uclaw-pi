@@ -2358,144 +2358,12 @@ pub async fn send_message(
     })
 }
 
-// ─── Conversation Commands ─────────────────────────────────────────────
+// ─── Conversation Commands → moved to commands::conversation + ────────────
+//     services::conversation_service (create/list/delete delegate to the
+//     session manager; list_recent_threads/get_messages/toggle_star have SQL).
+//     The `to_epoch_ms` + `parse_title_metadata` helpers moved with them.
 
-#[tauri::command]
-pub async fn create_conversation(
-    state: State<'_, AppState>,
-    input: CreateConversationInput,
-) -> Result<ConversationResponse, Error> {
-    let space_id = input.space_id.unwrap_or_else(|| "default".into());
-    let title = input.title.unwrap_or_else(|| "New Chat".into());
-
-    let summary = {
-        let mut session_mgr = state.session_manager.write().await;
-        session_mgr.create(&title, &space_id)
-    };
-
-    Ok(ConversationResponse {
-        id: summary.id,
-        space_id: summary.space_id,
-        title: summary.title,
-        message_count: summary.message_count,
-        created_at: summary.created_at,
-        updated_at: summary.updated_at,
-    })
-}
-
-#[tauri::command]
-pub async fn list_conversations(state: State<'_, AppState>) -> Result<Vec<ConversationResponse>, Error> {
-    let session_mgr = state.session_manager.read().await;
-    Ok(session_mgr.list().into_iter().map(|s| ConversationResponse {
-        id: s.id,
-        space_id: s.space_id,
-        title: s.title,
-        message_count: s.message_count,
-        created_at: s.created_at,
-        updated_at: s.updated_at,
-    }).collect())
-}
-
-#[tauri::command]
-pub async fn list_recent_threads(state: State<'_, AppState>) -> Result<Vec<RecentThread>, Error> {
-    let conn = state.db.lock().map_err(|e| Error::Internal(format!("DB lock: {}", e)))?;
-
-    let mut out: Vec<RecentThread> = Vec::new();
-
-    // Chat conversations — JOIN spaces for workspace name
-    let mut stmt = conn.prepare(
-        "SELECT
-            c.id, c.title, c.metadata_json,
-            COALESCE(s.name, 'default') AS workspace_name,
-            COALESCE(s.id, 'default') AS workspace_id,
-            (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) AS msg_count,
-            c.updated_at
-         FROM conversations c
-         LEFT JOIN spaces s ON s.id = c.space_id
-         WHERE COALESCE(c.is_agent, 0) = 0
-         ORDER BY c.updated_at DESC
-         LIMIT 20"
-    ).map_err(|e| Error::Internal(format!("prepare chat list: {}", e)))?;
-    let rows = stmt.query_map([], |row| {
-        let id: String = row.get(0)?;
-        let title: Option<String> = row.get(1)?;
-        let metadata_json: Option<String> = row.get(2)?;
-        let workspace_name: String = row.get(3)?;
-        let workspace_id: String = row.get(4)?;
-        let msg_count: i64 = row.get(5)?;
-        let updated_at: String = row.get(6)?;
-        Ok((id, title, metadata_json, workspace_name, workspace_id, msg_count, updated_at))
-    }).map_err(|e| Error::Internal(format!("query chat list: {}", e)))?;
-    for r in rows.flatten() {
-        let (id, title, metadata_json, ws_name, ws_id, msg_count, updated_at) = r;
-        let (emoji, pending) = parse_title_metadata(metadata_json.as_deref());
-        out.push(RecentThread {
-            id,
-            kind: "chat".into(),
-            title: title.unwrap_or_else(|| "(untitled)".into()),
-            title_emoji: emoji,
-            title_pending: pending,
-            workspace_name: ws_name,
-            workspace_id: ws_id,
-            message_count: msg_count.max(0) as u32,
-            updated_at,
-        });
-    }
-    drop(stmt);
-
-    // Agent sessions — title_emoji/title_pending columns don't exist on this
-    // schema (V8 migration not present); use NULL placeholders so the query
-    // succeeds without a migration.
-    let mut stmt = conn.prepare(
-        "SELECT
-            s.id, s.title,
-            NULL AS title_emoji, NULL AS title_pending,
-            COALESCE(sp.name, 'default') AS workspace_name,
-            COALESCE(sp.id, 'default') AS workspace_id,
-            s.message_count,
-            s.updated_at
-         FROM agent_sessions s
-         LEFT JOIN spaces sp ON sp.id = s.space_id
-         ORDER BY s.updated_at DESC
-         LIMIT 20"
-    ).map_err(|e| Error::Internal(format!("prepare agent list: {}", e)))?;
-    let rows = stmt.query_map([], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, Option<String>>(1)?.unwrap_or_else(|| "(untitled)".into()),
-            row.get::<_, Option<String>>(2)?,
-            row.get::<_, Option<i64>>(3)?.map(|v| v != 0),
-            row.get::<_, String>(4)?,
-            row.get::<_, String>(5)?,
-            row.get::<_, i64>(6)?,
-            row.get::<_, i64>(7)?,
-        ))
-    }).map_err(|e| Error::Internal(format!("query agent list: {}", e)))?;
-    for r in rows.flatten() {
-        let (id, title, emoji, pending, ws_name, ws_id, msg_count, updated_at) = r;
-        let updated_at_rfc = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(updated_at)
-            .map(|dt| dt.to_rfc3339())
-            .unwrap_or_default();
-        out.push(RecentThread {
-            id,
-            kind: "agent".into(),
-            title,
-            title_emoji: emoji,
-            title_pending: pending,
-            workspace_name: ws_name,
-            workspace_id: ws_id,
-            message_count: msg_count.max(0) as u32,
-            updated_at: updated_at_rfc,
-        });
-    }
-    drop(stmt);
-
-    // Sort merged list by updated_at DESC, cap at 20.
-    // Both sides emit RFC3339 now, but normalize defensively to epoch-ms.
-    out.sort_by(|a, b| to_epoch_ms(&b.updated_at).cmp(&to_epoch_ms(&a.updated_at)));
-    out.truncate(20);
-    Ok(out)
-}
+// ─── Cost Query Commands ───────────────────────────────────────────────
 
 #[tauri::command]
 pub async fn get_daily_costs(
@@ -2659,30 +2527,7 @@ pub async fn get_month_cost_total(
     Ok(total)
 }
 
-/// Parse an `updated_at` string into epoch milliseconds. Accepts a bare i64-ms
-/// integer string (legacy agent format) or an RFC3339 timestamp; returns 0 on
-/// parse failure so unknown formats sort to the bottom rather than crashing.
-fn to_epoch_ms(s: &str) -> i64 {
-    if let Ok(n) = s.parse::<i64>() {
-        return n;
-    }
-    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
-        return dt.timestamp_millis();
-    }
-    0
-}
-
-/// Parse the conversation `metadata_json` blob for `emoji` and `title_pending`.
-/// The blob looks like `{"title":"…","emoji":"🎨","title_pending":false}`.
-fn parse_title_metadata(meta: Option<&str>) -> (Option<String>, Option<bool>) {
-    let Some(raw) = meta else { return (None, None) };
-    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(raw) else {
-        return (None, None)
-    };
-    let emoji = parsed.get("emoji").and_then(|v| v.as_str()).map(|s| s.to_string());
-    let pending = parsed.get("title_pending").and_then(|v| v.as_bool());
-    (emoji, pending)
-}
+// `to_epoch_ms` + `parse_title_metadata` moved to services::conversation_service.
 
 /// Walk a slice of `ChatMessage` (typically the messages added during one
 /// agent loop) and extract:
@@ -2832,103 +2677,8 @@ fn append_browser_task_intervention_activities(
     }
 }
 
-#[tauri::command]
-pub async fn get_messages(state: State<'_, AppState>, input: GetMessagesInput) -> Result<Vec<MessageResponse>, Error> {
-    // Always read from SQLite as the source of truth so messages survive
-    // across app restarts and include reasoning + tool activities.
-    let conn = state.db.lock().map_err(|e| Error::Internal(format!("DB lock: {}", e)))?;
-    let mut stmt = conn.prepare(
-        "SELECT id, role, content, reasoning, tool_activities_json, model, created_at \
-         FROM messages WHERE conversation_id = ?1 ORDER BY created_at ASC",
-    ).map_err(|e| Error::Internal(format!("prepare get_messages: {}", e)))?;
-
-    let rows = stmt.query_map(rusqlite::params![input.conversation_id], |row| {
-        let id: String = row.get(0)?;
-        let role: String = row.get(1)?;
-        let raw_content: String = row.get(2)?;
-        let reasoning: Option<String> = row.get(3)?;
-        let tool_activities_json: Option<String> = row.get(4)?;
-        let model: Option<String> = row.get(5)?;
-        let created_at: String = row.get(6)?;
-        Ok((id, role, raw_content, reasoning, tool_activities_json, model, created_at))
-    }).map_err(|e| Error::Internal(format!("query get_messages: {}", e)))?;
-
-    let mut out: Vec<MessageResponse> = Vec::new();
-    for row in rows.flatten() {
-        let (id, role, raw_content, reasoning, tool_activities_json, model, created_at) = row;
-
-        // Parse `content` once. Two persisted shapes have been seen historically:
-        //   - JSON of Option<Vec<ContentBlock>> — written by add_message_with_meta
-        //     via serde_json::to_string(&session.messages.last().map(|m| &m.content))
-        //   - JSON of Vec<ContentBlock> — written by older code paths
-        //   - Plain text — pre-V5 rows
-        let parsed_blocks: Option<Vec<ContentBlock>> =
-            serde_json::from_str::<Option<Vec<ContentBlock>>>(&raw_content)
-                .ok()
-                .flatten()
-                .or_else(|| serde_json::from_str::<Vec<ContentBlock>>(&raw_content).ok());
-
-        // Flat text projection — joins all Text blocks. Used by the legacy
-        // renderer + minimap snippets.
-        let content_text: String = parsed_blocks
-            .as_ref()
-            .map(|blocks| {
-                blocks.iter()
-                    .filter_map(|b| if let ContentBlock::Text { text } = b { Some(text.clone()) } else { None })
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            })
-            .unwrap_or(raw_content);
-
-        let tool_activities = tool_activities_json
-            .as_deref()
-            .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok());
-
-        out.push(MessageResponse {
-            id,
-            conversation_id: input.conversation_id.clone(),
-            role,
-            content: content_text,
-            created_at,
-            reasoning,
-            tool_activities,
-            model,
-            content_blocks: parsed_blocks,
-        });
-    }
-    Ok(out)
-}
-
-#[tauri::command]
-pub async fn delete_conversation(state: State<'_, AppState>, id: String) -> Result<bool, Error> {
-    let mut session_mgr = state.session_manager.write().await;
-    Ok(session_mgr.delete(&id))
-}
-
-#[tauri::command]
-pub async fn toggle_star_conversation(
-    state: State<'_, AppState>,
-    input: ToggleStarInput,
-) -> Result<ToggleStarResponse, Error> {
-    let db = state.db.lock().map_err(|e| Error::Internal(format!("DB lock: {}", e)))?;
-
-    let current: bool = db.query_row(
-        "SELECT COALESCE(starred, 0) FROM conversations WHERE id = ?1",
-        rusqlite::params![input.conversation_id],
-        |row| row.get::<_, i32>(0),
-    ).unwrap_or(0) != 0;
-
-    let new_starred = !current;
-    db.execute(
-        "UPDATE conversations SET starred = ?1 WHERE id = ?2",
-        rusqlite::params![new_starred as i32, input.conversation_id],
-    ).map_err(Error::Database)?;
-
-    Ok(ToggleStarResponse {
-        conversation_id: input.conversation_id,
-        starred: new_starred,
-    })
-}
+// ─── get_messages / delete_conversation / toggle_star_conversation ────────
+//     moved to commands::conversation + services::conversation_service.
 
 // ─── Space Commands → moved to commands::space + services::space_service ──
 // ─── LLM Config Commands → moved to commands::llm_config ──────────────────
