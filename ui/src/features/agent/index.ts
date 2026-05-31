@@ -170,3 +170,21 @@ export { BackgroundTasksPanel } from './components/BackgroundTasksPanel'
 // TaskBadge scrolls to its ToolActivityItem. Pure presentation (tasks +
 // callbacks via props; renders the migrated TaskBadge) — no IPC.
 export { ActiveTasksBar } from './components/ActiveTasksBar'
+
+// ── Agent-Teams sub-feature (lives under features/agent for now to clear
+// components/agent/; a future dedicated features/teams split can re-home these
+// three — flagged, not done here). ──
+
+// TeamNode — one agent node row (role icon + status + last message). Pure
+// presentation — no IPC.
+export { TeamNode } from './components/TeamNode'
+
+// ChannelFeed — scrolling team-channel message list. Pure presentation
+// (messages via prop); the TeamChannelMessage type comes from the agent bridge.
+export { ChannelFeed } from './components/ChannelFeed'
+
+// AgentTeamsPanel — RightSidePanel "Teams" tab body (task + agent nodes +
+// channel feed). The `agent:team-message` subscription routes through the agent
+// bridge's onTeamMessage wrapper (no direct @tauri-apps/api). Renders the
+// migrated TeamNode + ChannelFeed siblings.
+export { AgentTeamsPanel } from './components/AgentTeamsPanel'

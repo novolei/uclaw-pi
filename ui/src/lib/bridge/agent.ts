@@ -66,11 +66,17 @@ export type { SafetyModeWire } from '../tauri-bridge'
 // ExitPlanModeBanner imports it from this bridge instead of the monolith.
 export type { RespondExitPlanModeInput } from '../tauri-bridge'
 
+// One Agent-Teams channel message, surfaced so the migrated Teams components
+// (AgentTeamsPanel, ChannelFeed) import it from this bridge instead of reaching
+// back into the monolith. Shape unchanged.
+export type { TeamChannelMessage } from '../tauri-bridge'
+
 // ── Session self-evaluation event stream (was `@tauri-apps/api/event` `listen`
 // directly inside SessionEvalBadge). The component subscribes through these
 // wrappers so no `features/agent` component imports `@tauri-apps/api`. ──
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { invoke } from '@tauri-apps/api/core'
+import type { TeamChannelMessage } from '../tauri-bridge'
 
 /** Payload emitted on `session:eval-complete` / `session:eval-warning`. */
 export interface SessionEvalPayload {
@@ -221,3 +227,14 @@ export const onPlanUpdated = (
   handler: (payload: PlanUpdatedPayload) => void,
 ): Promise<UnlistenFn> =>
   listen<PlanUpdatedPayload>('plan:updated', (e) => handler(e.payload))
+
+// ── Agent-Teams channel stream (was `@tauri-apps/api/event` `listen` directly
+// inside AgentTeamsPanel). The migrated panel subscribes through this wrapper so
+// no `features/agent` component imports `@tauri-apps/api`. Event name + payload
+// shape are unchanged. ──
+
+/** Subscribe to live Agent-Teams channel messages for the active team run. */
+export const onTeamMessage = (
+  handler: (payload: TeamChannelMessage) => void,
+): Promise<UnlistenFn> =>
+  listen<TeamChannelMessage>('agent:team-message', (e) => handler(e.payload))

@@ -1,5 +1,5 @@
 import * as React from 'react'
-import type { TeamChannelMessage } from '@/lib/tauri-bridge'
+import type { TeamChannelMessage } from '@/lib/bridge/agent'
 
 function roleLabel(role: string): string {
   if (role.toLowerCase().includes('worker')) return `👷 Worker`

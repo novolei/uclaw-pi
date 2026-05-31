@@ -1,10 +1,9 @@
 import * as React from 'react'
 import { useAtomValue, useSetAtom } from 'jotai'
-import { listen } from '@tauri-apps/api/event'
 import { activeTeamAtom, appendTeamMessageAtom } from '@/atoms/agent-teams'
+import { onTeamMessage } from '@/lib/bridge/agent'
 import { TeamNode } from './TeamNode'
 import { ChannelFeed } from './ChannelFeed'
-import type { TeamChannelMessage } from '@/lib/tauri-bridge'
 
 export function AgentTeamsPanel(): React.ReactElement | null {
   const team = useAtomValue(activeTeamAtom)
@@ -14,7 +13,7 @@ export function AgentTeamsPanel(): React.ReactElement | null {
     let cancelled = false
     let unlisten: (() => void) | null = null
 
-    listen<TeamChannelMessage>('agent:team-message', ({ payload }) => {
+    onTeamMessage((payload) => {
       appendMessage(payload)
     }).then((fn) => {
       if (cancelled) fn()
