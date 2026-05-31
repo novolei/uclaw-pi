@@ -8,7 +8,6 @@ import { ToolsTab } from './ToolsTab'
 import { ShortcutSettings } from './ShortcutSettings'
 import { ConnectivityTab } from './ConnectivityTab'
 import { IntelligenceTab } from './IntelligenceTab'
-import { PetSettings } from './PetSettings'
 import { SettingsNav } from './SettingsNav'
 import { SttSettings } from './SttSettings'
 import { MemoryRecallTab } from '@/features/settings'
@@ -18,6 +17,7 @@ import {
   BrowserRuntimeSettings,
   GeneralTab,
   ImChannelsSettings,
+  PetSettings,
   ProxySetting,
   SystemTab,
 } from '@/features/settings'

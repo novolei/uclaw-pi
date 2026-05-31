@@ -160,3 +160,7 @@ export { AboutSettings } from './components/AboutSettings'
 // handleSave is still a [PLACEHOLDER] console.log as in the original). No hook
 // needed since there is no IPC or effect to extract.
 export { ProxySetting } from './components/ProxySetting'
+
+// PetSettings migrated (1:1 move — pure atom-driven UI writing the petEnabled/
+// petCharacter atomWithStorage atoms; no IPC or effect, so no hook is needed).
+export { PetSettings } from './components/PetSettings'

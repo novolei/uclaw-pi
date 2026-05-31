@@ -6,10 +6,10 @@
 import { useAtom } from 'jotai'
 import { cn } from '@/lib/utils'
 import { petCharacterAtom, petEnabledAtom, type PetCharacter } from '@/atoms/pet-atoms'
-import { SettingsSection } from './primitives/SettingsSection'
-import { SettingsCard } from './primitives/SettingsCard'
-import { SettingsToggle } from './primitives/SettingsToggle'
-import { LABEL_CLASS, DESCRIPTION_CLASS, ROW_CLASS } from './primitives/SettingsUIConstants'
+import { SettingsSection } from '@/components/settings/primitives/SettingsSection'
+import { SettingsCard } from '@/components/settings/primitives/SettingsCard'
+import { SettingsToggle } from '@/components/settings/primitives/SettingsToggle'
+import { LABEL_CLASS, DESCRIPTION_CLASS, ROW_CLASS } from '@/components/settings/primitives/SettingsUIConstants'
 
 const CHARACTERS: Array<{ value: PetCharacter; label: string; description: string }> = [
   { value: 'astro', label: '小宇 Astro', description: '3D 磨砂塑料宇航小子' },
