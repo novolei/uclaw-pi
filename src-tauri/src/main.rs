@@ -1007,7 +1007,7 @@ fn main() {
             uclaw_core::commands::notification::get_notifications,
             uclaw_core::commands::notification::clear_notifications,
             // Background tasks
-            uclaw_core::tauri_commands::get_background_tasks,
+            uclaw_core::commands::background_task::get_background_tasks,
             // Memory
             uclaw_core::tauri_commands::memory_set,
             uclaw_core::tauri_commands::memory_get,

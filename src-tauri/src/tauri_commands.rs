@@ -3736,14 +3736,7 @@ async fn build_artifact_tree(root: &std::path::PathBuf, base: &std::path::PathBu
 }
 
 // ─── Notification Commands → moved to commands::notification ──────────────
-
-// ─── Background Task Commands ──────────────────────────────────────────
-
-#[tauri::command]
-pub async fn get_background_tasks(state: State<'_, AppState>) -> Result<Vec<crate::background::BackgroundTask>, Error> {
-    let mgr = state.background_tasks.lock().await;
-    Ok(mgr.list().into_iter().cloned().collect())
-}
+// ─── Background Task Commands → moved to commands::background_task ─────────
 
 // ─── Memory Commands ───────────────────────────────────────────────────
 
