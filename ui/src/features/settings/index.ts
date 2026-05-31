@@ -43,3 +43,7 @@ export { ModelSettings } from './components/ModelSettings'
 // permissions/ cards; all IPC + draft state in usePermissionsSettings; the
 // sandbox sub-panel stays under components/settings/ for now).
 export { PermissionsSettings } from './components/PermissionsSettings'
+
+// P3a — EmbeddingEndpointSection migrated (config load/save in a hook; IPC stays
+// in the @/lib/embedding-endpoint gbrain/memU helper). Consumed by SystemTab.
+export { EmbeddingEndpointSection } from './components/EmbeddingEndpointSection'

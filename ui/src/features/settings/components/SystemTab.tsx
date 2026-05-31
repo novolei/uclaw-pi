@@ -7,9 +7,8 @@ import { DiagnosticsCard } from './system/DiagnosticsCard'
 import { ServicesCard } from './system/ServicesCard'
 import { HttpApiToggleCard } from './system/HttpApiToggleCard'
 import { EvalsCard } from './system/EvalsCard'
-// Tunable sections that already live as standalone components (out of P1 scope;
-// migrated in P3). Kept in the shell so behavior is preserved exactly.
-import { EmbeddingEndpointSection } from '@/components/settings/EmbeddingEndpointSection'
+// Tunable sections (migrated into the feature in P3a). Feature-local imports.
+import { EmbeddingEndpointSection } from './EmbeddingEndpointSection'
 import { StreamSkillThresholdsSection } from '@/components/settings/StreamSkillThresholdsSection'
 import { FoldDeltaThresholdSection } from '@/components/settings/FoldDeltaThresholdSection'
 import { DeveloperOptionsSection } from '@/components/settings/DeveloperOptionsSection'
