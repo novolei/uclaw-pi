@@ -1244,8 +1244,8 @@ fn main() {
             uclaw_core::commands::memubot::set_skill_prune_min_unused_days,
             uclaw_core::commands::memubot::get_skill_promote_min_returned_count,
             uclaw_core::commands::memubot::set_skill_promote_min_returned_count,
-            // Dev / Testing
-            uclaw_core::tauri_commands::trigger_proactive_scenario,
+            // Dev / Testing → commands::dev_testing (slice 12)
+            uclaw_core::commands::dev_testing::trigger_proactive_scenario,
             // Agent Session Control
             uclaw_core::tauri_commands::stop_agent_session,
             uclaw_core::tauri_commands::create_agent_session,

@@ -15,6 +15,7 @@ pub mod browser_cmds;
 pub mod channel;
 pub mod conversation;
 pub mod cost;
+pub mod dev_testing;
 pub mod gep;
 pub mod knowledge_ingestion;
 pub mod learned_skills;
