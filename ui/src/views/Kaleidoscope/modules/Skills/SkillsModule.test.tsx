@@ -38,9 +38,6 @@ vi.mock('@/features/settings', () => ({
   SkillEvolutionTab: () => <div data-testid="skill-evolution-tab" />,
   SkillConsolidationDialog: () => null,
 }))
-vi.mock('@/components/settings/SkillConsolidationDialog', () => ({
-  SkillConsolidationDialog: () => null,
-}))
 vi.mock('react-markdown', () => ({ default: ({ children }: { children: string }) => <span>{children}</span> }))
 
 // Mock Tauri event listener to avoid jsdom unhandled rejections

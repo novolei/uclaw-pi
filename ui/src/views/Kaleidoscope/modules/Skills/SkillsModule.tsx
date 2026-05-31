@@ -32,7 +32,7 @@ import { ModuleHeader } from '../../shared/ModuleHeader'
 import { SkillsList } from './SkillsList'
 import { SkillDetail } from './SkillDetail'
 import { CreateSkillDialog } from './CreateSkillDialog'
-import { SkillConsolidationDialog } from '@/components/settings/SkillConsolidationDialog'
+import { SkillConsolidationDialog } from '@/features/settings'
 import {
   AlertDialog,
   AlertDialogAction,

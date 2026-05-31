@@ -116,3 +116,7 @@ export { MemorySettings } from './components/MemorySettings'
 // SkillEvolutionTab migrated (version-history load + selection in useSkillVersions).
 // Consumed by views/Kaleidoscope/.../SkillDetail.
 export { SkillEvolutionTab } from './components/SkillEvolutionTab'
+
+// SkillConsolidationDialog migrated (expanded/applying state machine + apply
+// action in useSkillConsolidation). Consumed by views/Kaleidoscope/.../SkillsModule.
+export { SkillConsolidationDialog } from './components/SkillConsolidationDialog'
