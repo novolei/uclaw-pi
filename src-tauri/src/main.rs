@@ -163,21 +163,58 @@ fn main() {
 
             let router = uclaw_core::api::router::build_router(http_state);
 
-            // Spawn HTTP server in a background thread with its own Tokio runtime
-            std::thread::spawn(move || {
-                let rt = tokio::runtime::Runtime::new()
-                    .expect("Failed to create Tokio runtime for HTTP server");
-                rt.block_on(async move {
-                    // Spawn stale WebSocket connection reaper
-                    uclaw_core::api::ws::spawn_stale_connection_reaper(ws_manager);
-
-                    let listener = tokio::net::TcpListener::bind("127.0.0.1:27270")
-                        .await
-                        .expect("Failed to bind HTTP server");
-                    tracing::info!("uClaw HTTP API server listening on http://127.0.0.1:27270");
-                    axum::serve(listener, router).await.expect("HTTP server error");
+            // [pi-lightweight] The local HTTP API (memory / `/v1/embeddings` /
+            // external access) is an OPTIONAL layer beside the pi kernel, not core —
+            // chat & agent run entirely over Tauri IPC. Opt-in via `UCLAW_HTTP_API`,
+            // default OFF, so the default startup stays lightweight and a port clash
+            // (e.g. the original uClaw) can never crash the app. gbrain does not
+            // auto-depend on it; point gbrain's llama-server at :19528/v1 only if you
+            // enable this. Bind/serve failures degrade gracefully (log, never panic).
+            // Enabled by either the env override OR the persisted `http_api_enabled`
+            // setting (toggled in Settings → 系统诊断). Read once at startup; the UI
+            // toggle takes effect on the next restart.
+            let http_api_enabled = std::env::var_os("UCLAW_HTTP_API").is_some()
+                || app_state.db.lock().ok().is_some_and(|conn| {
+                    use uclaw_core::services::settings_service::SettingsService as _;
+                    uclaw_core::services::settings_service::DbSettings.http_api_enabled(&conn)
                 });
-            });
+            if http_api_enabled {
+                std::thread::spawn(move || {
+                    let rt = match tokio::runtime::Runtime::new() {
+                        Ok(rt) => rt,
+                        Err(e) => {
+                            tracing::warn!("HTTP API server not started: runtime init failed: {e}");
+                            return;
+                        }
+                    };
+                    rt.block_on(async move {
+                        // Spawn stale WebSocket connection reaper
+                        uclaw_core::api::ws::spawn_stale_connection_reaper(ws_manager);
+
+                        let listener = match tokio::net::TcpListener::bind("127.0.0.1:19528").await {
+                            Ok(l) => l,
+                            Err(e) => {
+                                tracing::warn!(
+                                    "HTTP API server not started: bind 127.0.0.1:19528 failed \
+                                     (port in use?): {e}"
+                                );
+                                return;
+                            }
+                        };
+                        tracing::info!(
+                            "uClaw HTTP API server listening on http://127.0.0.1:19528 (UCLAW_HTTP_API)"
+                        );
+                        if let Err(e) = axum::serve(listener, router).await {
+                            tracing::warn!("HTTP API server stopped: {e}");
+                        }
+                    });
+                });
+            } else {
+                tracing::info!(
+                    "HTTP API server disabled (optional; set UCLAW_HTTP_API=1 to enable the local \
+                     API / embeddings endpoint)"
+                );
+            }
 
             app.manage(app_state);
 
@@ -909,6 +946,8 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             // Bootstrap
             uclaw_core::tauri_commands::get_settings,
+            uclaw_core::commands::settings::get_http_api_enabled,
+            uclaw_core::commands::settings::set_http_api_enabled,
             uclaw_core::tauri_commands::patch_settings,
             uclaw_core::browser::runtime_pack_ipc::get_browser_runtime_status,
             uclaw_core::browser::runtime_pack_ipc::get_browser_runtime_control_center,

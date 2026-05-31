@@ -208,7 +208,7 @@ export const apiClient = {
 };
 // ─── Remote HTTP API Client ─────────────────────────────────────────────
 
-const DEFAULT_REMOTE_URL = "http://127.0.0.1:27270";
+const DEFAULT_REMOTE_URL = "http://127.0.0.1:19528";
 
 export const remoteClient = {
   config: { baseUrl: DEFAULT_REMOTE_URL, token: null as string | null } as RemoteConfig,

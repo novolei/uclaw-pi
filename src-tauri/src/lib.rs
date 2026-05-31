@@ -5,6 +5,9 @@ pub mod error;
 pub mod ipc;
 pub mod settings;
 pub mod tauri_commands;
+// [ADR 2026-05-31] Decomposed command layer (one domain per file, thin bodies).
+// New command domains land here, not in the tauri_commands.rs god file.
+pub mod commands;
 pub mod cost_store;
 // [R1 接线] Tauri EventSink adapter for the new pi-based agent backend (PiEngine).
 pub mod engine_sink;

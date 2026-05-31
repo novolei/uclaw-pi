@@ -43,8 +43,9 @@ vi.mock('@/components/automation/AppsTab', () => ({
 vi.mock('@/components/memory/MemoryGraphView', () => ({
   MemoryGraphView: () => <div data-testid="memory-graph-view" />,
 }))
-vi.mock('@/components/settings/SkillConsolidationDialog', () => ({
+vi.mock('@/features/settings', () => ({
   SkillConsolidationDialog: () => null,
+  SkillEvolutionTab: () => <div data-testid="skill-evolution-tab" />,
 }))
 
 describe('KaleidoscopeShell', () => {

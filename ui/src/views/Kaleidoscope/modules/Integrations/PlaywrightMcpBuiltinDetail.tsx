@@ -1,5 +1,5 @@
 import { Badge } from '@/components/ui/badge'
-import { SettingsCard, SettingsRow, SettingsSection } from '@/components/settings/primitives'
+import { SettingsCard, SettingsRow, SettingsSection } from '@/features/settings'
 
 export function PlaywrightMcpBuiltinDetail() {
   return (

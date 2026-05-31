@@ -158,6 +158,10 @@ struct StreamComplete {
     conversation_id: String,
     text: String,
     truncated: bool,
+    /// Accumulated thinking/reasoning text across the turn. The persist layer
+    /// stores it as a leading `thinking` ContentBlock so the Agent view renders
+    /// the THINKING block on reload. Empty string when the model didn't think.
+    reasoning: String,
 }
 
 #[derive(Serialize)]
@@ -181,6 +185,7 @@ pub struct Acl {
     chunk_seq: u64,
     reasoning_seq: u64,
     acc_text: String,
+    acc_reasoning: String,
     completed: bool,
     tool_starts: HashMap<String, Instant>,
 }
@@ -193,6 +198,7 @@ impl Acl {
             chunk_seq: 0,
             reasoning_seq: 0,
             acc_text: String::new(),
+            acc_reasoning: String::new(),
             completed: false,
             tool_starts: HashMap::new(),
         }
@@ -227,6 +233,7 @@ impl Acl {
                 })
             }
             RawEvt::ThinkingDelta { delta } => {
+                self.acc_reasoning.push_str(delta);
                 let seq = self.next_reasoning_seq();
                 Some(FeEvent {
                     name: event::STREAM_REASONING,
@@ -290,10 +297,16 @@ impl Acl {
                     error: e.clone(),
                 }),
             }),
-            // TurnEnd or AgentEnd{error:None}, whichever arrives FIRST, emits one
-            // `complete` (§3.3 lists both as sources). `truncated` is false here;
-            // a real run sets it when uClaw-side compaction drops history.
-            RawEvt::TurnEnd | RawEvt::AgentEnd { error: None } if !self.completed => {
+            // `complete` fires ONLY on AgentEnd{error:None} — the single terminal
+            // event pi emits once the whole turn drains (agent.rs:1851). NOT on
+            // TurnEnd: pi emits a TurnEnd after EVERY assistant message
+            // (agent.rs:1818), so in a tool turn (LLM→toolcall→tool→TurnEnd→LLM→
+            // TurnEnd→AgentEnd) completing on the first TurnEnd would latch right
+            // after the preamble and silently drop the tool result + final answer —
+            // the "stuck running / reply is just '好的，我看一下…'" bug. `truncated`
+            // is false here; a real run sets it when uClaw-side compaction drops
+            // history.
+            RawEvt::AgentEnd { error: None } if !self.completed => {
                 self.completed = true;
                 Some(FeEvent {
                     name: event::STREAM_COMPLETE,
@@ -301,6 +314,7 @@ impl Acl {
                         conversation_id: self.conv_id.clone(),
                         text: self.acc_text.clone(),
                         truncated: false,
+                        reasoning: self.acc_reasoning.clone(),
                     }),
                 })
             }
@@ -352,13 +366,18 @@ mod tests {
             .expect("chunk");
         assert_eq!(e1.payload["seq"], 1);
 
-        let c = acl.translate(&RawEvt::TurnEnd).expect("complete");
+        // TurnEnd fires after every assistant message and must NOT complete;
+        // the single terminal AgentEnd{None} carries the accumulated text.
+        assert!(acl.translate(&RawEvt::TurnEnd).is_none());
+        let c = acl
+            .translate(&RawEvt::AgentEnd { error: None })
+            .expect("complete");
         assert_eq!(c.name, event::STREAM_COMPLETE);
         assert_eq!(c.payload["text"], "pong from the void");
         assert_eq!(c.payload["truncated"], false);
 
-        // A trailing AgentEnd{None} must NOT re-emit complete (one-shot latch).
-        assert!(acl.translate(&RawEvt::AgentEnd { error: None }).is_none());
+        // A trailing TurnEnd must NOT re-emit complete (one-shot latch).
+        assert!(acl.translate(&RawEvt::TurnEnd).is_none());
     }
 
     #[test]
@@ -469,10 +488,16 @@ mod tests {
                 result: json!({ "content": [{ "type": "text", "text": "a.txt" }] }),
                 is_error: false,
             },
+            // pi emits a TurnEnd after the tool-call assistant message
+            // (agent.rs:1818), BEFORE the follow-up LLM answer streams. It must NOT
+            // complete — the old TurnEnd-completes path latched here and dropped the
+            // " Done." that follows (the stuck-running bug).
+            RawEvt::TurnEnd,
             RawEvt::TextDelta {
                 delta: " Done.".into(),
             },
             RawEvt::TurnEnd,
+            RawEvt::AgentEnd { error: None },
         ];
         let events: Vec<FeEvent> = feed.iter().filter_map(|ev| acl.translate(ev)).collect();
 
@@ -502,9 +527,11 @@ mod tests {
         assert_eq!(events[4].payload["activity"]["toolName"], "bash");
         assert_eq!(events[5].payload["activity"]["type"], "tool_result");
         assert_eq!(events[5].payload["activity"]["isError"], false);
-        // Complete carries the full accumulated assistant text (chunks only).
+        // Complete carries the full accumulated assistant text (chunks only)…
         assert_eq!(events[7].payload["text"], "Running ls. Done.");
         assert_eq!(events[7].payload["truncated"], false);
+        // …and the accumulated thinking text (persisted as a leading thinking block).
+        assert_eq!(events[7].payload["reasoning"], "let me think");
     }
 
     #[test]

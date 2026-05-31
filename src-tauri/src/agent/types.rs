@@ -234,18 +234,70 @@ pub struct TurnCostInfo {
 // ─── Cost Calculation ─────────────────────────────────────────────────
 
 /// Calculate USD cost based on model pricing (per 1M tokens).
+/// CNY per USD, used to convert providers that bill in 元 (DeepSeek) into the USD
+/// the cost badge shows. An estimate — the frontend caption multiplies the USD
+/// back by the SAME rate to surface the native ¥ amount, so keep them in lock-step
+/// (`ui` `MessageMetaBar` `CNY_PER_USD`). Exact billing is on the provider invoice.
+pub const CNY_PER_USD: f64 = 7.15;
+
+/// Per-1M-token USD prices for a model. `input_hit` is the cache-HIT input rate —
+/// DeepSeek caches input at a steep discount (flash ¥0.02 vs ¥1 = 50× cheaper), so
+/// ignoring it badly over-bills the big, reused system prompt of a coding agent.
+struct ModelPricing {
+    input_miss: f64,
+    input_hit: f64,
+    output: f64,
+}
+
+/// USD/1M-token pricing per model. DeepSeek rates are its published ¥/M
+/// (api-docs.deepseek.com, 2026-05) ÷ [`CNY_PER_USD`]; others are public USD rates
+/// with cache-read modeled as the provider's discount (Anthropic 0.1×, OpenAI 0.5×).
+fn model_pricing(model: &str) -> ModelPricing {
+    let cny = |yuan: f64| yuan / CNY_PER_USD;
+    match model {
+        // DeepSeek — ¥/M: v4-flash 1 / 0.02 / 2 ; v4-pro 12 / 0.1 / 24 (regular rate).
+        m if m.contains("deepseek-v4-flash") || m.contains("deepseek-chat") => {
+            ModelPricing { input_miss: cny(1.0), input_hit: cny(0.02), output: cny(2.0) }
+        }
+        m if m.contains("deepseek-v4-pro") || m.contains("deepseek-reasoner") => {
+            ModelPricing { input_miss: cny(12.0), input_hit: cny(0.1), output: cny(24.0) }
+        }
+        m if m.contains("deepseek") => {
+            ModelPricing { input_miss: cny(1.0), input_hit: cny(0.02), output: cny(2.0) }
+        }
+        // Anthropic / OpenAI / Qwen — public USD/M; cache-hit ≈ the provider discount.
+        m if m.contains("claude-3-5-sonnet") || m.contains("claude-4") || m.contains("claude-sonnet-4") => {
+            ModelPricing { input_miss: 3.0, input_hit: 0.3, output: 15.0 }
+        }
+        m if m.contains("claude-3-5-haiku") || m.contains("claude-haiku") => {
+            ModelPricing { input_miss: 0.8, input_hit: 0.08, output: 4.0 }
+        }
+        m if m.contains("gpt-4o-mini") => ModelPricing { input_miss: 0.15, input_hit: 0.075, output: 0.6 },
+        m if m.contains("gpt-4o") => ModelPricing { input_miss: 2.5, input_hit: 1.25, output: 10.0 },
+        m if m.contains("gpt-4") => ModelPricing { input_miss: 2.5, input_hit: 1.25, output: 10.0 },
+        m if m.contains("qwen") => ModelPricing { input_miss: 0.5, input_hit: 0.05, output: 2.0 },
+        _ => ModelPricing { input_miss: 1.0, input_hit: 0.1, output: 3.0 },
+    }
+}
+
+/// USD cost, treating all input as cache-miss (no cache info). Back-compat wrapper
+/// over [`calculate_cost_cached`] for the legacy dispatcher path.
 pub fn calculate_cost(model: &str, input_tokens: u32, output_tokens: u32) -> f64 {
-    let (input_price, output_price) = match model {
-        m if m.contains("claude-3-5-sonnet") || m.contains("claude-4") || m.contains("claude-sonnet-4") => (3.0, 15.0),
-        m if m.contains("claude-3-5-haiku") || m.contains("claude-haiku") => (0.8, 4.0),
-        m if m.contains("gpt-4o-mini") => (0.15, 0.6),
-        m if m.contains("gpt-4o") => (2.5, 10.0),
-        m if m.contains("gpt-4") => (2.5, 10.0),
-        m if m.contains("deepseek") => (0.14, 0.28),
-        m if m.contains("qwen") => (0.5, 2.0),
-        _ => (1.0, 3.0),
-    };
-    (input_tokens as f64 * input_price + output_tokens as f64 * output_price) / 1_000_000.0
+    calculate_cost_cached(model, input_tokens, output_tokens, 0)
+}
+
+/// Cache-aware USD cost: the cached portion of `input_tokens` (`cache_read_tokens`)
+/// bills at the cache-hit rate, the remainder at cache-miss.
+pub fn calculate_cost_cached(
+    model: &str,
+    input_tokens: u32,
+    output_tokens: u32,
+    cache_read_tokens: u32,
+) -> f64 {
+    let p = model_pricing(model);
+    let cached = cache_read_tokens.min(input_tokens) as f64;
+    let uncached = input_tokens as f64 - cached;
+    (uncached * p.input_miss + cached * p.input_hit + output_tokens as f64 * p.output) / 1_000_000.0
 }
 
 pub fn format_cost(cost: f64) -> String {
@@ -631,6 +683,34 @@ pub const FAKE_PROGRESS_CHALLENGE: &str =
      resumed), call plan_update again with the `note` field set to a \
      concrete description of WHAT was done and WHERE (file paths, command \
      output, etc.) — that will satisfy the challenge.";
+
+#[cfg(test)]
+mod cost_tests {
+    use super::{calculate_cost, calculate_cost_cached};
+
+    #[test]
+    fn deepseek_flash_cache_hit_is_far_cheaper_than_miss() {
+        // ¥1/M miss, ¥0.02/M hit (50× cheaper), ¥2/M output (÷ CNY_PER_USD → USD).
+        let miss = calculate_cost_cached("deepseek-v4-flash", 100_000, 1_000, 0);
+        let hit = calculate_cost_cached("deepseek-v4-flash", 100_000, 1_000, 90_000);
+        assert!(hit < miss / 2.0, "cache hit {hit} should be ≪ all-miss {miss}");
+        assert!(miss > 0.0 && miss < 0.05, "miss {miss} out of sane range");
+    }
+
+    #[test]
+    fn calculate_cost_equals_zero_cache_variant() {
+        let a = calculate_cost("deepseek-v4-flash", 10_000, 500);
+        let b = calculate_cost_cached("deepseek-v4-flash", 10_000, 500, 0);
+        assert!((a - b).abs() < 1e-12);
+    }
+
+    #[test]
+    fn pro_is_much_more_expensive_than_flash() {
+        let flash = calculate_cost("deepseek-v4-flash", 10_000, 1_000);
+        let pro = calculate_cost("deepseek-v4-pro", 10_000, 1_000);
+        assert!(pro > flash * 5.0, "pro {pro} should be ≫ flash {flash}");
+    }
+}
 
 #[cfg(test)]
 mod mutation_tracking_tests {

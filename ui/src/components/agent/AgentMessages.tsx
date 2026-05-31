@@ -637,6 +637,10 @@ export function DurationBadge({ durationMs, usage }: { durationMs: number; usage
 }
 
 /** 统一消息元信息栏 — 耗时 + token 用量合并为单行，单一 tooltip */
+/** CNY per USD — MUST match the backend (`agent::types::CNY_PER_USD`) so the ¥
+ *  caption is the provider's native amount, not a second estimate. */
+const CNY_PER_USD = 7.15
+
 function MessageMetaBar({ durationMs, usage }: { durationMs?: number; usage?: AgentEventUsage }): React.ReactElement | null {
   if (durationMs == null && usage == null) return null
 
@@ -646,7 +650,13 @@ function MessageMetaBar({ durationMs, usage }: { durationMs?: number; usage?: Ag
     const { inputTokens, outputTokens, costUsd } = usage
     parts.push(`${inputTokens.toLocaleString()} 输入`)
     parts.push(`${(outputTokens ?? 0).toLocaleString()} 输出`)
-    if (costUsd != null && costUsd > 0) parts.push(`$${costUsd.toFixed(4)}`)
+    if (costUsd != null && costUsd > 0) {
+      // USD primary + a ¥ caption (DeepSeek bills in 元). Uses the SAME rate as the
+      // backend (agent::types::CNY_PER_USD), so ¥ is the provider's native amount
+      // rather than a second estimate.
+      const cny = costUsd * CNY_PER_USD
+      parts.push(`$${costUsd.toFixed(4)} (¥${cny < 0.1 ? cny.toFixed(4) : cny.toFixed(2)})`)
+    }
   }
 
   const tooltipText = durationMs != null ? buildUsageTooltip(durationMs, usage) : null

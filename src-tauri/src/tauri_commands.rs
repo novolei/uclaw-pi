@@ -107,6 +107,9 @@ fn build_gene_retriever(
 }
 
 // ─── Bootstrap Commands ────────────────────────────────────────────────
+// NOTE: the HTTP-API toggle commands moved to `commands::settings` +
+// `services::settings_service` (code-organization ADR 2026-05-31). New domains
+// go there, not here.
 
 #[tauri::command]
 pub async fn get_settings(state: State<'_, AppState>) -> Result<GetSettingsResponse, Error> {
@@ -1502,6 +1505,9 @@ pub async fn send_message(
         // before driving pi; the assistant half is persisted by the EventSink on
         // chat:stream-complete, so get_messages renders the full turn 1:1.
         let user_msg_id = uuid::Uuid::new_v4().to_string();
+        // The conversation's workspace (spaces.path via workspace_id) → pi's cwd,
+        // matching the Agent path. None ⇒ pi keeps the process cwd.
+        let mut run_cwd: Option<std::path::PathBuf> = None;
         if let Ok(conn) = state.db.lock() {
             if let Err(e) = crate::engine_persist::persist_chat_text_message(
                 &conn,
@@ -1513,6 +1519,10 @@ pub async fn send_message(
             ) {
                 tracing::warn!("PiEngine user-message persist failed: {e}");
             }
+            run_cwd = {
+                use crate::services::workspace_service::WorkspaceService as _;
+                crate::services::workspace_service::DbWorkspace.conversation_cwd(&conn, &conv_id)
+            };
         }
         // [R4/F7] Source pi's provider/model/api_key from provider_service — the
         // SAME resolution the legacy path uses (per-msg override → role → active →
@@ -1545,6 +1555,7 @@ pub async fn send_message(
         engine.send(uclaw_pi_engine::EngineCmd::Prompt {
             conv_id: conv_id.clone(),
             input: input.content.clone(),
+            cwd: run_cwd,
         });
         return Ok(SendMessageResponse {
             message_id: user_msg_id,
@@ -9916,6 +9927,10 @@ pub async fn send_agent_message(
             tauri::Manager::state::<std::sync::Arc<uclaw_pi_engine::PiEngine>>(&app_handle);
         let conv_id = input.session_id.clone();
         let user_msg_id = uuid::Uuid::new_v4().to_string();
+        // The session's workspace (spaces.path via space_id) → pi's cwd, so its
+        // tools + project-context loading run in the user's workspace, not uClaw's
+        // own source tree (the app process cwd). None ⇒ pi keeps the process cwd.
+        let mut run_cwd: Option<std::path::PathBuf> = None;
         if let Ok(conn) = state.db.lock() {
             if let Err(e) = crate::engine_persist::persist_agent_text_message(
                 &conn,
@@ -9924,9 +9939,14 @@ pub async fn send_agent_message(
                 "user",
                 &input.user_message,
                 None,
+                &crate::engine_persist::TurnUsage::default(),
             ) {
                 tracing::warn!("PiEngine agent user-message persist failed: {e}");
             }
+            run_cwd = {
+                use crate::services::workspace_service::WorkspaceService as _;
+                crate::services::workspace_service::DbWorkspace.agent_session_cwd(&conn, &conv_id)
+            };
         }
         // Active provider/model/key/base_url/api from provider_service (服务商 tab).
         if let Some((provider, model, api_key, base_url, api_type)) =
@@ -9947,6 +9967,7 @@ pub async fn send_agent_message(
         engine.send(uclaw_pi_engine::EngineCmd::Prompt {
             conv_id,
             input: input.user_message.clone(),
+            cwd: run_cwd,
         });
         return Ok(());
     }

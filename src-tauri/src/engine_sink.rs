@@ -10,12 +10,20 @@ use uclaw_pi_engine::EventSink;
 /// Wraps the Tauri `AppHandle` and forwards engine events to the frontend.
 pub struct TauriEventSink {
     app: AppHandle,
+    /// Last `agent:turn_cost` payload per conversation, cached when emitted (on
+    /// AgentEnd, just before `chat:stream-complete`) so `persist_assistant` can
+    /// write the token/cost/duration columns onto the assistant row — the
+    /// metadata badge must survive reload. Keyed by conversationId.
+    turn_cost: std::sync::Mutex<std::collections::HashMap<String, serde_json::Value>>,
 }
 
 impl TauriEventSink {
     #[must_use]
     pub fn new(app: AppHandle) -> Arc<dyn EventSink> {
-        Arc::new(Self { app })
+        Arc::new(Self {
+            app,
+            turn_cost: std::sync::Mutex::new(std::collections::HashMap::new()),
+        })
     }
 }
 
@@ -38,6 +46,23 @@ impl TauriEventSink {
         if text.is_empty() {
             return;
         }
+        // Thinking/reasoning text the ACL accumulated over the turn → persisted so
+        // the Agent view re-renders the THINKING block on reload (the live badge is
+        // driven by chat:stream-reasoning; this is its durable counterpart). Empty
+        // ⇒ None (no thinking block written).
+        let reasoning = payload
+            .get("reasoning")
+            .and_then(serde_json::Value::as_str)
+            .filter(|s| !s.is_empty());
+        // The turn's token/cost/duration (cached from the preceding
+        // agent:turn_cost) → the assistant row's metadata-badge columns.
+        let usage = self
+            .turn_cost
+            .lock()
+            .ok()
+            .and_then(|cache| cache.get(conv).cloned())
+            .map(|v| crate::engine_persist::TurnUsage::from_turn_cost(&v))
+            .unwrap_or_default();
         let Some(state) = self.app.try_state::<crate::app::AppState>() else {
             return;
         };
@@ -54,9 +79,11 @@ impl TauriEventSink {
             )
             .is_ok();
         let result = if is_agent_session {
-            crate::engine_persist::persist_agent_text_message(&conn, &id, conv, "assistant", text, None)
+            crate::engine_persist::persist_agent_text_message(
+                &conn, &id, conv, "assistant", text, reasoning, &usage,
+            )
         } else {
-            crate::engine_persist::persist_chat_text_message(&conn, &id, conv, "assistant", text, None)
+            crate::engine_persist::persist_chat_text_message(&conn, &id, conv, "assistant", text, reasoning)
         };
         if let Err(e) = result {
             tracing::warn!("PiEngine assistant persist failed: {e}");
@@ -66,6 +93,39 @@ impl TauriEventSink {
 
 impl EventSink for TauriEventSink {
     fn emit(&self, event: &str, payload: serde_json::Value) {
+        let mut payload = payload;
+        // [metadata] On agent:turn_cost (emitted on AgentEnd, just before
+        // stream-complete): delegate the cache-aware cost recompute + cost_records
+        // recording to the cost service (pi leaves cost=0 for ad-hoc models), set
+        // the corrected costUsd back, and cache the payload so persist_assistant
+        // writes the cost_usd column. This bridge stays a translator (ADR 2026-05-31).
+        if event == "agent:turn_cost" {
+            if let (Some(model), Some(input), Some(output), Some(conv)) = (
+                payload.get("model").and_then(serde_json::Value::as_str).map(str::to_owned),
+                payload.get("inputTokens").and_then(serde_json::Value::as_u64),
+                payload.get("outputTokens").and_then(serde_json::Value::as_u64),
+                payload.get("conversationId").and_then(serde_json::Value::as_str).map(str::to_owned),
+            ) {
+                let cache_read = payload
+                    .get("cacheReadTokens")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0);
+                if let Some(state) = self.app.try_state::<crate::app::AppState>() {
+                    use crate::services::cost_service::CostService as _;
+                    let cost_usd = crate::services::cost_service::PricingCostService.settle_turn(
+                        &state, &conv, &model, input as u32, output as u32, cache_read as u32,
+                    );
+                    if let Some(obj) = payload.as_object_mut() {
+                        obj.insert("costUsd".into(), serde_json::Value::String(cost_usd));
+                    }
+                }
+            }
+            if let Some(conv) = payload.get("conversationId").and_then(serde_json::Value::as_str) {
+                if let Ok(mut cache) = self.turn_cost.lock() {
+                    cache.insert(conv.to_owned(), payload.clone());
+                }
+            }
+        }
         // [R2 闭环] On complete, persist the assistant message BEFORE emitting so
         // the frontend's complete→refresh sees it. Gated by the same migration
         // flag as the routing (only fires when the engine path is active).
