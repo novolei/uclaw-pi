@@ -9480,52 +9480,6 @@ pub async fn memu_embed_text(
 }
 
 
-// ─── Knowledge Ingestion Commands ─────────────────────────────────────────────
-
-#[tauri::command]
-pub async fn ingest_files(
-    state: State<'_, AppState>,
-    app: tauri::AppHandle,
-    paths: Vec<String>,
-) -> Result<Vec<String>, String> {
-    let mut ids = Vec::new();
-    for p in paths {
-        let id = state
-            .ingestion
-            .submit(crate::ingestion::IngestionSource::File(p), app.clone())
-            .await;
-        ids.push(id);
-    }
-    Ok(ids)
-}
-
-#[tauri::command]
-pub async fn ingest_url(
-    state: State<'_, AppState>,
-    app: tauri::AppHandle,
-    url: String,
-) -> Result<String, String> {
-    Ok(state
-        .ingestion
-        .submit(crate::ingestion::IngestionSource::Url(url), app)
-        .await)
-}
-
-#[tauri::command]
-pub async fn ingest_job_status(
-    state: State<'_, AppState>,
-    id: String,
-) -> Result<Option<crate::ingestion::IngestionJob>, String> {
-    Ok(state.ingestion.status(&id).await)
-}
-
-#[tauri::command]
-pub async fn ingest_list_jobs(
-    state: State<'_, AppState>,
-) -> Result<Vec<crate::ingestion::IngestionJob>, String> {
-    Ok(state.ingestion.list().await)
-}
-
 #[cfg(test)]
 mod list_chat_sessions_for_spec_tests {
     //! Phase 2b cluster A · §9 acceptance #3: owner can see all chat threads

@@ -1219,10 +1219,10 @@ fn main() {
             uclaw_core::tauri_commands::gbrain_full_graph,
             uclaw_core::tauri_commands::gbrain_serve_smoke,
             // Knowledge Ingestion
-            uclaw_core::tauri_commands::ingest_files,
-            uclaw_core::tauri_commands::ingest_url,
-            uclaw_core::tauri_commands::ingest_job_status,
-            uclaw_core::tauri_commands::ingest_list_jobs,
+            uclaw_core::commands::knowledge_ingestion::ingest_files,
+            uclaw_core::commands::knowledge_ingestion::ingest_url,
+            uclaw_core::commands::knowledge_ingestion::ingest_job_status,
+            uclaw_core::commands::knowledge_ingestion::ingest_list_jobs,
             uclaw_core::tauri_commands::reset_ai_engine,
             uclaw_core::tauri_commands::restart_app,
             // MEMUBOT Services
