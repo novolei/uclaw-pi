@@ -34,8 +34,9 @@ vi.mock('@/lib/tauri-bridge', () => ({
 }))
 
 // 重子树 —— stub 掉,本测试只关心 SkillsModule 的 merge / 分组 / 选中。
-vi.mock('@/components/settings/SkillEvolutionTab', () => ({
+vi.mock('@/features/settings', () => ({
   SkillEvolutionTab: () => <div data-testid="skill-evolution-tab" />,
+  SkillConsolidationDialog: () => null,
 }))
 vi.mock('@/components/settings/SkillConsolidationDialog', () => ({
   SkillConsolidationDialog: () => null,

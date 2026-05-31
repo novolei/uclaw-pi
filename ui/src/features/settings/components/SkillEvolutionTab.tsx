@@ -11,8 +11,8 @@
  */
 
 import * as React from 'react'
-import { getSkillVersions, type SkillVersionInfo } from '@/lib/tauri-bridge'
 import { cn } from '@/lib/utils'
+import { useSkillVersions } from '../hooks/useSkillVersions'
 
 interface Props {
   skillId: string
@@ -42,23 +42,7 @@ function StatusBadge({ status }: { status: string }): React.ReactElement {
 }
 
 export function SkillEvolutionTab({ skillId }: Props): React.ReactElement {
-  const [versions, setVersions] = React.useState<SkillVersionInfo[]>([])
-  const [loading, setLoading] = React.useState(true)
-  const [selectedId, setSelectedId] = React.useState<string | null>(null)
-
-  React.useEffect(() => {
-    let cancelled = false
-    setLoading(true)
-    getSkillVersions(skillId).then((v) => {
-      if (cancelled) return
-      setVersions(v)
-      // Default: show active vs previous
-      const first = v[0]
-      if (first) setSelectedId(first.id)
-      setLoading(false)
-    })
-    return () => { cancelled = true }
-  }, [skillId])
+  const { versions, loading, selectedId, setSelectedId } = useSkillVersions(skillId)
 
   if (loading) {
     return (

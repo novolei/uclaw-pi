@@ -1,10 +1,10 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import * as React from 'react'
-import { render, screen, waitFor } from '@testing-library/react'
+import { renderWithProviders as render, screen, waitFor } from '@/test-utils/render'
 import { SkillEvolutionTab } from './SkillEvolutionTab'
 import type { SkillVersionInfo } from '@/lib/tauri-bridge'
 
-// Mock the entire tauri-bridge so the component never calls invoke()
+// IPC flows through useSkillVersions → the typed @/lib/tauri-bridge getSkillVersions
+// helper. Mock the bridge so the component never calls invoke().
 vi.mock('@/lib/tauri-bridge', () => ({
   getSkillVersions: vi.fn(),
 }))

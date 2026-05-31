@@ -108,3 +108,11 @@ export { default as DingTalkSettings } from './components/channels/DingTalkSetti
 // MemorySettings migrated (boot-node load + toggle state in useMemorySettings).
 // No in-tree consumer renders it today; kept for completeness.
 export { MemorySettings } from './components/MemorySettings'
+
+// ── Skill cluster (used from the Kaleidoscope Skills module, not Settings nav).
+// Migrated out of components/settings/ ; side effects moved into hooks; IPC stays
+// in the typed @/lib/tauri-bridge skill helpers. Consumers import from this barrel. ──
+
+// SkillEvolutionTab migrated (version-history load + selection in useSkillVersions).
+// Consumed by views/Kaleidoscope/.../SkillDetail.
+export { SkillEvolutionTab } from './components/SkillEvolutionTab'
