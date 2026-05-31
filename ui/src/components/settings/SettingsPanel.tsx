@@ -9,7 +9,6 @@ import { ShortcutSettings } from './ShortcutSettings'
 import { ConnectivityTab } from './ConnectivityTab'
 import { IntelligenceTab } from './IntelligenceTab'
 import { SettingsNav } from './SettingsNav'
-import { SttSettings } from './SttSettings'
 import { MemoryRecallTab } from '@/features/settings'
 import { LearnedProfileTab } from './LearnedProfileTab'
 import {
@@ -19,6 +18,7 @@ import {
   ImChannelsSettings,
   PetSettings,
   ProxySetting,
+  SttSettings,
   SystemTab,
 } from '@/features/settings'
 import { SettingsBreadcrumb } from './SettingsBreadcrumb'

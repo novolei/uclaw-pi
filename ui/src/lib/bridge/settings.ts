@@ -40,6 +40,18 @@ export interface ModelRoleConfig {
   model_ref: string | null
 }
 
+/** Backend STT model-readiness probe result (mirrors the Rust `stt_model_status`). */
+export interface SttModelStatusResult {
+  openflow_ready: boolean
+  openflow_model_dir: string
+}
+
+/** Request payload for `stt_download_model`. */
+export interface SttDownloadModelRequest {
+  preset: string
+  force: boolean
+}
+
 /** A freshly-issued WeChat iLink login QR code (polling token + image payload). */
 export interface WechatIlinkQrcode {
   qrcode: string
@@ -261,6 +273,15 @@ export const settingsBridge = {
   /** Disconnect (unbind) a WeChat iLink instance. */
   disconnectWechatIlink: (instanceId: string): Promise<void> =>
     invoke<void>('disconnect_wechat_ilink', { instanceId }),
+
+  // ── STT model IPC (was raw `invoke` inside SttSettings). Powers Settings → 语音.
+  // Thin wrappers — these never swallowed errors (the caller owns its try/catch). ──
+  /** Probe whether the OpenFlow STT model is downloaded + ready. */
+  sttModelStatus: (): Promise<SttModelStatusResult> =>
+    invoke<SttModelStatusResult>('stt_model_status'),
+  /** Download (or force-redownload) the STT model; resolves to the model dir. */
+  sttDownloadModel: (request: SttDownloadModelRequest): Promise<string> =>
+    invoke<string>('stt_download_model', { request }),
 }
 
 // ── Developer-options setup-script event stream (was `@tauri-apps/api/event`

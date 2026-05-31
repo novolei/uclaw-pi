@@ -170,3 +170,9 @@ export { PetSettings } from './components/PetSettings'
 // @/lib/tauri-bridge sandbox-path helpers stay in the hook). Consumed by
 // PermissionsSettings (relative sibling import).
 export { WorkspaceSandboxSettings } from './components/WorkspaceSandboxSettings'
+
+// SttSettings migrated (model-status probe + device enumeration + download in
+// useSttModel; the raw invoke('stt_model_status'/'stt_download_model') moved behind
+// settingsBridge.sttModelStatus/.sttDownloadModel). The sttSettings prefs atom +
+// the shortcut lookup stay in the component.
+export { SttSettings } from './components/SttSettings'

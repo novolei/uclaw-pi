@@ -5,15 +5,22 @@ import { SttSettings } from './SttSettings'
 import { createStore } from 'jotai'
 import { modelStatusAtom, sttSettingsAtom } from '@/atoms/stt-atoms'
 
-const invokeMock = vi.fn()
-vi.mock('@tauri-apps/api/core', () => ({
-  invoke: (...args: unknown[]) => invokeMock(...args),
+// The model-status probe + download now go through settingsBridge (via the
+// useSttModel hook), so mock the bridge instead of raw @tauri-apps/api.
+const statusMock = vi.fn()
+const downloadMock = vi.fn()
+vi.mock('../../../lib/bridge/settings', () => ({
+  settingsBridge: {
+    sttModelStatus: (...a: unknown[]) => statusMock(...a),
+    sttDownloadModel: (...a: unknown[]) => downloadMock(...a),
+  },
 }))
 
 beforeEach(() => {
-  invokeMock.mockReset()
+  statusMock.mockReset()
+  downloadMock.mockReset()
   // Default: stt_model_status never resolves (so we can control modelStatusAtom via store)
-  invokeMock.mockReturnValue(new Promise(() => {}))
+  statusMock.mockReturnValue(new Promise(() => {}))
 })
 
 describe('SttSettings', () => {

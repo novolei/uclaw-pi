@@ -6,18 +6,18 @@
  */
 import * as React from 'react'
 import { useAtom } from 'jotai'
-import { invoke } from '@tauri-apps/api/core'
 import { Download, Loader2, CheckCircle2 } from 'lucide-react'
 import {
   SettingsCard,
   SettingsSection,
   SettingsRow,
   SettingsSelect,
-} from './primitives'
-import { LABEL_CLASS } from './primitives/SettingsUIConstants'
+} from '@/components/settings/primitives'
+import { LABEL_CLASS } from '@/components/settings/primitives/SettingsUIConstants'
 import { Button } from '@/components/ui/button'
-import { modelStatusAtom, sttSettingsAtom, type Language } from '@/atoms/stt-atoms'
+import { sttSettingsAtom, type Language } from '@/atoms/stt-atoms'
 import { getShortcutForPlatform } from '@/lib/shortcut-defaults'
+import { useSttModel } from '../hooks/useSttModel'
 
 const LANGUAGE_OPTIONS: Array<{ value: Language; label: string }> = [
   { value: 'auto', label: '自动' },
@@ -36,55 +36,11 @@ const SILENCE_OPTIONS: Array<{ value: string; label: string }> = [
 ]
 
 export function SttSettings(): React.ReactElement {
-  const [modelStatus, setModelStatus] = useAtom(modelStatusAtom)
+  const { modelStatus, devices, handleDownload } = useSttModel()
   const [settings, setSettings] = useAtom(sttSettingsAtom)
-  const [devices, setDevices] = React.useState<MediaDeviceInfo[]>([])
 
   // 兜底：旧 localStorage 值可能缺 silenceThresholdMs。
   const silenceThresholdMs = settings.silenceThresholdMs ?? 1800
-
-  React.useEffect(() => {
-    void invoke('stt_model_status')
-      .then((s: unknown) => {
-        const status = s as { openflow_ready: boolean; openflow_model_dir: string }
-        setModelStatus(
-          status.openflow_ready
-            ? { kind: 'ready', modelDir: status.openflow_model_dir }
-            : { kind: 'not-downloaded', expectedDir: status.openflow_model_dir },
-        )
-      })
-      .catch(() => {})
-  }, [setModelStatus])
-
-  React.useEffect(() => {
-    if (navigator.mediaDevices?.enumerateDevices) {
-      void navigator.mediaDevices
-        .enumerateDevices()
-        .then((d) => setDevices(d.filter((x) => x.kind === 'audioinput')))
-        .catch(() => {})
-    }
-  }, [])
-
-  const handleDownload = React.useCallback(async () => {
-    setModelStatus({
-      kind: 'downloading',
-      file: 'model_quant.onnx',
-      downloaded: 0,
-      total: null,
-      percent: 0,
-    })
-    try {
-      const dir = (await invoke('stt_download_model', {
-        request: { preset: 'quantized', force: false },
-      })) as string
-      setModelStatus({ kind: 'ready', modelDir: dir })
-    } catch (e) {
-      setModelStatus({
-        kind: 'error',
-        message: String((e as Error)?.message ?? e),
-      })
-    }
-  }, [setModelStatus])
 
   const shortcut = getShortcutForPlatform('toggle-stt-recording') ?? 'Cmd+Shift+M'
 
