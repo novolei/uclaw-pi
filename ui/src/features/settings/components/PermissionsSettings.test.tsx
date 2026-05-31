@@ -36,9 +36,9 @@ vi.mock('../../../lib/bridge/settings', () => ({
   },
 }))
 
-// The WorkspaceSandboxSettings sub-tree (still under components/settings/) pulls
-// its own sandbox IPC from @/lib/tauri-bridge on mount — stub those so it renders
-// quietly inside the shell.
+// The WorkspaceSandboxSettings sub-tree (a migrated sibling) pulls its own sandbox
+// IPC from @/lib/tauri-bridge (via useWorkspaceSandbox) on mount — stub those so it
+// renders quietly inside the shell.
 vi.mock('@/lib/tauri-bridge', () => ({
   listAlwaysAllowedPaths: vi.fn(async () => []),
   listSessionAllowedPaths: vi.fn(async () => []),

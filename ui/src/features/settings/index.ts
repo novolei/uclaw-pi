@@ -164,3 +164,9 @@ export { ProxySetting } from './components/ProxySetting'
 // PetSettings migrated (1:1 move — pure atom-driven UI writing the petEnabled/
 // petCharacter atomWithStorage atoms; no IPC or effect, so no hook is needed).
 export { PetSettings } from './components/PetSettings'
+
+// WorkspaceSandboxSettings migrated (global + per-session allowed-path lists +
+// add/remove/promote in useWorkspaceSandbox; the current-session atom read + typed
+// @/lib/tauri-bridge sandbox-path helpers stay in the hook). Consumed by
+// PermissionsSettings (relative sibling import).
+export { WorkspaceSandboxSettings } from './components/WorkspaceSandboxSettings'

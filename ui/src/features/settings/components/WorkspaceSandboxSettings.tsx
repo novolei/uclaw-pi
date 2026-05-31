@@ -1,69 +1,11 @@
 import * as React from 'react'
-import { useAtomValue } from 'jotai'
 import { Plus, Trash2 } from 'lucide-react'
-import { toast } from 'sonner'
 import { cn } from '@/lib/utils'
-import {
-  listAlwaysAllowedPaths,
-  addAlwaysAllowedPath,
-  removeAlwaysAllowedPath,
-  listSessionAllowedPaths,
-  promoteSessionPathToGlobal,
-  openFolderDialog,
-} from '@/lib/tauri-bridge'
-import { currentAgentSessionIdAtom } from '@/atoms/agent-atoms'
+import { useWorkspaceSandbox } from '../hooks/useWorkspaceSandbox'
 
 export function WorkspaceSandboxSettings(): React.ReactElement {
-  const sessionId = useAtomValue(currentAgentSessionIdAtom)
-  const [global, setGlobal] = React.useState<string[]>([])
-  const [session, setSession] = React.useState<string[]>([])
-
-  const refreshGlobal = React.useCallback(async () => {
-    try { setGlobal(await listAlwaysAllowedPaths()) } catch (err) { console.error('[sandbox]', err) }
-  }, [])
-
-  const refreshSession = React.useCallback(async () => {
-    if (!sessionId) { setSession([]); return }
-    try { setSession(await listSessionAllowedPaths(sessionId)) } catch (err) { console.error('[sandbox]', err) }
-  }, [sessionId])
-
-  React.useEffect(() => { void refreshGlobal() }, [refreshGlobal])
-  React.useEffect(() => { void refreshSession() }, [refreshSession])
-
-  const handleAdd = async () => {
-    try {
-      const picked = await openFolderDialog()
-      if (!picked) return
-      await addAlwaysAllowedPath(picked.path)
-      await refreshGlobal()
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err)
-      toast.error(`添加失败: ${msg}`)
-    }
-  }
-
-  const handleRemove = async (p: string) => {
-    try {
-      await removeAlwaysAllowedPath(p)
-      await refreshGlobal()
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err)
-      toast.error(`删除失败: ${msg}`)
-    }
-  }
-
-  const handlePromote = async (p: string) => {
-    if (!sessionId) return
-    try {
-      await promoteSessionPathToGlobal(sessionId, p)
-      await refreshGlobal()
-      await refreshSession()
-      toast.success('已升级为永久允许')
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err)
-      toast.error(`升级失败: ${msg}`)
-    }
-  }
+  const { sessionId, global, session, handleAdd, handleRemove, handlePromote } =
+    useWorkspaceSandbox()
 
   return (
     <div className="flex flex-col gap-6">

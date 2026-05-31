@@ -9,15 +9,13 @@
  *      rules (section 2) for granular trust.
  *   2. PermissionRulesSection — V14 session + pattern rules (the granular tier).
  *   3. PermissionAuditLog — most-recent decisions across all sessions.
- * Plus WorkspaceSandboxSettings (still under components/settings/, migrated later).
+ * Plus WorkspaceSandboxSettings (now a migrated sibling under features/settings/).
  *
  * Live update: re-fetch on mount; manual refresh button. Split out of the
  * 328-line components/settings/PermissionsSettings.tsx during P3a.
  */
 import * as React from 'react'
-// WorkspaceSandboxSettings still lives under components/settings/ (migrated in a
-// later phase); imported via the @/ alias so behavior is preserved exactly.
-import { WorkspaceSandboxSettings } from '@/components/settings/WorkspaceSandboxSettings'
+import { WorkspaceSandboxSettings } from './WorkspaceSandboxSettings'
 import { usePermissionsSettings } from '../hooks/usePermissionsSettings'
 import { GlobalAllowBlockLists } from './permissions/GlobalAllowBlockLists'
 import { PermissionRulesSection } from './permissions/PermissionRulesSection'
