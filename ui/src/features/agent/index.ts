@@ -75,3 +75,9 @@ export { ExitPlanModeBanner } from './components/ExitPlanModeBanner'
 // keyboard nav). Split: presentational shell + AskUserQuestionCard sub-view, with
 // the answer state machine + respondAskUser / stopAgent IPC in useAskUserBanner.
 export { AskUserBanner } from './components/AskUserBanner'
+
+// AgentHeartbeatBanner — live heartbeat chip + stall banner + interrupted-reply
+// recovery (Bundle 27-A). Split: presentational AgentHeartbeatView + the
+// event/IPC wiring (heartbeat/stall/recovery subscriptions, consume/interrupt/
+// dismiss) in useAgentHeartbeat, all routed through the agent bridge.
+export { AgentHeartbeatBanner } from './components/AgentHeartbeatBanner'

@@ -25,7 +25,7 @@ import { AutoPreviewPopover } from './AutoPreviewPopover'
 import { StrategyPresetSelector } from '@/features/agent'
 import { PermissionBanner } from '@/features/agent'
 // Bundle 27-A — heartbeat indicator + stall banner + interrupted-reply recovery.
-import { AgentHeartbeatBanner } from './AgentHeartbeatBanner'
+import { AgentHeartbeatBanner } from '@/features/agent'
 import { PermissionModeSelector } from '@/features/agent'
 import { AgentStatusBar } from '@/features/agent'
 import { AskUserBanner } from '@/features/agent'
