@@ -21,9 +21,13 @@ import {
 } from 'lucide-react'
 import { useSetAtom } from 'jotai'
 import { cn } from '@/lib/utils'
-import { getToolIcon, formatElapsed } from './tool-utils'
-import { getToolPhrase } from './tool-phrase'
-import { ToolResultRenderer } from './tool-renderers'
+import {
+  getToolIcon,
+  formatElapsed,
+  getToolPhrase,
+  ToolResultRenderer,
+  BashStreamView,
+} from '@/shared/tool-rendering'
 import {
   type ToolActivity,
   type ActivityGroup,
@@ -34,7 +38,6 @@ import {
 } from '@/atoms/agent-atoms'
 import { TaskProgressCard, TASK_TOOL_NAMES } from '@/features/agent'
 import { readAttachment, saveImageAs } from '@/lib/tauri-bridge'
-import { BashStreamView } from './tool-renderers/BashStreamView'
 import { openPreviewTabAction } from '@/atoms/preview-panel-atoms'
 
 // ===== 预览按钮资格判断 =====

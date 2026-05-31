@@ -23,7 +23,10 @@ vi.mock('@/lib/tauri-bridge', () => ({
   saveImageAs: vi.fn(async () => {}),
 }))
 
-vi.mock('@/components/agent/tool-renderers', () => ({
+// Keep the real tool metadata helpers (getToolIcon / getToolPhrase / formatElapsed /
+// BashStreamView) and only stub the heavyweight result dispatcher.
+vi.mock('@/shared/tool-rendering', async (importActual) => ({
+  ...(await importActual<typeof import('@/shared/tool-rendering')>()),
   ToolResultRenderer: () => <div data-testid="tool-result-renderer">result</div>,
 }))
 
