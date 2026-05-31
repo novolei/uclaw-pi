@@ -56,6 +56,30 @@ export {
   // save-as). Thin re-exports — command names + payload shapes unchanged. ──
   readAttachment,
   saveImageAs,
+  // ── AgentView composer + shell IPC surfaced for the migrated AgentView
+  // (the final, largest agent-domain leaf). Thin re-exports — command names,
+  // payload shapes, and `.catch` fallbacks are unchanged from the monolith. ──
+  // Session workspace path (file browser) + per-message context estimate are
+  // already exported above; these are the remaining composer/shell commands.
+  getAgentSessionPath,
+  forkAgentSession,
+  rewindSession,
+  saveFilesToAgentSession,
+  attachSessionDirectory,
+  // File-dialog / drag-drop path helpers used by the composer's attachment +
+  // drop pipeline (open the OS file picker, resolve dropped File→path, and
+  // classify dropped paths into directories vs files).
+  openFileDialog,
+  getPathForFile,
+  checkPathsType,
+  // The composer's thinking-toggle + auto-model-selection persist their choice
+  // through the settings patch command (re-exported here so the agent feature
+  // routes it via the agent bridge rather than reaching into the monolith).
+  updateSettings,
+  // Per-session stream-complete + queued-consumed listeners the AgentView shell
+  // subscribes to (refresh-on-complete, dequeue-on-consume). CleanupFn-returning.
+  onStreamComplete,
+  onQueuedConsumed,
 } from '../tauri-bridge'
 
 // Per-turn record shape returned by `get_session_trajectory`, surfaced so the
@@ -243,3 +267,19 @@ export const onTeamMessage = (
   handler: (payload: TeamChannelMessage) => void,
 ): Promise<UnlistenFn> =>
   listen<TeamChannelMessage>('agent:team-message', (e) => handler(e.payload))
+
+// ── STT model-readiness probe (was a raw `@tauri-apps/api/core` `invoke` inside
+// AgentView — the composer queries it on mount so the SpeechButton can show its
+// readiness dot + drive the first-run download dialog). Routed through this
+// wrapper so no `features/agent` component imports `@tauri-apps/api`. Command
+// name + result shape are unchanged. ──
+
+/** Result of `stt_model_status` — whether the OpenFlow STT model is ready. */
+export interface SttModelStatus {
+  openflow_ready: boolean
+  openflow_model_dir: string
+}
+
+/** Probe whether the OpenFlow STT model is downloaded + ready. */
+export const getSttModelStatus = (): Promise<SttModelStatus> =>
+  invoke<SttModelStatus>('stt_model_status')
