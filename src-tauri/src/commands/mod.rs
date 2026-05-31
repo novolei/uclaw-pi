@@ -8,7 +8,9 @@
 //! god file (~13k lines), which is being decomposed into this module one domain
 //! at a time. `settings` is the first slice (the HTTP-API toggle).
 
+pub mod artifact;
 pub mod background_task;
+pub mod channel;
 pub mod conversation;
 pub mod cost;
 pub mod llm_config;
