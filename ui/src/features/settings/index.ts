@@ -182,3 +182,9 @@ export { SttSettings } from './components/SttSettings'
 // + the agent:turn_cost live re-fetch in useUsageData; the typed @/lib/tauri-bridge
 // cost helpers + @/atoms/cost atoms stay in the hook). Consumed by ConnectivityTab.
 export { UsageSettings } from './components/UsageSettings'
+
+// ShortcutSettings migrated + split (433 → thin panel root composing shortcuts/
+// cards [ShortcutRow, KbdCluster, ResetAllButton] + lib/shortcut-binding helpers;
+// each row's capture/conflict state + the global-shortcut updateGlobalShortcut sync
+// in useShortcutRow/useResetAllShortcuts; the shortcutOverrides atom stays the SSoT).
+export { ShortcutSettings } from './components/ShortcutSettings'

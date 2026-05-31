@@ -5,7 +5,6 @@ import { hasUpdateAtom } from '@/atoms/updater'
 import { modelStatusAtom } from '@/atoms/stt-atoms'
 import { ScrollArea } from '@/components/ui/scroll-area'
 import { ToolsTab } from './ToolsTab'
-import { ShortcutSettings } from './ShortcutSettings'
 import { ConnectivityTab } from './ConnectivityTab'
 import { IntelligenceTab } from './IntelligenceTab'
 import { SettingsNav } from './SettingsNav'
@@ -18,6 +17,7 @@ import {
   ImChannelsSettings,
   PetSettings,
   ProxySetting,
+  ShortcutSettings,
   SttSettings,
   SystemTab,
 } from '@/features/settings'
