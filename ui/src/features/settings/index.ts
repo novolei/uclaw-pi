@@ -13,3 +13,6 @@ export { GeneralTab } from './components/GeneralTab'
 
 // P2 — AgentSettings migrated (presentation; plan-mode persist in a hook).
 export { AgentSettings } from './components/AgentSettings'
+
+// P2 — PromptsSettings migrated (presentation; load/save IPC in a hook).
+export { PromptsSettings } from './components/PromptsSettings'

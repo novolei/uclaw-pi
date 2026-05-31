@@ -10,19 +10,9 @@
 
 import * as React from 'react'
 import { Save, ExternalLink, FileCode2, ChevronDown, ChevronRight } from 'lucide-react'
-import { useAtomValue, useSetAtom } from 'jotai'
-import { toast } from 'sonner'
 import { Button } from '@/components/ui/button'
 import { cn } from '@/lib/utils'
-import {
-  readWorkspaceUclawMd,
-  writeWorkspaceUclawMd,
-  readDefaultPrompts,
-  openWorkspaceUclawMdExternally,
-} from '@/lib/tauri-bridge'
-import type { DefaultPromptsResponse } from '@/lib/types'
-import { safetyModeAtom } from '@/atoms/safety-atoms'
-import { settingsTabAtom } from '@/atoms/settings-tab'
+import { usePromptsSettings } from '../hooks/usePromptsSettings'
 
 const PLACEHOLDER_TEMPLATE = `# uClaw — <project name>
 
@@ -49,55 +39,18 @@ const PLACEHOLDER_TEMPLATE = `# uClaw — <project name>
 `
 
 export function PromptsSettings(): React.ReactElement {
-  const [content, setContent] = React.useState('')
-  const [pristine, setPristine] = React.useState('')
-  const [defaults, setDefaults] = React.useState<DefaultPromptsResponse | null>(null)
-  const [loading, setLoading] = React.useState(true)
-  const [saving, setSaving] = React.useState(false)
-  const [showGuardrails, setShowGuardrails] = React.useState(false)
-  const mode = useAtomValue(safetyModeAtom)
-  const setSettingsTab = useSetAtom(settingsTabAtom)
-
-  React.useEffect(() => {
-    Promise.all([readWorkspaceUclawMd(), readDefaultPrompts()])
-      .then(([md, p]) => {
-        setContent(md)
-        setPristine(md)
-        setDefaults(p)
-      })
-      .catch((e) => {
-        console.error('[PromptsSettings] load failed:', e)
-        toast.error('加载提示词失败')
-      })
-      .finally(() => setLoading(false))
-  }, [])
-
-  const dirty = content !== pristine
-
-  const onSave = async () => {
-    setSaving(true)
-    try {
-      await writeWorkspaceUclawMd(content)
-      setPristine(content)
-      toast.success('uclaw.md 已保存')
-    } catch (e) {
-      console.error('[PromptsSettings] save failed:', e)
-      toast.error('保存失败')
-    } finally {
-      setSaving(false)
-    }
-  }
-
-  const currentModeAddition = React.useMemo(() => {
-    if (!defaults) return ''
-    switch (mode) {
-      case 'ask': return defaults.modeAsk
-      case 'acceptedits': return defaults.modeAcceptEdits
-      case 'plan': return defaults.modePlan
-      case 'yolo': return defaults.modeBypass
-      default: return '(Auto mode — no mode-specific addition)'
-    }
-  }, [mode, defaults])
+  const {
+    content, setContent,
+    defaults,
+    loading, saving,
+    showGuardrails, setShowGuardrails,
+    mode,
+    dirty,
+    onSave,
+    openExternally,
+    currentModeAddition,
+    goToGeneralTab,
+  } = usePromptsSettings()
 
   return (
     <div className="space-y-6 pb-8">
@@ -106,7 +59,7 @@ export function PromptsSettings(): React.ReactElement {
         <h3 className="mb-2 text-[12px] font-semibold uppercase tracking-widest text-muted-foreground/70">
           全局系统提示词
         </h3>
-        <Button variant="outline" size="sm" onClick={() => setSettingsTab('general')}>
+        <Button variant="outline" size="sm" onClick={goToGeneralTab}>
           跳到 通用 tab 编辑
         </Button>
       </section>
@@ -120,14 +73,7 @@ export function PromptsSettings(): React.ReactElement {
           <div className="flex items-center gap-2">
             <Button
               variant="ghost" size="sm"
-              onClick={async () => {
-                try {
-                  await openWorkspaceUclawMdExternally()
-                } catch (e) {
-                  console.error('[PromptsSettings] open external failed:', e)
-                  toast.error('打开外部编辑器失败')
-                }
-              }}
+              onClick={() => void openExternally()}
             >
               <ExternalLink className="size-3.5 mr-1" />
               在外部编辑器打开

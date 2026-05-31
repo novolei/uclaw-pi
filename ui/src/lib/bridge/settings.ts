@@ -10,6 +10,7 @@
 // generation lands these signatures become generated, not hand-written.
 
 import { invoke } from '@tauri-apps/api/core'
+import type { DefaultPromptsResponse } from '../types'
 
 export const settingsBridge = {
   /** Whether the optional local HTTP API server is enabled (persisted; restart to apply). */
@@ -26,4 +27,15 @@ export const settingsBridge = {
   /** Persist whether the agent suggests Plan mode for complex multi-step requests. */
   setPlanModeSuggestEnabled: (enabled: boolean): Promise<void> =>
     invoke<void>('set_plan_mode_suggest_enabled', { enabled }),
+  /** Read the workspace-level `uclaw.md` project-context file (empty string if absent). */
+  readWorkspaceUclawMd: (): Promise<string> => invoke<string>('read_workspace_uclaw_md'),
+  /** Persist the workspace-level `uclaw.md` project-context file. */
+  writeWorkspaceUclawMd: (content: string): Promise<void> =>
+    invoke<void>('write_workspace_uclaw_md', { content }),
+  /** Read the built-in default prompts (Karpathy baseline + per-mode additions). */
+  readDefaultPrompts: (): Promise<DefaultPromptsResponse> =>
+    invoke<DefaultPromptsResponse>('read_default_prompts'),
+  /** Open `<workspace>/uclaw.md` in the OS default editor (creates it if missing). */
+  openWorkspaceUclawMdExternally: (): Promise<void> =>
+    invoke<void>('open_workspace_uclaw_md_externally'),
 }

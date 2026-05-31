@@ -3,17 +3,20 @@ import * as React from 'react'
 import { PromptsSettings } from './PromptsSettings'
 import { renderWithProviders, screen, waitFor } from '@/test-utils/render'
 
-vi.mock('@/lib/tauri-bridge', () => ({
-  readWorkspaceUclawMd: vi.fn(async () => '# my project\nuse rust 2021'),
-  writeWorkspaceUclawMd: vi.fn(async () => {}),
-  readDefaultPrompts: vi.fn(async () => ({
-    baseline: 'BASELINE_TEXT',
-    modeAsk: 'ASK_TEXT',
-    modeAcceptEdits: 'ACCEPT_EDITS_TEXT',
-    modePlan: 'PLAN_TEXT',
-    modeBypass: 'BYPASS_TEXT',
-  })),
-  openWorkspaceUclawMdExternally: vi.fn(async () => {}),
+// IPC now flows through settingsBridge (the hook calls it), so mock the bridge.
+vi.mock('../../../lib/bridge/settings', () => ({
+  settingsBridge: {
+    readWorkspaceUclawMd: vi.fn(async () => '# my project\nuse rust 2021'),
+    writeWorkspaceUclawMd: vi.fn(async () => {}),
+    readDefaultPrompts: vi.fn(async () => ({
+      baseline: 'BASELINE_TEXT',
+      modeAsk: 'ASK_TEXT',
+      modeAcceptEdits: 'ACCEPT_EDITS_TEXT',
+      modePlan: 'PLAN_TEXT',
+      modeBypass: 'BYPASS_TEXT',
+    })),
+    openWorkspaceUclawMdExternally: vi.fn(async () => {}),
+  },
 }))
 
 vi.mock('sonner', () => ({
@@ -34,7 +37,7 @@ describe('PromptsSettings', () => {
   })
 
   it('Save button calls writeWorkspaceUclawMd with edited content', async () => {
-    const bridge = await import('@/lib/tauri-bridge')
+    const { settingsBridge } = await import('../../../lib/bridge/settings')
     const { user } = renderWithProviders(<PromptsSettings />)
     const textarea = await waitFor(() => {
       const el = screen.getByRole('textbox') as HTMLTextAreaElement
@@ -46,7 +49,7 @@ describe('PromptsSettings', () => {
     const save = screen.getByRole('button', { name: /保存/ })
     await user.click(save)
     await waitFor(() => {
-      expect(bridge.writeWorkspaceUclawMd).toHaveBeenCalledWith('# edited content')
+      expect(settingsBridge.writeWorkspaceUclawMd).toHaveBeenCalledWith('# edited content')
     })
   })
 
