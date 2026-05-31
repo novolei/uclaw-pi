@@ -9,7 +9,7 @@ import { HttpApiToggleCard } from './system/HttpApiToggleCard'
 import { EvalsCard } from './system/EvalsCard'
 // Tunable sections (migrated into the feature in P3a). Feature-local imports.
 import { EmbeddingEndpointSection } from './EmbeddingEndpointSection'
-import { StreamSkillThresholdsSection } from '@/components/settings/StreamSkillThresholdsSection'
+import { StreamSkillThresholdsSection } from './StreamSkillThresholdsSection'
 import { FoldDeltaThresholdSection } from '@/components/settings/FoldDeltaThresholdSection'
 import { DeveloperOptionsSection } from '@/components/settings/DeveloperOptionsSection'
 
