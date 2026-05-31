@@ -56,3 +56,8 @@ export { TaskProgressCard, TASK_TOOL_NAMES } from './components/TaskProgressCard
 // PermissionBanner — inline FIFO permission-request prompt (allow / deny /
 // always-allow). stopAgent + respondPermission routed through the agent bridge.
 export { PermissionBanner } from './components/PermissionBanner'
+
+// QueuedMessagesBanner — Codex-style queue card above the composer
+// (steer / edit / delete). Pure presentation: actions arrive as callback
+// props, no IPC.
+export { QueuedMessagesBanner } from './components/QueuedMessagesBanner'

@@ -105,7 +105,7 @@ import {
   removeQueuedMessage,
   type QueuedAgentMessage,
 } from '@/atoms/agent-queue-messages'
-import { QueuedMessagesBanner } from './QueuedMessagesBanner'
+import { QueuedMessagesBanner } from '@/features/agent'
 import { activeProviderModelAtom } from '@/atoms/active-model'
 import { channelsAtom, thinkingExpandedAtom } from '@/atoms/chat-atoms'
 import { workspacesAtom } from '@/atoms/workspace'
