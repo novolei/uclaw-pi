@@ -30,3 +30,4 @@ pub mod tool_approval;
 pub mod trajectory;
 pub mod space;
 pub mod system_prompt;
+pub mod workspace;
