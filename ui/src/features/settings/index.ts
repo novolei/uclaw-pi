@@ -82,3 +82,9 @@ export { ImChannelForm } from './components/im-channels/ImChannelForm'
 // realtime status subscription in useImChannelsSettings, pure-UI tab state in
 // the component). Consumed by SettingsPanel.
 export { ImChannelsSettings } from './components/im-channels/ImChannelsSettings'
+
+// ChannelSettings migrated + split (455 → list shell + channels/ProviderDetail +
+// useChannelSettings + useProviderDetail). Model-provider config panel; IPC stays
+// in the typed @/lib/tauri-bridge provider helpers. Consumed by ConnectivityTab.
+// ProviderDetail is re-exported for consumers/tests that import it by name.
+export { ChannelSettings, ProviderDetail } from './components/channels/ChannelSettings'
