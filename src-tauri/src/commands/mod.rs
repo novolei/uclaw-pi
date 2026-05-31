@@ -15,6 +15,7 @@ pub mod llm_config;
 pub mod mcp;
 pub mod memory;
 pub mod notification;
+pub mod provider;
 pub mod safety;
 pub mod search;
 pub mod settings;
