@@ -45,8 +45,8 @@ export { SessionEvalBadge } from './components/SessionEvalBadge'
 export { TaskBadge } from './components/TaskBadge'
 
 // TaskProgressCard — inline aggregated task/todo progress card. Pure
-// presentation (no IPC). `TASK_TOOL_NAMES` is re-exported for the renderers
-// that gate on it (ToolActivityItem / SDKMessageRenderer).
+// presentation (no IPC). `TASK_TOOL_NAMES` is re-exported for the renderer
+// that gates on it (ToolActivityItem).
 export { TaskProgressCard, TASK_TOOL_NAMES } from './components/TaskProgressCard'
 
 // ── Second migration batch: the interactive approval/status banners that sit
@@ -189,15 +189,19 @@ export { ChannelFeed } from './components/ChannelFeed'
 // migrated TeamNode + ChannelFeed siblings.
 export { AgentTeamsPanel } from './components/AgentTeamsPanel'
 
-// ── Agent render core (the streaming-message content/tool renderers). ──
+// ── Agent render core (the LIVE streaming-message renderers). ──
+//
+// The agent message stream renders through AgentMessages → NativeBlockRenderer +
+// ThinkingBlock (@/shared/tool-rendering) + ToolActivityList (below). The former
+// SDKMessageRenderer + ContentBlock/ToolUseBlock/SubAgentToolBlock tree was dead
+// Proma-migration skeleton (no live consumer — only the deleted SDKMessageRenderer
+// entered it) and was removed; only its two live system-divider helpers survive
+// as CompactionIndicators.
 
-// ContentBlock — per-message content-block dispatcher (text / tool_use /
-// thinking). Split (was 609 lines): the tool_use renderer + its result/usage
-// hooks live in `content-blocks/ToolUseBlock`; structural SDK types in
-// `content-blocks/types`; ThinkingBlock sank to `@/shared/tool-rendering` (also
-// used by chat's NativeBlockRenderer). Consumed by SDKMessageRenderer.
-export { ContentBlock } from './components/ContentBlock'
-export type { ContentBlockProps } from './components/ContentBlock'
+// CompactionIndicators — the two context-compaction system-message dividers
+// (settled "上下文已压缩" + in-progress "正在压缩..." spinner) rendered inline by
+// AgentMessages. Salvaged from the deleted SDKMessageRenderer. No IPC.
+export { CompactBoundaryDivider, CompactingIndicator } from './components/CompactionIndicators'
 
 // ToolActivityList / ToolActivityItem — compact tool-activity list (grouping +
 // Tools card + collapse). Split (was 693 lines): the row family lives in

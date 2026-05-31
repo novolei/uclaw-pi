@@ -51,7 +51,7 @@ import { ScrollPositionManager } from '@/hooks/useScrollPositionMemory'
 import { cn } from '@/lib/utils'
 import { Spinner } from '@/components/ui/spinner'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
-import { CompactingIndicator, CompactBoundaryDivider } from './SDKMessageRenderer'
+import { CompactingIndicator, CompactBoundaryDivider } from '@/features/agent'
 import type { AgentMessage, AgentEventUsage, RetryAttempt } from '@/lib/agent-types'
 import type { ToolActivity, AgentStreamState } from '@/atoms/agent-atoms'
 import { readAttachment, saveImageAs } from '@/lib/tauri-bridge'
@@ -619,7 +619,7 @@ export function buildUsageTooltip(durationMs: number, usage?: AgentEventUsage): 
   return lines.join('\n')
 }
 
-/** 耗时徽章 — 悬浮显示 token 用量明细（SDKMessageRenderer 复用） */
+/** 耗时徽章 — 悬浮显示 token 用量明细 */
 export function DurationBadge({ durationMs, usage }: { durationMs: number; usage?: AgentEventUsage }): React.ReactElement {
   return (
     <Tooltip>
