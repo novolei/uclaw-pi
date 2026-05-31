@@ -1379,9 +1379,9 @@ fn main() {
             uclaw_core::tauri_commands::read_default_prompts,
             uclaw_core::tauri_commands::open_workspace_uclaw_md_externally,
             uclaw_core::tauri_commands::reveal_path_in_file_manager,
-            // Trajectory
-            uclaw_core::tauri_commands::get_session_trajectory,
-            uclaw_core::tauri_commands::search_trajectories,
+            // Trajectory → commands::trajectory (slice 9)
+            uclaw_core::commands::trajectory::get_session_trajectory,
+            uclaw_core::commands::trajectory::search_trajectories,
             // Session Title
             uclaw_core::tauri_commands::generate_session_title,
             // Agent Teams

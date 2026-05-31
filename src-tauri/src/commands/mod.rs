@@ -27,5 +27,6 @@ pub mod search;
 pub mod settings;
 pub mod skills;
 pub mod tool_approval;
+pub mod trajectory;
 pub mod space;
 pub mod system_prompt;

@@ -8822,24 +8822,7 @@ pub async fn read_default_prompts() -> Result<crate::ipc::DefaultPromptsResponse
     })
 }
 
-// ─── Trajectory Commands ────────────────────────────────────────────────────
-
-#[tauri::command]
-pub async fn get_session_trajectory(
-    state: State<'_, AppState>,
-    session_id: String,
-) -> Result<Vec<crate::agent::trajectory::TurnRecord>, Error> {
-    Ok(state.trajectory_store.get_session_turns(&session_id))
-}
-
-#[tauri::command]
-pub async fn search_trajectories(
-    state: State<'_, AppState>,
-    query: String,
-    limit: Option<u32>,
-) -> Result<Vec<crate::agent::trajectory::TrajectorySearchHit>, Error> {
-    Ok(state.trajectory_store.search(&query, limit.unwrap_or(20)))
-}
+// ─── Trajectory Commands → moved to commands::trajectory (thin move, slice 9) ──
 
 // ─── Session Title Generation ───────────────────────────────────────────────
 
