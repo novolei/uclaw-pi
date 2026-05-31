@@ -20,3 +20,6 @@ export { PromptsSettings } from './components/PromptsSettings'
 // P3 — BrowserRuntimeSettings migrated (thin shell; side effects in a hook,
 // split into browser-runtime/ cards + lib/browser-runtime-format helpers).
 export { BrowserRuntimeSettings } from './components/BrowserRuntimeSettings'
+
+// P3 — AppearanceSettings migrated (theme cards; atom-helper side effects, no IPC).
+export { AppearanceSettings } from './components/AppearanceSettings'
