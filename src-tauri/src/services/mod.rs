@@ -14,6 +14,7 @@ pub use types::*;
 pub mod conversation_service;
 pub mod cost_service;
 pub mod mcp_audit_service;
+pub mod persona_service;
 pub mod search_service;
 pub mod settings_service;
 pub mod space_service;
