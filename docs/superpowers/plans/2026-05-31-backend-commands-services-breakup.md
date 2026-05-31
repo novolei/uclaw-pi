@@ -48,6 +48,38 @@ unit-testable with a temp dir + `Connection::open_in_memory()`.
 No new DB migrations expected (pure reorg of existing commands). If a service needs a new
 table, take the next free V-number per the *Active migration registry* in `CONTEXT.md`.
 
+## Progress — as of 2026-06-01 (clean-domain phase COMPLETE, then paused)
+
+**12 slices merged (PR #4–#14), 30 domains extracted, `tauri_commands.rs` 18,001 → 10,004 lines (−44%).**
+`commands/` 31 files · `services/` 16 files. The actual slices were re-grouped from the original
+table by *clean-vs-messy + real section boundaries* (the banner headers don't cleanly bound
+domains — watch for interleaved interlopers). Extracted (✅): Space, LLM Config, Notification,
+Background Task, Conversation, Cost, Search, Safety, Tool Approval, Memory, MCP (+mcp_audit),
+Provider, Persona, Skills, System Prompt, Artifact, Channel/IM, Learned Skills, Browser,
+Automation, Trajectory, Workspace, MEMUBOT, GEP, Knowledge Ingestion, Humane Automation,
+Bootstrap, Dev/Testing, System Tray. Services landed: space, conversation, search, mcp_audit,
+persona, system_prompt, channel, automation, workspace (extended) — the rest are thin
+manager-delegating moves (≈16 domains had no `&Connection` SQL → correctly NO service).
+
+**RESUME POINT — the risky/messy half (~half the remaining 10k lines), paused per user:**
+- 🔴 **Agent Session** (~2.4k) and **Chat** (~1.3k) and **Agent Teams** (~1.5k) — live agent/chat
+  send paths; behavior-preserving moves, but require **human UI verification** in the native
+  window after extraction.
+- 🟠 **Memory Recall Config** (~1.3k grab-bag: recall-config + embedding-endpoint + setup-script +
+  gbrain) and **Memory OS cluster** (EntityPage/Wiki/Health/Fragment ~1.3k) — need decomposition
+  into proper sub-domains/sub-slices.
+- 🟠 **Memory Graph grab-bag** (memory_graph_* + proactive/metrics/stream/skill settings mixed),
+  **Marketplace**, and scattered interlopers (`respond_plan_mode_suggest`, `get_app_health`,
+  `get_memu_status`, `memu_embed_text`, `memory_graph_delete_node`, `stop_agent_session`).
+
+**Flags for follow-up (not blockers):**
+- 2 **pre-existing** test failures (NOT from the breakup — byte-identical moves): `shell::
+  test_daemon_mode_approval_unchanged` (safety-relevant: daemon-mode approval `Never` vs `Always`)
+  and `skill_marketplace::truncate_for_error_long` (UTF-8 off-by-2). Each a small standalone fix.
+- `commands/workspace.rs` (973) + `commands/browser_cmds.rs` (801) exceed the ~400-line soft cap
+  (big cohesive single domains) — optional sub-module split.
+- 10 stale `git stash` entries are pre-existing repo cruft (May 18–25, old branches) — left alone.
+
 ## Out of scope (separate concerns)
 - `main.rs` Stage-3 service registration (unchanged).
 - The `tauri-specta`/`ts-rs` bridge-type generation (ADR rule 5 end-state).
