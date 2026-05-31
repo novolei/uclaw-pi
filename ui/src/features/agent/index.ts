@@ -157,3 +157,7 @@ export { AutomationRunBanner } from './components/AutomationRunBanner'
 // driven by pet-atoms + usePetHover). Pure atom-driven UI; CSS sidecar travels
 // with it. No IPC.
 export { PetWidget } from './components/PetWidget'
+
+// ModeBanner — session-top pill shown only for Plan / AcceptEdits safety modes.
+// Pure atom-driven UI (safetyModeAtom) — no IPC.
+export { ModeBanner } from './components/ModeBanner'

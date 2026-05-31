@@ -17,7 +17,7 @@ import { ApprovalModal } from '@/components/ApprovalModal'
 import { SettingsDialog } from '@/features/settings'
 import { ConnectionsPanel } from '@/components/dock/ConnectionsPanel'
 import { AlertPanel } from '@/components/dock/AlertPanel'
-import { ModeBanner } from '@/components/agent/ModeBanner'
+import { ModeBanner } from '@/features/agent'
 import { appModeAtom } from '@/atoms/app-mode'
 import {
   agentSessionsAtom,
