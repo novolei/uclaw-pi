@@ -148,3 +148,7 @@ export { AutoPreviewPopover } from './components/AutoPreviewPopover'
 // PlanModeDashedBorder — SVG dashed-border overlay for the plan-mode input box.
 // Pure presentation (ResizeObserver on the parent) — no IPC, no atoms.
 export { PlanModeDashedBorder } from './components/PlanModeDashedBorder'
+
+// AutomationRunBanner — top-of-session banner shown when the loaded session is
+// an automation run (parses the metadata JSON prop). Pure presentation — no IPC.
+export { AutomationRunBanner } from './components/AutomationRunBanner'
