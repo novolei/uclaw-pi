@@ -19,7 +19,7 @@ import {
   refreshWorkspacesAtom,
 } from '@/atoms/workspace'
 import { SessionItem } from './SessionItem'
-import { MoveSessionDialog } from '@/components/agent/MoveSessionDialog'
+import { MoveSessionDialog } from '@/features/agent'
 import {
   agentSessionsAtom,
   agentSessionIndicatorMapAtom,

@@ -4,7 +4,7 @@ import { Provider } from 'jotai'
 import { MoveSessionDialog } from './MoveSessionDialog'
 
 const moveAgentSessionToWorkspace = vi.fn().mockResolvedValue({ id: 's-1', workspaceId: 'ws-b' })
-vi.mock('@/lib/tauri-bridge', () => ({
+vi.mock('@/lib/bridge/agent', () => ({
   moveAgentSessionToWorkspace: (args: unknown) => moveAgentSessionToWorkspace(args),
 }))
 

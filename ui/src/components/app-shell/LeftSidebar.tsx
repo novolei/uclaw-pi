@@ -74,7 +74,7 @@ import { homeOfficePanelOpenAtom } from '@/atoms/home-office-atoms'
 import { topLevelViewAtom } from '@/atoms/top-level-view'
 import { kaleidoscopeModuleAtom } from '@/atoms/kaleidoscope'
 import { getWorkspaceIcon } from '@/lib/workspace-icons'
-import { MoveSessionDialog } from '@/components/agent/MoveSessionDialog'
+import { MoveSessionDialog } from '@/features/agent'
 import {
   AlertDialog,
   AlertDialogAction,

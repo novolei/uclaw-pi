@@ -21,7 +21,7 @@ import {
 } from '@/components/ui/select'
 import { Button } from '@/components/ui/button'
 import type { AgentWorkspace, AgentSessionMeta } from '@/lib/agent-types'
-import { moveAgentSessionToWorkspace } from '@/lib/tauri-bridge'
+import { moveAgentSessionToWorkspace } from '@/lib/bridge/agent'
 
 interface MoveSessionDialogProps {
   open: boolean

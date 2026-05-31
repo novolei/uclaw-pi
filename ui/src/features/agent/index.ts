@@ -19,6 +19,10 @@ export { AgentHeader } from './components/AgentHeader'
 // the streaming-state atom; the Stop button routes through the agent bridge.
 export { AgentStatusBar } from './components/AgentStatusBar'
 
+// MoveSessionDialog — move-session-to-workspace dialog. The move IPC is routed
+// through the agent bridge (moveAgentSessionToWorkspace).
+export { MoveSessionDialog } from './components/MoveSessionDialog'
+
 // SessionEvalBadge — post-session self-evaluation score badge. The raw
 // @tauri-apps/api/event `listen` moved behind the agent bridge's
 // onSessionEvalComplete / onSessionEvalWarning wrappers.
