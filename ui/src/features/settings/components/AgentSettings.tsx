@@ -1,14 +1,14 @@
 import { useState } from 'react'
 import { useAtomValue } from 'jotai'
-// Primitives + the not-yet-migrated PersonaBondTimeline still live under
-// components/settings/ (migrated in a later phase); imported via the @/ alias so
-// behavior is preserved exactly. PersonaStudio is a migrated sibling (relative).
+// Primitives still live under components/settings/ (migrated in a later phase);
+// imported via the @/ alias so behavior is preserved exactly. PersonaStudio +
+// PersonaBondTimeline are migrated siblings (relative imports).
 import { SettingsSection } from '@/components/settings/primitives/SettingsSection'
 import { SettingsToggle } from '@/components/settings/primitives/SettingsToggle'
 import { SettingsCard } from '@/components/settings/primitives/SettingsCard'
 import { SettingsRow } from '@/components/settings/primitives/SettingsRow'
 import { PersonaStudio } from './PersonaStudio'
-import { PersonaBondTimeline } from '@/components/settings/PersonaBondTimeline'
+import { PersonaBondTimeline } from './PersonaBondTimeline'
 import { activeProviderModelAtom } from '@/atoms/active-model'
 import { Cpu } from 'lucide-react'
 import { usePlanModeSuggest } from '../hooks/usePlanModeSuggest'

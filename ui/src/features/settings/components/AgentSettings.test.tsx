@@ -7,7 +7,7 @@ import { AgentSettings } from './AgentSettings'
 vi.mock('./PersonaStudio', () => ({
   PersonaStudio: () => <div data-testid="persona-studio" />,
 }))
-vi.mock('@/components/settings/PersonaBondTimeline', () => ({
+vi.mock('./PersonaBondTimeline', () => ({
   PersonaBondTimeline: () => <div data-testid="persona-bond-timeline" />,
 }))
 vi.mock('../../../lib/bridge/settings', () => ({

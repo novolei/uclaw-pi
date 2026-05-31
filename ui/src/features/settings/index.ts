@@ -109,6 +109,11 @@ export { default as DingTalkSettings } from './components/channels/DingTalkSetti
 // clampVoice/clampSlider moved with the write path).
 export { PersonaStudio } from './components/PersonaStudio'
 
+// PersonaBondTimeline migrated + split (560 → thin shell composing persona-bond/
+// section lists; all state + the six mutating actions in usePersonaBondTimeline;
+// the typed @/lib/persona domain helpers stay in the hook).
+export { PersonaBondTimeline } from './components/PersonaBondTimeline'
+
 // ── Memory cluster (Settings → 记忆 / 记忆召回). Migrated out of
 // components/settings/ ; the boot-node load + config CRUD side effects moved into
 // hooks; IPC stays in the typed @/lib/tauri-bridge memory-graph + recall helpers. ──
