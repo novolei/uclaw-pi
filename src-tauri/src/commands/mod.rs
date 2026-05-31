@@ -9,3 +9,4 @@
 //! at a time. `settings` is the first slice (the HTTP-API toggle).
 
 pub mod settings;
+pub mod space;

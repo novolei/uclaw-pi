@@ -979,9 +979,9 @@ fn main() {
             uclaw_core::tauri_commands::delete_conversation,
             uclaw_core::tauri_commands::toggle_star_conversation,
             // Spaces
-            uclaw_core::tauri_commands::create_space,
-            uclaw_core::tauri_commands::list_spaces,
-            uclaw_core::tauri_commands::delete_space,
+            uclaw_core::commands::space::create_space,
+            uclaw_core::commands::space::list_spaces,
+            uclaw_core::commands::space::delete_space,
             // LLM Config
             uclaw_core::tauri_commands::get_llm_config,
             uclaw_core::tauri_commands::update_llm_config,
