@@ -13,16 +13,16 @@ import { renderWithProviders, screen } from '@/test-utils/render'
 //     It also takes children, not a `content` prop.
 //   - ChatToolBlock lives at `@/components/chat/ChatToolBlock`, not on
 //     ContentBlock (only ThinkingBlock comes from there).
-//   - ThinkingBlock comes from `@/components/agent/ContentBlock` (the agent core
-//     still owns ContentBlock; this shared renderer reaches into it by absolute
-//     path), so the mock targets that absolute path, not a relative one.
+//   - ThinkingBlock is a sibling in this shared layer (`./ThinkingBlock`); the
+//     mock targets that relative path. (It used to live in the agent core's
+//     ContentBlock module, which was a back-edge from shared up into a feature.)
 vi.mock('@/components/ai-elements/message', () => ({
   MessageResponse: ({ children }: { children?: React.ReactNode }) => (
     <div data-testid="text-block">{children}</div>
   ),
 }))
 
-vi.mock('@/components/agent/ContentBlock', () => ({
+vi.mock('./ThinkingBlock', () => ({
   ThinkingBlock: ({ block }: { block: { thinking: string } }) => (
     <div data-testid="thinking-block">{block.thinking}</div>
   ),

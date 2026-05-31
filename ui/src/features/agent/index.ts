@@ -188,3 +188,13 @@ export { ChannelFeed } from './components/ChannelFeed'
 // bridge's onTeamMessage wrapper (no direct @tauri-apps/api). Renders the
 // migrated TeamNode + ChannelFeed siblings.
 export { AgentTeamsPanel } from './components/AgentTeamsPanel'
+
+// ── Agent render core (the streaming-message content/tool renderers). ──
+
+// ContentBlock — per-message content-block dispatcher (text / tool_use /
+// thinking). Split (was 609 lines): the tool_use renderer + its result/usage
+// hooks live in `content-blocks/ToolUseBlock`; structural SDK types in
+// `content-blocks/types`; ThinkingBlock sank to `@/shared/tool-rendering` (also
+// used by chat's NativeBlockRenderer). Consumed by SDKMessageRenderer.
+export { ContentBlock } from './components/ContentBlock'
+export type { ContentBlockProps } from './components/ContentBlock'

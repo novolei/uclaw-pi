@@ -13,6 +13,12 @@
 export { NativeBlockRenderer } from './NativeBlockRenderer'
 export type { NativeBlockRendererProps } from './NativeBlockRenderer'
 
+// Collapsible "Thinking" reasoning block. Shared because BOTH the agent core
+// (ContentBlock / AgentMessages) and the chat NativeBlockRenderer render it —
+// previously a `shared → features/agent` back-edge; now it sinks down here.
+export { ThinkingBlock } from './ThinkingBlock'
+export type { ThinkingBlockProps } from './ThinkingBlock'
+
 // Tool-result renderer dispatcher.
 export { ToolResultRenderer } from './tool-renderers'
 export type { ToolResultRendererProps } from './tool-renderers'

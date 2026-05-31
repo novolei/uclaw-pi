@@ -16,8 +16,7 @@ import { Bot, Loader2, AlertTriangle, FileText, FileImage, Download, Split, Undo
 import { useAtomValue, useSetAtom } from 'jotai'
 import { cn } from '@/lib/utils'
 import { ImageLightbox } from '@/components/ui/image-lightbox'
-import { ContentBlock } from './ContentBlock'
-import { TaskProgressCard, TASK_TOOL_NAMES } from '@/features/agent'
+import { ContentBlock, TaskProgressCard, TASK_TOOL_NAMES } from '@/features/agent'
 import { DurationBadge } from './AgentMessages'
 import {
   Message,
