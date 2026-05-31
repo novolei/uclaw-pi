@@ -16,6 +16,7 @@ pub mod cost_service;
 pub mod mcp_audit_service;
 pub mod persona_service;
 pub mod search_service;
+pub mod skills_service;
 pub mod settings_service;
 pub mod space_service;
 pub mod workspace_service;
