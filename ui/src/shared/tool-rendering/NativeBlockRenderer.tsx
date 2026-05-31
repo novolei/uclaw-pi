@@ -10,7 +10,7 @@
 
 import * as React from 'react'
 import type { ContentBlock } from '@/lib/chat-types'
-import { ThinkingBlock } from './ContentBlock'
+import { ThinkingBlock } from '@/components/agent/ContentBlock'
 import { ChatToolBlock } from '@/components/chat/ChatToolBlock'
 import { MessageResponse } from '@/components/ai-elements/message'
 
