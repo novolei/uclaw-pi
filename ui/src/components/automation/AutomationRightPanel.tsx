@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { WorkspaceFilesView } from '@/components/agent/SidePanel'
-import { TrajectoryReel } from '@/components/agent/TrajectoryReel'
+import { TrajectoryReel } from '@/features/agent'
 
 type Tab = 'files' | 'trajectory'
 

@@ -1,6 +1,6 @@
 import * as React from 'react'
-import { getSessionTrajectory, type TurnRecord } from '@/lib/tauri-bridge'
-import { SessionEvalBadge } from '@/features/agent'
+import { useSessionTrajectory } from '../hooks/useSessionTrajectory'
+import { SessionEvalBadge } from './SessionEvalBadge'
 
 function roleIcon(role: string): string {
   const r = role.toLowerCase()
@@ -26,36 +26,7 @@ interface TrajectoryReelProps {
 }
 
 export function TrajectoryReel({ sessionId }: TrajectoryReelProps): React.ReactElement {
-  const [turns, setTurns] = React.useState<TurnRecord[]>([])
-  const [loading, setLoading] = React.useState(true)
-  const [error, setError] = React.useState<string | null>(null)
-
-  React.useEffect(() => {
-    let cancelled = false
-
-    setLoading(true)
-    setError(null)
-    setTurns([])
-
-    getSessionTrajectory(sessionId)
-      .then((data) => {
-        if (!cancelled) {
-          setTurns(data)
-          setLoading(false)
-        }
-      })
-      .catch((err: unknown) => {
-        if (!cancelled) {
-          const msg = err instanceof Error ? err.message : String(err)
-          setError(msg)
-          setLoading(false)
-        }
-      })
-
-    return () => {
-      cancelled = true
-    }
-  }, [sessionId])
+  const { turns, loading, error } = useSessionTrajectory(sessionId)
 
   if (loading) {
     return (

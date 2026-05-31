@@ -30,7 +30,7 @@ import { activePlanAtom } from '@/atoms/agent-teams'
 import { WorkspaceFilesView } from '@/components/agent/SidePanel'
 import { AgentTeamsPanel } from '@/components/agent/AgentTeamsPanel'
 import { PlanViewer } from '@/features/agent'
-import { TrajectoryReel } from '@/components/agent/TrajectoryReel'
+import { TrajectoryReel } from '@/features/agent'
 import { BrowserViewer } from '@/components/agent/BrowserViewer'
 import { useWindowDragOnMove } from '@/hooks/useWindowDragOnMove'
 

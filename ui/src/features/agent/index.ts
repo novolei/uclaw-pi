@@ -90,3 +90,8 @@ export { AgentHeartbeatBanner } from './components/AgentHeartbeatBanner'
 // (routed through the agent bridge's onPlanUpdated wrapper). `parsePlanMarkdown`
 // is re-exported for tests.
 export { PlanViewer, parsePlanMarkdown } from './components/PlanViewer'
+
+// TrajectoryReel — per-turn execution reel for a session (+ trailing
+// SessionEvalBadge). The `get_session_trajectory` fetch + loading/error state
+// live in hooks/useSessionTrajectory (routed through the agent bridge).
+export { TrajectoryReel } from './components/TrajectoryReel'

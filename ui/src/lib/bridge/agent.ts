@@ -34,7 +34,15 @@ export {
   respondAskUser,
   respondExitPlanMode,
   respondPlanModeSuggest,
+  // ── Read-side session data surfaced for the migrated TrajectoryReel
+  // (per-turn breakdown reel). Thin re-export — command name + payload shape
+  // unchanged. ──
+  getSessionTrajectory,
 } from '../tauri-bridge'
+
+// Per-turn record shape returned by `get_session_trajectory`, surfaced so the
+// migrated TrajectoryReel imports it from this bridge instead of the monolith.
+export type { TurnRecord } from '../tauri-bridge'
 
 // The wire enum the permission-mode picker maps over (`ask`/`acceptedits`/
 // `plan`/`supervised`/`yolo`). Re-exported as a type so migrated components
