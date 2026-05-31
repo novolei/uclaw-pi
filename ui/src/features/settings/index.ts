@@ -1,0 +1,6 @@
+// Public surface of the settings feature — other features import ONLY from here,
+// never from internal files (code-organization ADR 2026-05-31, rule 1).
+//
+// Components/hooks are added to this barrel as they migrate (plan P1–P3:
+// docs/superpowers/plans/2026-05-31-frontend-settings-feature-migration.md).
+export { settingsBridge } from '../../lib/bridge/settings'
