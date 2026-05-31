@@ -1,5 +1,6 @@
 import * as React from 'react'
 import { invoke } from '@tauri-apps/api/core'
+import { settingsBridge } from '../../lib/bridge/settings'
 import { Activity, ChevronDown, ChevronUp, PlayCircle, RefreshCw, RotateCcw, Power } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { EmbeddingEndpointSection } from './EmbeddingEndpointSection'
@@ -211,7 +212,7 @@ export function SystemTab() {
   // Persisted backend setting; null = still loading. Applies on next restart.
   const [httpApiEnabled, setHttpApiEnabled] = React.useState<boolean | null>(null)
   React.useEffect(() => {
-    invoke<boolean>('get_http_api_enabled')
+    settingsBridge.getHttpApiEnabled()
       .then(setHttpApiEnabled)
       .catch(() => setHttpApiEnabled(false))
   }, [])
@@ -219,7 +220,7 @@ export function SystemTab() {
     if (httpApiEnabled === null) return
     const next = !httpApiEnabled
     try {
-      await invoke('set_http_api_enabled', { enabled: next })
+      await settingsBridge.setHttpApiEnabled(next)
       setHttpApiEnabled(next)
     } catch (e) {
       setActionError(String(e))
