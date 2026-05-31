@@ -10,7 +10,8 @@
 // generation lands these signatures become generated, not hand-written.
 
 import { invoke } from '@tauri-apps/api/core'
-import type { DefaultPromptsResponse, PatchSettingsInput, Settings } from '../types'
+import type { DefaultPromptsResponse, PatchSettingsInput, Settings, SpaceSummary } from '../types'
+import type { ImChannelInput, ImChannelStatus } from '../../atoms/im-channel-atoms'
 import type {
   BrowserRuntimeControlCenterReport,
   BrowserRuntimeProviderId,
@@ -37,6 +38,19 @@ import type {
 export interface ModelRoleConfig {
   role: string
   model_ref: string | null
+}
+
+/** A freshly-issued WeChat iLink login QR code (polling token + image payload). */
+export interface WechatIlinkQrcode {
+  qrcode: string
+  qrcode_img_content: string
+}
+
+/** Poll result for a pending WeChat iLink QR binding. */
+export interface WechatIlinkQrcodeStatus {
+  status: string
+  bot_token?: string
+  account_id?: string
 }
 
 export const settingsBridge = {
@@ -208,6 +222,45 @@ export const settingsBridge = {
   /** Unblock a globally-blocked tool; returns the updated policy. */
   unblockTool: (input: ToolNameInput): Promise<SafetyPolicyResponse> =>
     invoke<SafetyPolicyResponse>('unblock_tool', { input }),
+
+  // ── IM channel (机器人 / 渠道) IPC (was raw `invoke` inside the ImChannel* +
+  // WechatIlinkBindingPanel components). Powers Settings → 机器人. Thin wrappers —
+  // these never swallowed errors (callers own their try/catch + toast). The
+  // list/status *atoms* keep their own IPC in `@/atoms/im-channel-atoms`. ──
+  /** List the spaces a channel can bind to (id + name only at the call site). */
+  listSpaces: (): Promise<SpaceSummary[]> => invoke<SpaceSummary[]>('list_spaces'),
+  /** Create a new IM channel instance. */
+  createImChannel: (input: ImChannelInput): Promise<void> =>
+    invoke<void>('create_im_channel', { input }),
+  /** Update an existing IM channel instance. */
+  updateImChannel: (id: string, input: ImChannelInput): Promise<void> =>
+    invoke<void>('update_im_channel', { id, input }),
+  /** Enable/disable an IM channel instance. */
+  toggleImChannel: (id: string, enabled: boolean): Promise<void> =>
+    invoke<void>('toggle_im_channel', { id, enabled }),
+  /** Delete an IM channel instance. */
+  deleteImChannel: (id: string): Promise<void> => invoke<void>('delete_im_channel', { id }),
+
+  // ── WeChat iLink QR-binding IPC (was raw `invoke` inside WechatIlinkBindingPanel). ──
+  /** Request a fresh login QR code for a WeChat iLink instance. */
+  requestWechatIlinkQrcode: (instanceId: string): Promise<WechatIlinkQrcode> =>
+    invoke<WechatIlinkQrcode>('request_wechat_ilink_qrcode', { instanceId }),
+  /** Poll the scan/confirm status of a pending WeChat iLink QR code. */
+  pollWechatIlinkQrcodeStatus: (
+    instanceId: string,
+    qrcode: string,
+  ): Promise<WechatIlinkQrcodeStatus> =>
+    invoke<WechatIlinkQrcodeStatus>('poll_wechat_ilink_qrcode_status', { instanceId, qrcode }),
+  /** Persist the bot token + account id once a WeChat iLink binding is confirmed. */
+  saveWechatIlinkToken: (
+    instanceId: string,
+    botToken: string,
+    accountId: string,
+  ): Promise<void> =>
+    invoke<void>('save_wechat_ilink_token', { instanceId, botToken, accountId }),
+  /** Disconnect (unbind) a WeChat iLink instance. */
+  disconnectWechatIlink: (instanceId: string): Promise<void> =>
+    invoke<void>('disconnect_wechat_ilink', { instanceId }),
 }
 
 // ── Developer-options setup-script event stream (was `@tauri-apps/api/event`
@@ -227,3 +280,12 @@ export const onSetupScriptEnd = (
   handler: (e: SetupScriptEndEvent) => void,
 ): Promise<UnlistenFn> =>
   listen<SetupScriptEndEvent>('system-setup-script:end', (e) => handler(e.payload))
+
+// ── IM channel realtime status stream (was `@tauri-apps/api/event` `listen`
+// directly inside ImChannelsSettings). The hook subscribes through this wrapper
+// so no settings component imports `@tauri-apps/api`. ──
+/** Subscribe to backend-pushed per-instance IM channel status changes. */
+export const onImChannelStatusChanged = (
+  handler: (status: ImChannelStatus) => void,
+): Promise<UnlistenFn> =>
+  listen<ImChannelStatus>('im_channel_status_changed', (e) => handler(e.payload))

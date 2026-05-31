@@ -2,7 +2,9 @@ import { useState, useEffect } from 'react'
 import { invoke } from '@tauri-apps/api/core'
 import { toast } from 'sonner'
 import type { ImChannelRow, ImChannelInput, ImChannelStatus } from '@/atoms/im-channel-atoms'
-import { WechatIlinkBindingPanel } from './WechatIlinkBindingPanel'
+// WechatIlinkBindingPanel migrated into the settings feature; this old-location
+// row consumes it from the barrel until the row itself migrates (same batch).
+import { WechatIlinkBindingPanel } from '@/features/settings'
 
 // ──────────────── helpers ────────────────
 

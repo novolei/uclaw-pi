@@ -60,3 +60,11 @@ export { FoldDeltaThresholdSection } from './components/FoldDeltaThresholdSectio
 // subscriptions in a hook; the `@tauri-apps/api/event` `listen` moved behind
 // settingsBridge.onSetupScript* wrappers). Consumed by SystemTab.
 export { DeveloperOptionsSection } from './components/DeveloperOptionsSection'
+
+// ── IM / channel cluster (Settings → 机器人 / 渠道). Migrated out of
+// components/settings/ ; raw `invoke` moved behind settingsBridge.*; oversized
+// rows split into im-channels/ accordion parts + hooks. ──
+
+// WechatIlinkBindingPanel migrated (QR-binding state machine in
+// useWechatIlinkBinding; only the canvas draw effect stays in the component).
+export { WechatIlinkBindingPanel } from './components/im-channels/WechatIlinkBindingPanel'

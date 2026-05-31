@@ -4,12 +4,26 @@ import { renderWithProviders, screen } from '@/test-utils/render'
 import type { ImChannelStatus } from '@/atoms/im-channel-atoms'
 import { WechatIlinkBindingPanel } from './WechatIlinkBindingPanel'
 
-const invokeMock = vi.fn()
-vi.mock('@tauri-apps/api/core', () => ({ invoke: (...a: unknown[]) => invokeMock(...a) }))
+// IPC now flows through settingsBridge (was a raw Tauri-core invoke mock before
+// the migration). Each command maps to its own bridge method.
+vi.mock('../../../../lib/bridge/settings', () => ({
+  settingsBridge: {
+    requestWechatIlinkQrcode: vi.fn(),
+    pollWechatIlinkQrcodeStatus: vi.fn(),
+    saveWechatIlinkToken: vi.fn(),
+    disconnectWechatIlink: vi.fn(),
+  },
+}))
 vi.mock('sonner', () => ({ toast: { error: vi.fn() } }))
 vi.mock('qrcode', () => ({
   default: { toCanvas: vi.fn().mockResolvedValue(undefined) },
 }))
+
+import { settingsBridge } from '../../../../lib/bridge/settings'
+
+const requestQr = vi.mocked(settingsBridge.requestWechatIlinkQrcode)
+const pollStatus = vi.mocked(settingsBridge.pollWechatIlinkQrcodeStatus)
+const saveToken = vi.mocked(settingsBridge.saveWechatIlinkToken)
 
 const PROPS = {
   instanceId: 'inst-1',
@@ -18,7 +32,9 @@ const PROPS = {
 }
 
 beforeEach(() => {
-  invokeMock.mockReset()
+  requestQr.mockReset()
+  pollStatus.mockReset()
+  saveToken.mockReset()
   PROPS.onSaved = vi.fn()
   PROPS.onDisconnect = vi.fn()
 })
@@ -37,22 +53,22 @@ describe('WechatIlinkBindingPanel', () => {
   })
 
   it('qr-shown: fetching QR invokes request command and shows canvas', async () => {
-    invokeMock.mockResolvedValueOnce({ qrcode: 'mock_qr_data' })
+    requestQr.mockResolvedValueOnce({ qrcode: 'mock_qr_data', qrcode_img_content: 'mock_qr_data' })
     renderWithProviders(
       <WechatIlinkBindingPanel {...PROPS} status={undefined} />
     )
     const btn = screen.getByText('获取二维码')
     await act(async () => { btn.click() })
     await waitFor(() =>
-      expect(invokeMock).toHaveBeenCalledWith('request_wechat_ilink_qrcode', { instanceId: 'inst-1' })
+      expect(requestQr).toHaveBeenCalledWith('inst-1')
     )
     expect(screen.getByText('用微信扫码绑定账号')).not.toBeNull()
   })
 
   it('scanning: poll returning scaned shows "已扫码" text', async () => {
     vi.useFakeTimers()
-    invokeMock
-      .mockResolvedValueOnce({ qrcode: 'qr123' })               // request_wechat_ilink_qrcode
+    requestQr.mockResolvedValueOnce({ qrcode: 'qr123', qrcode_img_content: 'qr123' })
+    pollStatus
       .mockResolvedValueOnce({ status: 'wait' })                 // first poll
       .mockResolvedValueOnce({ status: 'scaned' })               // second poll → scanning
     renderWithProviders(
@@ -68,20 +84,16 @@ describe('WechatIlinkBindingPanel', () => {
 
   it('confirmed: poll returning confirmed calls save_wechat_ilink_token and onSaved', async () => {
     vi.useFakeTimers()
-    invokeMock
-      .mockResolvedValueOnce({ qrcode: 'qr123' })
-      .mockResolvedValueOnce({ status: 'confirmed', bot_token: 'tok999', account_id: 'acc456' })
-      .mockResolvedValueOnce(undefined)                          // save_wechat_ilink_token
+    requestQr.mockResolvedValueOnce({ qrcode: 'qr123', qrcode_img_content: 'qr123' })
+    pollStatus.mockResolvedValueOnce({ status: 'confirmed', bot_token: 'tok999', account_id: 'acc456' })
+    saveToken.mockResolvedValueOnce(undefined)
     renderWithProviders(
       <WechatIlinkBindingPanel {...PROPS} status={undefined} />
     )
     await act(async () => { screen.getByText('获取二维码').click() })
     // fire first interval tick and drain all resulting promises (including saveToken)
     await act(async () => { await vi.advanceTimersByTimeAsync(2100) })
-    expect(invokeMock).toHaveBeenCalledWith(
-      'save_wechat_ilink_token',
-      expect.objectContaining({ instanceId: 'inst-1', botToken: 'tok999', accountId: 'acc456' })
-    )
+    expect(saveToken).toHaveBeenCalledWith('inst-1', 'tok999', 'acc456')
     expect(PROPS.onSaved).toHaveBeenCalledOnce()
   })
 })
