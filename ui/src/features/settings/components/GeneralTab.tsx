@@ -4,9 +4,9 @@
 import * as React from 'react'
 // Sub-sections still live under components/settings/ (migrated in a later phase);
 // imported via the @/ alias so behavior is preserved exactly after the P2 move.
-import { GeneralSettings } from '@/components/settings/GeneralSettings'
 // Migrated siblings (P3) — imported relatively (intra-feature wiring), not via the
 // public barrel, to avoid a self-referential barrel import.
+import { GeneralSettings } from './GeneralSettings'
 import { PromptSettings } from './PromptSettings'
 import { AppearanceSettings } from './AppearanceSettings'
 

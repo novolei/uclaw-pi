@@ -27,3 +27,6 @@ export { AppearanceSettings } from './components/AppearanceSettings'
 // P3 — PromptSettings migrated (thin shell; CRUD side effects in a hook, rows
 // split into prompts/PromptRow). Distinct from the P2 PromptsSettings tab above.
 export { PromptSettings } from './components/PromptSettings'
+
+// P3 — GeneralSettings migrated (thin shell; language load/persist in a hook).
+export { GeneralSettings } from './components/GeneralSettings'

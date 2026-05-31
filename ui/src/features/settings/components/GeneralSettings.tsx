@@ -1,12 +1,16 @@
-import { useState, useEffect } from 'react'
+import { useState } from 'react'
 import { useAtom } from 'jotai'
-import { SettingsSection } from './primitives/SettingsSection'
-import { SettingsCard } from './primitives/SettingsCard'
-import { SettingsRow } from './primitives/SettingsRow'
-import { SettingsSelect } from './primitives/SettingsSelect'
-import { SettingsToggle } from './primitives/SettingsToggle'
-import { getSettings, patchSettings } from '@/lib/tauri-bridge'
+// Primitives still live under components/settings/ (migrated in a later phase);
+// imported via the @/ alias so behavior is preserved exactly after the P3 move.
+import {
+  SettingsSection,
+  SettingsCard,
+  SettingsRow,
+  SettingsSelect,
+  SettingsToggle,
+} from '@/components/settings/primitives'
 import { bottomDockEnabledAtom } from '@/atoms/dock-atoms'
+import { useGeneralSettings } from '../hooks/useGeneralSettings'
 
 const LANGUAGE_OPTIONS = [
   { value: 'zh-CN', label: '简体中文' },
@@ -15,21 +19,12 @@ const LANGUAGE_OPTIONS = [
 ]
 
 export function GeneralSettings() {
-  const [language, setLanguage] = useState('zh-CN')
+  // Interface-language load/persist (IPC) lives in the hook; the rest are
+  // local-only UI toggles + the bottom-dock atom (no side effects).
+  const { language, handleLanguageChange } = useGeneralSettings()
   const [sendOnEnter, setSendOnEnter] = useState(true)
   const [showTimestamp, setShowTimestamp] = useState(true)
   const [bottomDockEnabled, setBottomDockEnabled] = useAtom(bottomDockEnabledAtom)
-
-  useEffect(() => {
-    getSettings().then((s) => {
-      if (s.language) setLanguage(s.language)
-    })
-  }, [])
-
-  const handleLanguageChange = async (value: string) => {
-    setLanguage(value)
-    await patchSettings({ language: value })
-  }
 
   return (
     <div className="space-y-6">
