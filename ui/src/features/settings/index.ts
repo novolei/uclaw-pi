@@ -4,3 +4,6 @@
 // Components/hooks are added to this barrel as they migrate (plan P1–P3:
 // docs/superpowers/plans/2026-05-31-frontend-settings-feature-migration.md).
 export { settingsBridge } from '../../lib/bridge/settings'
+
+// P1 — SystemTab migrated + split into system/ cards + hooks.
+export { SystemTab } from './components/SystemTab'

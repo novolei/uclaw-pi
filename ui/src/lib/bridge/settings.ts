@@ -17,4 +17,10 @@ export const settingsBridge = {
   /** Enable/disable the optional local HTTP API server (persisted; restart to apply). */
   setHttpApiEnabled: (enabled: boolean): Promise<void> =>
     invoke<void>('set_http_api_enabled', { enabled }),
+  /** Snapshot the system-diagnostics report (health, bridges, services, processes). */
+  getSystemDiagnostics: <T = unknown>(): Promise<T> => invoke<T>('get_system_diagnostics'),
+  /** Run an eval suite by its command name (e.g. `run_agent_control_plane_eval`). */
+  runEval: <T = unknown>(command: string): Promise<T> => invoke<T>(command),
+  /** Invoke a side-effecting bridge/recovery action by command name (e.g. `restart_memu_bridge`). */
+  bridgeAction: (command: string): Promise<void> => invoke<void>(command),
 }

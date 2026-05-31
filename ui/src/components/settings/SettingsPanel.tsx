@@ -17,7 +17,7 @@ import { SttSettings } from './SttSettings'
 import { MemoryRecallTab } from './MemoryRecallTab'
 import { LearnedProfileTab } from './LearnedProfileTab'
 import { ImChannelsSettings } from './ImChannelsSettings'
-import { SystemTab } from './SystemTab'
+import { SystemTab } from '@/features/settings'
 import { SettingsBreadcrumb } from './SettingsBreadcrumb'
 import { BrowserRuntimeSettings } from './BrowserRuntimeSettings'
 
