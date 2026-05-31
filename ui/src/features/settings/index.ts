@@ -100,3 +100,11 @@ export { BotHubSettings } from './components/channels/BotHubSettings'
 export { default as WeChatSettings } from './components/channels/WeChatSettings'
 export { default as FeishuSettings } from './components/channels/FeishuSettings'
 export { default as DingTalkSettings } from './components/channels/DingTalkSettings'
+
+// ── Memory cluster (Settings → 记忆 / 记忆召回). Migrated out of
+// components/settings/ ; the boot-node load + config CRUD side effects moved into
+// hooks; IPC stays in the typed @/lib/tauri-bridge memory-graph + recall helpers. ──
+
+// MemorySettings migrated (boot-node load + toggle state in useMemorySettings).
+// No in-tree consumer renders it today; kept for completeness.
+export { MemorySettings } from './components/MemorySettings'

@@ -1,19 +1,15 @@
-import { useState, useEffect } from 'react'
-import { SettingsSection } from './primitives/SettingsSection'
-import { SettingsToggle } from './primitives/SettingsToggle'
-import { SettingsCard } from './primitives/SettingsCard'
-import { memoryGraphListBoot } from '@/lib/tauri-bridge'
+// MemorySettings — 记忆设置 tab. Thin presentation: the boot-node load + toggle
+// state live in useMemorySettings (code-organization ADR 2026-05-31). Primitives
+// stay under components/settings/ for now, imported via the @/ alias. Behavior
+// preserved verbatim from the pre-migration components/settings/MemorySettings.
+import { SettingsSection } from '@/components/settings/primitives/SettingsSection'
+import { SettingsToggle } from '@/components/settings/primitives/SettingsToggle'
+import { SettingsCard } from '@/components/settings/primitives/SettingsCard'
+import { useMemorySettings } from '../hooks/useMemorySettings'
 
 export function MemorySettings() {
-  const [autoMemorize, setAutoMemorize] = useState(true)
-  const [graphEnabled, setGraphEnabled] = useState(true)
-  const [bootNodes, setBootNodes] = useState<unknown[]>([])
-
-  useEffect(() => {
-    memoryGraphListBoot({ limit: 20 }).then((data: any) => {
-      if (Array.isArray(data)) setBootNodes(data)
-    }).catch(() => {})
-  }, [])
+  const { autoMemorize, setAutoMemorize, graphEnabled, setGraphEnabled, bootNodes } =
+    useMemorySettings()
 
   return (
     <div className="space-y-6">
