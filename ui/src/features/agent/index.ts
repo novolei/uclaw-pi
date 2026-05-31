@@ -106,3 +106,8 @@ export { SkillCitationChips } from './components/SkillCitationChips'
 // debounced fuzzy match move into hooks/useSkillSuggestions (routed through the
 // agent bridge).
 export { SkillSuggestionBar } from './components/SkillSuggestionBar'
+
+// SkillRecallChips — per-session skill_search / load_skill chips (+ category
+// conflict indicator). Pure atom-driven UI (skillRecallsMapAtom) — no IPC, so
+// no hook extraction needed.
+export { SkillRecallChips } from './components/SkillRecallChips'
