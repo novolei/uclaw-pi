@@ -13,6 +13,7 @@ pub mod background_task;
 pub mod channel;
 pub mod conversation;
 pub mod cost;
+pub mod learned_skills;
 pub mod llm_config;
 pub mod mcp;
 pub mod memory;
