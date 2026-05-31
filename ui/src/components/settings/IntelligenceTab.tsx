@@ -4,8 +4,7 @@
  */
 import * as React from 'react'
 import { Play, Square, Loader2 } from 'lucide-react'
-import { ModelSettings } from './ModelSettings'
-import { AgentSettings, PromptsSettings } from '@/features/settings'
+import { ModelSettings, AgentSettings, PromptsSettings } from '@/features/settings'
 import { SettingsSection } from './primitives/SettingsSection'
 import { SettingsCard } from './primitives/SettingsCard'
 import { Button } from '@/components/ui/button'

@@ -1,11 +1,9 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useSetAtom } from 'jotai'
 import { Check, ChevronDown, AlertCircle, MessageSquare, Wrench, Zap, FileText, Brain } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { settingsOpenAtom, settingsTabAtom } from '@/atoms/settings-tab'
-import { getAllConfiguredModels, getRoleModels, setRoleModel } from '@/lib/tauri-bridge'
-import type { ModelRoleConfig } from '@/lib/tauri-bridge'
-import { toast } from 'sonner'
+import { useModelSettings } from '../hooks/useModelSettings'
 
 // ── Role metadata ────────────────────────────────────────────────────────────
 
@@ -48,8 +46,6 @@ const ROLE_META: Record<string, RoleMeta> = {
     color: 'text-rose-600',
   },
 }
-
-const ALL_ROLES = ['chat', 'utility', 'utility_large', 'summarizer', 'compiler']
 
 // ── Grouped model data ───────────────────────────────────────────────────────
 
@@ -165,35 +161,11 @@ function ModelDropdown({ value, groups, isOpen, onOpen, onClose, onChange, conta
 // ── Main page ─────────────────────────────────────────────────────────────────
 
 export function ModelSettings() {
-  const [groups, setGroups] = useState<ModelGroup[]>([])
-  const [roleConfigs, setRoleConfigs] = useState<ModelRoleConfig[]>([])
+  const { groups, roleConfigs, allRoles, handleChange } = useModelSettings()
   const [openRole, setOpenRole] = useState<string | null>(null)
   const dropdownRefs = useRef<Map<string, HTMLDivElement>>(new Map())
 
   const configuredCount = roleConfigs.filter((r) => r.model_ref).length
-
-  // Load data
-  const loadData = useCallback(async () => {
-    const [allModels, roles] = await Promise.all([
-      getAllConfiguredModels(),
-      getRoleModels(),
-    ])
-
-    // Build groups from [providerId, modelIds[]][]
-    const g: ModelGroup[] = allModels
-      .filter(([, mids]) => mids.length > 0)
-      .map(([pid, mids]) => ({ providerId: pid, models: mids }))
-    setGroups(g)
-
-    // Merge roles with defaults
-    const merged = ALL_ROLES.map((role) => {
-      const existing = roles.find((r) => r.role === role)
-      return existing ?? { role, model_ref: null }
-    })
-    setRoleConfigs(merged)
-  }, [])
-
-  useEffect(() => { void loadData() }, [loadData])
 
   // Close dropdown on outside click / ESC
   useEffect(() => {
@@ -211,19 +183,6 @@ export function ModelSettings() {
     }
   }, [openRole])
 
-  const handleChange = useCallback(async (role: string, modelRef: string | null) => {
-    // Optimistic update
-    setRoleConfigs((prev) =>
-      prev.map((r) => (r.role === role ? { ...r, model_ref: modelRef } : r)),
-    )
-    try {
-      await setRoleModel(role, modelRef)
-    } catch (e) {
-      toast.error(`保存失败: ${(e as Error).message ?? e}`)
-      void loadData() // revert
-    }
-  }, [loadData])
-
   return (
     <div className="space-y-6">
       {/* Summary */}
@@ -234,7 +193,7 @@ export function ModelSettings() {
           </p>
         </div>
         <span className="text-[11px] text-muted-foreground/60">
-          {configuredCount}/{ALL_ROLES.length} 已配置
+          {configuredCount}/{allRoles.length} 已配置
         </span>
       </div>
 

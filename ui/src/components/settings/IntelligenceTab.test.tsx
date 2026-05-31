@@ -2,11 +2,8 @@ import { describe, it, expect, vi } from 'vitest'
 import { renderWithProviders } from '@/test-utils/render'
 import { IntelligenceTab } from './IntelligenceTab'
 
-vi.mock('./ModelSettings', () => ({
-  ModelSettings: () => <div data-testid="model-settings" />,
-}))
-
 vi.mock('@/features/settings', () => ({
+  ModelSettings: () => <div data-testid="model-settings" />,
   AgentSettings: () => <div data-testid="agent-settings" />,
   PromptsSettings: () => <div data-testid="prompts-settings" />,
 }))

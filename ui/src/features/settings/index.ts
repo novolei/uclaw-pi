@@ -34,3 +34,7 @@ export { GeneralSettings } from './components/GeneralSettings'
 // P3a — ToolSettings migrated (active-manifest load in a hook; skill-tag editor
 // stays under components/settings/ for now).
 export { ToolSettings } from './components/ToolSettings'
+
+// P3a — ModelSettings migrated (role→model load + optimistic write in a hook;
+// dropdown open/outside-click UI state stays in the component).
+export { ModelSettings } from './components/ModelSettings'
