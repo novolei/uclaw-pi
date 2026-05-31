@@ -16,4 +16,5 @@ pub mod notification;
 pub mod safety;
 pub mod search;
 pub mod settings;
+pub mod tool_approval;
 pub mod space;

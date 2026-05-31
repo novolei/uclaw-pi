@@ -2,7 +2,6 @@ use tauri::State;
 use crate::app::AppState;
 use crate::error::Error;
 use crate::ipc::*;
-use crate::ipc::{PermissionRule, PermissionAuditEntry, CreatePermissionRuleInput};
 use crate::agent::types::*;
 use crate::agent::tools::tool::ToolRegistry;
 use crate::agent::tools::builtin;
@@ -4971,98 +4970,13 @@ pub async fn update_append_setting(
     Ok(())
 }
 
-// ─── Tool Approval Commands ─────────────────────────────────────────────────
-
-#[tauri::command]
-pub async fn approve_tool_call(
-    state: State<'_, AppState>,
-    _app_handle: tauri::AppHandle,
-    engine: State<'_, std::sync::Arc<uclaw_pi_engine::PiEngine>>,
-    input: ApproveToolCallInput,
-) -> Result<ApproveToolCallResponse, Error> {
-    tracing::info!(
-        session_id = %input.session_id,
-        tool_id = %input.tool_id,
-        approved = input.approved,
-        always_allow = ?input.always_allow,
-        tool_name = ?input.tool_name,
-        "Tool approval response received"
-    );
-
-    // [R3 交互] Resolve the PiEngine's pending approval keyed by tool_call_id.
-    // Idempotent with the legacy uClaw approval flow below — the engine registry
-    // only holds this request when the pi path raised it (UCLAW_PI_ENGINE on).
-    if crate::engine_sink::pi_engine_enabled() {
-        engine.send(uclaw_pi_engine::EngineCmd::Respond {
-            request_id: input.tool_id.clone(),
-            allow: input.approved,
-            reason: None,
-        });
-    }
-
-    // If approved with always_allow, add tool to auto-approved whitelist immediately
-    if input.approved {
-        if input.always_allow.unwrap_or(false) {
-            if let Some(ref tool_name) = input.tool_name {
-                let mut mgr = state.safety_manager.write().await;
-                let _ = mgr.add_auto_approved(tool_name);
-                tracing::info!(tool_name = %tool_name, "Tool added to auto-approved whitelist via always_allow");
-            }
-        }
-    }
-
-    // Resolve the pending approval via oneshot channel
-    let result = crate::app::ApprovalResult {
-        approved: input.approved,
-        always_allow: input.always_allow.unwrap_or(false),
-        tool_name: input.tool_name.clone(),
-        path_scope: input.path_scope.clone(),
-        paths: input.paths.clone(),
-    };
-
-    let resolved = state.pending_approvals.resolve(&input.tool_id, result);
-    if !resolved {
-        tracing::warn!(tool_id = %input.tool_id, "No pending approval found for tool_id");
-    }
-
-    Ok(ApproveToolCallResponse { success: resolved })
-}
-
-#[tauri::command]
-pub async fn list_permission_rules(
-    state: State<'_, AppState>,
-) -> Result<Vec<PermissionRule>, Error> {
-    crate::safety::permissions::list_rules(&state.db)
-        .map_err(|e| Error::Internal(format!("list_permission_rules: {}", e)))
-}
-
-#[tauri::command]
-pub async fn create_permission_rule(
-    state: State<'_, AppState>,
-    input: CreatePermissionRuleInput,
-) -> Result<PermissionRule, Error> {
-    crate::safety::permissions::create_rule(&state.db, input)
-        .map_err(|e| Error::Internal(format!("create_permission_rule: {}", e)))
-}
-
-#[tauri::command]
-pub async fn delete_permission_rule(
-    state: State<'_, AppState>,
-    id: String,
-) -> Result<bool, Error> {
-    crate::safety::permissions::delete_rule(&state.db, &id)
-        .map_err(|e| Error::Internal(format!("delete_permission_rule: {}", e)))
-}
-
-#[tauri::command]
-pub async fn list_permission_audit(
-    state: State<'_, AppState>,
-    session_id: Option<String>,
-    limit: Option<u32>,
-) -> Result<Vec<PermissionAuditEntry>, Error> {
-    crate::safety::permissions::list_audit(&state.db, session_id.as_deref(), limit.unwrap_or(100))
-        .map_err(|e| Error::Internal(format!("list_permission_audit: {}", e)))
-}
+// ─── Tool Approval Commands → moved to commands::tool_approval ────────────────
+// approve_tool_call / list_permission_rules / create_permission_rule /
+// delete_permission_rule / list_permission_audit now live in
+// commands/tool_approval.rs (thin: approve_tool_call orchestrates the in-memory
+// engine + pending_approvals + safety_manager; the permission_* commands pass
+// through to crate::safety::permissions, which already owns the SQL). No new
+// service.
 
 // ─── Memory Graph Commands ──────────────────────────────────────────────
 
