@@ -7,3 +7,6 @@ export { settingsBridge } from '../../lib/bridge/settings'
 
 // P1 — SystemTab migrated + split into system/ cards + hooks.
 export { SystemTab } from './components/SystemTab'
+
+// P2 — GeneralTab migrated (thin composer; sub-sections migrate later).
+export { GeneralTab } from './components/GeneralTab'

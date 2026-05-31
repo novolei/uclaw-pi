@@ -2,9 +2,11 @@
  * GeneralTab — composes GeneralSettings + PromptSettings + AppearanceSettings.
  */
 import * as React from 'react'
-import { GeneralSettings } from './GeneralSettings'
-import { PromptSettings } from './PromptSettings'
-import { AppearanceSettings } from './AppearanceSettings'
+// Sub-sections still live under components/settings/ (migrated in a later phase);
+// imported via the @/ alias so behavior is preserved exactly after the P2 move.
+import { GeneralSettings } from '@/components/settings/GeneralSettings'
+import { PromptSettings } from '@/components/settings/PromptSettings'
+import { AppearanceSettings } from '@/components/settings/AppearanceSettings'
 
 export function GeneralTab(): React.ReactElement {
   return (
