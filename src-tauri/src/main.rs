@@ -983,8 +983,8 @@ fn main() {
             uclaw_core::commands::space::list_spaces,
             uclaw_core::commands::space::delete_space,
             // LLM Config
-            uclaw_core::tauri_commands::get_llm_config,
-            uclaw_core::tauri_commands::update_llm_config,
+            uclaw_core::commands::llm_config::get_llm_config,
+            uclaw_core::commands::llm_config::update_llm_config,
             // Artifacts
             uclaw_core::tauri_commands::list_artifacts,
             uclaw_core::tauri_commands::read_artifact,

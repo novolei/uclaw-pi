@@ -8,5 +8,6 @@
 //! god file (~13k lines), which is being decomposed into this module one domain
 //! at a time. `settings` is the first slice (the HTTP-API toggle).
 
+pub mod llm_config;
 pub mod settings;
 pub mod space;

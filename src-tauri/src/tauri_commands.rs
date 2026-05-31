@@ -2931,48 +2931,7 @@ pub async fn toggle_star_conversation(
 }
 
 // ─── Space Commands → moved to commands::space + services::space_service ──
-
-// ─── LLM Config Commands ───────────────────────────────────────────────
-
-#[tauri::command]
-pub async fn get_llm_config(state: State<'_, AppState>) -> Result<LlmConfigResponse, Error> {
-    let config = state.llm_config.read().await;
-    Ok(LlmConfigResponse {
-        provider: config.provider.clone(),
-        model: config.model.clone(),
-        has_api_key: !config.api_key.is_empty(),
-        base_url: config.base_url.clone(),
-        max_tokens: config.max_tokens,
-        temperature: config.temperature,
-    })
-}
-
-#[tauri::command]
-pub async fn update_llm_config(
-    state: State<'_, AppState>,
-    input: LlmConfigInput,
-) -> Result<LlmConfigResponse, Error> {
-    let mut config = state.llm_config.write().await;
-    config.provider = input.provider;
-    config.model = input.model;
-    if !input.api_key.is_empty() {
-        config.api_key = input.api_key;
-    }
-    config.base_url = input.base_url;
-    config.max_tokens = input.max_tokens;
-    config.temperature = input.temperature;
-
-    config.save(&state.llm_config_path)?;
-
-    Ok(LlmConfigResponse {
-        provider: config.provider.clone(),
-        model: config.model.clone(),
-        has_api_key: !config.api_key.is_empty(),
-        base_url: config.base_url.clone(),
-        max_tokens: config.max_tokens,
-        temperature: config.temperature,
-    })
-}
+// ─── LLM Config Commands → moved to commands::llm_config ──────────────────
 
 // ─── Artifact Commands ─────────────────────────────────────────────────
 
