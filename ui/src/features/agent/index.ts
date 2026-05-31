@@ -121,3 +121,9 @@ export { BrowserPreviewOverlay } from './components/BrowserPreviewOverlay'
 // the auto-open-on-edit effect). Pure atom-driven UI — no IPC, so no hook
 // extraction. File kept as SidePanel.tsx to preserve git history.
 export { WorkspaceFilesView } from './components/SidePanel'
+
+// ContextUsageBadge — input-bar token-usage ring + popover breakdown. Split
+// (was 419 lines): the usage computation + last-valid-value cache live in
+// hooks/useContextUsage; the popover body is the presentational
+// ContextUsagePopover; this shell owns the spinner + hover-open state. No IPC.
+export { ContextUsageBadge } from './components/ContextUsageBadge'

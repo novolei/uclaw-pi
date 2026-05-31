@@ -20,7 +20,7 @@ import { Bot, CornerDownLeft, Square, Settings, Paperclip, X, Copy, Check, Brain
 import { AgentMessages } from './AgentMessages'
 import { AgentHeader } from '@/features/agent'
 import { BrowserPreviewOverlay } from '@/features/agent'
-import { ContextUsageBadge } from './ContextUsageBadge'
+import { ContextUsageBadge } from '@/features/agent'
 import { AutoPreviewPopover } from './AutoPreviewPopover'
 import { StrategyPresetSelector } from '@/features/agent'
 import { PermissionBanner } from '@/features/agent'
