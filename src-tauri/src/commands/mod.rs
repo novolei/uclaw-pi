@@ -23,3 +23,4 @@ pub mod settings;
 pub mod skills;
 pub mod tool_approval;
 pub mod space;
+pub mod system_prompt;

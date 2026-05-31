@@ -19,5 +19,6 @@ pub mod search_service;
 pub mod skills_service;
 pub mod settings_service;
 pub mod space_service;
+pub mod system_prompt_service;
 pub mod workspace_service;
 
