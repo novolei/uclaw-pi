@@ -23,6 +23,15 @@ export { AgentStatusBar } from './components/AgentStatusBar'
 // through the agent bridge (moveAgentSessionToWorkspace).
 export { MoveSessionDialog } from './components/MoveSessionDialog'
 
+// PermissionModeMenu — the 5-mode Radix popover (presentation + keyboard). No
+// IPC. `MODE_ITEMS` is re-exported for PermissionModeSelector + tests.
+export { PermissionModeMenu, MODE_ITEMS } from './components/PermissionModeMenu'
+
+// PermissionModeSelector — input-bar trigger that opens PermissionModeMenu;
+// hydrates + persists SafetyMode through the agent bridge (getSafetyPolicy /
+// setSafetyMode).
+export { PermissionModeSelector } from './components/PermissionModeSelector'
+
 // SessionEvalBadge — post-session self-evaluation score badge. The raw
 // @tauri-apps/api/event `listen` moved behind the agent bridge's
 // onSessionEvalComplete / onSessionEvalWarning wrappers.

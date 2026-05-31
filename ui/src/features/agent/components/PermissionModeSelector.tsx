@@ -10,7 +10,7 @@ import * as React from 'react'
 import { useAtom, useSetAtom } from 'jotai'
 import { safetyModeAtom } from '@/atoms/safety-atoms'
 import { silencedPlanModeSessionsAtom } from '@/atoms/plan-mode-suggest-atoms'
-import { getSafetyPolicy, setSafetyMode, type SafetyModeWire } from '@/lib/tauri-bridge'
+import { getSafetyPolicy, setSafetyMode, type SafetyModeWire } from '@/lib/bridge/agent'
 import { PermissionModeMenu, MODE_ITEMS } from './PermissionModeMenu'
 
 export interface PermissionModeSelectorProps {

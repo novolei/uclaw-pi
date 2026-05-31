@@ -13,7 +13,7 @@ import * as React from 'react'
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
 import { ShieldQuestion, Pencil, Map as MapIcon, Compass, Zap, Check } from 'lucide-react'
 import { cn } from '@/lib/utils'
-import type { SafetyModeWire } from '@/lib/tauri-bridge'
+import type { SafetyModeWire } from '@/lib/bridge/agent'
 
 export interface ModeMenuItem {
   wire: SafetyModeWire

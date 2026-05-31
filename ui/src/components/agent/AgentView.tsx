@@ -26,7 +26,7 @@ import { StrategyPresetSelector } from './StrategyPresetSelector'
 import { PermissionBanner } from './PermissionBanner'
 // Bundle 27-A — heartbeat indicator + stall banner + interrupted-reply recovery.
 import { AgentHeartbeatBanner } from './AgentHeartbeatBanner'
-import { PermissionModeSelector } from './PermissionModeSelector'
+import { PermissionModeSelector } from '@/features/agent'
 import { AgentStatusBar } from '@/features/agent'
 import { AskUserBanner } from './AskUserBanner'
 import { ExitPlanModeBanner } from './ExitPlanModeBanner'
