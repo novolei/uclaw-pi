@@ -23,4 +23,7 @@ export const settingsBridge = {
   runEval: <T = unknown>(command: string): Promise<T> => invoke<T>(command),
   /** Invoke a side-effecting bridge/recovery action by command name (e.g. `restart_memu_bridge`). */
   bridgeAction: (command: string): Promise<void> => invoke<void>(command),
+  /** Persist whether the agent suggests Plan mode for complex multi-step requests. */
+  setPlanModeSuggestEnabled: (enabled: boolean): Promise<void> =>
+    invoke<void>('set_plan_mode_suggest_enabled', { enabled }),
 }

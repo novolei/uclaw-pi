@@ -10,3 +10,6 @@ export { SystemTab } from './components/SystemTab'
 
 // P2 — GeneralTab migrated (thin composer; sub-sections migrate later).
 export { GeneralTab } from './components/GeneralTab'
+
+// P2 — AgentSettings migrated (presentation; plan-mode persist in a hook).
+export { AgentSettings } from './components/AgentSettings'

@@ -1,30 +1,22 @@
 import { useState } from 'react'
-import { invoke } from '@tauri-apps/api/core'
-import { useAtom, useAtomValue } from 'jotai'
-import { SettingsSection } from './primitives/SettingsSection'
-import { SettingsToggle } from './primitives/SettingsToggle'
-import { SettingsCard } from './primitives/SettingsCard'
-import { SettingsRow } from './primitives/SettingsRow'
-import { PersonaStudio } from './PersonaStudio'
-import { PersonaBondTimeline } from './PersonaBondTimeline'
+import { useAtomValue } from 'jotai'
+// Sub-components + primitives still live under components/settings/ (migrated in a
+// later phase); imported via the @/ alias so behavior is preserved exactly.
+import { SettingsSection } from '@/components/settings/primitives/SettingsSection'
+import { SettingsToggle } from '@/components/settings/primitives/SettingsToggle'
+import { SettingsCard } from '@/components/settings/primitives/SettingsCard'
+import { SettingsRow } from '@/components/settings/primitives/SettingsRow'
+import { PersonaStudio } from '@/components/settings/PersonaStudio'
+import { PersonaBondTimeline } from '@/components/settings/PersonaBondTimeline'
 import { activeProviderModelAtom } from '@/atoms/active-model'
-import { planModeSuggestEnabledAtom } from '@/atoms/ui-preferences'
 import { Cpu } from 'lucide-react'
+import { usePlanModeSuggest } from '../hooks/usePlanModeSuggest'
 
 export function AgentSettings() {
   const activeModel = useAtomValue(activeProviderModelAtom)
   const [streamResponse, setStreamResponse] = useState(true)
   const [autoTitle, setAutoTitle] = useState(true)
-  const [planSuggestEnabled, setPlanSuggestEnabled] = useAtom(planModeSuggestEnabledAtom)
-
-  const handlePlanSuggestChange = async (v: boolean) => {
-    setPlanSuggestEnabled(v)
-    try {
-      await invoke('set_plan_mode_suggest_enabled', { enabled: v })
-    } catch (e) {
-      console.error('[AgentSettings] set_plan_mode_suggest_enabled failed', e)
-    }
-  }
+  const { enabled: planSuggestEnabled, setPlanSuggestEnabled } = usePlanModeSuggest()
 
   return (
     <div className="space-y-6">
@@ -63,7 +55,7 @@ export function AgentSettings() {
             label="为复杂任务建议 Plan 模式"
             description="检测到多步骤构建/重构/设计请求时弹出建议横幅；可被 agent 主动调用，也按关键词触发。"
             checked={planSuggestEnabled}
-            onCheckedChange={handlePlanSuggestChange}
+            onCheckedChange={setPlanSuggestEnabled}
           />
         </SettingsCard>
       </SettingsSection>

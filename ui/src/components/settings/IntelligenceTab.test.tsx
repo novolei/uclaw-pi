@@ -6,7 +6,7 @@ vi.mock('./ModelSettings', () => ({
   ModelSettings: () => <div data-testid="model-settings" />,
 }))
 
-vi.mock('./AgentSettings', () => ({
+vi.mock('@/features/settings', () => ({
   AgentSettings: () => <div data-testid="agent-settings" />,
 }))
 
