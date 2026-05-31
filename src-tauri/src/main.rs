@@ -1292,12 +1292,12 @@ fn main() {
             uclaw_core::commands::browser_cmds::browser_webview_complete_login,
             // System Tray / Badge Commands (Phase 3)
             uclaw_core::tauri_commands::update_badge_count,
-            // Automation Commands (Phase 3)
-            uclaw_core::tauri_commands::list_automations,
-            uclaw_core::tauri_commands::trigger_automation_manual,
-            uclaw_core::tauri_commands::stop_automation_runs,
-            uclaw_core::tauri_commands::get_automation_activity,
-            uclaw_core::tauri_commands::get_or_create_spec_home_thread,
+            // Automation Commands (Phase 3) → commands::automation (slice 9)
+            uclaw_core::commands::automation::list_automations,
+            uclaw_core::commands::automation::trigger_automation_manual,
+            uclaw_core::commands::automation::stop_automation_runs,
+            uclaw_core::commands::automation::get_automation_activity,
+            uclaw_core::commands::automation::get_or_create_spec_home_thread,
             // Humane Automation Commands (Phase 1 spec § 7.3)
             uclaw_core::tauri_commands::install_humane_spec,
             uclaw_core::tauri_commands::import_humane_spec_file,

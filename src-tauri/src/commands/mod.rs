@@ -9,6 +9,7 @@
 //! at a time. `settings` is the first slice (the HTTP-API toggle).
 
 pub mod artifact;
+pub mod automation;
 pub mod background_task;
 pub mod browser_cmds;
 pub mod channel;
