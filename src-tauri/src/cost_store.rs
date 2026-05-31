@@ -13,6 +13,19 @@ use rusqlite::params;
 /// is best-effort and must never fail the agent loop.
 pub fn record(state: &AppState, session_id: &str, model: &str, input_tokens: u32, output_tokens: u32) {
     let cost = calculate_cost(model, input_tokens, output_tokens);
+    record_cost(state, session_id, model, input_tokens, output_tokens, cost);
+}
+
+/// Like [`record`] but with a pre-computed `cost` (the pi path computes a
+/// cache-aware cost itself, so this avoids the non-cache [`calculate_cost`]).
+pub fn record_cost(
+    state: &AppState,
+    session_id: &str,
+    model: &str,
+    input_tokens: u32,
+    output_tokens: u32,
+    cost: f64,
+) {
     let now = chrono::Utc::now().timestamp_millis();
     let id = uuid::Uuid::new_v4().to_string();
     let conn = match state.db.lock() {

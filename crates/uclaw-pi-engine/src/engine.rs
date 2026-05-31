@@ -72,8 +72,16 @@ pub enum EngineCmd {
         base_url: Option<String>,
         api: Option<String>,
     },
-    /// Drive one user prompt on `conv_id`'s session (lazily created).
-    Prompt { conv_id: String, input: String },
+    /// Drive one user prompt on `conv_id`'s session (lazily created). `cwd` is the
+    /// owning space's filesystem path (uClaw `spaces.path`) → pi's working
+    /// directory; `None` keeps the engine default (process cwd). Applied only at
+    /// session creation (the first prompt for `conv_id`), since a session's
+    /// workspace is fixed for its lifetime.
+    Prompt {
+        conv_id: String,
+        input: String,
+        cwd: Option<PathBuf>,
+    },
     /// Continue `conv_id`'s loop without a new user message (steer/retry flows).
     FollowUp { conv_id: String },
     /// Switch the model for `conv_id`'s session.
@@ -242,11 +250,11 @@ async fn actor_loop(
             EngineCmd::Configure { provider, model, api_key, base_url, api } => {
                 model_config = ModelConfig { provider, model, api_key, base_url, api };
             }
-            EngineCmd::Prompt { conv_id, input } => {
-                start_run(&mut sessions, &rt, &sink, &cx, &config, &model_config, &approval_handler, &tool_factory, conv_id, RunKind::Prompt(input)).await;
+            EngineCmd::Prompt { conv_id, input, cwd } => {
+                start_run(&mut sessions, &rt, &sink, &cx, &config, &model_config, &approval_handler, &tool_factory, cwd, conv_id, RunKind::Prompt(input)).await;
             }
             EngineCmd::FollowUp { conv_id } => {
-                start_run(&mut sessions, &rt, &sink, &cx, &config, &model_config, &approval_handler, &tool_factory, conv_id, RunKind::FollowUp).await;
+                start_run(&mut sessions, &rt, &sink, &cx, &config, &model_config, &approval_handler, &tool_factory, None, conv_id, RunKind::FollowUp).await;
             }
             EngineCmd::SetModel { conv_id, provider, model } => {
                 if let Some(entry) = sessions.get(&conv_id) {
@@ -284,6 +292,52 @@ async fn actor_loop(
     }
 }
 
+/// Sum the turn's assistant-message token usage + cost into the `agent:turn_cost`
+/// payload the frontend renders (input/output tokens + a `$cost` string). A tool
+/// turn has multiple assistant messages (one per LLM call); we sum them for the
+/// whole-turn total. Returns `None` when the turn produced no assistant message.
+fn turn_cost_payload(
+    conv_id: &str,
+    messages: &[pi::model::Message],
+    duration_ms: u64,
+    model: &str,
+) -> Option<serde_json::Value> {
+    use pi::model::Message;
+    let (mut input, mut output, mut cache_read, mut cache_write) = (0u64, 0u64, 0u64, 0u64);
+    let mut cost = 0f64;
+    let mut any = false;
+    for m in messages {
+        if let Message::Assistant(a) = m {
+            input += a.usage.input;
+            output += a.usage.output;
+            cache_read += a.usage.cache_read;
+            cache_write += a.usage.cache_write;
+            cost += a.usage.cost.total;
+            any = true;
+        }
+    }
+    if !any {
+        return None;
+    }
+    // `durationMs` is ignored by the frontend's turn_cost handler (it reads
+    // tokens/cost) but rides along so engine_sink can cache it for the
+    // duration_ms column — the persisted message's "⚡ 耗时" badge.
+    // `costUsd` here is pi's own (0 for ad-hoc models with no pricing); the uClaw
+    // sink authoritatively recomputes it from `model` + tokens via
+    // `agent::types::calculate_cost` (same pricing table the legacy path uses) and
+    // records it to `cost_records`. `model` is carried for that.
+    Some(serde_json::json!({
+        "conversationId": conv_id,
+        "model": model,
+        "inputTokens": input,
+        "outputTokens": output,
+        "cacheReadTokens": cache_read,
+        "cacheCreationTokens": cache_write,
+        "costUsd": format!("${cost:.4}"),
+        "durationMs": duration_ms,
+    }))
+}
+
 /// Ensure `conv_id`'s session exists, register a fresh abort handle, and spawn
 /// the streaming run (prompt or continue) as its own asupersync task.
 async fn start_run(
@@ -295,6 +349,7 @@ async fn start_run(
     model_config: &ModelConfig,
     approval_handler: &ToolApprovalHandler,
     tool_factory: &Arc<UclawToolFactory>,
+    run_cwd: Option<PathBuf>,
     conv_id: String,
     kind: RunKind,
 ) {
@@ -303,6 +358,15 @@ async fn start_run(
         // surfaces every tool through uClaw's approval dialog.
         // [R4 F5] Inject the tool factory: pi built-ins verbatim + uClaw tools.
         let mut opts = config.to_session_options();
+        // [cwd] Per-conversation working directory: the owning space's path
+        // (uClaw `spaces.path`, resolved by the tauri command from the session's
+        // space_id). Overrides the engine-global default (process cwd) so pi's
+        // tools + project-context loading run in the user's workspace, not uClaw's
+        // own source tree. pi reads this via SessionOptions.working_directory
+        // (sdk.rs `cwd = options.working_directory…`).
+        if let Some(cwd) = run_cwd {
+            opts.working_directory = Some(cwd);
+        }
         // [R4/F7] Apply the user's configured provider/model/key (provider_service
         // / 服务商 tab). pi uses SessionOptions.api_key, not ~/.pi/auth.json.
         if model_config.provider.is_some() {
@@ -356,10 +420,26 @@ async fn start_run(
 
     let sink_task = Arc::clone(sink);
     let cx_task = cx.clone();
+    // Own the model name BEFORE the 'static spawn — capturing `model_config`
+    // (a borrow) inside the async move would escape the function (E0521).
+    let cost_model = model_config.model.clone().unwrap_or_default();
     rt.spawn(async move {
         let acl = StdMutex::new(Acl::new(conv_id.clone()));
         let sink_cb = Arc::clone(&sink_task);
+        let cost_conv = conv_id.clone();
+        let run_start = std::time::Instant::now();
         let on_event = move |ev: AgentEvent| {
+            // [metadata] Surface the turn's token usage + cost as `agent:turn_cost`
+            // BEFORE stream-complete, so the live badge populates while the
+            // streaming state still exists. engine_sink also caches this to persist
+            // the input_tokens/output_tokens/cost_usd/duration_ms columns (so the
+            // badge survives reload on the rendered message).
+            if let AgentEvent::AgentEnd { messages, .. } = &ev {
+                let duration_ms = run_start.elapsed().as_millis() as u64;
+                if let Some(cost) = turn_cost_payload(&cost_conv, messages, duration_ms, &cost_model) {
+                    sink_cb.emit("agent:turn_cost", cost);
+                }
+            }
             let raw = demux(&ev);
             if let Ok(mut a) = acl.lock() {
                 if let Some(fe) = a.translate(&raw) {

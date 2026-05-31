@@ -9,9 +9,42 @@
 //! (`tauri_commands::send_message`, gated) and the assistant message on complete
 //! (`engine_sink::TauriEventSink::emit`, gated). UI stays read-only (R2 scope).
 
+use std::path::PathBuf;
+
 use rusqlite::Connection;
 
 use crate::agent::types::ContentBlock;
+
+/// Per-turn token/cost/duration for an assistant row → the `input_tokens`,
+/// `output_tokens`, `cost_usd`, `duration_ms` columns `get_agent_session_messages`
+/// reads into `usage` + `durationMs` (the "⚡ 耗时 · N 输入 · M 输出 · $费用" badge).
+/// `None` fields write SQL NULL.
+#[derive(Default)]
+pub struct TurnUsage {
+    pub input_tokens: Option<i64>,
+    pub output_tokens: Option<i64>,
+    pub cost_usd: Option<f64>,
+    pub duration_ms: Option<i64>,
+}
+
+impl TurnUsage {
+    /// Parse an `agent:turn_cost` payload (`{inputTokens, outputTokens,
+    /// costUsd:"$x", durationMs}`) into the columns. Zero token counts collapse to
+    /// `None` so a no-usage turn doesn't render a "0 输入" badge.
+    #[must_use]
+    pub fn from_turn_cost(v: &serde_json::Value) -> Self {
+        let positive = |n: i64| (n > 0).then_some(n);
+        Self {
+            input_tokens: v.get("inputTokens").and_then(serde_json::Value::as_i64).and_then(positive),
+            output_tokens: v.get("outputTokens").and_then(serde_json::Value::as_i64).and_then(positive),
+            cost_usd: v
+                .get("costUsd")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|s| s.trim_start_matches('$').parse::<f64>().ok()),
+            duration_ms: v.get("durationMs").and_then(serde_json::Value::as_i64),
+        }
+    }
+}
 
 /// Insert one message into `messages`, encoding `text` as the same
 /// `Option<Vec<ContentBlock>>` JSON shape `get_messages` parses — so it
@@ -50,9 +83,13 @@ pub fn persist_chat_text_message(
 }
 
 /// [R3 agent path] Persist into `agent_messages` (the Agent view's table, read by
-/// `get_agent_session_messages`). Unlike the chat `messages` table, its `content`
-/// is **plain text** (read straight as a String), so no ContentBlock encoding.
-/// `session_id` must reference an existing `agent_sessions` row (FK).
+/// `get_agent_session_messages`). `session_id` must reference an existing
+/// `agent_sessions` row (FK). Two shapes MUST match that reader exactly or rows
+/// are silently dropped: `content` is JSON `[{"type":"text",…}]` (parsed as
+/// `Vec<ContentBlock>`), and `created_at` is **epoch millis `i64`** — the column
+/// is `INTEGER` and the reader does `row.get::<i64>` then `filter_map(.ok())`,
+/// which discards any row whose read fails (an RFC3339 string vanishes every
+/// refresh — the "agent messages disappear after the turn ends" bug).
 pub fn persist_agent_text_message(
     conn: &Connection,
     id: &str,
@@ -60,28 +97,92 @@ pub fn persist_agent_text_message(
     role: &str,
     text: &str,
     reasoning: Option<&str>,
+    usage: &TurnUsage,
 ) -> rusqlite::Result<()> {
-    // The Agent renderer (NativeBlockRenderer) parses `content` as a JSON array of
-    // ContentBlocks — exactly the legacy backend's shape. Plain text fails to parse
-    // and renders empty (the "messages disappear after complete" bug). Encode the
-    // same `[{"type":"text","text":…}]` shape here.
-    let blocks: Option<Vec<ContentBlock>> = Some(vec![ContentBlock::Text {
-        text: text.to_owned(),
-    }]);
-    let content = serde_json::to_string(&blocks).unwrap_or_else(|_| "[]".into());
+    // Content shape is role-specific, matching the legacy backend + the Agent view:
+    // • user → PLAIN TEXT. The user bubble renders `message.content` directly
+    //   (AgentMessages.tsx:704 → parseAttachedFiles), so a JSON array would show
+    //   literally as `[{"type":"text",…}]`. Legacy user rows are plain text ("hi").
+    // • assistant → JSON `[{"type":"text",…}]`, which the assistant branch parses
+    //   via NativeBlockRenderer.
+    // (The "messages disappear" bug was `created_at` typing, NOT the content shape —
+    //  see the doc above; that's why user can safely be plain text again.)
+    let content = if role == "user" {
+        text.to_owned()
+    } else if let Some(r) = reasoning.filter(|s| !s.is_empty()) {
+        // Assistant WITH thinking → a leading `thinking` block then the text block,
+        // matching the legacy shape NativeBlockRenderer renders
+        // (`{"type":"thinking","thinking":…,"signature":null}`). Built as raw JSON
+        // so it round-trips through the `Vec<ContentBlock>` reader.
+        serde_json::json!([
+            { "type": "thinking", "thinking": r, "signature": null },
+            { "type": "text", "text": text },
+        ])
+        .to_string()
+    } else {
+        let blocks: Option<Vec<ContentBlock>> = Some(vec![ContentBlock::Text {
+            text: text.to_owned(),
+        }]);
+        serde_json::to_string(&blocks).unwrap_or_else(|_| "[]".into())
+    };
     conn.execute(
-        "INSERT INTO agent_messages (id, session_id, role, content, created_at, reasoning) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        "INSERT INTO agent_messages \
+         (id, session_id, role, content, created_at, reasoning, \
+          input_tokens, output_tokens, cost_usd, duration_ms) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         rusqlite::params![
             id,
             session_id,
             role,
             content,
-            chrono::Utc::now().to_rfc3339(),
+            // Epoch millis (i64) — agent_messages.created_at is INTEGER and the
+            // reader reads it as i64; an RFC3339 string is dropped (see doc above).
+            chrono::Utc::now().timestamp_millis(),
             reasoning,
+            // Token/cost/duration columns → get_agent_session_messages builds
+            // `usage` + `durationMs` from these for the metadata badge. None ⇒ NULL.
+            usage.input_tokens,
+            usage.output_tokens,
+            usage.cost_usd,
+            usage.duration_ms,
         ],
     )?;
     Ok(())
+}
+
+/// Resolve the working directory pi should run in for a conversation: the owning
+/// space's `path` (uClaw `spaces.path`). Agent sessions key on
+/// `agent_sessions.space_id`; chat conversations on `conversations.workspace_id`
+/// — both FK into `spaces.id`. Returns `None` when there's no space row, the
+/// stored path is empty, or it isn't a directory on disk, so pi keeps its default
+/// (process cwd) instead of erroring on a bad cwd. Without this, pi inherits the
+/// app's process cwd (uClaw's own source tree) and runs its tools + project
+/// context there instead of the user's workspace.
+pub fn space_cwd_for_agent_session(conn: &Connection, session_id: &str) -> Option<PathBuf> {
+    space_cwd(
+        conn,
+        "SELECT sp.path FROM agent_sessions s JOIN spaces sp ON s.space_id = sp.id WHERE s.id = ?1",
+        session_id,
+    )
+}
+
+/// The chat-conversation variant of [`space_cwd_for_agent_session`] —
+/// `conversations.workspace_id` → `spaces.path`.
+pub fn space_cwd_for_conversation(conn: &Connection, conversation_id: &str) -> Option<PathBuf> {
+    space_cwd(
+        conn,
+        "SELECT sp.path FROM conversations c JOIN spaces sp ON c.workspace_id = sp.id WHERE c.id = ?1",
+        conversation_id,
+    )
+}
+
+fn space_cwd(conn: &Connection, sql: &str, id: &str) -> Option<PathBuf> {
+    let path: String = conn.query_row(sql, [id], |r| r.get(0)).ok()?;
+    if path.is_empty() {
+        return None;
+    }
+    let pb = PathBuf::from(path);
+    pb.is_dir().then_some(pb)
 }
 
 #[cfg(test)]
@@ -148,5 +249,138 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM messages WHERE conversation_id='c1'", [], |r| r.get(0))
             .unwrap();
         assert_eq!(n, 2);
+    }
+
+    /// Regression: agent rows MUST store `created_at` as epoch-millis `i64`.
+    /// `get_agent_session_messages` reads it with `row.get::<i64>` and
+    /// `filter_map(.ok())` — an RFC3339 string fails that read and the row is
+    /// silently dropped, so every pi agent message vanished on refresh.
+    #[test]
+    fn agent_created_at_reads_as_i64_so_rows_are_not_dropped() {
+        let conn = Connection::open_in_memory().unwrap();
+        // Minimal agent_messages with the real INTEGER created_at affinity.
+        conn.execute_batch(
+            "CREATE TABLE agent_messages (
+                id         TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                role       TEXT NOT NULL,
+                content    TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                reasoning  TEXT,
+                input_tokens INTEGER, output_tokens INTEGER, cost_usd REAL, duration_ms INTEGER
+            );",
+        )
+        .unwrap();
+
+        persist_agent_text_message(&conn, "m1", "s1", "assistant", "hello", None, &TurnUsage::default())
+            .unwrap();
+
+        // The exact read the reader performs — must not error.
+        let (ts, content): (i64, String) = conn
+            .query_row(
+                "SELECT created_at, content FROM agent_messages WHERE id = 'm1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("created_at must read as i64 (else the row vanishes on refresh)");
+        assert!(ts > 1_700_000_000_000, "expected epoch millis, got {ts}");
+
+        // Stored affinity is integer, matching legacy rows + the INTEGER column.
+        let ty: String = conn
+            .query_row("SELECT typeof(created_at) FROM agent_messages WHERE id='m1'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(ty, "integer", "created_at must be stored as integer, not text");
+
+        // content is still the ContentBlock JSON the Agent renderer parses.
+        let blocks: Option<Vec<ContentBlock>> = serde_json::from_str(&content).unwrap();
+        assert_eq!(blocks.expect("Some(blocks)").len(), 1);
+    }
+
+    /// Role decides the content shape: user → plain text (the user bubble renders
+    /// `message.content` raw, so JSON would show literally), assistant → JSON
+    /// ContentBlocks (parsed by NativeBlockRenderer).
+    #[test]
+    fn agent_user_is_plain_text_assistant_is_json() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE agent_messages (
+                id TEXT PRIMARY KEY, session_id TEXT NOT NULL, role TEXT NOT NULL,
+                content TEXT NOT NULL, created_at INTEGER NOT NULL, reasoning TEXT,
+                input_tokens INTEGER, output_tokens INTEGER, cost_usd REAL, duration_ms INTEGER
+            );",
+        )
+        .unwrap();
+
+        persist_agent_text_message(&conn, "u1", "s1", "user", "ls -a", None, &TurnUsage::default())
+            .unwrap();
+        persist_agent_text_message(&conn, "a1", "s1", "assistant", "done", None, &TurnUsage::default())
+            .unwrap();
+
+        let user_content: String = conn
+            .query_row("SELECT content FROM agent_messages WHERE id='u1'", [], |r| r.get(0))
+            .unwrap();
+        // Plain text — NOT a JSON array (a JSON array renders literally in the bubble).
+        assert_eq!(user_content, "ls -a");
+
+        let asst_content: String = conn
+            .query_row("SELECT content FROM agent_messages WHERE id='a1'", [], |r| r.get(0))
+            .unwrap();
+        let blocks: Option<Vec<ContentBlock>> = serde_json::from_str(&asst_content).unwrap();
+        match &blocks.expect("Some(blocks)")[0] {
+            ContentBlock::Text { text } => assert_eq!(text, "done"),
+            other => panic!("expected Text block, got {other:?}"),
+        }
+    }
+
+    /// End-to-end of the metadata badge persist: an `agent:turn_cost` payload →
+    /// TurnUsage → the four columns `get_agent_session_messages` reads into
+    /// `usage` + `durationMs`. (The badge: ⚡ 耗时 · N 输入 · M 输出 · $费用.)
+    #[test]
+    fn agent_assistant_persists_turn_cost_columns() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE agent_messages (
+                id TEXT PRIMARY KEY, session_id TEXT NOT NULL, role TEXT NOT NULL,
+                content TEXT NOT NULL, created_at INTEGER NOT NULL, reasoning TEXT,
+                input_tokens INTEGER, output_tokens INTEGER, cost_usd REAL, duration_ms INTEGER
+            );",
+        )
+        .unwrap();
+
+        // Parse the cached agent:turn_cost payload exactly as engine_sink does.
+        let usage = TurnUsage::from_turn_cost(&serde_json::json!({
+            "conversationId": "s1",
+            "inputTokens": 19119,
+            "outputTokens": 65,
+            "costUsd": "$0.0027",
+            "durationMs": 1200,
+        }));
+        persist_agent_text_message(&conn, "a1", "s1", "assistant", "hi", None, &usage).unwrap();
+
+        let (it, ot, cost, dur): (Option<i64>, Option<i64>, Option<f64>, Option<i64>) = conn
+            .query_row(
+                "SELECT input_tokens, output_tokens, cost_usd, duration_ms \
+                 FROM agent_messages WHERE id = 'a1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(it, Some(19119));
+        assert_eq!(ot, Some(65));
+        assert!((cost.unwrap() - 0.0027).abs() < 1e-9, "cost {cost:?}");
+        assert_eq!(dur, Some(1200));
+    }
+
+    /// Zero token counts collapse to None (no "0 输入" badge), but duration stays.
+    #[test]
+    fn turn_usage_drops_zero_tokens_keeps_duration() {
+        let u = TurnUsage::from_turn_cost(&serde_json::json!({
+            "inputTokens": 0, "outputTokens": 0, "costUsd": "$0.0000", "durationMs": 50,
+        }));
+        assert_eq!(u.input_tokens, None);
+        assert_eq!(u.output_tokens, None);
+        assert_eq!(u.duration_ms, Some(50));
     }
 }
