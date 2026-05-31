@@ -4,8 +4,8 @@
  *  - `CompactBoundaryDivider`: a settled "上下文已压缩" divider (optionally with counts)
  *  - `CompactingIndicator`: the in-progress "正在压缩..." spinner divider
  *
- * Salvaged from the former `components/agent/SDKMessageRenderer.tsx` — the only
- * two live exports of that file. The rest (the SDK-message renderer / turn-grouping
+ * Salvaged from the former agent `SDKMessageRenderer.tsx` — the only two live
+ * exports of that file. The rest (the SDK-message renderer / turn-grouping
  * machinery) was dead Proma-migration skeleton and was removed; the live agent
  * stream renders through `AgentMessages` + `ContentBlock` directly.
  */

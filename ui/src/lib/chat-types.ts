@@ -1,5 +1,5 @@
 /**
- * Chat-layer types — used by components/chat/* and shared with components/agent/*.
+ * Chat-layer types — used by components/chat/* and shared with features/agent/*.
  * Split from the legacy proma-types.ts as part of P1 cleanup (Roadmap A4).
  */
 

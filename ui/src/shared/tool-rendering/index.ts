@@ -1,7 +1,7 @@
 /**
  * `shared/tool-rendering` — cross-domain tool-call / content-block rendering layer.
  *
- * Used by BOTH the agent core (`components/agent/*`) and the chat domain
+ * Used by BOTH the agent core (`features/agent/*`) and the chat domain
  * (`components/chat/*`), so per the code-organization discipline
  * (docs/adr/2026-05-31-pi-code-organization-discipline.md: "共享只下沉 shared/")
  * it lives here rather than inside a single feature.

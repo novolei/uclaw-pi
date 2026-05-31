@@ -1,5 +1,5 @@
 /**
- * Agent-specific types — used by components/agent/*.
+ * Agent-specific types — used by features/agent/*.
  * Split from the legacy proma-types.ts as part of P1 cleanup (Roadmap A4).
  */
 
