@@ -1,9 +1,13 @@
-import { useState, useEffect } from 'react'
-import { SettingsSection } from './primitives/SettingsSection'
-import { SettingsInput } from './primitives/SettingsInput'
-import { SettingsSecretInput } from './primitives/SettingsSecretInput'
+// Provider quick-configure modal — presentation only. The config load + submit
+// (configureProvider) live in useChannelForm (IPC via the typed
+// `@/lib/tauri-bridge` provider helpers; no Tauri API here). Moved out of
+// components/settings/ during the migration; the Settings* primitives still live
+// under components/settings/. No in-tree consumer renders this form today.
+import { SettingsSection } from '@/components/settings/primitives/SettingsSection'
+import { SettingsInput } from '@/components/settings/primitives/SettingsInput'
+import { SettingsSecretInput } from '@/components/settings/primitives/SettingsSecretInput'
 import { Button } from '@/components/ui/button'
-import { configureProvider, getProviderConfig } from '@/lib/tauri-bridge'
+import { useChannelForm } from '../../hooks/useChannelForm'
 
 interface ChannelFormProps {
   providerId: string | null
@@ -12,40 +16,8 @@ interface ChannelFormProps {
 }
 
 export function ChannelForm({ providerId, onClose, onSaved }: ChannelFormProps) {
-  const [apiKey, setApiKey] = useState('')
-  const [baseUrl, setBaseUrl] = useState('')
-  const [submitting, setSubmitting] = useState(false)
-
-  useEffect(() => {
-    if (providerId) {
-      getProviderConfig(providerId).then((config) => {
-        if (config) {
-          setBaseUrl(config.baseUrl || '')
-          // API key is masked, don't pre-fill
-        }
-      })
-    }
-  }, [providerId])
-
-  const handleSubmit = async (e: React.FormEvent) => {
-    e.preventDefault()
-    if (!providerId) return
-
-    setSubmitting(true)
-    try {
-      await configureProvider({
-        providerId,
-        displayName: providerId,
-        apiKey,
-        baseUrl: baseUrl || undefined,
-      })
-      onSaved()
-    } catch (err) {
-      console.error('Failed to configure provider:', err)
-    } finally {
-      setSubmitting(false)
-    }
-  }
+  const { apiKey, setApiKey, baseUrl, setBaseUrl, submitting, handleSubmit } =
+    useChannelForm(providerId, onSaved)
 
   return (
     <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">

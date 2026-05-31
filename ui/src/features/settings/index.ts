@@ -88,3 +88,7 @@ export { ImChannelsSettings } from './components/im-channels/ImChannelsSettings'
 // in the typed @/lib/tauri-bridge provider helpers. Consumed by ConnectivityTab.
 // ProviderDetail is re-exported for consumers/tests that import it by name.
 export { ChannelSettings, ProviderDetail } from './components/channels/ChannelSettings'
+
+// ChannelForm migrated (provider quick-configure modal; config load + submit in
+// useChannelForm). No in-tree consumer renders it today; kept for completeness.
+export { ChannelForm } from './components/channels/ChannelForm'
