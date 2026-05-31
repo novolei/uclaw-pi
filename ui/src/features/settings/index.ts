@@ -72,3 +72,8 @@ export { WechatIlinkBindingPanel } from './components/im-channels/WechatIlinkBin
 // ImChannelAccordionRow migrated + split (602 → shell + im-channels/accordion/
 // ChannelTypeFields + useImChannelAccordionForm + lib/im-channel-format).
 export { ImChannelAccordionRow } from './components/im-channels/ImChannelAccordionRow'
+
+// ImChannelForm migrated + split (315 → shell + im-channels/form/
+// ImChannelFormFields + useImChannelForm). The flat add/edit form (distinct
+// from the accordion row); currently has no consumer in-tree.
+export { ImChannelForm } from './components/im-channels/ImChannelForm'
