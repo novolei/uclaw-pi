@@ -22,7 +22,7 @@ import { AgentHeader } from '@/features/agent'
 import { BrowserPreviewOverlay } from './BrowserPreviewOverlay'
 import { ContextUsageBadge } from './ContextUsageBadge'
 import { AutoPreviewPopover } from './AutoPreviewPopover'
-import { StrategyPresetSelector } from './StrategyPresetSelector'
+import { StrategyPresetSelector } from '@/features/agent'
 import { PermissionBanner } from './PermissionBanner'
 // Bundle 27-A — heartbeat indicator + stall banner + interrupted-reply recovery.
 import { AgentHeartbeatBanner } from './AgentHeartbeatBanner'

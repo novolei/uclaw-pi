@@ -32,6 +32,10 @@ export { PermissionModeMenu, MODE_ITEMS } from './components/PermissionModeMenu'
 // setSafetyMode).
 export { PermissionModeSelector } from './components/PermissionModeSelector'
 
+// StrategyPresetSelector — skill-manifest re-rank bias dropdown. Pure
+// atom-driven UI (no IPC).
+export { StrategyPresetSelector } from './components/StrategyPresetSelector'
+
 // SessionEvalBadge — post-session self-evaluation score badge. The raw
 // @tauri-apps/api/event `listen` moved behind the agent bridge's
 // onSessionEvalComplete / onSessionEvalWarning wrappers.
