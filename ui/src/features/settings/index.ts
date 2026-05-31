@@ -117,6 +117,15 @@ export { PersonaStudio } from './components/PersonaStudio'
 // No in-tree consumer renders it today; kept for completeness.
 export { MemorySettings } from './components/MemorySettings'
 
+// MemoryRecallSettings migrated + split (474 → thin shell composing memory-recall/
+// section cards; all state + IPC in useMemoryRecallSettings; the typed
+// @/lib/tauri-bridge get/patchMemoryRecallConfig helpers stay in the hook).
+export { MemoryRecallSettings } from './components/MemoryRecallSettings'
+
+// MemoryRecallTab migrated (记忆召回配置 page; thin wrapper around
+// MemoryRecallSettings). Consumed by components/settings/SettingsPanel.
+export { MemoryRecallTab } from './components/MemoryRecallTab'
+
 // ── Skill cluster (used from the Kaleidoscope Skills module, not Settings nav).
 // Migrated out of components/settings/ ; side effects moved into hooks; IPC stays
 // in the typed @/lib/tauri-bridge skill helpers. Consumers import from this barrel. ──

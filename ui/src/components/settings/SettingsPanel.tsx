@@ -13,7 +13,7 @@ import { AboutSettings } from './AboutSettings'
 import { PetSettings } from './PetSettings'
 import { SettingsNav } from './SettingsNav'
 import { SttSettings } from './SttSettings'
-import { MemoryRecallTab } from './MemoryRecallTab'
+import { MemoryRecallTab } from '@/features/settings'
 import { LearnedProfileTab } from './LearnedProfileTab'
 import {
   BrowserRuntimeSettings,
