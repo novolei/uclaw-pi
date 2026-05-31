@@ -13,6 +13,7 @@ pub mod conversation;
 pub mod cost;
 pub mod llm_config;
 pub mod notification;
+pub mod safety;
 pub mod search;
 pub mod settings;
 pub mod space;

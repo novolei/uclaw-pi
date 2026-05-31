@@ -4442,7 +4442,11 @@ fn parse_api_type(s: &str) -> Option<crate::providers::types::ApiType> {
     }
 }
 
-fn parse_safety_mode(s: &str) -> Result<crate::safety::SafetyMode, Error> {
+/// Parse a UI safety-mode string into the typed [`crate::safety::SafetyMode`].
+/// `pub(crate)` because it is shared: the Chat domain (still in this file) and
+/// the moved `commands::safety` commands both call it. `safety_mode_to_str` (the
+/// inverse) was Safety-only and moved to `commands/safety.rs`.
+pub(crate) fn parse_safety_mode(s: &str) -> Result<crate::safety::SafetyMode, Error> {
     match s {
         "ask" => Ok(crate::safety::SafetyMode::Ask),
         "acceptedits" => Ok(crate::safety::SafetyMode::AcceptEdits),
@@ -4452,16 +4456,6 @@ fn parse_safety_mode(s: &str) -> Result<crate::safety::SafetyMode, Error> {
         _ => Err(Error::InvalidInput(format!(
             "Invalid safety mode: '{}'. Use 'ask', 'acceptedits', 'plan', 'supervised', or 'yolo'", s
         ))),
-    }
-}
-
-fn safety_mode_to_str(mode: &crate::safety::SafetyMode) -> &'static str {
-    match mode {
-        crate::safety::SafetyMode::Ask => "ask",
-        crate::safety::SafetyMode::AcceptEdits => "acceptedits",
-        crate::safety::SafetyMode::Plan => "plan",
-        crate::safety::SafetyMode::Supervised => "supervised",
-        crate::safety::SafetyMode::Yolo => "yolo",
     }
 }
 
@@ -4693,144 +4687,14 @@ pub async fn update_persona_badge_visibility(
     persona_relationship_timeline_response(state)
 }
 
-// ─── Safety Commands ─────────────────────────────────────────────────────────
-
-#[tauri::command]
-pub async fn get_safety_policy(state: State<'_, AppState>) -> Result<SafetyPolicyResponse, Error> {
-    let mgr = state.safety_manager.read().await;
-    let policy = mgr.policy();
-    Ok(SafetyPolicyResponse {
-        global_mode: safety_mode_to_str(&policy.global_mode).to_string(),
-        tool_overrides: policy.tool_overrides.iter()
-            .map(|(k, v)| (k.clone(), safety_mode_to_str(v).to_string()))
-            .collect(),
-        auto_approved_tools: policy.auto_approved_tools.iter().cloned().collect(),
-        blocked_tools: policy.blocked_tools.iter().cloned().collect(),
-    })
-}
-
-#[tauri::command]
-pub async fn set_safety_mode(state: State<'_, AppState>, input: SetSafetyModeInput) -> Result<SafetyPolicyResponse, Error> {
-    let mode = parse_safety_mode(&input.mode)?;
-    let mut mgr = state.safety_manager.write().await;
-    mgr.set_global_mode(mode)?;
-    let policy = mgr.policy();
-    Ok(SafetyPolicyResponse {
-        global_mode: safety_mode_to_str(&policy.global_mode).to_string(),
-        tool_overrides: policy.tool_overrides.iter()
-            .map(|(k, v)| (k.clone(), safety_mode_to_str(v).to_string()))
-            .collect(),
-        auto_approved_tools: policy.auto_approved_tools.iter().cloned().collect(),
-        blocked_tools: policy.blocked_tools.iter().cloned().collect(),
-    })
-}
-
-#[tauri::command]
-pub async fn set_tool_safety_override(state: State<'_, AppState>, input: SetToolOverrideInput) -> Result<SafetyPolicyResponse, Error> {
-    let mode = parse_safety_mode(&input.mode)?;
-    let mut mgr = state.safety_manager.write().await;
-    mgr.set_tool_override(&input.tool_name, mode)?;
-    let policy = mgr.policy();
-    Ok(SafetyPolicyResponse {
-        global_mode: safety_mode_to_str(&policy.global_mode).to_string(),
-        tool_overrides: policy.tool_overrides.iter()
-            .map(|(k, v)| (k.clone(), safety_mode_to_str(v).to_string()))
-            .collect(),
-        auto_approved_tools: policy.auto_approved_tools.iter().cloned().collect(),
-        blocked_tools: policy.blocked_tools.iter().cloned().collect(),
-    })
-}
-
-#[tauri::command]
-pub async fn remove_tool_safety_override(state: State<'_, AppState>, input: ToolNameInput) -> Result<SafetyPolicyResponse, Error> {
-    let mut mgr = state.safety_manager.write().await;
-    mgr.remove_tool_override(&input.tool_name)?;
-    let policy = mgr.policy();
-    Ok(SafetyPolicyResponse {
-        global_mode: safety_mode_to_str(&policy.global_mode).to_string(),
-        tool_overrides: policy.tool_overrides.iter()
-            .map(|(k, v)| (k.clone(), safety_mode_to_str(v).to_string()))
-            .collect(),
-        auto_approved_tools: policy.auto_approved_tools.iter().cloned().collect(),
-        blocked_tools: policy.blocked_tools.iter().cloned().collect(),
-    })
-}
-
-#[tauri::command]
-pub async fn add_auto_approved_tool(state: State<'_, AppState>, input: ToolNameInput) -> Result<SafetyPolicyResponse, Error> {
-    let mut mgr = state.safety_manager.write().await;
-    mgr.add_auto_approved(&input.tool_name)?;
-    let policy = mgr.policy();
-    Ok(SafetyPolicyResponse {
-        global_mode: safety_mode_to_str(&policy.global_mode).to_string(),
-        tool_overrides: policy.tool_overrides.iter()
-            .map(|(k, v)| (k.clone(), safety_mode_to_str(v).to_string()))
-            .collect(),
-        auto_approved_tools: policy.auto_approved_tools.iter().cloned().collect(),
-        blocked_tools: policy.blocked_tools.iter().cloned().collect(),
-    })
-}
-
-#[tauri::command]
-pub async fn remove_auto_approved_tool(state: State<'_, AppState>, input: ToolNameInput) -> Result<SafetyPolicyResponse, Error> {
-    let mut mgr = state.safety_manager.write().await;
-    mgr.remove_auto_approved(&input.tool_name)?;
-    let policy = mgr.policy();
-    Ok(SafetyPolicyResponse {
-        global_mode: safety_mode_to_str(&policy.global_mode).to_string(),
-        tool_overrides: policy.tool_overrides.iter()
-            .map(|(k, v)| (k.clone(), safety_mode_to_str(v).to_string()))
-            .collect(),
-        auto_approved_tools: policy.auto_approved_tools.iter().cloned().collect(),
-        blocked_tools: policy.blocked_tools.iter().cloned().collect(),
-    })
-}
-
-#[tauri::command]
-pub async fn block_tool(state: State<'_, AppState>, input: ToolNameInput) -> Result<SafetyPolicyResponse, Error> {
-    let mut mgr = state.safety_manager.write().await;
-    mgr.block_tool(&input.tool_name)?;
-    let policy = mgr.policy();
-    Ok(SafetyPolicyResponse {
-        global_mode: safety_mode_to_str(&policy.global_mode).to_string(),
-        tool_overrides: policy.tool_overrides.iter()
-            .map(|(k, v)| (k.clone(), safety_mode_to_str(v).to_string()))
-            .collect(),
-        auto_approved_tools: policy.auto_approved_tools.iter().cloned().collect(),
-        blocked_tools: policy.blocked_tools.iter().cloned().collect(),
-    })
-}
-
-#[tauri::command]
-pub async fn unblock_tool(state: State<'_, AppState>, input: ToolNameInput) -> Result<SafetyPolicyResponse, Error> {
-    let mut mgr = state.safety_manager.write().await;
-    mgr.unblock_tool(&input.tool_name)?;
-    let policy = mgr.policy();
-    Ok(SafetyPolicyResponse {
-        global_mode: safety_mode_to_str(&policy.global_mode).to_string(),
-        tool_overrides: policy.tool_overrides.iter()
-            .map(|(k, v)| (k.clone(), safety_mode_to_str(v).to_string()))
-            .collect(),
-        auto_approved_tools: policy.auto_approved_tools.iter().cloned().collect(),
-        blocked_tools: policy.blocked_tools.iter().cloned().collect(),
-    })
-}
-
-#[tauri::command]
-pub async fn assess_command_risk(state: State<'_, AppState>, input: AssessCommandInput) -> Result<CommandRiskResponse, Error> {
-    let mgr = state.safety_manager.read().await;
-    let assessment = mgr.assess_command_risk(&input.command);
-    let suggested = match &assessment.suggested_action {
-        crate::safety::ApprovalDecision::AutoApprove => "auto_approve".to_string(),
-        crate::safety::ApprovalDecision::RequireApproval { .. } => "require_approval".to_string(),
-        crate::safety::ApprovalDecision::Block { .. } => "block".to_string(),
-    };
-    Ok(CommandRiskResponse {
-        level: format!("{:?}", assessment.level).to_lowercase(),
-        reasons: assessment.reasons,
-        suggested_action: suggested,
-    })
-}
+// ─── Safety Commands → moved to commands::safety ─────────────────────────────
+// get_safety_policy / set_safety_mode / set_tool_safety_override /
+// remove_tool_safety_override / add_auto_approved_tool / remove_auto_approved_tool
+// / block_tool / unblock_tool / assess_command_risk now live in
+// commands/safety.rs (thin wrappers over the in-memory state.safety_manager —
+// the manager IS the service, no SQL/logic to lift). The Safety-only
+// safety_mode_to_str helper moved with them; parse_safety_mode stays above
+// (shared with Chat) and is imported by commands::safety.
 
 // ─── System Prompt Commands ─────────────────────────────────────────────
 
