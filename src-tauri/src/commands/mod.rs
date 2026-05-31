@@ -10,6 +10,7 @@
 
 pub mod artifact;
 pub mod background_task;
+pub mod browser_cmds;
 pub mod channel;
 pub mod conversation;
 pub mod cost;
