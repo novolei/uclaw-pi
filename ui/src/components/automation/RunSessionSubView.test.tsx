@@ -8,7 +8,7 @@ vi.mock('@/lib/tauri-bridge', () => ({
   openFile: vi.fn(),
   openExternal: vi.fn(),
 }))
-vi.mock('@/components/agent/AgentMessages', () => ({
+vi.mock('@/features/agent', () => ({
   AgentMessages: () => <div data-testid="agent-messages" />,
 }))
 

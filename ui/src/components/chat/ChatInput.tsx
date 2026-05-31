@@ -54,7 +54,7 @@ import { openFileDialog } from '@/lib/tauri-bridge'
 import { toast } from 'sonner'
 import { createClipboardTextFile } from '@/lib/clipboard-attachment'
 import { GitChipsRow } from './git/GitChipsRow'
-import { SkillSuggestionBar } from '@/components/agent/SkillSuggestionBar'
+import { SkillSuggestionBar } from '@/features/agent'
 
 interface ChatInputProps {
   /** 当前对话 ID */

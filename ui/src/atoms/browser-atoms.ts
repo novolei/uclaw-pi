@@ -103,8 +103,8 @@ export const browserTaskRunAtom = atom(new Map<string, BrowserTaskRunEntry>())
 // legacy consumers were NOT migrated in the same PR and still import the
 // V1 names:
 //
-//   ui/src/components/agent/BrowserViewer.tsx   ← mounted by RightSidePanel
-//   ui/src/components/canvas/BrowserViewer.tsx  ← mounted by TabContent
+//   ui/src/features/agent/components/BrowserViewer.tsx  ← mounted by RightSidePanel
+//   ui/src/components/canvas/BrowserViewer.tsx          ← mounted by TabContent
 //
 // Without these names exported, vite fails the module graph at boot
 // (`SyntaxError: Importing binding name 'isBrowserLoadingAtom' is not

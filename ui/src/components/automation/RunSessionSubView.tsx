@@ -1,7 +1,7 @@
 import { useEffect, useState, useMemo } from 'react'
 import { getAgentSessionMessages } from '@/lib/tauri-bridge'
 import type { AutomationActivity } from '@/lib/tauri-bridge'
-import { AgentMessages } from '@/components/agent/AgentMessages'
+import { AgentMessages } from '@/features/agent'
 import type { AgentMessage } from '@/lib/agent-types'
 import { ActivityMarkdown } from './ActivityMarkdown'
 import { ArtifactChip, OUTCOME_CONFIG } from './ActivityListItem'

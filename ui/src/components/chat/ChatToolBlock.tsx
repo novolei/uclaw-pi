@@ -12,10 +12,12 @@
 import * as React from 'react'
 import { ChevronRight, AlertTriangle, Loader2, Check } from 'lucide-react'
 import { cn } from '@/lib/utils'
-import { getToolIcon } from '@/components/agent/tool-utils'
-import { getToolPhrase } from '@/components/agent/tool-phrase'
-import { ToolResultRenderer } from '@/components/agent/tool-renderers'
-import { BashStreamView } from '@/components/agent/tool-renderers/BashStreamView'
+import {
+  getToolIcon,
+  getToolPhrase,
+  ToolResultRenderer,
+  BashStreamView,
+} from '@/shared/tool-rendering'
 import type { LiveOutput } from '@/atoms/agent-atoms'
 
 export interface ChatToolBlockProps {

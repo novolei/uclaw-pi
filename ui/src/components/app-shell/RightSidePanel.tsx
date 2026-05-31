@@ -27,11 +27,11 @@ const rightPanelSlideVariants: Variants = {
   }),
 }
 import { activePlanAtom } from '@/atoms/agent-teams'
-import { WorkspaceFilesView } from '@/components/agent/SidePanel'
-import { AgentTeamsPanel } from '@/components/agent/AgentTeamsPanel'
-import { PlanViewer } from '@/components/agent/PlanViewer'
-import { TrajectoryReel } from '@/components/agent/TrajectoryReel'
-import { BrowserViewer } from '@/components/agent/BrowserViewer'
+import { WorkspaceFilesView } from '@/features/agent'
+import { AgentTeamsPanel } from '@/features/agent'
+import { PlanViewer } from '@/features/agent'
+import { TrajectoryReel } from '@/features/agent'
+import { BrowserViewer } from '@/features/agent'
 import { useWindowDragOnMove } from '@/hooks/useWindowDragOnMove'
 
 export type ActiveTab = 'files' | 'teams' | 'plan' | 'trajectory' | 'browser'

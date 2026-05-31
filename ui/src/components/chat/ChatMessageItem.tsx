@@ -38,7 +38,7 @@ import { agentDisplayNameForAtom } from '@/atoms/agent-display-name'
 import type { ChatMessage } from '@/lib/chat-types'
 import type { InlineEditSubmitPayload } from './InlineEditForm'
 import { ChatToolActivityIndicator } from './ChatToolActivityIndicator'
-import { NativeBlockRenderer } from '@/components/agent/NativeBlockRenderer'
+import { NativeBlockRenderer } from '@/shared/tool-rendering'
 
 // 重导出供外部使用
 export type { InlineEditSubmitPayload } from './InlineEditForm'
