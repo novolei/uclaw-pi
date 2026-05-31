@@ -1000,9 +1000,9 @@ fn main() {
             uclaw_core::tauri_commands::delete_artifact_recursive,
             uclaw_core::tauri_commands::detect_file_type,
             // Search
-            uclaw_core::tauri_commands::search_workspace,
-            uclaw_core::tauri_commands::search_conversations,
-            uclaw_core::tauri_commands::search_all,
+            uclaw_core::commands::search::search_workspace,
+            uclaw_core::commands::search::search_conversations,
+            uclaw_core::commands::search::search_all,
             // Notifications
             uclaw_core::commands::notification::get_notifications,
             uclaw_core::commands::notification::clear_notifications,
