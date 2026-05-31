@@ -1,11 +1,11 @@
-import { useState, useEffect, useCallback } from 'react'
-import { SettingsSection } from './primitives/SettingsSection'
-import { listActiveManifestSkills } from '@/lib/tauri-bridge'
 import type { ActiveManifestSkill } from '@/lib/types'
+// Primitives + the tags editor still live under components/settings/ (migrated in
+// a later phase); imported via the @/ alias so behavior is preserved exactly.
+import { SettingsSection } from '@/components/settings/primitives/SettingsSection'
+import { WorkspaceSkillTagsEditor } from '@/components/settings/WorkspaceSkillTagsEditor'
 import { Button } from '@/components/ui/button'
-import { WorkspaceSkillTagsEditor } from './WorkspaceSkillTagsEditor'
-import { toast } from 'sonner'
 import { RefreshCw } from 'lucide-react'
+import { useToolSettings } from '../hooks/useToolSettings'
 
 type ProvenanceKey = ActiveManifestSkill['provenance']
 
@@ -17,24 +17,7 @@ const PROVENANCE_BADGE: Record<ProvenanceKey, { label: string; className: string
 }
 
 export function ToolSettings() {
-  const [activeManifest, setActiveManifest] = useState<ActiveManifestSkill[] | null>(null)
-  const [manifestLoading, setManifestLoading] = useState(false)
-
-  const refreshActiveManifest = useCallback(async () => {
-    setManifestLoading(true)
-    try {
-      const rows = await listActiveManifestSkills()
-      setActiveManifest(rows)
-    } catch (e) {
-      toast.error('加载活动技能清单失败', { description: String(e) })
-    } finally {
-      setManifestLoading(false)
-    }
-  }, [])
-
-  useEffect(() => {
-    refreshActiveManifest()
-  }, [refreshActiveManifest])
+  const { activeManifest, manifestLoading, refreshActiveManifest } = useToolSettings()
 
   return (
     <div className="space-y-6">

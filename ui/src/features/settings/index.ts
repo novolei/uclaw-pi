@@ -30,3 +30,7 @@ export { PromptSettings } from './components/PromptSettings'
 
 // P3 — GeneralSettings migrated (thin shell; language load/persist in a hook).
 export { GeneralSettings } from './components/GeneralSettings'
+
+// P3a — ToolSettings migrated (active-manifest load in a hook; skill-tag editor
+// stays under components/settings/ for now).
+export { ToolSettings } from './components/ToolSettings'

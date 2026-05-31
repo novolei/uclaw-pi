@@ -24,6 +24,20 @@ import type {
   PlaywrightSetupExecutionReport,
 } from '../tauri-bridge'
 import type { SystemPrompt, SystemPromptConfig, SystemPromptVersion } from '../chat-types'
+import type {
+  ActiveManifestSkill,
+  CreatePermissionRuleInput,
+  PermissionAuditEntry,
+  PermissionRule,
+  SafetyPolicyResponse,
+  ToolNameInput,
+} from '../types'
+
+/** Role→model assignment row (mirrors the Rust `ModelRoleConfig`). */
+export interface ModelRoleConfig {
+  role: string
+  model_ref: string | null
+}
 
 export const settingsBridge = {
   /** Whether the optional local HTTP API server is enabled (persisted; restart to apply). */
@@ -148,4 +162,68 @@ export const settingsBridge = {
   /** Revoke a browser identity by profile id. */
   revokeBrowserIdentity: (profileId: string): Promise<BrowserIdentityRevocationReport> =>
     invoke<BrowserIdentityRevocationReport>('revoke_browser_identity', { profileId }),
+
+  // ── Active-skill manifest IPC (was `listActiveManifestSkills` in tauri-bridge.ts).
+  // Powers the ToolSettings 活动技能 debug panel. ──
+  /** Snapshot the active skill manifest the agent loop injects right now. */
+  listActiveManifestSkills: (
+    opts: { spaceId?: string; strategy?: string; maxEntries?: number } = {},
+  ): Promise<ActiveManifestSkill[]> =>
+    invoke<ActiveManifestSkill[]>('list_active_manifest_skills', {
+      spaceId: opts.spaceId,
+      strategy: opts.strategy,
+      maxEntries: opts.maxEntries,
+    }),
+
+  // ── Role→model assignment IPC (was the role-model fns in tauri-bridge.ts).
+  // Powers ModelSettings. Thin wrappers — these never swallowed errors. ──
+  /** List configured providers and their model ids as `[providerId, modelIds[]][]`. */
+  getAllConfiguredModels: (): Promise<[string, string[]][]> =>
+    invoke<[string, string[]][]>('get_all_configured_models'),
+  /** Read the per-role model assignments. */
+  getRoleModels: (): Promise<ModelRoleConfig[]> => invoke<ModelRoleConfig[]>('get_role_models'),
+  /** Assign (or clear, with `null`) the model for a role. */
+  setRoleModel: (role: string, modelRef: string | null): Promise<void> =>
+    invoke<void>('set_role_model', { role, modelRef }),
+
+  // ── Permission rules + safety-policy IPC (was the permission/safety fns in
+  // tauri-bridge.ts). Powers PermissionsSettings. ──
+  /** List the V14 session + pattern permission rules. */
+  listPermissionRules: (): Promise<PermissionRule[]> =>
+    invoke<PermissionRule[]>('list_permission_rules'),
+  /** Create a permission rule. */
+  createPermissionRule: (input: CreatePermissionRuleInput): Promise<PermissionRule> =>
+    invoke<PermissionRule>('create_permission_rule', { input }),
+  /** Delete a permission rule by id. */
+  deletePermissionRule: (id: string): Promise<boolean> =>
+    invoke<boolean>('delete_permission_rule', { id }),
+  /** Read the most-recent permission decisions (audit log). */
+  listPermissionAudit: (sessionId?: string, limit = 100): Promise<PermissionAuditEntry[]> =>
+    invoke<PermissionAuditEntry[]>('list_permission_audit', { sessionId, limit }),
+  /** Read the safety policy (global allow/block lists + per-tool overrides). */
+  getSafetyPolicy: (): Promise<SafetyPolicyResponse> => invoke<SafetyPolicyResponse>('get_safety_policy'),
+  /** Remove a tool from the global auto-approve list; returns the updated policy. */
+  removeAutoApprovedTool: (input: ToolNameInput): Promise<SafetyPolicyResponse> =>
+    invoke<SafetyPolicyResponse>('remove_auto_approved_tool', { input }),
+  /** Unblock a globally-blocked tool; returns the updated policy. */
+  unblockTool: (input: ToolNameInput): Promise<SafetyPolicyResponse> =>
+    invoke<SafetyPolicyResponse>('unblock_tool', { input }),
 }
+
+// ── Developer-options setup-script event stream (was `@tauri-apps/api/event`
+// `listen` directly inside DeveloperOptionsSection). The hook subscribes through
+// these wrappers so no settings component imports `@tauri-apps/api`. ──
+import { listen, type UnlistenFn } from '@tauri-apps/api/event'
+import type { SetupScriptEndEvent, SetupScriptOutputEvent } from '../embedding-endpoint'
+
+/** Subscribe to per-line stdout/stderr from a running setup script. */
+export const onSetupScriptOutput = (
+  handler: (e: SetupScriptOutputEvent) => void,
+): Promise<UnlistenFn> =>
+  listen<SetupScriptOutputEvent>('system-setup-script:output', (e) => handler(e.payload))
+
+/** Subscribe to the terminal exit event of a running setup script. */
+export const onSetupScriptEnd = (
+  handler: (e: SetupScriptEndEvent) => void,
+): Promise<UnlistenFn> =>
+  listen<SetupScriptEndEvent>('system-setup-script:end', (e) => handler(e.payload))

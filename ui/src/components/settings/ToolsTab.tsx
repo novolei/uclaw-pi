@@ -5,7 +5,7 @@
  * skill 标签、活动技能调试面板、工具权限。
  */
 import * as React from 'react'
-import { ToolSettings } from './ToolSettings'
+import { ToolSettings } from '@/features/settings'
 import { PermissionsSettings } from './PermissionsSettings'
 
 export function ToolsTab(): React.ReactElement {
