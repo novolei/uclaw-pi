@@ -1,5 +1,5 @@
 // 评估套件 — the autonomous regression eval suites (browser / memory / agent /
-// self-improvement gates). Moved verbatim out of `components/settings/SystemTab.tsx`
+// self-improvement gates). Moved verbatim out of `legacy settings/SystemTab.tsx`
 // during the P1 split; side effects live in `useEvalRunner`. Never calls IPC directly.
 import * as React from 'react'
 import { Activity, PlayCircle, RefreshCw } from 'lucide-react'

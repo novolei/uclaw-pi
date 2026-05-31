@@ -1,7 +1,7 @@
 /**
  * WorkspaceRollupSection — per-workspace spend for the current month (a labelled
  * bar list; renders null when empty). Split out of the 393-line
- * components/settings/UsageSettings.tsx during the features/settings migration
+ * legacy settings/UsageSettings.tsx during the features/settings migration
  * (code-organization ADR 2026-05-31). Behavior preserved verbatim.
  */
 import * as React from 'react'

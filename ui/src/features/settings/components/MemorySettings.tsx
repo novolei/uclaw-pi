@@ -1,10 +1,10 @@
 // MemorySettings — 记忆设置 tab. Thin presentation: the boot-node load + toggle
 // state live in useMemorySettings (code-organization ADR 2026-05-31). Primitives
-// stay under components/settings/ for now, imported via the @/ alias. Behavior
-// preserved verbatim from the pre-migration components/settings/MemorySettings.
-import { SettingsSection } from '@/components/settings/primitives/SettingsSection'
-import { SettingsToggle } from '@/components/settings/primitives/SettingsToggle'
-import { SettingsCard } from '@/components/settings/primitives/SettingsCard'
+// are migrated feature-internals (./primitives), imported relatively. Behavior
+// preserved verbatim from the pre-migration MemorySettings.
+import { SettingsSection } from './primitives/SettingsSection'
+import { SettingsToggle } from './primitives/SettingsToggle'
+import { SettingsCard } from './primitives/SettingsCard'
 import { useMemorySettings } from '../hooks/useMemorySettings'
 
 export function MemorySettings() {

@@ -1,5 +1,5 @@
 // 本地 HTTP API 服务 toggle — the optional local HTTP API server switch.
-// Moved verbatim out of `components/settings/SystemTab.tsx` during the P1
+// Moved verbatim out of `legacy settings/SystemTab.tsx` during the P1
 // split; side effects live in `useHttpApiToggle`. Never calls IPC directly.
 import * as React from 'react'
 import { cn } from '@/lib/utils'

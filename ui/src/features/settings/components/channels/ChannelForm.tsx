@@ -1,11 +1,11 @@
 // Provider quick-configure modal — presentation only. The config load + submit
 // (configureProvider) live in useChannelForm (IPC via the typed
-// `@/lib/tauri-bridge` provider helpers; no Tauri API here). Moved out of
-// components/settings/ during the migration; the Settings* primitives still live
-// under components/settings/. No in-tree consumer renders this form today.
-import { SettingsSection } from '@/components/settings/primitives/SettingsSection'
-import { SettingsInput } from '@/components/settings/primitives/SettingsInput'
-import { SettingsSecretInput } from '@/components/settings/primitives/SettingsSecretInput'
+// `@/lib/tauri-bridge` provider helpers; no Tauri API here). Migrated into the
+// settings feature; the Settings* primitives are feature-internals (../primitives),
+// imported relatively. No in-tree consumer renders this form today.
+import { SettingsSection } from '../primitives/SettingsSection'
+import { SettingsInput } from '../primitives/SettingsInput'
+import { SettingsSecretInput } from '../primitives/SettingsSecretInput'
 import { Button } from '@/components/ui/button'
 import { useChannelForm } from '../../hooks/useChannelForm'
 

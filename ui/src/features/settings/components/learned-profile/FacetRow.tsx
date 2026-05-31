@@ -1,7 +1,7 @@
 /**
  * FacetRow — one learned-preference row: `{name}: {value}` + state badge +
  * stability/evidence/last-seen meta, with a hover-revealed promote/demote/dismiss
- * action cluster. Split out of components/settings/LearnedProfileTab.tsx during the
+ * action cluster. Split out of legacy settings/LearnedProfileTab.tsx during the
  * features/settings migration (code-organization ADR 2026-05-31). Pure presentation.
  * Behavior preserved verbatim (Sprint 2.3 visibility rules unchanged).
  */

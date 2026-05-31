@@ -5,7 +5,7 @@
  * split pieces — shortcuts/ShortcutRow (per binding, state in useShortcutRow),
  * shortcuts/KbdCluster (the key-cap rendering), shortcuts/ResetAllButton (header
  * action) + lib/shortcut-binding helpers. Split out of the 433-line
- * components/settings/ShortcutSettings.tsx during the features/settings migration
+ * legacy settings/ShortcutSettings.tsx during the features/settings migration
  * (code-organization ADR 2026-05-31). Behavior preserved verbatim.
  *
  * Interaction (unchanged): click a kbd cluster → capture mode; press a combo →

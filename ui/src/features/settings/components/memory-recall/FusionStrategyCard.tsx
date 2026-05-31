@@ -1,10 +1,10 @@
 // MemoryRecall: 融合策略 + 技能挂载 sections. Extracted verbatim out of the 474-line
-// components/settings/MemoryRecallSettings during the features/settings split
+// legacy settings/MemoryRecallSettings during the features/settings split
 // (code-organization ADR 2026-05-31).
-import { SettingsSection } from '@/components/settings/primitives/SettingsSection'
-import { SettingsCard } from '@/components/settings/primitives/SettingsCard'
-import { SettingsRow } from '@/components/settings/primitives/SettingsRow'
-import { SettingsSelect } from '@/components/settings/primitives/SettingsSelect'
+import { SettingsSection } from '../primitives/SettingsSection'
+import { SettingsCard } from '../primitives/SettingsCard'
+import { SettingsRow } from '../primitives/SettingsRow'
+import { SettingsSelect } from '../primitives/SettingsSelect'
 import { NumberInput } from './NumberInput'
 import { DEFAULTS, FUSION_OPTIONS, RANGES } from '../../lib/memory-recall'
 import type { MemoryRecallCardProps } from './types'

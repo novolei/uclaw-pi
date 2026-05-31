@@ -3,14 +3,14 @@
  *
  * Thin shell: all state + persona IPC live in usePersonaBondTimeline; the section
  * lists are split into persona-bond/ presentation components. Split out of the
- * 560-line components/settings/PersonaBondTimeline during the features/settings
+ * 560-line legacy settings/PersonaBondTimeline during the features/settings
  * migration (code-organization ADR 2026-05-31). Behavior preserved verbatim.
  */
 import * as React from 'react'
 import { Award, BookOpen, Loader2, ScrollText } from 'lucide-react'
-import { SettingsSection } from '@/components/settings/primitives/SettingsSection'
-import { SettingsCard } from '@/components/settings/primitives/SettingsCard'
-import { SettingsToggle } from '@/components/settings/primitives/SettingsToggle'
+import { SettingsSection } from './primitives/SettingsSection'
+import { SettingsCard } from './primitives/SettingsCard'
+import { SettingsToggle } from './primitives/SettingsToggle'
 import { usePersonaBondTimeline } from '../hooks/usePersonaBondTimeline'
 import { Panel } from './persona-bond/Panel'
 import { BondProfileList } from './persona-bond/BondProfileList'

@@ -1,6 +1,6 @@
 /**
  * ResetAllButton — the panel header's "重置全部" action (wipes every override).
- * Split out of components/settings/ShortcutSettings.tsx during the features/settings
+ * Split out of legacy settings/ShortcutSettings.tsx during the features/settings
  * migration (code-organization ADR 2026-05-31); the atom + global-shortcut reset
  * loop live in useResetAllShortcuts. Pure presentation. Behavior preserved verbatim.
  */

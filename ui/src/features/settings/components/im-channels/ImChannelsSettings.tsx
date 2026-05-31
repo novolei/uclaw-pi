@@ -1,7 +1,7 @@
 // Settings → 机器人 — the IM-channel tabbed list. Thin shell: data + IPC +
 // the realtime status subscription live in useImChannelsSettings; only pure-UI
 // state (active tab, open row, adding-to-type) stays here. Migrated out of
-// components/settings/ during the IM-channel migration. No direct Tauri IPC
+// legacy settings/ during the IM-channel migration. No direct Tauri IPC
 // here; behavior (tabs always visible, error badges, add-new row) preserved.
 import { useState } from 'react'
 import { ImChannelAccordionRow } from './ImChannelAccordionRow'

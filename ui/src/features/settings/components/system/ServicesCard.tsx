@@ -1,5 +1,5 @@
 // 恢复操作 — memu/gbrain restart + AI-engine reset + app restart buttons.
-// Moved verbatim out of `components/settings/SystemTab.tsx` during the P1
+// Moved verbatim out of `legacy settings/SystemTab.tsx` during the P1
 // split; side effects live in `useBridgeAction`. Never calls IPC directly.
 import * as React from 'react'
 import { RotateCcw, RefreshCw, Power } from 'lucide-react'

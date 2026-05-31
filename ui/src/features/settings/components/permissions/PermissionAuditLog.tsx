@@ -1,7 +1,7 @@
 // Audit log — most-recent permission decisions across all sessions.
 // Presentational: receives the audit entries + loading flag from the
 // PermissionsSettings shell's hook. Split out of
-// components/settings/PermissionsSettings.tsx during P3a; markup is byte-identical
+// legacy settings/PermissionsSettings.tsx during P3a; markup is byte-identical
 // so behavior is preserved exactly.
 import * as React from 'react'
 import type { PermissionAuditEntry } from '@/lib/types'

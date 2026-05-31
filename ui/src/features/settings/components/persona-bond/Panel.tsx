@@ -1,5 +1,5 @@
 // Shared bordered panel used across the PersonaBondTimeline sections. Extracted
-// verbatim out of the 560-line components/settings/PersonaBondTimeline during the
+// verbatim out of the 560-line legacy settings/PersonaBondTimeline during the
 // features/settings split (code-organization ADR 2026-05-31).
 import * as React from 'react'
 

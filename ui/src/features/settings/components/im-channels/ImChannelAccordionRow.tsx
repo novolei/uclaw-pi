@@ -1,7 +1,7 @@
 // One IM-channel instance accordion row — thin shell. All field state + IPC
 // (create/update/toggle) live in useImChannelAccordionForm; the per-channel-type
 // field grid is ChannelTypeFields; formatDuration/getMetaLine are in
-// lib/im-channel-format. Split out of the 602-line components/settings version
+// lib/im-channel-format. Split out of the 602-line legacy settings module version
 // during the IM-channel migration. No direct Tauri IPC here; behavior preserved.
 import type { ImChannelRow, ImChannelStatus } from '@/atoms/im-channel-atoms'
 import { useImChannelAccordionForm } from '../../hooks/useImChannelAccordionForm'

@@ -1,7 +1,7 @@
 /**
  * ClassGroup — one facet-class section (label + description + the facet rows, or a
  * "(还没学到)" placeholder when empty). Split out of
- * components/settings/LearnedProfileTab.tsx during the features/settings migration
+ * legacy settings/LearnedProfileTab.tsx during the features/settings migration
  * (code-organization ADR 2026-05-31). Pure presentation. Behavior preserved verbatim.
  */
 import * as React from 'react'

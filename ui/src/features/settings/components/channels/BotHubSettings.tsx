@@ -1,5 +1,5 @@
-// SettingsSection primitive still lives under components/settings/.
-import { SettingsSection } from '@/components/settings/primitives/SettingsSection'
+// SettingsSection is a migrated feature-internal primitive (../primitives).
+import { SettingsSection } from '../primitives/SettingsSection'
 
 // [PLACEHOLDER - Tauri adaptation needed]
 // BotHubSettings — Bot Hub marketplace

@@ -1,6 +1,6 @@
 // System-diagnostics + eval type contracts — mirror the Rust structs the
 // settings IPC returns. Moved verbatim out of the legacy
-// `components/settings/SystemTab.tsx` during the P1 split so the cards + hooks
+// `legacy settings/SystemTab.tsx` during the P1 split so the cards + hooks
 // share one definition (docs/superpowers/plans/2026-05-31-frontend-settings-feature-migration.md).
 
 export type ServiceStatus =

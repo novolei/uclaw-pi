@@ -1,7 +1,7 @@
 // Permission rules — the V14 session + pattern rules (granular tier): the draft
 // editor + the rules table. Presentational: receives the rules + draft state +
 // add/delete callbacks from the PermissionsSettings shell's hook. Split out of
-// components/settings/PermissionsSettings.tsx during P3a; markup is byte-identical
+// legacy settings/PermissionsSettings.tsx during P3a; markup is byte-identical
 // so behavior is preserved exactly.
 import * as React from 'react'
 import { Trash2, Plus } from 'lucide-react'

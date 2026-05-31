@@ -1,9 +1,9 @@
 // MemoryRecall: Token 预算 + 召回数量限制 sections. Extracted verbatim out of the
-// 474-line components/settings/MemoryRecallSettings during the features/settings
+// 474-line legacy settings/MemoryRecallSettings during the features/settings
 // split (code-organization ADR 2026-05-31).
-import { SettingsSection } from '@/components/settings/primitives/SettingsSection'
-import { SettingsCard } from '@/components/settings/primitives/SettingsCard'
-import { SettingsRow } from '@/components/settings/primitives/SettingsRow'
+import { SettingsSection } from '../primitives/SettingsSection'
+import { SettingsCard } from '../primitives/SettingsCard'
+import { SettingsRow } from '../primitives/SettingsRow'
 import { NumberInput } from './NumberInput'
 import { DEFAULTS, RANGES } from '../../lib/memory-recall'
 import type { MemoryRecallCardProps } from './types'

@@ -6,7 +6,7 @@ import * as React from 'react'
 import { KeyRound, LogOut } from 'lucide-react'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
-import { SettingsCard, SettingsRow, SettingsSection } from '@/components/settings/primitives'
+import { SettingsCard, SettingsRow, SettingsSection } from '../primitives'
 import type { BrowserIdentityStatusReport } from '@/lib/tauri-bridge'
 import {
   formatIdentityTimestamp,

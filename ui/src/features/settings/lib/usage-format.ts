@@ -1,5 +1,5 @@
 // Pure USD/date formatting helpers + the donut palette for the 用量与预算 tab.
-// Extracted out of components/settings/UsageSettings.tsx during the
+// Extracted out of legacy settings/UsageSettings.tsx during the
 // features/settings migration (code-organization ADR 2026-05-31) so the split
 // sub-components (BudgetHeader, UsageCharts) share one copy. Behavior preserved
 // verbatim — identical rounding thresholds.

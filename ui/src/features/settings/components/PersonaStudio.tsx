@@ -1,9 +1,9 @@
 import * as React from 'react'
 import { Loader2, Sparkles } from 'lucide-react'
-import { SettingsSection } from '@/components/settings/primitives/SettingsSection'
-import { SettingsCard } from '@/components/settings/primitives/SettingsCard'
-import { SettingsRow } from '@/components/settings/primitives/SettingsRow'
-import { SettingsToggle } from '@/components/settings/primitives/SettingsToggle'
+import { SettingsSection } from './primitives/SettingsSection'
+import { SettingsCard } from './primitives/SettingsCard'
+import { SettingsRow } from './primitives/SettingsRow'
+import { SettingsToggle } from './primitives/SettingsToggle'
 import type { PersonaPreset, VoiceProfile } from '@/lib/persona-types'
 import { usePersonaStudio } from '../hooks/usePersonaStudio'
 

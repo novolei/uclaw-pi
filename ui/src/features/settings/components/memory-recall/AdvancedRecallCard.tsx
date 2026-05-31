@@ -1,5 +1,5 @@
 // MemoryRecall: the 高级设置 collapsible (图扩展参数 / 时间衰减 / FTS 降级 / 用户档案).
-// Extracted verbatim out of the 474-line components/settings/MemoryRecallSettings
+// Extracted verbatim out of the 474-line legacy settings/MemoryRecallSettings
 // during the features/settings split (code-organization ADR 2026-05-31).
 import { ChevronDown } from 'lucide-react'
 import {
@@ -7,10 +7,10 @@ import {
   CollapsibleTrigger,
   CollapsibleContent,
 } from '@/components/ui/collapsible'
-import { SettingsSection } from '@/components/settings/primitives/SettingsSection'
-import { SettingsCard } from '@/components/settings/primitives/SettingsCard'
-import { SettingsRow } from '@/components/settings/primitives/SettingsRow'
-import { SettingsSelect } from '@/components/settings/primitives/SettingsSelect'
+import { SettingsSection } from '../primitives/SettingsSection'
+import { SettingsCard } from '../primitives/SettingsCard'
+import { SettingsRow } from '../primitives/SettingsRow'
+import { SettingsSelect } from '../primitives/SettingsSelect'
 import { NumberInput } from './NumberInput'
 import { DEFAULTS, RANGES } from '../../lib/memory-recall'
 import type { MemoryRecallCardProps } from './types'

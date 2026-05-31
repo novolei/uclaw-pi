@@ -1,7 +1,7 @@
 // Global tier — the legacy whole-tool whitelist + blocklist from
 // `safety_policy.json`. Presentational: receives the lists + the remove/unblock
 // + refresh callbacks from the PermissionsSettings shell's hook. Split out of the
-// 328-line components/settings/PermissionsSettings.tsx during P3a; markup is
+// 328-line legacy settings/PermissionsSettings.tsx during P3a; markup is
 // byte-identical so behavior is preserved exactly.
 import * as React from 'react'
 import { Trash2, RefreshCw, ShieldCheck, ShieldOff } from 'lucide-react'

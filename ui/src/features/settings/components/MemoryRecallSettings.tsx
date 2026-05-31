@@ -3,7 +3,7 @@
  *
  * Thin shell: state + IPC live in useMemoryRecallSettings; the form is split into
  * memory-recall/ section cards (RecallBudget / FusionStrategy / Advanced). Split
- * out of the 474-line components/settings/MemoryRecallSettings during the
+ * out of the 474-line legacy settings/MemoryRecallSettings during the
  * features/settings migration (code-organization ADR 2026-05-31). Behavior
  * preserved verbatim: load → merge defaults, dirty-tracking, save, reset.
  */

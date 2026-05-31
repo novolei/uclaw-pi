@@ -4,7 +4,7 @@
  * 左可折叠分组列表(SkillsList)+ 右详情(SkillDetail)双栏。数据来自两个
  * 来源 —— 学得技能(listLearnedSkills)+ 内置技能(listSkills)—— 在此 merge
  * 成 UnifiedSkill 列表。维护操作(回填关键词 / 整合技能 / 重新加载)与删除确认
- * 也由本容器持有。整体迁自原 components/settings/SkillsSettings.tsx。
+ * 也由本容器持有。整体迁自原 legacy settings/SkillsSettings.tsx。
  */
 import * as React from 'react'
 import { toast } from 'sonner'

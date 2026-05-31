@@ -4,7 +4,7 @@
  * Thin shell: all data + the live re-fetch wiring live in useUsageData; the
  * sections are split into usage/ presentation components (BudgetHeader,
  * WorkspaceRollupSection, UsageCharts) + lib/usage-format helpers. Split out of
- * the 393-line components/settings/UsageSettings.tsx during the features/settings
+ * the 393-line legacy settings/UsageSettings.tsx during the features/settings
  * migration (code-organization ADR 2026-05-31). Behavior preserved verbatim.
  *
  * Sections (top to bottom):

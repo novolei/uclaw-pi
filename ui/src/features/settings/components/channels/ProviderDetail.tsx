@@ -2,12 +2,12 @@
 // (config load, model load, test, save, delete) live in useProviderDetail (IPC
 // via the typed `@/lib/tauri-bridge` provider helpers; no Tauri API here). Split
 // out of the 455-line ChannelSettings during the migration. SettingsSecretInput
-// is a settings primitive that still lives under components/settings/.
+// is a migrated feature-internal primitive (../primitives), imported relatively.
 import { Check, RefreshCw, Trash2 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { cn } from '@/lib/utils'
 import type { ProviderInfo } from '@/lib/types'
-import { SettingsSecretInput } from '@/components/settings/primitives/SettingsSecretInput'
+import { SettingsSecretInput } from '../primitives/SettingsSecretInput'
 import { useProviderDetail } from '../../hooks/useProviderDetail'
 
 const API_TYPE_OPTIONS = [

@@ -7,7 +7,7 @@
  *  - 创建 / 编辑 / 删除自定义提示词
  *  - 内置提示词（"默认"）不可删除或编辑
  *
- * Migrated + split out of components/settings/PromptSettings.tsx (378 lines)
+ * Migrated + split out of legacy settings/PromptSettings.tsx (378 lines)
  * during P3: state + CRUD side effects live in `usePromptSettings` (IPC via
  * `settingsBridge`); each list row is `prompts/PromptRow`.
  */

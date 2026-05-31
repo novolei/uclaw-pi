@@ -1,5 +1,5 @@
 // PersonaBondTimeline: 勋章 list. Extracted verbatim out of the 560-line
-// components/settings/PersonaBondTimeline during the features/settings split
+// legacy settings/PersonaBondTimeline during the features/settings split
 // (code-organization ADR 2026-05-31).
 import { EyeOff, Loader2 } from 'lucide-react'
 import { Button } from '@/components/ui/button'

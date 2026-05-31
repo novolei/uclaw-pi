@@ -1,7 +1,7 @@
 /**
  * KbdCluster + KeyCap — the macOS-style key-cap rendering of a keybinding (one cap
  * per modifier + final key), plus the capture / "未绑定" affordances. Split out of
- * components/settings/ShortcutSettings.tsx during the features/settings migration
+ * legacy settings/ShortcutSettings.tsx during the features/settings migration
  * (code-organization ADR 2026-05-31). Pure presentation. Behavior preserved verbatim.
  */
 import * as React from 'react'

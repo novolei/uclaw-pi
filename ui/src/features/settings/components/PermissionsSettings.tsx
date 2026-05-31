@@ -12,7 +12,7 @@
  * Plus WorkspaceSandboxSettings (now a migrated sibling under features/settings/).
  *
  * Live update: re-fetch on mount; manual refresh button. Split out of the
- * 328-line components/settings/PermissionsSettings.tsx during P3a.
+ * 328-line legacy settings/PermissionsSettings.tsx during P3a.
  */
 import * as React from 'react'
 import { WorkspaceSandboxSettings } from './WorkspaceSandboxSettings'

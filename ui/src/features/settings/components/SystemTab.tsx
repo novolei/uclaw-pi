@@ -1,7 +1,7 @@
 // 系统诊断 tab — thin shell composing the system/ cards. All state + IPC live
 // inside each card's hook (code-organization ADR 2026-05-31); this shell only
 // owns the shared error banner and the layout. Split out of the legacy
-// `components/settings/SystemTab.tsx` (865 lines) during P1.
+// `legacy settings/SystemTab.tsx` (865 lines) during P1.
 import * as React from 'react'
 import { DiagnosticsCard } from './system/DiagnosticsCard'
 import { ServicesCard } from './system/ServicesCard'

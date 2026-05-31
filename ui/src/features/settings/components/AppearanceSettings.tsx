@@ -3,9 +3,8 @@ import { Check } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { themeModeAtom, themeStyleAtom, applyThemeToDOM, updateThemeMode, updateThemeStyle, systemIsDarkAtom } from '@/atoms/theme'
 import { stickyUserMessageEnabledAtom, updateStickyUserMessageEnabled, agentStatusBarEnabledAtom } from '@/atoms/ui-preferences'
-// Primitives still live under components/settings/ (migrated in a later phase);
-// imported via the @/ alias so behavior is preserved exactly after the P3 move.
-import { SettingsSection, SettingsToggle } from '@/components/settings/primitives'
+// Primitives are migrated feature-internals (./primitives), imported relatively.
+import { SettingsSection, SettingsToggle } from './primitives'
 import type { ThemeStyle } from '@/lib/chat-types'
 
 // ─────────────────────────────────────────────────────────

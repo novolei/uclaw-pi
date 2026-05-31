@@ -3,7 +3,7 @@
 // state + side effects live in `useBrowserRuntimeSettings`; all IPC goes through
 // `settingsBridge`. Pure label/badge formatting lives in
 // `lib/browser-runtime-format`. Migrated + split out of
-// `components/settings/BrowserRuntimeSettings.tsx` (607 lines) during P3.
+// `legacy settings/BrowserRuntimeSettings.tsx` (607 lines) during P3.
 import * as React from 'react'
 import { Activity } from 'lucide-react'
 import { Badge } from '@/components/ui/badge'
@@ -12,17 +12,17 @@ import {
   deriveBrowserRuntimeSettingsViewModel,
   type BrowserRuntimeSettingsInput,
 } from '@/lib/browser-runtime/browser-runtime-settings'
-import { BrowserAutomationDiagnostics } from '@/components/settings/browser-runtime/BrowserAutomationDiagnostics'
-import { BrowserAutomationHeader } from '@/components/settings/browser-runtime/BrowserAutomationHeader'
-import { PlaywrightSetupProgress } from '@/components/settings/browser-runtime/PlaywrightSetupProgress'
-import { PlaywrightSkillsPanel } from '@/components/settings/browser-runtime/PlaywrightSkillsPanel'
-import { ProviderPriorityList } from '@/components/settings/browser-runtime/ProviderPriorityList'
+import { BrowserAutomationDiagnostics } from './browser-runtime/BrowserAutomationDiagnostics'
+import { BrowserAutomationHeader } from './browser-runtime/BrowserAutomationHeader'
+import { PlaywrightSetupProgress } from './browser-runtime/PlaywrightSetupProgress'
+import { PlaywrightSkillsPanel } from './browser-runtime/PlaywrightSkillsPanel'
+import { ProviderPriorityList } from './browser-runtime/ProviderPriorityList'
 import {
   SettingsCard,
   SettingsRow,
   SettingsSection,
   SettingsToggle,
-} from '@/components/settings/primitives'
+} from './primitives'
 import { BrowserIdentitySection } from './browser-runtime/BrowserIdentitySection'
 import { badgeVariant } from '../lib/browser-runtime-format'
 import { useBrowserRuntimeSettings } from '../hooks/useBrowserRuntimeSettings'

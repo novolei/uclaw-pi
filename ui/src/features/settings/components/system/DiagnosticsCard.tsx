@@ -1,6 +1,6 @@
 // 系统诊断 — health summary + the full `get_system_diagnostics` report
 // (system info, health metrics, bridge services, service status, gbrain init).
-// Moved verbatim out of `components/settings/SystemTab.tsx` during the P1 split;
+// Moved verbatim out of `legacy settings/SystemTab.tsx` during the P1 split;
 // the fetch lives in `useSystemDiagnostics`. Never calls IPC directly.
 import * as React from 'react'
 import { ChevronDown, ChevronUp, RefreshCw } from 'lucide-react'

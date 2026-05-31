@@ -1,7 +1,7 @@
 /**
  * BudgetHeader — month-to-date spend + progress bar vs. the configured budget,
  * with an inline edit form (set / modify / clear). Split out of the 393-line
- * components/settings/UsageSettings.tsx during the features/settings migration
+ * legacy settings/UsageSettings.tsx during the features/settings migration
  * (code-organization ADR 2026-05-31). Behavior preserved verbatim.
  */
 import * as React from 'react'

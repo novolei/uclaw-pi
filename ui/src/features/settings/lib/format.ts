@@ -1,5 +1,5 @@
 // Settings-feature presentation helpers — pure formatting, no IPC / side effects.
-// Moved verbatim out of the legacy `components/settings/SystemTab.tsx` during the
+// Moved verbatim out of the legacy `legacy settings/SystemTab.tsx` during the
 // P1 split (docs/superpowers/plans/2026-05-31-frontend-settings-feature-migration.md).
 
 import type { ServiceStatus } from './diagnostics-types'

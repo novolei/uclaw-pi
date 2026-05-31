@@ -5,6 +5,12 @@
 // docs/superpowers/plans/2026-05-31-frontend-settings-feature-migration.md).
 export { settingsBridge } from '../../lib/bridge/settings'
 
+// Settings UI primitives (SettingsCard/Section/Row/Input/Select/Toggle/…). Migrated
+// out of legacy settings/primitives during P4; re-exported here so cross-feature
+// consumers (e.g. Kaleidoscope integration detail panels) import them barrel-only
+// instead of reaching into feature internals.
+export * from './components/primitives'
+
 // P1 — SystemTab migrated + split into system/ cards + hooks.
 export { SystemTab } from './components/SystemTab'
 
@@ -41,7 +47,7 @@ export { ModelSettings } from './components/ModelSettings'
 
 // P3a — PermissionsSettings migrated + split (328 → thin shell composing
 // permissions/ cards; all IPC + draft state in usePermissionsSettings; the
-// sandbox sub-panel stays under components/settings/ for now).
+// sandbox sub-panel is the migrated WorkspaceSandboxSettings sibling).
 export { PermissionsSettings } from './components/PermissionsSettings'
 
 // P3a — EmbeddingEndpointSection migrated (config load/save in a hook; IPC stays
@@ -62,7 +68,7 @@ export { FoldDeltaThresholdSection } from './components/FoldDeltaThresholdSectio
 export { DeveloperOptionsSection } from './components/DeveloperOptionsSection'
 
 // ── IM / channel cluster (Settings → 机器人 / 渠道). Migrated out of
-// components/settings/ ; raw `invoke` moved behind settingsBridge.*; oversized
+// legacy settings/ ; raw `invoke` moved behind settingsBridge.*; oversized
 // rows split into im-channels/ accordion parts + hooks. ──
 
 // WechatIlinkBindingPanel migrated (QR-binding state machine in
@@ -101,7 +107,7 @@ export { default as WeChatSettings } from './components/channels/WeChatSettings'
 export { default as FeishuSettings } from './components/channels/FeishuSettings'
 export { default as DingTalkSettings } from './components/channels/DingTalkSettings'
 
-// ── Persona cluster (Settings → Agent 人格). Migrated out of components/settings/ ;
+// ── Persona cluster (Settings → Agent 人格). Migrated out of legacy settings/ ;
 // config load + optimistic writes moved into hooks; IPC stays in the typed
 // @/lib/persona domain helpers. Consumed by AgentSettings (relative sibling). ──
 
@@ -115,7 +121,7 @@ export { PersonaStudio } from './components/PersonaStudio'
 export { PersonaBondTimeline } from './components/PersonaBondTimeline'
 
 // ── Memory cluster (Settings → 记忆 / 记忆召回). Migrated out of
-// components/settings/ ; the boot-node load + config CRUD side effects moved into
+// legacy settings/ ; the boot-node load + config CRUD side effects moved into
 // hooks; IPC stays in the typed @/lib/tauri-bridge memory-graph + recall helpers. ──
 
 // MemorySettings migrated (boot-node load + toggle state in useMemorySettings).
@@ -128,11 +134,11 @@ export { MemorySettings } from './components/MemorySettings'
 export { MemoryRecallSettings } from './components/MemoryRecallSettings'
 
 // MemoryRecallTab migrated (记忆召回配置 page; thin wrapper around
-// MemoryRecallSettings). Consumed by components/settings/SettingsPanel.
+// MemoryRecallSettings). Consumed by SettingsPanel.
 export { MemoryRecallTab } from './components/MemoryRecallTab'
 
 // ── Skill cluster (used from the Kaleidoscope Skills module, not Settings nav).
-// Migrated out of components/settings/ ; side effects moved into hooks; IPC stays
+// Migrated out of legacy settings/ ; side effects moved into hooks; IPC stays
 // in the typed @/lib/tauri-bridge skill helpers. Consumers import from this barrel. ──
 
 // SkillEvolutionTab migrated (version-history load + selection in useSkillVersions).
@@ -149,8 +155,8 @@ export { SkillConsolidationDialog } from './components/SkillConsolidationDialog'
 export { WorkspaceSkillTagsEditor } from './components/WorkspaceSkillTagsEditor'
 
 // ── Standalone settings pages (Settings nav leaves). Migrated out of
-// components/settings/ ; side effects moved into hooks; typed @/lib/tauri-bridge
-// helpers stay in those hooks. Consumed by components/settings/SettingsPanel. ──
+// legacy settings/ ; side effects moved into hooks; typed @/lib/tauri-bridge
+// helpers stay in those hooks. Consumed by SettingsPanel. ──
 
 // AboutSettings migrated (version + platform load in useAboutInfo). No IPC in the
 // component; the external-link handlers stay [PLACEHOLDER] as in the original.
@@ -193,5 +199,35 @@ export { ShortcutSettings } from './components/ShortcutSettings'
 // cards [ClassGroup → FacetRow, EmptyState] + lib/facet-class taxonomy; all state +
 // the five memoryLearning IPC actions [fetch/rebuild/dismiss/promote/demote] +
 // grouping in useLearnedProfile; the typed @/lib/tauri-bridge memoryLearning* helpers
-// stay in the hook). Consumed by components/settings/SettingsPanel.
+// stay in the hook). Consumed by SettingsPanel.
 export { LearnedProfileTab } from './components/LearnedProfileTab'
+
+// ── FINAL batch (P4): the settings dialog shell + nav/breadcrumb chrome + the
+// tab composers + standalone leaves. Migrated out of the old legacy settings/
+// directory, which is now deleted. SettingsDialog is the only external entry
+// point (rendered by app-shell/AppShell); the rest are composed internally by
+// SettingsPanel (relative sibling imports). ──
+
+// SettingsDialog — motion-orchestrated Radix dialog wrapping SettingsPanel.
+// Consumed by app-shell/AppShell (barrel-only).
+export { SettingsDialog } from './components/SettingsDialog'
+
+// SettingsPanel — left nav + breadcrumb + the right-hand tab content switch.
+export { default as SettingsPanel } from './components/SettingsPanel'
+
+// SettingsNav — left rail (9 tabs / 3 groups, fuzzy label search).
+export { SettingsNav } from './components/SettingsNav'
+
+// SettingsBreadcrumb — sticky header; IntersectionObserver-driven subsection crumb.
+export { SettingsBreadcrumb } from './components/SettingsBreadcrumb'
+
+// Tab composers (pure composition + data-settings-section anchor markers).
+export { ConnectivityTab } from './components/ConnectivityTab'
+export { IntelligenceTab } from './components/IntelligenceTab'
+export { ToolsTab } from './components/ToolsTab'
+
+// Standalone / placeholder leaves (no in-tree consumer today; kept for parity).
+export { UpdateDialog } from './components/UpdateDialog'
+export { BrandSettings } from './components/BrandSettings'
+export { VersionHistory } from './components/VersionHistory'
+export { ReleaseNotesViewer } from './components/ReleaseNotesViewer'

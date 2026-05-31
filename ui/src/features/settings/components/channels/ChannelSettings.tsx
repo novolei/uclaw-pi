@@ -1,7 +1,7 @@
 // Model-provider settings — the grouped provider list + detail pane. Thin
 // shell: list data (providers, configured ids, model counts, refresh) lives in
 // useChannelSettings; the detail panel is ProviderDetail (its own hook). Split
-// out of the 455-line components/settings version during the migration. IPC
+// out of the 455-line legacy settings module version during the migration. IPC
 // stays in the typed `@/lib/tauri-bridge` provider helpers (no Tauri API here).
 import { cn } from '@/lib/utils'
 import { useChannelSettings } from '../../hooks/useChannelSettings'

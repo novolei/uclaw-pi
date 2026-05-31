@@ -1,5 +1,5 @@
 // Presentational sub-components for the diagnostics report. Moved verbatim out
-// of `components/settings/SystemTab.tsx` during the P1 split so `DiagnosticsCard`
+// of `legacy settings/SystemTab.tsx` during the P1 split so `DiagnosticsCard`
 // stays under the size cap. Pure presentation — no IPC, no side effects.
 import * as React from 'react'
 import { cn } from '@/lib/utils'

@@ -1,14 +1,13 @@
 import { useState } from 'react'
 import { useAtom } from 'jotai'
-// Primitives still live under components/settings/ (migrated in a later phase);
-// imported via the @/ alias so behavior is preserved exactly after the P3 move.
+// Primitives are migrated feature-internals (./primitives), imported relatively.
 import {
   SettingsSection,
   SettingsCard,
   SettingsRow,
   SettingsSelect,
   SettingsToggle,
-} from '@/components/settings/primitives'
+} from './primitives'
 import { bottomDockEnabledAtom } from '@/atoms/dock-atoms'
 import { useGeneralSettings } from '../hooks/useGeneralSettings'
 

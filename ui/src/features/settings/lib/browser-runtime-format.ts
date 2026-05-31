@@ -1,6 +1,6 @@
 // BrowserRuntimeSettings presentation helpers — pure label/badge/timestamp
 // formatting, no IPC / side effects. Moved verbatim out of the legacy
-// `components/settings/BrowserRuntimeSettings.tsx` during the P3 split
+// `legacy settings/BrowserRuntimeSettings.tsx` during the P3 split
 // (docs/superpowers/plans/2026-05-31-frontend-settings-feature-migration.md).
 
 import * as React from 'react'

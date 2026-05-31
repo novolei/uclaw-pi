@@ -1,5 +1,5 @@
 // Facet-class taxonomy + state-badge styling for the LearnedProfileTab. Extracted
-// out of components/settings/LearnedProfileTab.tsx during the features/settings
+// out of legacy settings/LearnedProfileTab.tsx during the features/settings
 // migration (code-organization ADR 2026-05-31). Pure constants/helpers — no React.
 // Behavior preserved verbatim.
 

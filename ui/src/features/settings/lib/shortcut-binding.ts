@@ -1,7 +1,7 @@
 // Pure keybinding helpers for ShortcutSettings: platform detection, the global-
 // shortcut id list (these sync to the backend on change), and the effective-
 // binding / conflict-lookup functions. Extracted out of
-// components/settings/ShortcutSettings.tsx during the features/settings migration
+// legacy settings/ShortcutSettings.tsx during the features/settings migration
 // (code-organization ADR 2026-05-31). No React, no IPC — behavior preserved verbatim.
 import {
   SHORTCUT_DEFINITIONS,

@@ -1,5 +1,5 @@
 // PersonaBondTimeline: 内心层 composer + list. Extracted verbatim out of the
-// 560-line components/settings/PersonaBondTimeline during the features/settings
+// 560-line legacy settings/PersonaBondTimeline during the features/settings
 // split (code-organization ADR 2026-05-31).
 import { Loader2, Plus, Trash2 } from 'lucide-react'
 import { Button } from '@/components/ui/button'

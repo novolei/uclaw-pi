@@ -12,8 +12,8 @@ import {
   SettingsSection,
   SettingsRow,
   SettingsSelect,
-} from '@/components/settings/primitives'
-import { LABEL_CLASS } from '@/components/settings/primitives/SettingsUIConstants'
+} from './primitives'
+import { LABEL_CLASS } from './primitives/SettingsUIConstants'
 import { Button } from '@/components/ui/button'
 import { sttSettingsAtom, type Language } from '@/atoms/stt-atoms'
 import { getShortcutForPlatform } from '@/lib/shortcut-defaults'

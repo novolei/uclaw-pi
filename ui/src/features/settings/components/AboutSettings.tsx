@@ -1,5 +1,5 @@
-import { SettingsSection } from '@/components/settings/primitives/SettingsSection'
-import { SettingsCard } from '@/components/settings/primitives/SettingsCard'
+import { SettingsSection } from './primitives/SettingsSection'
+import { SettingsCard } from './primitives/SettingsCard'
 import { useAboutInfo } from '../hooks/useAboutInfo'
 
 export function AboutSettings() {

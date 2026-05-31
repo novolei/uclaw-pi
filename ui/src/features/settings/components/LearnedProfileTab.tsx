@@ -5,7 +5,7 @@
  * Thin shell: all state + the five memoryLearning IPC actions live in
  * useLearnedProfile; the rows/groups are split into learned-profile/ presentation
  * components (ClassGroup → FacetRow, EmptyState) + the class taxonomy in
- * lib/facet-class. Split out of the 537-line components/settings/LearnedProfileTab.tsx
+ * lib/facet-class. Split out of the 537-line legacy settings/LearnedProfileTab.tsx
  * during the features/settings migration (code-organization ADR 2026-05-31).
  * Behavior preserved verbatim.
  *

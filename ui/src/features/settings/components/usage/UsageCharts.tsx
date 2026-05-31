@@ -1,7 +1,7 @@
 /**
  * UsageCharts — the last-30-days analytics block of the 用量与预算 tab: KPI cards,
  * the daily-spend bar chart, the per-model donut, and the per-session table. Split
- * out of the 393-line components/settings/UsageSettings.tsx during the
+ * out of the 393-line legacy settings/UsageSettings.tsx during the
  * features/settings migration (code-organization ADR 2026-05-31). Pure presentation
  * — all data is passed in by the UsageSettings shell. Behavior preserved verbatim.
  */

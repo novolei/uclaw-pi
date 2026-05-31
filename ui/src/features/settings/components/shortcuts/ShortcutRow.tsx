@@ -1,7 +1,7 @@
 /**
  * ShortcutRow — one keybinding row: label + customized badge, reset-to-default
  * icon, the KbdCluster capture chip, and the inline conflict banner. Split out of
- * components/settings/ShortcutSettings.tsx during the features/settings migration
+ * legacy settings/ShortcutSettings.tsx during the features/settings migration
  * (code-organization ADR 2026-05-31); all state + the global-shortcut IPC sync live
  * in useShortcutRow. Pure presentation. Behavior preserved verbatim.
  */

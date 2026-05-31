@@ -1,7 +1,7 @@
 // WeChat iLink QR-binding panel — presentation only. The QR fetch / poll loop /
 // token save / disconnect state machine + IPC live in `useWechatIlinkBinding`
 // (no direct Tauri IPC here). Only the canvas draw effect stays local since it
-// touches the DOM ref. Moved out of `components/settings/` during the IM-channel
+// touches the DOM ref. Moved out of `legacy settings/` during the IM-channel
 // migration; behavior preserved verbatim.
 import { useEffect, useRef } from 'react'
 import QRCode from 'qrcode'

@@ -1,6 +1,6 @@
 /**
  * EmptyState — the whole-tab placeholder shown when no preferences have been
- * learned yet. Split out of components/settings/LearnedProfileTab.tsx during the
+ * learned yet. Split out of legacy settings/LearnedProfileTab.tsx during the
  * features/settings migration (code-organization ADR 2026-05-31). Behavior verbatim.
  */
 import * as React from 'react'

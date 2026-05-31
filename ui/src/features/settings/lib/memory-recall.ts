@@ -1,6 +1,6 @@
 // Settings-only NON-IPC constants + helpers for the MemoryRecall config form,
 // shared by useMemoryRecallSettings (the hook) and the memory-recall/ cards.
-// Extracted verbatim out of the 474-line components/settings/MemoryRecallSettings
+// Extracted verbatim out of the 474-line legacy settings/MemoryRecallSettings
 // during the features/settings split (code-organization ADR 2026-05-31). Kept in
 // sync with the Rust MemoryRecallConfig::default() + patch_memory_recall_config.
 import type { MemoryRecallConfigDto } from '@/lib/tauri-bridge'

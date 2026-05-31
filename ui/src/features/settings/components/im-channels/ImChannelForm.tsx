@@ -1,6 +1,6 @@
 // Standalone IM-channel add/edit form — thin shell. Field state + buildInput +
 // save (create/update) IPC live in useImChannelForm; the per-channel-type field
-// blocks are ImChannelFormFields. Split out of the 315-line components/settings
+// blocks are ImChannelFormFields. Split out of the 315-line legacy settings module
 // version during the migration. No direct Tauri IPC here; behavior preserved.
 import type { ImChannelRow } from '@/atoms/im-channel-atoms'
 import { useImChannelForm } from '../../hooks/useImChannelForm'

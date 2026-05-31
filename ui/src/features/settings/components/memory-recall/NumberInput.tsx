@@ -1,5 +1,5 @@
 // Clamped numeric input shared by the MemoryRecall cards. Extracted verbatim out
-// of the inline NumberInput in the 474-line components/settings/MemoryRecallSettings
+// of the inline NumberInput in the 474-line legacy settings/MemoryRecallSettings
 // during the features/settings split. Clamp-on-change + re-clamp-on-blur behavior
 // preserved exactly.
 import { clamp } from '../../lib/memory-recall'

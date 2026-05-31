@@ -1,12 +1,11 @@
 import { useState } from 'react'
 import { useAtomValue } from 'jotai'
-// Primitives still live under components/settings/ (migrated in a later phase);
-// imported via the @/ alias so behavior is preserved exactly. PersonaStudio +
-// PersonaBondTimeline are migrated siblings (relative imports).
-import { SettingsSection } from '@/components/settings/primitives/SettingsSection'
-import { SettingsToggle } from '@/components/settings/primitives/SettingsToggle'
-import { SettingsCard } from '@/components/settings/primitives/SettingsCard'
-import { SettingsRow } from '@/components/settings/primitives/SettingsRow'
+// Primitives are migrated feature-internals (./primitives), imported relatively.
+// PersonaStudio + PersonaBondTimeline are migrated siblings (relative imports).
+import { SettingsSection } from './primitives/SettingsSection'
+import { SettingsToggle } from './primitives/SettingsToggle'
+import { SettingsCard } from './primitives/SettingsCard'
+import { SettingsRow } from './primitives/SettingsRow'
 import { PersonaStudio } from './PersonaStudio'
 import { PersonaBondTimeline } from './PersonaBondTimeline'
 import { activeProviderModelAtom } from '@/atoms/active-model'
