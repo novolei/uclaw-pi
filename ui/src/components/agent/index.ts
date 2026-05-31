@@ -4,6 +4,6 @@
 
 export * from './AgentView'
 // AgentHeader migrated to features/agent (consumers import from @/features/agent).
-export * from './AgentMessages'
+// AgentMessages migrated to features/agent (consumers import from @/features/agent).
 // ToolActivityItem migrated to features/agent (consumers import from @/features/agent).
 // ContextUsageBadge migrated to features/agent (consumers import from @/features/agent).

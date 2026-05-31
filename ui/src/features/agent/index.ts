@@ -210,3 +210,16 @@ export { CompactBoundaryDivider, CompactingIndicator } from './components/Compac
 // image IO routes through the agent bridge. ActivityRow is surfaced for tests.
 // Consumed by AgentMessages. `formatElapsed` is re-exported for compatibility.
 export { ToolActivityList, ToolActivityItem, ActivityRow, formatElapsed } from './components/ToolActivityItem'
+
+// AgentMessages — the LIVE agent chat message list (the highest-stakes render
+// surface): scroll-managed Conversation shell + per-message AgentMessageItem +
+// the streaming bubble + the user-verified token/cost/duration MessageMetaBar.
+// Split (was 1276 lines): presentational pieces live under `message-list/`
+// (AgentMessageItem / MessageMetaBar + DurationBadge / StreamingMessageBubble /
+// StreamingIndicators / CompactionFoldCard / MessageAttachments / AssistantLogo),
+// the pure helpers in `lib/agent-message-helpers`, and the list-shell
+// side-effects/derivations in `hooks/useMessageListState`. Attachment image IO
+// routes through the agent bridge (no @tauri-apps/api). Consumed by AgentView +
+// the automation Run/Home thread views. DurationBadge has no external consumer,
+// so it stays internal to the meta-bar file (not re-exported).
+export { AgentMessages } from './components/AgentMessages'

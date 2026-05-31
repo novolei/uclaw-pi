@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { getOrCreateSpecHomeThread, getAgentSessionMessages, sendAgentMessage } from '@/lib/tauri-bridge'
-import { AgentMessages } from '@/components/agent/AgentMessages'
+import { AgentMessages } from '@/features/agent'
 import type { AgentMessage } from '@/lib/agent-types'
 
 interface Props {
