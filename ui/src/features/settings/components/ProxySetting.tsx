@@ -1,8 +1,8 @@
 import { useState } from 'react'
-import { SettingsSection } from './primitives/SettingsSection'
-import { SettingsInput } from './primitives/SettingsInput'
-import { SettingsToggle } from './primitives/SettingsToggle'
-import { SettingsSelect } from './primitives/SettingsSelect'
+import { SettingsSection } from '@/components/settings/primitives/SettingsSection'
+import { SettingsInput } from '@/components/settings/primitives/SettingsInput'
+import { SettingsToggle } from '@/components/settings/primitives/SettingsToggle'
+import { SettingsSelect } from '@/components/settings/primitives/SettingsSelect'
 import { Button } from '@/components/ui/button'
 
 const PROXY_TYPE_OPTIONS = [

@@ -155,3 +155,8 @@ export { WorkspaceSkillTagsEditor } from './components/WorkspaceSkillTagsEditor'
 // AboutSettings migrated (version + platform load in useAboutInfo). No IPC in the
 // component; the external-link handlers stay [PLACEHOLDER] as in the original.
 export { AboutSettings } from './components/AboutSettings'
+
+// ProxySetting migrated (1:1 move — pure local form state, no side effects; the
+// handleSave is still a [PLACEHOLDER] console.log as in the original). No hook
+// needed since there is no IPC or effect to extract.
+export { ProxySetting } from './components/ProxySetting'
