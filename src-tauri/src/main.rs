@@ -1177,15 +1177,15 @@ fn main() {
             uclaw_core::tauri_commands::search_fragments,
             uclaw_core::tauri_commands::list_daily_summaries,
             // Learned Skills
-            uclaw_core::tauri_commands::list_learned_skills,
-            uclaw_core::tauri_commands::get_learned_skill,
-            uclaw_core::tauri_commands::toggle_learned_skill,
-            uclaw_core::tauri_commands::delete_learned_skill,
-            uclaw_core::tauri_commands::update_learned_skill,
-            uclaw_core::tauri_commands::record_skill_cited,
-            uclaw_core::tauri_commands::set_skill_lifecycle,
+            uclaw_core::commands::learned_skills::list_learned_skills,
+            uclaw_core::commands::learned_skills::get_learned_skill,
+            uclaw_core::commands::learned_skills::toggle_learned_skill,
+            uclaw_core::commands::learned_skills::delete_learned_skill,
+            uclaw_core::commands::learned_skills::update_learned_skill,
+            uclaw_core::commands::learned_skills::record_skill_cited,
+            uclaw_core::commands::learned_skills::set_skill_lifecycle,
             uclaw_core::tauri_commands::list_invocable_skills,
-            uclaw_core::tauri_commands::get_skill_versions,
+            uclaw_core::commands::learned_skills::get_skill_versions,
             // GEP Gene Evolution
             uclaw_core::tauri_commands::list_genes,
             uclaw_core::tauri_commands::get_gene_detail,
@@ -1193,10 +1193,10 @@ fn main() {
             uclaw_core::tauri_commands::retire_gene,
             uclaw_core::tauri_commands::reactivate_gene,
             // [R5] symphony 命令注册已删。
-            uclaw_core::tauri_commands::backfill_skill_keywords,
-            uclaw_core::tauri_commands::propose_skill_consolidation,
-            uclaw_core::tauri_commands::cancel_skill_consolidation,
-            uclaw_core::tauri_commands::apply_skill_consolidation,
+            uclaw_core::commands::learned_skills::backfill_skill_keywords,
+            uclaw_core::commands::learned_skills::propose_skill_consolidation,
+            uclaw_core::commands::learned_skills::cancel_skill_consolidation,
+            uclaw_core::commands::learned_skills::apply_skill_consolidation,
             // System Diagnostics
             uclaw_core::tauri_commands::get_system_diagnostics,
             // [R5] eval 命令注册已删。
