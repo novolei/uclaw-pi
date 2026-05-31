@@ -176,3 +176,9 @@ export { WorkspaceSandboxSettings } from './components/WorkspaceSandboxSettings'
 // settingsBridge.sttModelStatus/.sttDownloadModel). The sttSettings prefs atom +
 // the shortcut lookup stay in the component.
 export { SttSettings } from './components/SttSettings'
+
+// UsageSettings migrated + split (393 → thin shell composing usage/ cards
+// [BudgetHeader, WorkspaceRollupSection, UsageCharts] + lib/usage-format; all data
+// + the agent:turn_cost live re-fetch in useUsageData; the typed @/lib/tauri-bridge
+// cost helpers + @/atoms/cost atoms stay in the hook). Consumed by ConnectivityTab.
+export { UsageSettings } from './components/UsageSettings'

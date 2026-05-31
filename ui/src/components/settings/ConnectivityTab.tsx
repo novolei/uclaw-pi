@@ -7,9 +7,9 @@
  * anchor markers for the breadcrumb's IntersectionObserver.
  */
 import * as React from 'react'
-// ChannelSettings migrated into the settings feature; consumed from the barrel.
-import { ChannelSettings } from '@/features/settings'
-import { UsageSettings } from './UsageSettings'
+// ChannelSettings + UsageSettings migrated into the settings feature; consumed
+// from the barrel.
+import { ChannelSettings, UsageSettings } from '@/features/settings'
 
 export function ConnectivityTab(): React.ReactElement {
   return (
