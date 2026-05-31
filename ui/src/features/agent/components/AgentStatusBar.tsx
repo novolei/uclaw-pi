@@ -15,7 +15,7 @@ import { useAtomValue } from 'jotai'
 import { Loader2, Square, Wrench, Brain, AlertTriangle, CheckCircle2 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { agentStreamingStatesAtom, type AgentStreamState } from '@/atoms/agent-atoms'
-import { stopAgent } from '@/lib/tauri-bridge'
+import { stopAgent } from '@/lib/bridge/agent'
 
 export interface AgentStatusBarProps {
   sessionId: string

@@ -4,7 +4,7 @@ import { AgentStatusBar } from './AgentStatusBar'
 import { renderWithProviders, screen, waitFor } from '@/test-utils/render'
 import { agentStreamingStatesAtom, type AgentStreamState } from '@/atoms/agent-atoms'
 
-vi.mock('@/lib/tauri-bridge', () => ({
+vi.mock('@/lib/bridge/agent', () => ({
   stopAgent: vi.fn(async () => {}),
 }))
 
@@ -95,7 +95,7 @@ describe('AgentStatusBar', () => {
   })
 
   it('Stop button calls stopAgent', async () => {
-    const bridge = await import('@/lib/tauri-bridge')
+    const bridge = await import('@/lib/bridge/agent')
     const { store, user } = renderWithProviders(<AgentStatusBar sessionId={SESSION_ID} />)
     store.set(agentStreamingStatesAtom, new Map([
       [SESSION_ID, makeStream()],

@@ -15,6 +15,10 @@ export * from '../../lib/bridge/agent'
 // listAgentSessions).
 export { AgentHeader } from './components/AgentHeader'
 
+// AgentStatusBar — sticky execution-status one-liner above the input bar. Reads
+// the streaming-state atom; the Stop button routes through the agent bridge.
+export { AgentStatusBar } from './components/AgentStatusBar'
+
 // TaskBadge — single running background-task pill. Pure presentation (no IPC).
 export { TaskBadge } from './components/TaskBadge'
 

@@ -27,7 +27,7 @@ import { PermissionBanner } from './PermissionBanner'
 // Bundle 27-A — heartbeat indicator + stall banner + interrupted-reply recovery.
 import { AgentHeartbeatBanner } from './AgentHeartbeatBanner'
 import { PermissionModeSelector } from './PermissionModeSelector'
-import { AgentStatusBar } from './AgentStatusBar'
+import { AgentStatusBar } from '@/features/agent'
 import { AskUserBanner } from './AskUserBanner'
 import { ExitPlanModeBanner } from './ExitPlanModeBanner'
 import { PlanModeSuggestBanner } from './PlanModeSuggestBanner'
