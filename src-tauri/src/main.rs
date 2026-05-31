@@ -1290,8 +1290,8 @@ fn main() {
             uclaw_core::commands::browser_cmds::browser_ui_mouse_event,
             uclaw_core::commands::browser_cmds::browser_ui_complete_login,
             uclaw_core::commands::browser_cmds::browser_webview_complete_login,
-            // System Tray / Badge Commands (Phase 3)
-            uclaw_core::tauri_commands::update_badge_count,
+            // System Tray / Badge Commands (Phase 3) → commands::system_tray (slice 12)
+            uclaw_core::commands::system_tray::update_badge_count,
             // Automation Commands (Phase 3) → commands::automation (slice 9)
             uclaw_core::commands::automation::list_automations,
             uclaw_core::commands::automation::trigger_automation_manual,

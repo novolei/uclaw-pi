@@ -6970,17 +6970,7 @@ pub async fn rewind_session(
 
 // ─── Browser Commands → moved to commands::browser_cmds (thin move, slice 9) ──
 
-// ─── System Tray / Badge Commands (Phase 3) ─────────────────────────────────
-
-#[tauri::command]
-pub async fn update_badge_count(
-    app_handle: tauri::AppHandle,
-    count: u32,
-) -> Result<bool, Error> {
-    // Emit badge update event to frontend (UI handles display)
-    let _ = app_handle.emit("badge:updated", serde_json::json!({ "count": count }));
-    Ok(true)
-}
+// ─── System Tray / Badge Commands → moved to commands::system_tray (thin move, slice 12) ──
 
 // ─── Automation Commands → commands::automation + services::automation_service (slice 9) ──
 
