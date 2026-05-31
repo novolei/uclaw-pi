@@ -70,3 +70,8 @@ export { PlanModeSuggestBanner } from './components/PlanModeSuggestBanner'
 // ExitPlanModeBanner — plan-approval modal (accept+auto / accept+keep / reject
 // with feedback). respondExitPlanMode + stopAgent routed through the agent bridge.
 export { ExitPlanModeBanner } from './components/ExitPlanModeBanner'
+
+// AskUserBanner — interactive AskUserQuestion banner (tabs + vertical options +
+// keyboard nav). Split: presentational shell + AskUserQuestionCard sub-view, with
+// the answer state machine + respondAskUser / stopAgent IPC in useAskUserBanner.
+export { AskUserBanner } from './components/AskUserBanner'
