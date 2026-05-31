@@ -1004,8 +1004,8 @@ fn main() {
             uclaw_core::tauri_commands::search_conversations,
             uclaw_core::tauri_commands::search_all,
             // Notifications
-            uclaw_core::tauri_commands::get_notifications,
-            uclaw_core::tauri_commands::clear_notifications,
+            uclaw_core::commands::notification::get_notifications,
+            uclaw_core::commands::notification::clear_notifications,
             // Background tasks
             uclaw_core::tauri_commands::get_background_tasks,
             // Memory

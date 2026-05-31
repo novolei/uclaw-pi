@@ -3735,32 +3735,7 @@ async fn build_artifact_tree(root: &std::path::PathBuf, base: &std::path::PathBu
     Ok(nodes)
 }
 
-// ─── Notification Commands ─────────────────────────────────────────────
-
-#[tauri::command]
-pub async fn get_notifications(state: State<'_, AppState>) -> Result<Vec<NotificationItem>, Error> {
-    let mgr = state.notifications.lock().await;
-    Ok(mgr.history().into_iter().map(|n| NotificationItem {
-        id: n.id,
-        title: n.title,
-        message: n.message,
-        level: match n.level {
-            crate::notifications::NotificationLevel::Info => "info".into(),
-            crate::notifications::NotificationLevel::Success => "success".into(),
-            crate::notifications::NotificationLevel::Warning => "warning".into(),
-            crate::notifications::NotificationLevel::Error => "error".into(),
-        },
-        source: n.source,
-        timestamp: n.timestamp,
-    }).collect())
-}
-
-#[tauri::command]
-pub async fn clear_notifications(state: State<'_, AppState>) -> Result<bool, Error> {
-    let mut mgr = state.notifications.lock().await;
-    mgr.clear();
-    Ok(true)
-}
+// ─── Notification Commands → moved to commands::notification ──────────────
 
 // ─── Background Task Commands ──────────────────────────────────────────
 

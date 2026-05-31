@@ -9,5 +9,6 @@
 //! at a time. `settings` is the first slice (the HTTP-API toggle).
 
 pub mod llm_config;
+pub mod notification;
 pub mod settings;
 pub mod space;
