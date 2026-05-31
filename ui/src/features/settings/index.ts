@@ -147,3 +147,11 @@ export { SkillConsolidationDialog } from './components/SkillConsolidationDialog'
 // useWorkspaceSkillTags; the @/atoms/workspace reads + typed @/lib/tauri-bridge
 // tag helpers stay in the hook). Consumed by ToolSettings (relative sibling import).
 export { WorkspaceSkillTagsEditor } from './components/WorkspaceSkillTagsEditor'
+
+// ── Standalone settings pages (Settings nav leaves). Migrated out of
+// components/settings/ ; side effects moved into hooks; typed @/lib/tauri-bridge
+// helpers stay in those hooks. Consumed by components/settings/SettingsPanel. ──
+
+// AboutSettings migrated (version + platform load in useAboutInfo). No IPC in the
+// component; the external-link handlers stay [PLACEHOLDER] as in the original.
+export { AboutSettings } from './components/AboutSettings'

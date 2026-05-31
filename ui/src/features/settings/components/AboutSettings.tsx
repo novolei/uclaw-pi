@@ -1,17 +1,9 @@
-import { useState, useEffect } from 'react'
-import { SettingsSection } from './primitives/SettingsSection'
-import { SettingsCard } from './primitives/SettingsCard'
-import { getVersion, getPlatform } from '@/lib/tauri-bridge'
-import type { VersionInfo, PlatformInfo } from '@/lib/types'
+import { SettingsSection } from '@/components/settings/primitives/SettingsSection'
+import { SettingsCard } from '@/components/settings/primitives/SettingsCard'
+import { useAboutInfo } from '../hooks/useAboutInfo'
 
 export function AboutSettings() {
-  const [version, setVersion] = useState<VersionInfo | null>(null)
-  const [platform, setPlatform] = useState<PlatformInfo | null>(null)
-
-  useEffect(() => {
-    getVersion().then(setVersion)
-    getPlatform().then(setPlatform)
-  }, [])
+  const { version, platform } = useAboutInfo()
 
   return (
     <div className="space-y-6">
