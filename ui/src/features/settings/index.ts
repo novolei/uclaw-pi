@@ -16,3 +16,7 @@ export { AgentSettings } from './components/AgentSettings'
 
 // P2 — PromptsSettings migrated (presentation; load/save IPC in a hook).
 export { PromptsSettings } from './components/PromptsSettings'
+
+// P3 — BrowserRuntimeSettings migrated (thin shell; side effects in a hook,
+// split into browser-runtime/ cards + lib/browser-runtime-format helpers).
+export { BrowserRuntimeSettings } from './components/BrowserRuntimeSettings'

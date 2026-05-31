@@ -8,7 +8,28 @@ import type {
   BrowserRuntimeControlCenterReport,
   StartupRuntimePackStatusReport,
 } from '@/lib/startup/startup-doctor'
-import {
+import type { BrowserIdentityStatusReport } from '@/lib/tauri-bridge'
+import { settingsBridge } from '../../../lib/bridge/settings'
+
+// IPC now flows through the per-domain settings bridge (P3 migration); the test
+// mocks that bridge instead of the legacy `@/lib/tauri-bridge`. The bare names
+// below alias the mocked bridge methods so the call-count / arg assertions below
+// stay identical to the pre-migration test.
+vi.mock('../../../lib/bridge/settings', () => ({
+  settingsBridge: {
+    getBrowserRuntimeControlCenter: vi.fn(),
+    getBrowserRuntimeStatus: vi.fn(),
+    listBrowserIdentities: vi.fn(),
+    revokeBrowserIdentity: vi.fn(),
+    runBrowserRuntimeProviderProbe: vi.fn(),
+    runPlaywrightSetup: vi.fn(),
+    setBrowserRuntimeProviderEnabled: vi.fn(),
+    setBrowserRuntimeProviderPriority: vi.fn(),
+    setBrowserRuntimeMcpRawToolsExposed: vi.fn(),
+  },
+}))
+
+const {
   getBrowserRuntimeControlCenter,
   getBrowserRuntimeStatus,
   listBrowserIdentities,
@@ -17,19 +38,7 @@ import {
   runPlaywrightSetup,
   setBrowserRuntimeProviderEnabled,
   setBrowserRuntimeProviderPriority,
-  type BrowserIdentityStatusReport,
-} from '@/lib/tauri-bridge'
-
-vi.mock('@/lib/tauri-bridge', () => ({
-  getBrowserRuntimeControlCenter: vi.fn(),
-  getBrowserRuntimeStatus: vi.fn(),
-  listBrowserIdentities: vi.fn(),
-  revokeBrowserIdentity: vi.fn(),
-  runBrowserRuntimeProviderProbe: vi.fn(),
-  runPlaywrightSetup: vi.fn(),
-  setBrowserRuntimeProviderEnabled: vi.fn(),
-  setBrowserRuntimeProviderPriority: vi.fn(),
-}))
+} = settingsBridge
 
 function runtimeReport(manifestPackVersion = '1.48.2-uclaw.1'): StartupRuntimePackStatusReport {
   return {

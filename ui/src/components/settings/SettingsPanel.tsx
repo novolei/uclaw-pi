@@ -16,9 +16,8 @@ import { SttSettings } from './SttSettings'
 import { MemoryRecallTab } from './MemoryRecallTab'
 import { LearnedProfileTab } from './LearnedProfileTab'
 import { ImChannelsSettings } from './ImChannelsSettings'
-import { GeneralTab, SystemTab } from '@/features/settings'
+import { BrowserRuntimeSettings, GeneralTab, SystemTab } from '@/features/settings'
 import { SettingsBreadcrumb } from './SettingsBreadcrumb'
-import { BrowserRuntimeSettings } from './BrowserRuntimeSettings'
 
 
 function SettingsContent({ tab }: { tab: SettingsTab }) {
