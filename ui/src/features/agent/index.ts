@@ -198,3 +198,11 @@ export { AgentTeamsPanel } from './components/AgentTeamsPanel'
 // used by chat's NativeBlockRenderer). Consumed by SDKMessageRenderer.
 export { ContentBlock } from './components/ContentBlock'
 export type { ContentBlockProps } from './components/ContentBlock'
+
+// ToolActivityList / ToolActivityItem — compact tool-activity list (grouping +
+// Tools card + collapse). Split (was 693 lines): the row family lives in
+// `tool-activity/` (ActivityRow / ActivityGroupRow / ActivityDetails + row-bits
+// + constants), and the attachment-image decode in `hooks/useAttachmentImage`;
+// image IO routes through the agent bridge. ActivityRow is surfaced for tests.
+// Consumed by AgentMessages. `formatElapsed` is re-exported for compatibility.
+export { ToolActivityList, ToolActivityItem, ActivityRow, formatElapsed } from './components/ToolActivityItem'

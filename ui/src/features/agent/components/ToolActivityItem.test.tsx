@@ -18,7 +18,10 @@ import type { ToolActivity } from '@/atoms/agent-atoms'
 vi.mock('@tauri-apps/api/core', () => ({ invoke: vi.fn() }))
 vi.mock('@tauri-apps/api/event', () => ({ listen: vi.fn().mockResolvedValue(() => {}) }))
 
-vi.mock('@/lib/tauri-bridge', () => ({
+// Tool-result image IO now routes through the agent bridge (ActivityDetails /
+// ToolResultImage). ActivityRow — the unit under test — doesn't touch it, but
+// mock the bridge anyway so nothing reaches the real Tauri layer.
+vi.mock('@/lib/bridge/agent', () => ({
   readAttachment: vi.fn(async () => ''),
   saveImageAs: vi.fn(async () => {}),
 }))

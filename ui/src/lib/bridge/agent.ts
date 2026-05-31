@@ -51,6 +51,11 @@ export {
   // (the "open in OS browser" affordance on the live preview). Thin re-export —
   // delegates to the shell-open command, signature unchanged. ──
   openExternal,
+  // ── Tool-result image IO surfaced for the migrated ToolActivityItem
+  // (ActivityDetails renders generated images: read the attachment bytes, then
+  // save-as). Thin re-exports — command names + payload shapes unchanged. ──
+  readAttachment,
+  saveImageAs,
 } from '../tauri-bridge'
 
 // Per-turn record shape returned by `get_session_trajectory`, surfaced so the
