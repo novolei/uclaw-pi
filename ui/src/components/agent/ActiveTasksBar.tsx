@@ -6,7 +6,7 @@
  */
 
 import * as React from 'react'
-import { TaskBadge } from './TaskBadge'
+import { TaskBadge } from '@/features/agent'
 import { cn } from '@/lib/utils'
 import type { BackgroundTask } from '@/atoms/agent-atoms'
 
