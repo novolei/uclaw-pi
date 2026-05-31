@@ -152,3 +152,8 @@ export { PlanModeDashedBorder } from './components/PlanModeDashedBorder'
 // AutomationRunBanner — top-of-session banner shown when the loaded session is
 // an automation run (parses the metadata JSON prop). Pure presentation — no IPC.
 export { AutomationRunBanner } from './components/AutomationRunBanner'
+
+// PetWidget — desktop-pet anchored to the composer (crossfading WebP layers
+// driven by pet-atoms + usePetHover). Pure atom-driven UI; CSS sidecar travels
+// with it. No IPC.
+export { PetWidget } from './components/PetWidget'
