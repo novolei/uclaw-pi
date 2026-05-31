@@ -116,3 +116,8 @@ export { SkillRecallChips } from './components/SkillRecallChips'
 // screencast). The JPEG-frame decode + canvas paint moves into
 // hooks/useScreencastCanvas; openExternal routes through the agent bridge.
 export { BrowserPreviewOverlay } from './components/BrowserPreviewOverlay'
+
+// WorkspaceFilesView — the RightSidePanel "Files" tab body (wraps FilesRail +
+// the auto-open-on-edit effect). Pure atom-driven UI — no IPC, so no hook
+// extraction. File kept as SidePanel.tsx to preserve git history.
+export { WorkspaceFilesView } from './components/SidePanel'

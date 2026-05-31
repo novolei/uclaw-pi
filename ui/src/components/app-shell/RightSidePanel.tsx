@@ -27,7 +27,7 @@ const rightPanelSlideVariants: Variants = {
   }),
 }
 import { activePlanAtom } from '@/atoms/agent-teams'
-import { WorkspaceFilesView } from '@/components/agent/SidePanel'
+import { WorkspaceFilesView } from '@/features/agent'
 import { AgentTeamsPanel } from '@/components/agent/AgentTeamsPanel'
 import { PlanViewer } from '@/features/agent'
 import { TrajectoryReel } from '@/features/agent'
