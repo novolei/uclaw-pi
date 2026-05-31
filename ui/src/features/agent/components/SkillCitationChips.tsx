@@ -25,8 +25,8 @@ import {
   TooltipTrigger,
 } from '@/components/ui/tooltip'
 import type { SkillCitation } from '@/lib/skill-citation'
-import { recordSkillCited } from '@/lib/tauri-bridge'
 import { settingsOpenAtom, settingsTabAtom } from '@/atoms/settings-tab'
+import { useRecordSkillCitations } from '../hooks/useRecordSkillCitations'
 
 interface SkillCitationChipsProps {
   citations: SkillCitation[]
@@ -36,11 +36,6 @@ interface SkillCitationChipsProps {
   className?: string
 }
 
-// Module-level dedup. Streaming + finalized message can both render
-// the same citation; we only want one `recordSkillCited` per logical
-// citation per page lifetime.
-const recordedKeys = new Set<string>()
-
 export const SkillCitationChips = React.memo(function SkillCitationChips({
   citations,
   messageKey,
@@ -49,20 +44,8 @@ export const SkillCitationChips = React.memo(function SkillCitationChips({
   const setSettingsOpen = useSetAtom(settingsOpenAtom)
   const setSettingsTab = useSetAtom(settingsTabAtom)
 
-  React.useEffect(() => {
-    if (citations.length === 0) return
-    for (const c of citations) {
-      const key = `${messageKey}::${c.title}`
-      if (recordedKeys.has(key)) continue
-      recordedKeys.add(key)
-      // Fire-and-forget: bumping cited_count is best-effort observability,
-      // never block UI on it. Failures get logged in the bridge layer.
-      recordSkillCited(c.title).catch(() => {
-        // Swallow — backend logs the actual error. UI shouldn't surface
-        // a transient bump failure.
-      })
-    }
-  }, [citations, messageKey])
+  // Best-effort `record_skill_cited` bump (deduped per message + citation).
+  useRecordSkillCitations(citations, messageKey)
 
   if (citations.length === 0) return null
 

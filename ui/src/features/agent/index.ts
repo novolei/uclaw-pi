@@ -95,3 +95,8 @@ export { PlanViewer, parsePlanMarkdown } from './components/PlanViewer'
 // SessionEvalBadge). The `get_session_trajectory` fetch + loading/error state
 // live in hooks/useSessionTrajectory (routed through the agent bridge).
 export { TrajectoryReel } from './components/TrajectoryReel'
+
+// SkillCitationChips — "applied skill X" pills under an assistant message. The
+// fire-once `record_skill_cited` bump (module-level dedup) moves into
+// hooks/useRecordSkillCitations (routed through the agent bridge).
+export { SkillCitationChips } from './components/SkillCitationChips'

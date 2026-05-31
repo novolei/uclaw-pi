@@ -38,6 +38,10 @@ export {
   // (per-turn breakdown reel). Thin re-export — command name + payload shape
   // unchanged. ──
   getSessionTrajectory,
+  // ── Best-effort observability bump surfaced for the migrated
+  // SkillCitationChips (records that an applied-skill citation was rendered).
+  // Thin re-export — command name + payload shape unchanged. ──
+  recordSkillCited,
 } from '../tauri-bridge'
 
 // Per-turn record shape returned by `get_session_trajectory`, surfaced so the
