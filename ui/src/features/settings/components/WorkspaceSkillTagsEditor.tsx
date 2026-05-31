@@ -11,71 +11,23 @@
  * component echoes back what's actually stored.
  */
 import * as React from 'react'
-import { useAtomValue } from 'jotai'
-import { activeWorkspaceIdAtom, workspacesAtom } from '@/atoms/workspace'
-import { getWorkspaceSkillTags, setWorkspaceSkillTags } from '@/lib/tauri-bridge'
 import { Button } from '@/components/ui/button'
-import { toast } from 'sonner'
 import { X } from 'lucide-react'
+import { useWorkspaceSkillTags } from '../hooks/useWorkspaceSkillTags'
 
 export function WorkspaceSkillTagsEditor(): React.ReactElement | null {
-  const activeId = useAtomValue(activeWorkspaceIdAtom)
-  const workspaces = useAtomValue(workspacesAtom)
-  const activeWorkspace = React.useMemo(
-    () => workspaces.find((w) => w.id === activeId),
-    [workspaces, activeId],
-  )
-
-  const [tags, setTags] = React.useState<string[]>([])
+  // Tag data + load/persist/add/remove actions live in the hook; the component
+  // keeps only the draft input state (code-organization ADR 2026-05-31).
+  const { activeId, activeWorkspace, tags, loading, saving, addTag, removeTag } =
+    useWorkspaceSkillTags()
   const [draft, setDraft] = React.useState('')
-  const [loading, setLoading] = React.useState(false)
-  const [saving, setSaving] = React.useState(false)
 
-  React.useEffect(() => {
-    if (!activeId) {
-      setTags([])
-      return
-    }
-    setLoading(true)
-    getWorkspaceSkillTags(activeId)
-      .then(setTags)
-      .catch((e) => toast.error('读取标签失败', { description: String(e) }))
-      .finally(() => setLoading(false))
-  }, [activeId])
-
-  const persist = React.useCallback(
-    async (next: string[]) => {
-      if (!activeId) return
-      setSaving(true)
-      try {
-        const normalized = await setWorkspaceSkillTags(activeId, next)
-        setTags(normalized)
-      } catch (e) {
-        toast.error('保存失败', { description: String(e) })
-      } finally {
-        setSaving(false)
-      }
-    },
-    [activeId],
-  )
-
-  const addTag = React.useCallback(() => {
-    const trimmed = draft.trim()
-    if (!trimmed) return
-    if (tags.includes(trimmed.toLowerCase())) {
-      setDraft('')
-      return
-    }
-    void persist([...tags, trimmed])
+  // Always clear the draft after an add attempt (mirrors the pre-migration
+  // behavior, including the duplicate-tag case).
+  const submitDraft = React.useCallback(() => {
+    addTag(draft)
     setDraft('')
-  }, [draft, tags, persist])
-
-  const removeTag = React.useCallback(
-    (tag: string) => {
-      void persist(tags.filter((t) => t !== tag))
-    },
-    [tags, persist],
-  )
+  }, [addTag, draft])
 
   if (!activeId) {
     return (
@@ -129,17 +81,17 @@ export function WorkspaceSkillTagsEditor(): React.ReactElement | null {
           onKeyDown={(e) => {
             if (e.key === 'Enter') {
               e.preventDefault()
-              addTag()
+              submitDraft()
             } else if (e.key === ',') {
               e.preventDefault()
-              addTag()
+              submitDraft()
             }
           }}
           placeholder="输入标签，回车或逗号添加"
           disabled={saving}
           className="flex-1 text-xs px-2 py-1 rounded border border-border bg-background focus:outline-none focus:ring-1 focus:ring-primary disabled:opacity-50"
         />
-        <Button size="sm" variant="outline" onClick={addTag} disabled={saving || !draft.trim()}>
+        <Button size="sm" variant="outline" onClick={submitDraft} disabled={saving || !draft.trim()}>
           添加
         </Button>
       </div>

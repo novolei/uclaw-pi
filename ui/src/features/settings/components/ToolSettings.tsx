@@ -1,8 +1,9 @@
 import type { ActiveManifestSkill } from '@/lib/types'
-// Primitives + the tags editor still live under components/settings/ (migrated in
-// a later phase); imported via the @/ alias so behavior is preserved exactly.
+// Primitives still live under components/settings/ (migrated in a later phase);
+// imported via the @/ alias so behavior is preserved exactly. The tags editor is
+// a migrated sibling — imported relatively.
 import { SettingsSection } from '@/components/settings/primitives/SettingsSection'
-import { WorkspaceSkillTagsEditor } from '@/components/settings/WorkspaceSkillTagsEditor'
+import { WorkspaceSkillTagsEditor } from './WorkspaceSkillTagsEditor'
 import { Button } from '@/components/ui/button'
 import { RefreshCw } from 'lucide-react'
 import { useToolSettings } from '../hooks/useToolSettings'

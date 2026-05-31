@@ -31,8 +31,8 @@ export { PromptSettings } from './components/PromptSettings'
 // P3 — GeneralSettings migrated (thin shell; language load/persist in a hook).
 export { GeneralSettings } from './components/GeneralSettings'
 
-// P3a — ToolSettings migrated (active-manifest load in a hook; skill-tag editor
-// stays under components/settings/ for now).
+// P3a — ToolSettings migrated (active-manifest load in a hook). The skill-tag
+// editor is now a migrated sibling (see WorkspaceSkillTagsEditor below).
 export { ToolSettings } from './components/ToolSettings'
 
 // P3a — ModelSettings migrated (role→model load + optimistic write in a hook;
@@ -120,3 +120,8 @@ export { SkillEvolutionTab } from './components/SkillEvolutionTab'
 // SkillConsolidationDialog migrated (expanded/applying state machine + apply
 // action in useSkillConsolidation). Consumed by views/Kaleidoscope/.../SkillsModule.
 export { SkillConsolidationDialog } from './components/SkillConsolidationDialog'
+
+// WorkspaceSkillTagsEditor migrated (workspace-tag data + persist in
+// useWorkspaceSkillTags; the @/atoms/workspace reads + typed @/lib/tauri-bridge
+// tag helpers stay in the hook). Consumed by ToolSettings (relative sibling import).
+export { WorkspaceSkillTagsEditor } from './components/WorkspaceSkillTagsEditor'
