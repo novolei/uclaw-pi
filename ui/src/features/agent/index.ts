@@ -161,3 +161,12 @@ export { PetWidget } from './components/PetWidget'
 // ModeBanner — session-top pill shown only for Plan / AcceptEdits safety modes.
 // Pure atom-driven UI (safetyModeAtom) — no IPC.
 export { ModeBanner } from './components/ModeBanner'
+
+// BackgroundTasksPanel — table of running background tasks (rendered under an
+// assistant message's tool area). Pure presentation (tasks via prop) — no IPC.
+export { BackgroundTasksPanel } from './components/BackgroundTasksPanel'
+
+// ActiveTasksBar — horizontal running-task bar above the composer; clicking a
+// TaskBadge scrolls to its ToolActivityItem. Pure presentation (tasks +
+// callbacks via props; renders the migrated TaskBadge) — no IPC.
+export { ActiveTasksBar } from './components/ActiveTasksBar'
