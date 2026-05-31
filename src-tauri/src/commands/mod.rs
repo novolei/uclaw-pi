@@ -15,6 +15,7 @@ pub mod browser_cmds;
 pub mod channel;
 pub mod conversation;
 pub mod cost;
+pub mod gep;
 pub mod learned_skills;
 pub mod llm_config;
 pub mod mcp;

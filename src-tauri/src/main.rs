@@ -1187,11 +1187,11 @@ fn main() {
             uclaw_core::tauri_commands::list_invocable_skills,
             uclaw_core::commands::learned_skills::get_skill_versions,
             // GEP Gene Evolution
-            uclaw_core::tauri_commands::list_genes,
-            uclaw_core::tauri_commands::get_gene_detail,
-            uclaw_core::tauri_commands::get_gene_evolution_tree,
-            uclaw_core::tauri_commands::retire_gene,
-            uclaw_core::tauri_commands::reactivate_gene,
+            uclaw_core::commands::gep::list_genes,
+            uclaw_core::commands::gep::get_gene_detail,
+            uclaw_core::commands::gep::get_gene_evolution_tree,
+            uclaw_core::commands::gep::retire_gene,
+            uclaw_core::commands::gep::reactivate_gene,
             // [R5] symphony 命令注册已删。
             uclaw_core::commands::learned_skills::backfill_skill_keywords,
             uclaw_core::commands::learned_skills::propose_skill_consolidation,
