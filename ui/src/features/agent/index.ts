@@ -111,3 +111,8 @@ export { SkillSuggestionBar } from './components/SkillSuggestionBar'
 // conflict indicator). Pure atom-driven UI (skillRecallsMapAtom) — no IPC, so
 // no hook extraction needed.
 export { SkillRecallChips } from './components/SkillRecallChips'
+
+// BrowserPreviewOverlay — floating live preview of the agent's browser (CDP
+// screencast). The JPEG-frame decode + canvas paint moves into
+// hooks/useScreencastCanvas; openExternal routes through the agent bridge.
+export { BrowserPreviewOverlay } from './components/BrowserPreviewOverlay'

@@ -47,6 +47,10 @@ export {
   // names + payload shapes unchanged. ──
   listSkills,
   listLearnedSkills,
+  // ── Open-in-system-browser surfaced for the migrated BrowserPreviewOverlay
+  // (the "open in OS browser" affordance on the live preview). Thin re-export —
+  // delegates to the shell-open command, signature unchanged. ──
+  openExternal,
 } from '../tauri-bridge'
 
 // Per-turn record shape returned by `get_session_trajectory`, surfaced so the
