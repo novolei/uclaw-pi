@@ -30,7 +30,7 @@ import {
   agentStreamingStatesAtom,
   finalizeStreamingActivities,
 } from '@/atoms/agent-atoms'
-import { respondExitPlanMode, stopAgent } from '@/lib/tauri-bridge'
+import { respondExitPlanMode, stopAgent } from '@/lib/bridge/agent'
 
 const REMARK_PLUGINS = [remarkGfm]
 

@@ -66,3 +66,7 @@ export { QueuedMessagesBanner } from './components/QueuedMessagesBanner'
 // `agent:plan_mode_suggest` subscription + respondPlanModeSuggest / setSafetyMode
 // IPC route through the agent bridge (onPlanModeSuggest wrapper).
 export { PlanModeSuggestBanner } from './components/PlanModeSuggestBanner'
+
+// ExitPlanModeBanner — plan-approval modal (accept+auto / accept+keep / reject
+// with feedback). respondExitPlanMode + stopAgent routed through the agent bridge.
+export { ExitPlanModeBanner } from './components/ExitPlanModeBanner'
