@@ -207,6 +207,25 @@ export function SystemTab() {
     }
   }, [])
 
+  // Optional local HTTP API server toggle (memory / embeddings / external).
+  // Persisted backend setting; null = still loading. Applies on next restart.
+  const [httpApiEnabled, setHttpApiEnabled] = React.useState<boolean | null>(null)
+  React.useEffect(() => {
+    invoke<boolean>('get_http_api_enabled')
+      .then(setHttpApiEnabled)
+      .catch(() => setHttpApiEnabled(false))
+  }, [])
+  async function toggleHttpApi() {
+    if (httpApiEnabled === null) return
+    const next = !httpApiEnabled
+    try {
+      await invoke('set_http_api_enabled', { enabled: next })
+      setHttpApiEnabled(next)
+    } catch (e) {
+      setActionError(String(e))
+    }
+  }
+
   const isHealthy = report
     ? report.consecutive_failures === 0
       && !report.services.some(s => s.status.status === 'Failed')
@@ -319,6 +338,30 @@ export function SystemTab() {
           {actionError}
         </div>
       )}
+
+      {/* 本地 HTTP API 服务开关（可选，默认关） */}
+      <div className="rounded-xl border border-border px-4 py-3">
+        <div className="flex items-center justify-between gap-3">
+          <div className="min-w-0">
+            <div className="text-sm font-medium text-foreground">本地 HTTP API 服务</div>
+            <p className="text-xs text-muted-foreground mt-0.5">
+              可选的本地接口（记忆 / embedding / 外部访问，端口 19528）。聊天与 Agent 不依赖它，默认关闭。修改后需<span className="text-foreground/70">重启应用</span>生效。
+            </p>
+          </div>
+          <button
+            onClick={toggleHttpApi}
+            disabled={httpApiEnabled === null}
+            className={cn(
+              'shrink-0 text-xs px-3 py-1.5 rounded-lg transition-colors disabled:opacity-50',
+              httpApiEnabled
+                ? 'bg-green-500/15 text-green-400 hover:bg-green-500/25'
+                : 'bg-muted text-muted-foreground hover:bg-muted/70',
+            )}
+          >
+            {httpApiEnabled === null ? '…' : httpApiEnabled ? '已开启' : '已关闭'}
+          </button>
+        </div>
+      </div>
 
       {/* 系统健康 collapsible card */}
       {report && (
