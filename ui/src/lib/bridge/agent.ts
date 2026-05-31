@@ -42,6 +42,11 @@ export {
   // SkillCitationChips (records that an applied-skill citation was rendered).
   // Thin re-export — command name + payload shape unchanged. ──
   recordSkillCited,
+  // ── Skill catalog reads surfaced for the migrated SkillSuggestionBar
+  // (local fuzzy-match suggestions while typing). Thin re-exports — command
+  // names + payload shapes unchanged. ──
+  listSkills,
+  listLearnedSkills,
 } from '../tauri-bridge'
 
 // Per-turn record shape returned by `get_session_trajectory`, surfaced so the

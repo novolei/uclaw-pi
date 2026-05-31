@@ -100,3 +100,9 @@ export { TrajectoryReel } from './components/TrajectoryReel'
 // fire-once `record_skill_cited` bump (module-level dedup) moves into
 // hooks/useRecordSkillCitations (routed through the agent bridge).
 export { SkillCitationChips } from './components/SkillCitationChips'
+
+// SkillSuggestionBar — debounced "did you mean /skill" chip bar under the chat
+// composer. The catalog load (listSkills + listLearnedSkills) + cache +
+// debounced fuzzy match move into hooks/useSkillSuggestions (routed through the
+// agent bridge).
+export { SkillSuggestionBar } from './components/SkillSuggestionBar'
