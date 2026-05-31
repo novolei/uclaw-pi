@@ -10,6 +10,7 @@
 
 pub mod background_task;
 pub mod conversation;
+pub mod cost;
 pub mod llm_config;
 pub mod notification;
 pub mod settings;
