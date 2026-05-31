@@ -4,9 +4,25 @@ import { renderWithProviders, screen } from '@/test-utils/render'
 import type { ImChannelRow, ImChannelStatus } from '@/atoms/im-channel-atoms'
 import { ImChannelAccordionRow } from './ImChannelAccordionRow'
 
-const invokeMock = vi.fn()
-vi.mock('@tauri-apps/api/core', () => ({ invoke: (...a: unknown[]) => invokeMock(...a) }))
+// IPC now flows through settingsBridge (was a raw Tauri-core invoke mock before
+// the migration). The wechat_ilink branch also renders WechatIlinkBindingPanel,
+// which calls the same bridge — so the binding methods are stubbed here too.
+vi.mock('../../../../lib/bridge/settings', () => ({
+  settingsBridge: {
+    createImChannel: vi.fn().mockResolvedValue(undefined),
+    updateImChannel: vi.fn().mockResolvedValue(undefined),
+    toggleImChannel: vi.fn().mockResolvedValue(undefined),
+    requestWechatIlinkQrcode: vi.fn().mockResolvedValue({ qrcode: '', qrcode_img_content: '' }),
+    pollWechatIlinkQrcodeStatus: vi.fn().mockResolvedValue({ status: 'wait' }),
+    saveWechatIlinkToken: vi.fn().mockResolvedValue(undefined),
+    disconnectWechatIlink: vi.fn().mockResolvedValue(undefined),
+  },
+}))
 vi.mock('sonner', () => ({ toast: { error: vi.fn() } }))
+
+import { settingsBridge } from '../../../../lib/bridge/settings'
+const createMock = vi.mocked(settingsBridge.createImChannel)
+const updateMock = vi.mocked(settingsBridge.updateImChannel)
 
 const BASE_CHANNEL: ImChannelRow = {
   id: 'ch-1', spaceId: 'sp-1', channelType: 'wecom_bot', name: '客服机器人',
@@ -48,7 +64,10 @@ function renderRow(overrides: {
   return { onToggleOpen, onToggleEnabled, onSaved, onDeleted }
 }
 
-beforeEach(() => { invokeMock.mockReset() })
+beforeEach(() => {
+  createMock.mockClear().mockResolvedValue(undefined)
+  updateMock.mockClear().mockResolvedValue(undefined)
+})
 
 describe('ImChannelAccordionRow', () => {
   it('renders channel name in closed state', () => {
@@ -112,7 +131,6 @@ describe('ImChannelAccordionRow', () => {
   })
 
   it('calls update_im_channel on save', async () => {
-    invokeMock.mockResolvedValue(undefined)
     renderRow({ open: true })
     const nameInput = screen.getByPlaceholderText('我的企微机器人')
     fireEvent.change(nameInput, { target: { value: '新名称' } })
@@ -120,15 +138,14 @@ describe('ImChannelAccordionRow', () => {
       fireEvent.click(screen.getByRole('button', { name: '保存' }))
     })
     await waitFor(() => {
-      expect(invokeMock).toHaveBeenCalledWith(
-        'update_im_channel',
-        expect.objectContaining({ id: 'ch-1', input: expect.objectContaining({ name: '新名称' }) })
+      expect(updateMock).toHaveBeenCalledWith(
+        'ch-1',
+        expect.objectContaining({ name: '新名称' })
       )
     })
   })
 
   it('calls create_im_channel in new-instance mode', async () => {
-    invokeMock.mockResolvedValue(undefined)
     renderRow({ channel: null, newChannelType: 'wecom_bot', open: true })
     const nameInput = screen.getByPlaceholderText('我的企微机器人')
     fireEvent.change(nameInput, { target: { value: '新机器人' } })
@@ -136,10 +153,7 @@ describe('ImChannelAccordionRow', () => {
       fireEvent.click(screen.getByRole('button', { name: '保存' }))
     })
     await waitFor(() => {
-      expect(invokeMock).toHaveBeenCalledWith(
-        'create_im_channel',
-        expect.objectContaining({})
-      )
+      expect(createMock).toHaveBeenCalledWith(expect.objectContaining({ name: '新机器人' }))
     })
   })
 

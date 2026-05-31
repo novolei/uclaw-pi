@@ -68,3 +68,7 @@ export { DeveloperOptionsSection } from './components/DeveloperOptionsSection'
 // WechatIlinkBindingPanel migrated (QR-binding state machine in
 // useWechatIlinkBinding; only the canvas draw effect stays in the component).
 export { WechatIlinkBindingPanel } from './components/im-channels/WechatIlinkBindingPanel'
+
+// ImChannelAccordionRow migrated + split (602 → shell + im-channels/accordion/
+// ChannelTypeFields + useImChannelAccordionForm + lib/im-channel-format).
+export { ImChannelAccordionRow } from './components/im-channels/ImChannelAccordionRow'

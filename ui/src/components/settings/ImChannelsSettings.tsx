@@ -10,7 +10,9 @@ import {
   fetchImChannelStatusesAtom,
 } from '@/atoms/im-channel-atoms'
 import type { ImChannelStatus } from '@/atoms/im-channel-atoms'
-import { ImChannelAccordionRow } from './ImChannelAccordionRow'
+// ImChannelAccordionRow migrated into the settings feature; consumed from the
+// barrel until this settings panel itself migrates (same batch).
+import { ImChannelAccordionRow } from '@/features/settings'
 import type { SpaceSummary } from '@/lib/types'
 
 const CHANNEL_TYPES_ORDER = [
