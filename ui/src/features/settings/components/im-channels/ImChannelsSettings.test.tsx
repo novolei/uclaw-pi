@@ -6,10 +6,27 @@ import { imChannelsAtom, imChannelStatusesAtom } from '@/atoms/im-channel-atoms'
 import type { ImChannelRow, ImChannelStatus } from '@/atoms/im-channel-atoms'
 import { ImChannelsSettings } from './ImChannelsSettings'
 
+// The component + accordion row route IPC through settingsBridge (mocked below).
+// The list/status *atoms* still own their own Tauri-core invoke (they live
+// outside the feature, in @/atoms/im-channel-atoms), so their boundary is
+// stubbed here — this Tauri-core mock is for the out-of-feature atoms, not the
+// migrated component. `onImChannelStatusChanged` is the named realtime export.
 const invokeMock = vi.fn()
 vi.mock('@tauri-apps/api/core', () => ({ invoke: (...a: unknown[]) => invokeMock(...a) }))
-vi.mock('@tauri-apps/api/event', () => ({ listen: vi.fn(() => Promise.resolve(() => {})) }))
+vi.mock('../../../../lib/bridge/settings', () => ({
+  settingsBridge: {
+    listSpaces: vi.fn().mockResolvedValue([]),
+    toggleImChannel: vi.fn().mockResolvedValue(undefined),
+    deleteImChannel: vi.fn().mockResolvedValue(undefined),
+    createImChannel: vi.fn().mockResolvedValue(undefined),
+    updateImChannel: vi.fn().mockResolvedValue(undefined),
+  },
+  onImChannelStatusChanged: vi.fn(() => Promise.resolve(() => {})),
+}))
 vi.mock('sonner', () => ({ toast: { error: vi.fn() } }))
+
+import { settingsBridge } from '../../../../lib/bridge/settings'
+const toggleMock = vi.mocked(settingsBridge.toggleImChannel)
 
 const makeChannel = (overrides: Partial<ImChannelRow> = {}): ImChannelRow => ({
   id: 'ch-1', spaceId: 'sp-1', channelType: 'wecom_bot', name: '产品组机器人',
@@ -22,8 +39,9 @@ const makeChannel = (overrides: Partial<ImChannelRow> = {}): ImChannelRow => ({
 
 beforeEach(() => {
   invokeMock.mockReset()
-  // Default: list_im_channels, get_im_channel_statuses, list_spaces all return empty
+  // Default: list_im_channels, get_im_channel_statuses all return empty
   invokeMock.mockResolvedValue([])
+  toggleMock.mockClear().mockResolvedValue(undefined)
 })
 
 describe('ImChannelsSettings', () => {
@@ -61,21 +79,21 @@ describe('ImChannelsSettings', () => {
   })
 
   it('calls toggle_im_channel and optimistically updates enabled state', async () => {
-    invokeMock.mockResolvedValue(undefined)
     const store = createStore()
     store.set(imChannelsAtom, [makeChannel({ enabled: true })])
     renderWithProviders(<ImChannelsSettings />, { store })
     const toggleBtn = screen.getByRole('button', { name: '停用' })
     fireEvent.click(toggleBtn)
     await waitFor(() => {
-      expect(invokeMock).toHaveBeenCalledWith('toggle_im_channel', { id: 'ch-1', enabled: false })
+      expect(toggleMock).toHaveBeenCalledWith('ch-1', false)
     })
   })
 
   it('reverts optimistic toggle on invoke failure', async () => {
     const ch = makeChannel({ enabled: true })
+    // toggle rejects → hook re-fetches channels (the atom's list_im_channels invoke)
+    toggleMock.mockRejectedValue(new Error('network error'))
     invokeMock.mockImplementation((cmd: string) => {
-      if (cmd === 'toggle_im_channel') return Promise.reject(new Error('network error'))
       if (cmd === 'list_im_channels') return Promise.resolve([ch])
       return Promise.resolve([])
     })

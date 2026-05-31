@@ -77,3 +77,8 @@ export { ImChannelAccordionRow } from './components/im-channels/ImChannelAccordi
 // ImChannelFormFields + useImChannelForm). The flat add/edit form (distinct
 // from the accordion row); currently has no consumer in-tree.
 export { ImChannelForm } from './components/im-channels/ImChannelForm'
+
+// ImChannelsSettings migrated (Settings → 机器人 tabbed list; data + IPC + the
+// realtime status subscription in useImChannelsSettings, pure-UI tab state in
+// the component). Consumed by SettingsPanel.
+export { ImChannelsSettings } from './components/im-channels/ImChannelsSettings'

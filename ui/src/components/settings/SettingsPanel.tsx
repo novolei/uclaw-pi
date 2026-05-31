@@ -15,8 +15,12 @@ import { SettingsNav } from './SettingsNav'
 import { SttSettings } from './SttSettings'
 import { MemoryRecallTab } from './MemoryRecallTab'
 import { LearnedProfileTab } from './LearnedProfileTab'
-import { ImChannelsSettings } from './ImChannelsSettings'
-import { BrowserRuntimeSettings, GeneralTab, SystemTab } from '@/features/settings'
+import {
+  BrowserRuntimeSettings,
+  GeneralTab,
+  ImChannelsSettings,
+  SystemTab,
+} from '@/features/settings'
 import { SettingsBreadcrumb } from './SettingsBreadcrumb'
 
 

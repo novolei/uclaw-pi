@@ -1,19 +1,11 @@
-import { useAtom, useSetAtom } from 'jotai'
-import { useEffect, useState } from 'react'
-import { invoke } from '@tauri-apps/api/core'
-import { listen } from '@tauri-apps/api/event'
-import { toast } from 'sonner'
-import {
-  imChannelsAtom,
-  fetchImChannelsAtom,
-  imChannelStatusesAtom,
-  fetchImChannelStatusesAtom,
-} from '@/atoms/im-channel-atoms'
-import type { ImChannelStatus } from '@/atoms/im-channel-atoms'
-// ImChannelAccordionRow migrated into the settings feature; consumed from the
-// barrel until this settings panel itself migrates (same batch).
-import { ImChannelAccordionRow } from '@/features/settings'
-import type { SpaceSummary } from '@/lib/types'
+// Settings → 机器人 — the IM-channel tabbed list. Thin shell: data + IPC +
+// the realtime status subscription live in useImChannelsSettings; only pure-UI
+// state (active tab, open row, adding-to-type) stays here. Migrated out of
+// components/settings/ during the IM-channel migration. No direct Tauri IPC
+// here; behavior (tabs always visible, error badges, add-new row) preserved.
+import { useState } from 'react'
+import { ImChannelAccordionRow } from './ImChannelAccordionRow'
+import { useImChannelsSettings } from '../../hooks/useImChannelsSettings'
 
 const CHANNEL_TYPES_ORDER = [
   'wecom_bot', 'wechat_ilink', 'email', 'dingtalk', 'feishu', 'webhook',
@@ -38,30 +30,11 @@ const CHANNEL_DESCRIPTIONS: Record<string, string> = {
 }
 
 export function ImChannelsSettings() {
-  const [channels, setChannels] = useAtom(imChannelsAtom)
-  const fetchChannels = useSetAtom(fetchImChannelsAtom)
-  const [statuses, setStatuses] = useAtom(imChannelStatusesAtom)
-  const fetchStatuses = useSetAtom(fetchImChannelStatusesAtom)
-  const [spaces, setSpaces] = useState<{ id: string; name: string }[]>([])
+  const { channels, statuses, spaces, handleToggle, handleSaved, handleDelete } =
+    useImChannelsSettings()
   const [activeTab, setActiveTab] = useState<string | null>(null)
   const [openRowId, setOpenRowId] = useState<string | null>(null)
   const [addingToType, setAddingToType] = useState<string | null>(null)
-
-  useEffect(() => {
-    fetchChannels()
-    fetchStatuses()
-    invoke<SpaceSummary[]>('list_spaces')
-      .then(rows => setSpaces(rows.map(s => ({ id: s.id, name: s.name }))))
-      .catch(() => {})
-  }, [fetchChannels, fetchStatuses])
-
-  // Realtime status updates from backend
-  useEffect(() => {
-    const unlisten = listen<ImChannelStatus>('im_channel_status_changed', ({ payload }) => {
-      setStatuses(prev => ({ ...prev, [payload.instanceId]: payload }))
-    })
-    return () => { unlisten.then(fn => fn()) }
-  }, [setStatuses])
 
   // Group channels by type
   const channelsByType: Record<string, typeof channels> = {}
@@ -74,36 +47,15 @@ export function ImChannelsSettings() {
   const allTabs = CHANNEL_TYPES_ORDER
   const currentTab = (activeTab && allTabs.includes(activeTab)) ? activeTab : allTabs[0]
 
-  async function handleToggle(id: string, enabled: boolean) {
-    setChannels(prev => prev.map(ch => ch.id === id ? { ...ch, enabled } : ch))
-    try {
-      await invoke('toggle_im_channel', { id, enabled })
-    } catch (e) {
-      fetchChannels()
-      toast.error('切换失败：' + String(e))
-    }
-  }
-
   function handleToggleRow(id: string) {
     setOpenRowId(prev => (prev === id ? null : id))
     setAddingToType(null)
   }
 
-  function handleSaved() {
+  function onSaved() {
     setOpenRowId(null)
     setAddingToType(null)
-    fetchChannels()
-    fetchStatuses()
-  }
-
-  async function handleDelete(id: string) {
-    if (!confirm('确定删除此渠道实例？')) return
-    try {
-      await invoke('delete_im_channel', { id })
-      fetchChannels()
-    } catch (e) {
-      toast.error('删除失败：' + String(e))
-    }
+    handleSaved()
   }
 
   const tabChannels = currentTab ? (channelsByType[currentTab] ?? []) : []
@@ -160,7 +112,7 @@ export function ImChannelsSettings() {
             open={openRowId === ch.id}
             onToggleOpen={() => handleToggleRow(ch.id)}
             onToggleEnabled={(enabled) => handleToggle(ch.id, enabled)}
-            onSaved={handleSaved}
+            onSaved={onSaved}
             onDeleted={() => handleDelete(ch.id)}
           />
         ))}
@@ -176,7 +128,7 @@ export function ImChannelsSettings() {
             open={true}
             onToggleOpen={() => setAddingToType(null)}
             onToggleEnabled={(_enabled: boolean) => {}}
-            onSaved={handleSaved}
+            onSaved={onSaved}
             onDeleted={() => setAddingToType(null)}
           />
         ) : (
