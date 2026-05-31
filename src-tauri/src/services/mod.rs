@@ -13,4 +13,5 @@ pub use types::*;
 // `tauri_commands.rs` god file and out of bridges like `engine_sink.rs`.
 pub mod cost_service;
 pub mod settings_service;
+pub mod workspace_service;
 

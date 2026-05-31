@@ -9,8 +9,6 @@
 //! (`tauri_commands::send_message`, gated) and the assistant message on complete
 //! (`engine_sink::TauriEventSink::emit`, gated). UI stays read-only (R2 scope).
 
-use std::path::PathBuf;
-
 use rusqlite::Connection;
 
 use crate::agent::types::ContentBlock;
@@ -150,40 +148,9 @@ pub fn persist_agent_text_message(
     Ok(())
 }
 
-/// Resolve the working directory pi should run in for a conversation: the owning
-/// space's `path` (uClaw `spaces.path`). Agent sessions key on
-/// `agent_sessions.space_id`; chat conversations on `conversations.workspace_id`
-/// — both FK into `spaces.id`. Returns `None` when there's no space row, the
-/// stored path is empty, or it isn't a directory on disk, so pi keeps its default
-/// (process cwd) instead of erroring on a bad cwd. Without this, pi inherits the
-/// app's process cwd (uClaw's own source tree) and runs its tools + project
-/// context there instead of the user's workspace.
-pub fn space_cwd_for_agent_session(conn: &Connection, session_id: &str) -> Option<PathBuf> {
-    space_cwd(
-        conn,
-        "SELECT sp.path FROM agent_sessions s JOIN spaces sp ON s.space_id = sp.id WHERE s.id = ?1",
-        session_id,
-    )
-}
-
-/// The chat-conversation variant of [`space_cwd_for_agent_session`] —
-/// `conversations.workspace_id` → `spaces.path`.
-pub fn space_cwd_for_conversation(conn: &Connection, conversation_id: &str) -> Option<PathBuf> {
-    space_cwd(
-        conn,
-        "SELECT sp.path FROM conversations c JOIN spaces sp ON c.workspace_id = sp.id WHERE c.id = ?1",
-        conversation_id,
-    )
-}
-
-fn space_cwd(conn: &Connection, sql: &str, id: &str) -> Option<PathBuf> {
-    let path: String = conn.query_row(sql, [id], |r| r.get(0)).ok()?;
-    if path.is_empty() {
-        return None;
-    }
-    let pb = PathBuf::from(path);
-    pb.is_dir().then_some(pb)
-}
+// NOTE: the workspace-cwd resolvers (`space_cwd_for_agent_session` /
+// `_for_conversation`) moved to `services::workspace_service` — workspace
+// resolution is a distinct concern from message persistence (ADR 2026-05-31).
 
 #[cfg(test)]
 mod tests {

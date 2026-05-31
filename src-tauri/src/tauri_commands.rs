@@ -1519,7 +1519,10 @@ pub async fn send_message(
             ) {
                 tracing::warn!("PiEngine user-message persist failed: {e}");
             }
-            run_cwd = crate::engine_persist::space_cwd_for_conversation(&conn, &conv_id);
+            run_cwd = {
+                use crate::services::workspace_service::WorkspaceService as _;
+                crate::services::workspace_service::DbWorkspace.conversation_cwd(&conn, &conv_id)
+            };
         }
         // [R4/F7] Source pi's provider/model/api_key from provider_service — the
         // SAME resolution the legacy path uses (per-msg override → role → active →
@@ -9940,7 +9943,10 @@ pub async fn send_agent_message(
             ) {
                 tracing::warn!("PiEngine agent user-message persist failed: {e}");
             }
-            run_cwd = crate::engine_persist::space_cwd_for_agent_session(&conn, &conv_id);
+            run_cwd = {
+                use crate::services::workspace_service::WorkspaceService as _;
+                crate::services::workspace_service::DbWorkspace.agent_session_cwd(&conn, &conv_id)
+            };
         }
         // Active provider/model/key/base_url/api from provider_service (服务商 tab).
         if let Some((provider, model, api_key, base_url, api_type)) =
