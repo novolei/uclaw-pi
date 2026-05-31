@@ -9,7 +9,9 @@
 //! at a time. `settings` is the first slice (the HTTP-API toggle).
 
 pub mod artifact;
+pub mod automation;
 pub mod background_task;
+pub mod browser_cmds;
 pub mod channel;
 pub mod conversation;
 pub mod cost;
@@ -25,5 +27,6 @@ pub mod search;
 pub mod settings;
 pub mod skills;
 pub mod tool_approval;
+pub mod trajectory;
 pub mod space;
 pub mod system_prompt;
