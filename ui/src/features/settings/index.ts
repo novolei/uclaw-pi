@@ -55,3 +55,8 @@ export { StreamSkillThresholdsSection } from './components/StreamSkillThresholds
 // P3a — FoldDeltaThresholdSection migrated (load/save in a hook; IPC stays in the
 // @/lib/fold-delta-threshold Bundle-17-B helper). Consumed by SystemTab.
 export { FoldDeltaThresholdSection } from './components/FoldDeltaThresholdSection'
+
+// P3a — DeveloperOptionsSection migrated (run state machine + setup-script event
+// subscriptions in a hook; the `@tauri-apps/api/event` `listen` moved behind
+// settingsBridge.onSetupScript* wrappers). Consumed by SystemTab.
+export { DeveloperOptionsSection } from './components/DeveloperOptionsSection'

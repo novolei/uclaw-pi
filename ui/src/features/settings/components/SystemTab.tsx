@@ -11,7 +11,7 @@ import { EvalsCard } from './system/EvalsCard'
 import { EmbeddingEndpointSection } from './EmbeddingEndpointSection'
 import { StreamSkillThresholdsSection } from './StreamSkillThresholdsSection'
 import { FoldDeltaThresholdSection } from './FoldDeltaThresholdSection'
-import { DeveloperOptionsSection } from '@/components/settings/DeveloperOptionsSection'
+import { DeveloperOptionsSection } from './DeveloperOptionsSection'
 
 export function SystemTab() {
   const [error, setError] = React.useState<string | null>(null)

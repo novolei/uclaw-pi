@@ -1,152 +1,15 @@
 import * as React from 'react'
-import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { Play, AlertTriangle, ChevronDown, ChevronUp } from 'lucide-react'
 import {
   SETUP_SCRIPTS,
   SETUP_SCRIPT_DESCRIPTORS,
-  runSetupScript,
   type SetupScriptName,
-  type SetupScriptOutputEvent,
-  type SetupScriptEndEvent,
 } from '@/lib/embedding-endpoint'
-
-interface ScriptState {
-  running: boolean
-  runId: string | null
-  log: string[]
-  exitCode: number | null
-  progressPct: number
-  startedAtMs: number | null
-  error: string | null
-}
-
-const EMPTY_STATE: ScriptState = {
-  running: false,
-  runId: null,
-  log: [],
-  exitCode: null,
-  progressPct: 0,
-  startedAtMs: null,
-  error: null,
-}
-
-const MAX_LOG_LINES = 500
-
-function makeInitial(): Record<SetupScriptName, ScriptState> {
-  const r = {} as Record<SetupScriptName, ScriptState>
-  for (const n of SETUP_SCRIPTS) {
-    r[n] = { ...EMPTY_STATE }
-  }
-  return r
-}
+import { useDeveloperOptions, type ScriptState } from '../hooks/useDeveloperOptions'
 
 export function DeveloperOptionsSection(): React.ReactElement {
-  const [expanded, setExpanded] = React.useState(false)
-  const [states, setStates] = React.useState<Record<SetupScriptName, ScriptState>>(makeInitial())
-  const [forceConfirm, setForceConfirm] = React.useState<SetupScriptName | null>(null)
-
-  React.useEffect(() => {
-    if (!expanded) return
-    let unlistenOutput: UnlistenFn | null = null
-    let unlistenEnd: UnlistenFn | null = null
-    ;(async () => {
-      unlistenOutput = await listen<SetupScriptOutputEvent>('system-setup-script:output', (e) => {
-        const { run_id, line } = e.payload
-        setStates((prev) => {
-          const next = { ...prev }
-          for (const n of SETUP_SCRIPTS) {
-            if (prev[n].runId === run_id) {
-              const log = [...prev[n].log, line]
-              if (log.length > MAX_LOG_LINES) log.splice(0, log.length - MAX_LOG_LINES)
-              next[n] = { ...prev[n], log }
-              break
-            }
-          }
-          return next
-        })
-      })
-      unlistenEnd = await listen<SetupScriptEndEvent>('system-setup-script:end', (e) => {
-        const { run_id, exit_code, success } = e.payload
-        setStates((prev) => {
-          const next = { ...prev }
-          for (const n of SETUP_SCRIPTS) {
-            if (prev[n].runId === run_id) {
-              next[n] = {
-                ...prev[n],
-                running: false,
-                exitCode: exit_code,
-                progressPct: success ? 100 : prev[n].progressPct,
-                error: success ? null : `exit ${exit_code ?? 'killed'}`,
-              }
-              break
-            }
-          }
-          return next
-        })
-      })
-    })()
-    return () => {
-      unlistenOutput?.()
-      unlistenEnd?.()
-    }
-  }, [expanded])
-
-  React.useEffect(() => {
-    const anyRunning = SETUP_SCRIPTS.some((n) => states[n].running)
-    if (!anyRunning) return
-    const timer = setInterval(() => {
-      setStates((prev) => {
-        const next = { ...prev }
-        let changed = false
-        for (const n of SETUP_SCRIPTS) {
-          if (!prev[n].running || prev[n].startedAtMs == null) continue
-          const elapsedSecs = (Date.now() - prev[n].startedAtMs) / 1000
-          const expected = SETUP_SCRIPT_DESCRIPTORS[n].expectedDurationSecs
-          const pct = Math.min(95, Math.floor((elapsedSecs / expected) * 95))
-          if (pct !== prev[n].progressPct) {
-            next[n] = { ...prev[n], progressPct: pct }
-            changed = true
-          }
-        }
-        return changed ? next : prev
-      })
-    }, 500)
-    return () => clearInterval(timer)
-  }, [states])
-
-  const handleRun = async (name: SetupScriptName, force: boolean) => {
-    // Generate the run_id BEFORE invoke so the event listeners can
-    // route output to this card from the very first emit. Without
-    // this, runSetupScript's promise only resolves at child exit
-    // (because backend awaits the wait) — and during the entire run
-    // the card's runId would be null, dropping every output line.
-    const runId = `setup-${name}-${Date.now()}`
-    setStates((prev) => ({
-      ...prev,
-      [name]: {
-        running: true,
-        runId,
-        log: [],
-        exitCode: null,
-        progressPct: 1,
-        startedAtMs: Date.now(),
-        error: null,
-      },
-    }))
-    setForceConfirm(null)
-    try {
-      await runSetupScript(name, { force, runId })
-    } catch (e) {
-      setStates((prev) => ({
-        ...prev,
-        [name]: {
-          ...prev[name],
-          running: false,
-          error: String(e),
-        },
-      }))
-    }
-  }
+  const { expanded, setExpanded, states, forceConfirm, setForceConfirm, handleRun } =
+    useDeveloperOptions()
 
   return (
     <div className="border border-border rounded-lg">
