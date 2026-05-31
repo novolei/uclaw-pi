@@ -1,4 +1,5 @@
-import { SettingsSection } from './primitives/SettingsSection'
+// SettingsSection primitive still lives under components/settings/.
+import { SettingsSection } from '@/components/settings/primitives/SettingsSection'
 
 // [PLACEHOLDER - Tauri adaptation needed]
 // BotHubSettings — Bot Hub marketplace

@@ -92,3 +92,11 @@ export { ChannelSettings, ProviderDetail } from './components/channels/ChannelSe
 // ChannelForm migrated (provider quick-configure modal; config load + submit in
 // useChannelForm). No in-tree consumer renders it today; kept for completeness.
 export { ChannelForm } from './components/channels/ChannelForm'
+
+// Platform stubs migrated (1:1 moves, no IPC): BotHubSettings is the Bot-Hub
+// marketplace placeholder; WeChat/Feishu/DingTalk are Proma-only integrations
+// that render null in uClaw. None have in-tree consumers today.
+export { BotHubSettings } from './components/channels/BotHubSettings'
+export { default as WeChatSettings } from './components/channels/WeChatSettings'
+export { default as FeishuSettings } from './components/channels/FeishuSettings'
+export { default as DingTalkSettings } from './components/channels/DingTalkSettings'
