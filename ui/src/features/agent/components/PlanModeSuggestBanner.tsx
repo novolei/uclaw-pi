@@ -21,8 +21,7 @@
  */
 
 import * as React from 'react'
-import { useAtom, useSetAtom } from 'jotai'
-import { listen } from '@tauri-apps/api/event'
+import { useAtom } from 'jotai'
 import { Button } from '@/components/ui/button'
 import {
   pendingPlanModeSuggestsAtom,
@@ -30,7 +29,7 @@ import {
   type PlanModeSuggestRequest,
 } from '@/atoms/plan-mode-suggest-atoms'
 import { planModeSuggestEnabledAtom } from '@/atoms/ui-preferences'
-import { respondPlanModeSuggest, setSafetyMode } from '@/lib/tauri-bridge'
+import { onPlanModeSuggest, respondPlanModeSuggest, setSafetyMode } from '@/lib/bridge/agent'
 
 interface Props { sessionId: string }
 
@@ -49,7 +48,7 @@ export function PlanModeSuggestBanner({ sessionId }: Props): React.ReactElement 
   React.useEffect(() => {
     let cancelled = false
     let unlisten: (() => void) | null = null
-    listen<PlanModeSuggestRequest>('agent:plan_mode_suggest', ({ payload }) => {
+    onPlanModeSuggest<PlanModeSuggestRequest>((payload) => {
       // Backend emits snake_case keys via serde_json::json! macro.
       if (payload.session_id !== sessionId) return
       if (silencedRef.current.has(sessionId)) return  // skip silenced sessions

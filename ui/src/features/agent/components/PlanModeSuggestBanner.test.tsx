@@ -9,12 +9,12 @@ import {
 } from '@/atoms/plan-mode-suggest-atoms'
 import { planModeSuggestEnabledAtom } from '@/atoms/ui-preferences'
 
-vi.mock('@/lib/tauri-bridge', () => ({
+// IPC + the plan-mode-suggest event subscription both route through the agent
+// bridge now (lib/bridge/agent.ts), so we mock that instead of @tauri-apps/api.
+vi.mock('@/lib/bridge/agent', () => ({
+  onPlanModeSuggest: vi.fn().mockResolvedValue(() => {}),
   respondPlanModeSuggest: vi.fn().mockResolvedValue(undefined),
   setSafetyMode: vi.fn().mockResolvedValue(undefined),
-}))
-vi.mock('@tauri-apps/api/event', () => ({
-  listen: vi.fn().mockResolvedValue(() => {}),
 }))
 
 // Payload uses snake_case to match what the Rust backend emits via serde_json::json!
@@ -73,7 +73,7 @@ describe('PlanModeSuggestBanner', () => {
   })
 
   it('clicking 本次不用 reports skipped', async () => {
-    const bridge = await import('@/lib/tauri-bridge')
+    const bridge = await import('@/lib/bridge/agent')
     renderWithReq()
     fireEvent.click(screen.getByText('本次不用'))
     await waitFor(() => {
@@ -82,7 +82,7 @@ describe('PlanModeSuggestBanner', () => {
   })
 
   it('clicking 不再建议 flips the enabled atom off + reports silenced', async () => {
-    const bridge = await import('@/lib/tauri-bridge')
+    const bridge = await import('@/lib/bridge/agent')
     const store = createStore()
     store.set(pendingPlanModeSuggestsAtom, { s1: FRESH_REQ })
     store.set(planModeSuggestEnabledAtom, true)
@@ -99,7 +99,7 @@ describe('PlanModeSuggestBanner', () => {
   })
 
   it('clicking 切到 Plan 模式 calls setSafetyMode(plan) + reports accepted', async () => {
-    const bridge = await import('@/lib/tauri-bridge')
+    const bridge = await import('@/lib/bridge/agent')
     renderWithReq()
     fireEvent.click(screen.getByText('切到 Plan 模式'))
     await waitFor(() => {
@@ -155,12 +155,14 @@ describe('PlanModeSuggestBanner', () => {
     })
 
     it('skips future events when session is silenced (listener gate via ref)', async () => {
-      // Capture the listener handler when the component registers it.
-      let listenerHandler: ((e: { payload: unknown }) => void) | null = null
-      const eventMod = await import('@tauri-apps/api/event')
-      ;(eventMod.listen as ReturnType<typeof vi.fn>).mockImplementation(
-        (name: string, h: (e: { payload: unknown }) => void) => {
-          if (name === 'agent:plan_mode_suggest') listenerHandler = h
+      // Capture the handler the component registers with onPlanModeSuggest.
+      // The bridge wrapper unwraps e.payload, so the handler receives the raw
+      // payload directly (not a Tauri event object).
+      let listenerHandler: ((payload: unknown) => void) | null = null
+      const bridge = await import('@/lib/bridge/agent')
+      ;(bridge.onPlanModeSuggest as ReturnType<typeof vi.fn>).mockImplementation(
+        (h: (payload: unknown) => void) => {
+          listenerHandler = h
           return Promise.resolve(() => {})
         },
       )
@@ -176,11 +178,11 @@ describe('PlanModeSuggestBanner', () => {
           <PlanModeSuggestBanner sessionId="s1" />
         </Provider>,
       )
-      // Wait for the listen() promise to resolve and set listenerHandler.
+      // Wait for the onPlanModeSuggest() promise to resolve and set the handler.
       await waitFor(() => expect(listenerHandler).not.toBeNull())
 
       // Simulate a backend emit for the silenced session.
-      listenerHandler!({ payload: FRESH_REQ })
+      listenerHandler!(FRESH_REQ)
       await Promise.resolve()
 
       // Queue must remain empty — silenced ref blocked the write.

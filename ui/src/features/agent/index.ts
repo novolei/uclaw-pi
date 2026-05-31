@@ -61,3 +61,8 @@ export { PermissionBanner } from './components/PermissionBanner'
 // (steer / edit / delete). Pure presentation: actions arrive as callback
 // props, no IPC.
 export { QueuedMessagesBanner } from './components/QueuedMessagesBanner'
+
+// PlanModeSuggestBanner — advisory plan-mode auto-suggest banner. The
+// `agent:plan_mode_suggest` subscription + respondPlanModeSuggest / setSafetyMode
+// IPC route through the agent bridge (onPlanModeSuggest wrapper).
+export { PlanModeSuggestBanner } from './components/PlanModeSuggestBanner'
