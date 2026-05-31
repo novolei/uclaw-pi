@@ -7,15 +7,12 @@
  */
 
 import * as React from 'react'
-import { listen } from '@tauri-apps/api/event'
 import { AlertTriangle, Star } from 'lucide-react'
-
-interface EvalPayload {
-  sessionId: string
-  score: number
-  reasoning: string
-  learnings?: string[]
-}
+import {
+  onSessionEvalComplete,
+  onSessionEvalWarning,
+  type SessionEvalPayload,
+} from '@/lib/bridge/agent'
 
 interface SessionEvalBadgeProps {
   sessionId: string
@@ -47,7 +44,7 @@ function ScoreBar({ score }: { score: number }): React.ReactElement {
 }
 
 export function SessionEvalBadge({ sessionId }: SessionEvalBadgeProps): React.ReactElement | null {
-  const [eval_, setEval] = React.useState<EvalPayload | null>(null)
+  const [eval_, setEval] = React.useState<SessionEvalPayload | null>(null)
   const [warning, setWarning] = React.useState(false)
   const [expanded, setExpanded] = React.useState(false)
 
@@ -55,7 +52,7 @@ export function SessionEvalBadge({ sessionId }: SessionEvalBadgeProps): React.Re
     let cancelled = false
     const unlistens: Array<() => void> = []
 
-    listen<EvalPayload>('session:eval-complete', ({ payload }) => {
+    onSessionEvalComplete((payload) => {
       if (payload.sessionId === sessionId) {
         setEval(payload)
         if (payload.score < 0.5) setWarning(true)
@@ -65,7 +62,7 @@ export function SessionEvalBadge({ sessionId }: SessionEvalBadgeProps): React.Re
       else unlistens.push(fn)
     })
 
-    listen<EvalPayload>('session:eval-warning', ({ payload }) => {
+    onSessionEvalWarning((payload) => {
       if (payload.sessionId === sessionId) setWarning(true)
     }).then((fn) => {
       if (cancelled) fn()

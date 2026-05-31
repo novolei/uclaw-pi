@@ -19,6 +19,11 @@ export { AgentHeader } from './components/AgentHeader'
 // the streaming-state atom; the Stop button routes through the agent bridge.
 export { AgentStatusBar } from './components/AgentStatusBar'
 
+// SessionEvalBadge — post-session self-evaluation score badge. The raw
+// @tauri-apps/api/event `listen` moved behind the agent bridge's
+// onSessionEvalComplete / onSessionEvalWarning wrappers.
+export { SessionEvalBadge } from './components/SessionEvalBadge'
+
 // TaskBadge — single running background-task pill. Pure presentation (no IPC).
 export { TaskBadge } from './components/TaskBadge'
 

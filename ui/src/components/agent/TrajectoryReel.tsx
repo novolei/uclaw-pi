@@ -1,6 +1,6 @@
 import * as React from 'react'
 import { getSessionTrajectory, type TurnRecord } from '@/lib/tauri-bridge'
-import { SessionEvalBadge } from './SessionEvalBadge'
+import { SessionEvalBadge } from '@/features/agent'
 
 function roleIcon(role: string): string {
   const r = role.toLowerCase()
