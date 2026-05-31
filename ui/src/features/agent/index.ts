@@ -140,3 +140,11 @@ export { AgentPlaceholder } from './components/AgentPlaceholder'
 // currentAgentSessionIdAtom and mounts BrowserPanel (which owns its own IPC);
 // no direct @tauri-apps/api here.
 export { BrowserViewer } from './components/BrowserViewer'
+
+// AutoPreviewPopover — composer-footer toggle for "auto-open preview when the
+// agent writes a file". Pure atom-driven UI (autoPreviewEnabledAtom) — no IPC.
+export { AutoPreviewPopover } from './components/AutoPreviewPopover'
+
+// PlanModeDashedBorder — SVG dashed-border overlay for the plan-mode input box.
+// Pure presentation (ResizeObserver on the parent) — no IPC, no atoms.
+export { PlanModeDashedBorder } from './components/PlanModeDashedBorder'
