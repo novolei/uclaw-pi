@@ -48,3 +48,11 @@ export { TaskBadge } from './components/TaskBadge'
 // presentation (no IPC). `TASK_TOOL_NAMES` is re-exported for the renderers
 // that gate on it (ToolActivityItem / SDKMessageRenderer).
 export { TaskProgressCard, TASK_TOOL_NAMES } from './components/TaskProgressCard'
+
+// ── Second migration batch: the interactive approval/status banners that sit
+// above the composer in AgentView. IPC routed through the agent bridge;
+// side-effects (event subscriptions / timers) extracted into hooks/. ──
+
+// PermissionBanner — inline FIFO permission-request prompt (allow / deny /
+// always-allow). stopAgent + respondPermission routed through the agent bridge.
+export { PermissionBanner } from './components/PermissionBanner'
