@@ -12,7 +12,7 @@ import { Button } from '@/components/ui/button'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import { ChatAppearancePopover } from '@/components/chat/ChatAppearancePopover'
 import { agentSessionsAtom, agentSidePanelOpenMapAtom, workspaceFilesVersionAtom } from '@/atoms/agent-atoms'
-import { updateAgentSessionTitle, listAgentSessions } from '@/lib/tauri-bridge'
+import { updateAgentSessionTitle, listAgentSessions } from '@/lib/bridge/agent'
 
 /** AgentHeader 属性接口 */
 interface AgentHeaderProps {

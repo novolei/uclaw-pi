@@ -10,6 +10,11 @@ export * from '../../lib/bridge/agent'
 // ── First migration batch (smallest self-contained leaves). Each component is
 // added to this barrel in its own bisectable commit as it migrates. ──
 
+// AgentHeader — session title bar (edit-in-place + file-panel toggle). Title
+// persist routed through the agent bridge (updateAgentSessionTitle /
+// listAgentSessions).
+export { AgentHeader } from './components/AgentHeader'
+
 // TaskBadge — single running background-task pill. Pure presentation (no IPC).
 export { TaskBadge } from './components/TaskBadge'
 

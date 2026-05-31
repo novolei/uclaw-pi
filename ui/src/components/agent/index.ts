@@ -3,7 +3,7 @@
  */
 
 export * from './AgentView'
-export * from './AgentHeader'
+// AgentHeader migrated to features/agent (consumers import from @/features/agent).
 export * from './AgentMessages'
 export * from './ToolActivityItem'
 export * from './ContextUsageBadge'
