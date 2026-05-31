@@ -97,41 +97,10 @@ fn build_gene_retriever(
     Some(std::sync::Arc::new(retriever))
 }
 
-// ─── Bootstrap Commands ────────────────────────────────────────────────
-// NOTE: the HTTP-API toggle commands moved to `commands::settings` +
+// ─── Bootstrap Commands → moved to commands::bootstrap (thin move, slice 12) ──
+// NOTE: the HTTP-API toggle commands earlier moved to `commands::settings` +
 // `services::settings_service` (code-organization ADR 2026-05-31). New domains
-// go there, not here.
-
-#[tauri::command]
-pub async fn get_settings(state: State<'_, AppState>) -> Result<GetSettingsResponse, Error> {
-    let settings = state.settings.read().await;
-    Ok(GetSettingsResponse {
-        language: settings.language.clone(),
-        theme: settings.theme.clone(),
-        config_path: state.config_path.to_string_lossy().into(),
-        data_path: state.data_dir.to_string_lossy().into(),
-        monthly_budget_usd: settings.monthly_budget_usd,
-    })
-}
-
-#[tauri::command]
-pub async fn patch_settings(state: State<'_, AppState>, input: PatchSettingsInput) -> Result<GetSettingsResponse, Error> {
-    let mut settings = state.settings.write().await;
-    if let Some(lang) = input.language {
-        settings.language = lang;
-    }
-    if let Some(theme) = input.theme {
-        settings.theme = theme;
-    }
-    // Outer Some = field was present in the JSON; inner is the new value (or None to clear).
-    if let Some(budget) = input.monthly_budget_usd {
-        // Clamp negatives/zero to None — belt-and-suspenders for IPC robustness.
-        settings.monthly_budget_usd = budget.filter(|&b| b > 0.0);
-    }
-    settings.save(&state.config_path)?;
-    drop(settings);
-    get_settings(state).await
-}
+// go in `commands::`, not here.
 
 // ─── Memory Recall Config Commands ──────────────────────────────────────
 
@@ -4447,100 +4416,7 @@ pub async fn list_invocable_skills(
     Ok(out)
 }
 
-// ─── Dev / Testing Commands ──────────────────────────────────────────────────
-
-/// 手动触发指定的 Proactive 场景（跳过定时器和阈值条件）
-///
-/// 用于端到端验证完整链路：场景 → memorize → IPC 事件。
-/// 生产环境也可调用，日志会标注为手动触发。
-#[tauri::command]
-pub async fn trigger_proactive_scenario(
-    app_handle: tauri::AppHandle,
-    state: State<'_, AppState>,
-    scenario_name: String,
-) -> Result<serde_json::Value, String> {
-    let valid_scenarios = ["conversation_learning", "skill_extraction", "multimodal_context"];
-    if !valid_scenarios.contains(&scenario_name.as_str()) {
-        return Err(format!(
-            "Unknown scenario: {}. Valid: {:?}",
-            scenario_name, valid_scenarios
-        ));
-    }
-
-    tracing::info!(
-        "[DevTrigger] Manually triggering proactive scenario: {}",
-        scenario_name
-    );
-
-    // 尝试通过 memU client 执行真实的 memorize
-    let mut items_extracted: usize = 0;
-    let mut categories: Vec<String> = vec![];
-
-    if let Some(ref memu) = state.memu_client {
-        let (memory_types, source_type): (Vec<&str>, &str) = match scenario_name.as_str() {
-            "conversation_learning" => (
-                vec!["profile", "behavior"],
-                "proactive_test_conversation",
-            ),
-            "skill_extraction" => (
-                vec!["skill", "tool"],
-                "proactive_test_skill",
-            ),
-            _ => (
-                vec!["knowledge"],
-                "proactive_test_multimodal",
-            ),
-        };
-
-        let test_content = format!(
-            "[Dev Test] Triggered {} scenario manually at {}",
-            scenario_name,
-            chrono::Utc::now().to_rfc3339()
-        );
-
-        match memu
-            .memorize_with_config(&test_content, &memory_types, None, source_type)
-            .await
-        {
-            Ok(result) => {
-                items_extracted = result.items_extracted;
-                categories = result.categories_updated;
-                tracing::info!(
-                    "[DevTrigger] memorize_with_config OK: items={}, categories={:?}",
-                    items_extracted,
-                    categories
-                );
-            }
-            Err(e) => {
-                tracing::warn!("[DevTrigger] memorize_with_config failed: {}", e);
-            }
-        }
-    } else {
-        tracing::warn!("[DevTrigger] memu_client is None, skipping memorize");
-    }
-
-    // Emit IPC 事件到前端
-    let summary = format!("[Dev Test] {} 场景手动触发成功", scenario_name);
-    let _ = app_handle.emit(
-        "agent:proactive-learning",
-        serde_json::json!({
-            "scenario": scenario_name,
-            "items_extracted": items_extracted,
-            "categories": categories,
-            "timestamp": chrono::Utc::now().to_rfc3339(),
-            "summary": summary,
-            "dev_trigger": true,
-        }),
-    );
-
-    Ok(serde_json::json!({
-        "success": true,
-        "scenario": scenario_name,
-        "items_extracted": items_extracted,
-        "categories": categories,
-        "dev_trigger": true,
-    }))
-}
+// ─── Dev / Testing Commands → moved to commands::dev_testing (thin move, slice 12) ──
 
 // ─── Agent Session Control ───────────────────────────────────────────────────
 
@@ -6970,130 +6846,11 @@ pub async fn rewind_session(
 
 // ─── Browser Commands → moved to commands::browser_cmds (thin move, slice 9) ──
 
-// ─── System Tray / Badge Commands (Phase 3) ─────────────────────────────────
-
-#[tauri::command]
-pub async fn update_badge_count(
-    app_handle: tauri::AppHandle,
-    count: u32,
-) -> Result<bool, Error> {
-    // Emit badge update event to frontend (UI handles display)
-    let _ = app_handle.emit("badge:updated", serde_json::json!({ "count": count }));
-    Ok(true)
-}
+// ─── System Tray / Badge Commands → moved to commands::system_tray (thin move, slice 12) ──
 
 // ─── Automation Commands → commands::automation + services::automation_service (slice 9) ──
 
-// ─── Humane Automation Commands (Phase 1 spec § 7.3) ─────────────────────────
-
-#[tauri::command]
-pub async fn install_humane_spec(
-    state: State<'_, AppState>,
-    yaml: String,
-    source_ref: Option<String>,
-) -> Result<crate::automation::manager::HumaneSpecRow, Error> {
-    state.runtime_service.install_humane_spec(&yaml, source_ref).await
-        .map_err(|e| Error::Internal(e.to_string()))
-}
-
-#[tauri::command]
-pub async fn import_humane_spec_file(
-    state: State<'_, AppState>,
-    path: String,
-) -> Result<crate::automation::manager::HumaneSpecRow, Error> {
-    state.runtime_service.import_humane_spec_file(&path).await
-        .map_err(|e| Error::Internal(e.to_string()))
-}
-
-#[tauri::command]
-pub async fn get_automation_spec(
-    state: State<'_, AppState>,
-    spec_id: String,
-) -> Result<crate::automation::manager::HumaneSpecRow, Error> {
-    state.runtime_service.get_spec(&spec_id)
-        .map_err(|e| Error::Internal(e.to_string()))
-}
-
-#[tauri::command]
-pub async fn update_user_config(
-    state: State<'_, AppState>,
-    spec_id: String,
-    values: serde_json::Value,
-) -> Result<(), Error> {
-    state.runtime_service.update_user_config(&spec_id, &values)
-        .map_err(|e| Error::Internal(e.to_string()))
-}
-
-#[tauri::command]
-pub async fn set_automation_permission(
-    state: State<'_, AppState>,
-    spec_id: String,
-    permission: String,
-    granted: bool,
-) -> Result<(), Error> {
-    state.runtime_service.set_permission(&spec_id, &permission, granted).await
-        .map_err(|e| Error::Internal(e.to_string()))
-}
-
-#[tauri::command]
-pub async fn set_automation_enabled(
-    state: State<'_, AppState>,
-    spec_id: String,
-    enabled: bool,
-) -> Result<(), Error> {
-    state.runtime_service.set_enabled(&spec_id, enabled).await
-        .map_err(|e| Error::Internal(e.to_string()))
-}
-
-#[tauri::command]
-pub async fn uninstall_automation(
-    state: State<'_, AppState>,
-    spec_id: String,
-) -> Result<(), Error> {
-    state.runtime_service.uninstall(&spec_id).await
-        .map_err(|e| Error::Internal(e.to_string()))
-}
-
-#[tauri::command]
-pub async fn resolve_escalation(
-    state: State<'_, AppState>,
-    escalation_id: String,
-    choice: String,
-    note: Option<String>,
-) -> Result<(), Error> {
-    state.runtime_service
-        .resolve_escalation(&escalation_id, &choice, note.as_deref())
-        .await
-        .map_err(|e| Error::Internal(e.to_string()))
-}
-
-#[tauri::command]
-pub async fn list_pending_escalations(
-    state: State<'_, AppState>,
-    spec_id: Option<String>,
-) -> Result<Vec<crate::automation::runtime::EscalationRow>, Error> {
-    state.runtime_service
-        .list_pending_escalations(spec_id.as_deref())
-        .map_err(|e| Error::Internal(e.to_string()))
-}
-
-#[tauri::command]
-pub async fn read_automation_memory(
-    state: State<'_, AppState>,
-    spec_id: String,
-) -> Result<String, Error> {
-    state.runtime_service.read_memory(&spec_id).await
-        .map_err(|e| Error::Internal(e.to_string()))
-}
-
-#[tauri::command]
-pub async fn compact_automation_memory(
-    state: State<'_, AppState>,
-    spec_id: String,
-) -> Result<String, Error> {
-    state.runtime_service.compact_memory(&spec_id).await
-        .map_err(|e| Error::Internal(e.to_string()))
-}
+// ─── Humane Automation Commands → moved to commands::humane_automation (thin move, slice 12) ──
 
 // ─── Marketplace (Phase 3a — § 13) ────────────────────────────────────
 

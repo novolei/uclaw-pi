@@ -944,11 +944,11 @@ fn main() {
             }
         })
         .invoke_handler(tauri::generate_handler![
-            // Bootstrap
-            uclaw_core::tauri_commands::get_settings,
+            // Bootstrap → commands::bootstrap (slice 12)
+            uclaw_core::commands::bootstrap::get_settings,
             uclaw_core::commands::settings::get_http_api_enabled,
             uclaw_core::commands::settings::set_http_api_enabled,
-            uclaw_core::tauri_commands::patch_settings,
+            uclaw_core::commands::bootstrap::patch_settings,
             uclaw_core::browser::runtime_pack_ipc::get_browser_runtime_status,
             uclaw_core::browser::runtime_pack_ipc::get_browser_runtime_control_center,
             uclaw_core::browser::runtime_pack_ipc::set_browser_runtime_provider_enabled,
@@ -1244,8 +1244,8 @@ fn main() {
             uclaw_core::commands::memubot::set_skill_prune_min_unused_days,
             uclaw_core::commands::memubot::get_skill_promote_min_returned_count,
             uclaw_core::commands::memubot::set_skill_promote_min_returned_count,
-            // Dev / Testing
-            uclaw_core::tauri_commands::trigger_proactive_scenario,
+            // Dev / Testing → commands::dev_testing (slice 12)
+            uclaw_core::commands::dev_testing::trigger_proactive_scenario,
             // Agent Session Control
             uclaw_core::tauri_commands::stop_agent_session,
             uclaw_core::tauri_commands::create_agent_session,
@@ -1290,26 +1290,26 @@ fn main() {
             uclaw_core::commands::browser_cmds::browser_ui_mouse_event,
             uclaw_core::commands::browser_cmds::browser_ui_complete_login,
             uclaw_core::commands::browser_cmds::browser_webview_complete_login,
-            // System Tray / Badge Commands (Phase 3)
-            uclaw_core::tauri_commands::update_badge_count,
+            // System Tray / Badge Commands (Phase 3) → commands::system_tray (slice 12)
+            uclaw_core::commands::system_tray::update_badge_count,
             // Automation Commands (Phase 3) → commands::automation (slice 9)
             uclaw_core::commands::automation::list_automations,
             uclaw_core::commands::automation::trigger_automation_manual,
             uclaw_core::commands::automation::stop_automation_runs,
             uclaw_core::commands::automation::get_automation_activity,
             uclaw_core::commands::automation::get_or_create_spec_home_thread,
-            // Humane Automation Commands (Phase 1 spec § 7.3)
-            uclaw_core::tauri_commands::install_humane_spec,
-            uclaw_core::tauri_commands::import_humane_spec_file,
-            uclaw_core::tauri_commands::get_automation_spec,
-            uclaw_core::tauri_commands::update_user_config,
-            uclaw_core::tauri_commands::set_automation_permission,
-            uclaw_core::tauri_commands::set_automation_enabled,
-            uclaw_core::tauri_commands::uninstall_automation,
-            uclaw_core::tauri_commands::resolve_escalation,
-            uclaw_core::tauri_commands::list_pending_escalations,
-            uclaw_core::tauri_commands::read_automation_memory,
-            uclaw_core::tauri_commands::compact_automation_memory,
+            // Humane Automation Commands (Phase 1 spec § 7.3) → commands::humane_automation (slice 12)
+            uclaw_core::commands::humane_automation::install_humane_spec,
+            uclaw_core::commands::humane_automation::import_humane_spec_file,
+            uclaw_core::commands::humane_automation::get_automation_spec,
+            uclaw_core::commands::humane_automation::update_user_config,
+            uclaw_core::commands::humane_automation::set_automation_permission,
+            uclaw_core::commands::humane_automation::set_automation_enabled,
+            uclaw_core::commands::humane_automation::uninstall_automation,
+            uclaw_core::commands::humane_automation::resolve_escalation,
+            uclaw_core::commands::humane_automation::list_pending_escalations,
+            uclaw_core::commands::humane_automation::read_automation_memory,
+            uclaw_core::commands::humane_automation::compact_automation_memory,
             uclaw_core::tauri_commands::list_installed_marketplace_automations,
             uclaw_core::tauri_commands::list_marketplace_humans,
             uclaw_core::tauri_commands::install_marketplace_human,
