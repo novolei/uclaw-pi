@@ -18,6 +18,7 @@ pub mod conversation;
 pub mod cost;
 pub mod dev_testing;
 pub mod gep;
+pub mod humane_automation;
 pub mod knowledge_ingestion;
 pub mod learned_skills;
 pub mod llm_config;
