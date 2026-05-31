@@ -9,12 +9,12 @@ import { ConnectivityTab } from './ConnectivityTab'
 import { IntelligenceTab } from './IntelligenceTab'
 import { SettingsNav } from './SettingsNav'
 import { MemoryRecallTab } from '@/features/settings'
-import { LearnedProfileTab } from './LearnedProfileTab'
 import {
   AboutSettings,
   BrowserRuntimeSettings,
   GeneralTab,
   ImChannelsSettings,
+  LearnedProfileTab,
   PetSettings,
   ProxySetting,
   ShortcutSettings,

@@ -188,3 +188,10 @@ export { UsageSettings } from './components/UsageSettings'
 // each row's capture/conflict state + the global-shortcut updateGlobalShortcut sync
 // in useShortcutRow/useResetAllShortcuts; the shortcutOverrides atom stays the SSoT).
 export { ShortcutSettings } from './components/ShortcutSettings'
+
+// LearnedProfileTab migrated + split (537 → thin shell composing learned-profile/
+// cards [ClassGroup → FacetRow, EmptyState] + lib/facet-class taxonomy; all state +
+// the five memoryLearning IPC actions [fetch/rebuild/dismiss/promote/demote] +
+// grouping in useLearnedProfile; the typed @/lib/tauri-bridge memoryLearning* helpers
+// stay in the hook). Consumed by components/settings/SettingsPanel.
+export { LearnedProfileTab } from './components/LearnedProfileTab'
