@@ -4,7 +4,7 @@ import { AgentSettings } from './AgentSettings'
 
 // Heavy sibling sections do their own IPC; mock them so this test exercises
 // only AgentSettings' own presentation (matches the IntelligenceTab test pattern).
-vi.mock('@/components/settings/PersonaStudio', () => ({
+vi.mock('./PersonaStudio', () => ({
   PersonaStudio: () => <div data-testid="persona-studio" />,
 }))
 vi.mock('@/components/settings/PersonaBondTimeline', () => ({

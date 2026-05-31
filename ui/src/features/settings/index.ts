@@ -101,6 +101,14 @@ export { default as WeChatSettings } from './components/channels/WeChatSettings'
 export { default as FeishuSettings } from './components/channels/FeishuSettings'
 export { default as DingTalkSettings } from './components/channels/DingTalkSettings'
 
+// ── Persona cluster (Settings → Agent 人格). Migrated out of components/settings/ ;
+// config load + optimistic writes moved into hooks; IPC stays in the typed
+// @/lib/persona domain helpers. Consumed by AgentSettings (relative sibling). ──
+
+// PersonaStudio migrated (config load + optimistic voice write in usePersonaStudio;
+// clampVoice/clampSlider moved with the write path).
+export { PersonaStudio } from './components/PersonaStudio'
+
 // ── Memory cluster (Settings → 记忆 / 记忆召回). Migrated out of
 // components/settings/ ; the boot-node load + config CRUD side effects moved into
 // hooks; IPC stays in the typed @/lib/tauri-bridge memory-graph + recall helpers. ──

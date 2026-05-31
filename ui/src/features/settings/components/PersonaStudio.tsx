@@ -1,12 +1,11 @@
 import * as React from 'react'
 import { Loader2, Sparkles } from 'lucide-react'
-import { toast } from 'sonner'
-import { SettingsSection } from './primitives/SettingsSection'
-import { SettingsCard } from './primitives/SettingsCard'
-import { SettingsRow } from './primitives/SettingsRow'
-import { SettingsToggle } from './primitives/SettingsToggle'
-import { getPersonaConfig, updatePersonaVoiceProfile } from '@/lib/persona'
-import type { PersonaConfig, PersonaPreset, VoiceProfile } from '@/lib/persona-types'
+import { SettingsSection } from '@/components/settings/primitives/SettingsSection'
+import { SettingsCard } from '@/components/settings/primitives/SettingsCard'
+import { SettingsRow } from '@/components/settings/primitives/SettingsRow'
+import { SettingsToggle } from '@/components/settings/primitives/SettingsToggle'
+import type { PersonaPreset, VoiceProfile } from '@/lib/persona-types'
+import { usePersonaStudio } from '../hooks/usePersonaStudio'
 
 const SLIDERS: Array<{ key: keyof Omit<VoiceProfile, 'presetId' | 'neutralMode'>; label: string }> = [
   { key: 'warmth', label: '温度' },
@@ -20,32 +19,9 @@ const SLIDERS: Array<{ key: keyof Omit<VoiceProfile, 'presetId' | 'neutralMode'>
 ]
 
 export function PersonaStudio(): React.ReactElement {
-  const [config, setConfig] = React.useState<PersonaConfig | null>(null)
-  const [saving, setSaving] = React.useState(false)
-
-  React.useEffect(() => {
-    getPersonaConfig()
-      .then(setConfig)
-      .catch((error) => {
-        console.error('[PersonaStudio] load failed', error)
-        toast.error('加载人格配置失败')
-      })
-  }, [])
-
-  const updateVoice = async (voice: VoiceProfile) => {
-    const optimisticVoice = clampVoice(voice)
-    setConfig((prev) => (prev ? { ...prev, voice: optimisticVoice } : prev))
-    setSaving(true)
-    try {
-      const next = await updatePersonaVoiceProfile(optimisticVoice)
-      setConfig(next)
-    } catch (error) {
-      console.error('[PersonaStudio] save failed', error)
-      toast.error('保存人格配置失败')
-    } finally {
-      setSaving(false)
-    }
-  }
+  // Config load + optimistic voice write + saving flag live in the hook
+  // (code-organization ADR 2026-05-31); the component stays presentation-only.
+  const { config, saving, updateVoice } = usePersonaStudio()
 
   if (!config) {
     return (
@@ -154,22 +130,4 @@ function PersonaPreview({
       {saving && <div className="text-[11px] text-muted-foreground">保存中…</div>}
     </div>
   )
-}
-
-function clampVoice(voice: VoiceProfile): VoiceProfile {
-  return {
-    ...voice,
-    warmth: clampSlider(voice.warmth),
-    directness: clampSlider(voice.directness),
-    challenge: clampSlider(voice.challenge),
-    playfulness: clampSlider(voice.playfulness),
-    detail: clampSlider(voice.detail),
-    initiative: clampSlider(voice.initiative),
-    structure: clampSlider(voice.structure),
-    restraint: clampSlider(voice.restraint),
-  }
-}
-
-function clampSlider(value: number): number {
-  return Math.max(0, Math.min(5, Math.round(value)))
 }
