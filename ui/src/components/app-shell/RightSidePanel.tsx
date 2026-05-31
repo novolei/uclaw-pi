@@ -31,7 +31,7 @@ import { WorkspaceFilesView } from '@/features/agent'
 import { AgentTeamsPanel } from '@/components/agent/AgentTeamsPanel'
 import { PlanViewer } from '@/features/agent'
 import { TrajectoryReel } from '@/features/agent'
-import { BrowserViewer } from '@/components/agent/BrowserViewer'
+import { BrowserViewer } from '@/features/agent'
 import { useWindowDragOnMove } from '@/hooks/useWindowDragOnMove'
 
 export type ActiveTab = 'files' | 'teams' | 'plan' | 'trajectory' | 'browser'

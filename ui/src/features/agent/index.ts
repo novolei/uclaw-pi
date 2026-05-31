@@ -127,3 +127,16 @@ export { WorkspaceFilesView } from './components/SidePanel'
 // hooks/useContextUsage; the popover body is the presentational
 // ContextUsagePopover; this shell owns the spinner + hover-open state. No IPC.
 export { ContextUsageBadge } from './components/ContextUsageBadge'
+
+// ── Fourth migration batch (3b — tiny leaves, ≤85 lines, no splits). The last
+// non-streaming-core agent components; clears components/agent/ down to the 6
+// streaming-core files. ──
+
+// AgentPlaceholder — "Agent 模式 / 即将推出" empty-state placeholder. Pure
+// presentation (no IPC, no atoms).
+export { AgentPlaceholder } from './components/AgentPlaceholder'
+
+// BrowserViewer — RightSidePanel "Browser" tab body. Reads
+// currentAgentSessionIdAtom and mounts BrowserPanel (which owns its own IPC);
+// no direct @tauri-apps/api here.
+export { BrowserViewer } from './components/BrowserViewer'
