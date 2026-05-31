@@ -129,8 +129,8 @@ export { WorkspaceFilesView } from './components/SidePanel'
 export { ContextUsageBadge } from './components/ContextUsageBadge'
 
 // ── Fourth migration batch (3b — tiny leaves, ≤85 lines, no splits). The last
-// non-streaming-core agent components; clears components/agent/ down to the 6
-// streaming-core files. ──
+// non-streaming-core agent components; cleared the old components-agent folder
+// down to the 6 streaming-core files. ──
 
 // AgentPlaceholder — "Agent 模式 / 即将推出" empty-state placeholder. Pure
 // presentation (no IPC, no atoms).
@@ -171,9 +171,9 @@ export { BackgroundTasksPanel } from './components/BackgroundTasksPanel'
 // callbacks via props; renders the migrated TaskBadge) — no IPC.
 export { ActiveTasksBar } from './components/ActiveTasksBar'
 
-// ── Agent-Teams sub-feature (lives under features/agent for now to clear
-// components/agent/; a future dedicated features/teams split can re-home these
-// three — flagged, not done here). ──
+// ── Agent-Teams sub-feature (lives under features/agent for now to clear the
+// old components-agent folder; a future dedicated features/teams split can
+// re-home these three — flagged, not done here). ──
 
 // TeamNode — one agent node row (role icon + status + last message). Pure
 // presentation — no IPC.
@@ -223,3 +223,19 @@ export { ToolActivityList, ToolActivityItem, ActivityRow, formatElapsed } from '
 // the automation Run/Home thread views. DurationBadge has no external consumer,
 // so it stays internal to the meta-bar file (not re-exported).
 export { AgentMessages } from './components/AgentMessages'
+
+// ── FINAL migration batch: AgentView — the top-level live agent view + the
+// agent composer the user drives every session. This deleted the old
+// components-agent folder entirely (pilot complete). ──
+//
+// AgentView — Agent-mode shell: layout (AgentHeader | AgentMessages | composer +
+// FileBrowser side panel) + the session/streaming wiring + first-run/STT modals.
+// Split (was 1926 lines, the single biggest file in the app): the composer card
+// → components/agent-input/AgentComposer (+ AgentThinkingPopover); the critical
+// paste/drop/submit/attachment user path → hooks/useAgentComposer (moved
+// VERBATIM); the session/event/streaming effects → hooks/useAgentSession; the
+// Codex-style steer/edit/delete queue handlers → hooks/useAgentQueue; and the
+// stop/compact/retry/fork/rewind + error wiring → hooks/useAgentActions. All IPC
+// routes through the agent bridge (incl. the new getSttModelStatus probe +
+// composer/shell command re-exports). Consumed by the TabContent app shell.
+export { AgentView } from './components/AgentView'
