@@ -6,7 +6,7 @@ import { createStore } from 'jotai'
 import { modelStatusAtom, sttSettingsAtom } from '@/atoms/stt-atoms'
 
 // The model-status probe + download now go through settingsBridge (via the
-// useSttModel hook), so mock the bridge instead of raw @tauri-apps/api.
+// useSttModel hook), so mock the bridge instead of the raw Tauri invoke layer.
 const statusMock = vi.fn()
 const downloadMock = vi.fn()
 vi.mock('../../../lib/bridge/settings', () => ({
