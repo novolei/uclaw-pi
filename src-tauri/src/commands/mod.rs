@@ -19,6 +19,7 @@ pub mod learned_skills;
 pub mod llm_config;
 pub mod mcp;
 pub mod memory;
+pub mod memubot;
 pub mod notification;
 pub mod persona;
 pub mod provider;
