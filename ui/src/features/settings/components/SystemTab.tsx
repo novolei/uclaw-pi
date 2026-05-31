@@ -10,7 +10,7 @@ import { EvalsCard } from './system/EvalsCard'
 // Tunable sections (migrated into the feature in P3a). Feature-local imports.
 import { EmbeddingEndpointSection } from './EmbeddingEndpointSection'
 import { StreamSkillThresholdsSection } from './StreamSkillThresholdsSection'
-import { FoldDeltaThresholdSection } from '@/components/settings/FoldDeltaThresholdSection'
+import { FoldDeltaThresholdSection } from './FoldDeltaThresholdSection'
 import { DeveloperOptionsSection } from '@/components/settings/DeveloperOptionsSection'
 
 export function SystemTab() {

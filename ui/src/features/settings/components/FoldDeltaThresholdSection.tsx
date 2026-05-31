@@ -1,8 +1,7 @@
 import * as React from 'react'
 import { Save, RotateCcw, RotateCw } from 'lucide-react'
+import { useFoldDeltaThreshold } from '../hooks/useFoldDeltaThreshold'
 import {
-  getFoldDeltaThreshold,
-  setFoldDeltaThreshold,
   FOLD_DELTA_THRESHOLD_DEFAULT,
   FOLD_DELTA_THRESHOLD_MIN,
   FOLD_DELTA_THRESHOLD_MAX,
@@ -28,56 +27,17 @@ import {
  * reads `cfg.context.fold_delta_threshold` afresh on each invocation).
  */
 export function FoldDeltaThresholdSection(): React.ReactElement {
-  const [value, setValue] = React.useState<number>(FOLD_DELTA_THRESHOLD_DEFAULT)
-  const [pristine, setPristine] = React.useState<number>(FOLD_DELTA_THRESHOLD_DEFAULT)
-  const [loading, setLoading] = React.useState(false)
-  const [saving, setSaving] = React.useState(false)
-  const [error, setError] = React.useState<string | null>(null)
-  const [toast, setToast] = React.useState<string | null>(null)
-
-  React.useEffect(() => {
-    setLoading(true)
-    getFoldDeltaThreshold()
-      .then((v) => {
-        setValue(v)
-        setPristine(v)
-      })
-      .catch((e) => setError(String(e)))
-      .finally(() => setLoading(false))
-  }, [])
-
-  const dirty = value !== pristine
-
-  const handleSave = async () => {
-    setSaving(true)
-    setError(null)
-    setToast(null)
-    try {
-      await setFoldDeltaThreshold(value)
-      // Re-read post-clamp value so the UI reflects what the backend
-      // actually persisted.
-      const updated = await getFoldDeltaThreshold()
-      setValue(updated)
-      setPristine(updated)
-      setToast(`已保存。下一次 /compact 触发时按 drift < ${updated} 走 delta 路径。`)
-    } catch (e) {
-      setError(String(e))
-    } finally {
-      setSaving(false)
-    }
-  }
-
-  const handleReset = () => {
-    setValue(pristine)
-    setError(null)
-    setToast(null)
-  }
-
-  const handleResetToDefaults = () => {
-    setValue(FOLD_DELTA_THRESHOLD_DEFAULT)
-    setError(null)
-    setToast(null)
-  }
+  const {
+    value, setValue,
+    loading,
+    saving,
+    error,
+    toast,
+    dirty,
+    handleSave,
+    handleReset,
+    handleResetToDefaults,
+  } = useFoldDeltaThreshold()
 
   return (
     <div className="border border-border rounded-lg p-4 space-y-3">

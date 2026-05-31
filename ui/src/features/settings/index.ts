@@ -51,3 +51,7 @@ export { EmbeddingEndpointSection } from './components/EmbeddingEndpointSection'
 // P3a — StreamSkillThresholdsSection migrated (load/save in a hook; IPC stays in
 // the @/lib/stream-skill-thresholds Bundle-26/27 helper). Consumed by SystemTab.
 export { StreamSkillThresholdsSection } from './components/StreamSkillThresholdsSection'
+
+// P3a — FoldDeltaThresholdSection migrated (load/save in a hook; IPC stays in the
+// @/lib/fold-delta-threshold Bundle-17-B helper). Consumed by SystemTab.
+export { FoldDeltaThresholdSection } from './components/FoldDeltaThresholdSection'
