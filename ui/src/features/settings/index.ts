@@ -23,3 +23,7 @@ export { BrowserRuntimeSettings } from './components/BrowserRuntimeSettings'
 
 // P3 — AppearanceSettings migrated (theme cards; atom-helper side effects, no IPC).
 export { AppearanceSettings } from './components/AppearanceSettings'
+
+// P3 — PromptSettings migrated (thin shell; CRUD side effects in a hook, rows
+// split into prompts/PromptRow). Distinct from the P2 PromptsSettings tab above.
+export { PromptSettings } from './components/PromptSettings'
