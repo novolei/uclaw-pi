@@ -38,3 +38,8 @@ export { ToolSettings } from './components/ToolSettings'
 // P3a — ModelSettings migrated (role→model load + optimistic write in a hook;
 // dropdown open/outside-click UI state stays in the component).
 export { ModelSettings } from './components/ModelSettings'
+
+// P3a — PermissionsSettings migrated + split (328 → thin shell composing
+// permissions/ cards; all IPC + draft state in usePermissionsSettings; the
+// sandbox sub-panel stays under components/settings/ for now).
+export { PermissionsSettings } from './components/PermissionsSettings'

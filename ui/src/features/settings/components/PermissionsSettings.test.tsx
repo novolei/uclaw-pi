@@ -3,33 +3,49 @@ import * as React from 'react'
 import { PermissionsSettings } from './PermissionsSettings'
 import { renderWithProviders, screen, waitFor } from '@/test-utils/render'
 
+// IPC now flows through settingsBridge (was @/lib/tauri-bridge before the P3a
+// migration) — mock the bridge so the cards render the mocked rows.
+vi.mock('../../../lib/bridge/settings', () => ({
+  settingsBridge: {
+    listPermissionRules: vi.fn(async () => [
+      { id: 'r1', scope: 'pattern', toolName: 'bash', target: 'git status', mode: 'allow', createdAt: 1715000000000 },
+    ]),
+    listPermissionAudit: vi.fn(async () => [
+      { id: 'a1', sessionId: 'sess-aaa', toolName: 'bash', argsHash: 'abc1', decision: 'auto_approve', createdAt: 1715000000000 },
+    ]),
+    createPermissionRule: vi.fn(async (i) => ({ ...i, id: 'new', createdAt: Date.now() })),
+    deletePermissionRule: vi.fn(async () => true),
+    getSafetyPolicy: vi.fn(async () => ({
+      globalMode: 'supervised',
+      toolOverrides: {},
+      autoApprovedTools: ['grep', 'glob', 'read_file'],
+      blockedTools: [],
+    })),
+    removeAutoApprovedTool: vi.fn(async () => ({
+      globalMode: 'supervised',
+      toolOverrides: {},
+      autoApprovedTools: ['glob', 'read_file'],
+      blockedTools: [],
+    })),
+    unblockTool: vi.fn(async () => ({
+      globalMode: 'supervised',
+      toolOverrides: {},
+      autoApprovedTools: ['grep', 'glob', 'read_file'],
+      blockedTools: [],
+    })),
+  },
+}))
+
+// The WorkspaceSandboxSettings sub-tree (still under components/settings/) pulls
+// its own sandbox IPC from @/lib/tauri-bridge on mount — stub those so it renders
+// quietly inside the shell.
 vi.mock('@/lib/tauri-bridge', () => ({
-  listPermissionRules: vi.fn(async () => [
-    { id: 'r1', scope: 'pattern', toolName: 'bash', target: 'git status', mode: 'allow', createdAt: 1715000000000 },
-  ]),
-  listPermissionAudit: vi.fn(async () => [
-    { id: 'a1', sessionId: 'sess-aaa', toolName: 'bash', argsHash: 'abc1', decision: 'auto_approve', createdAt: 1715000000000 },
-  ]),
-  createPermissionRule: vi.fn(async (i) => ({ ...i, id: 'new', createdAt: Date.now() })),
-  deletePermissionRule: vi.fn(async () => true),
-  getSafetyPolicy: vi.fn(async () => ({
-    globalMode: 'supervised',
-    toolOverrides: {},
-    autoApprovedTools: ['grep', 'glob', 'read_file'],
-    blockedTools: [],
-  })),
-  removeAutoApprovedTool: vi.fn(async () => ({
-    globalMode: 'supervised',
-    toolOverrides: {},
-    autoApprovedTools: ['glob', 'read_file'],
-    blockedTools: [],
-  })),
-  unblockTool: vi.fn(async () => ({
-    globalMode: 'supervised',
-    toolOverrides: {},
-    autoApprovedTools: ['grep', 'glob', 'read_file'],
-    blockedTools: [],
-  })),
+  listAlwaysAllowedPaths: vi.fn(async () => []),
+  listSessionAllowedPaths: vi.fn(async () => []),
+  addAlwaysAllowedPath: vi.fn(async () => undefined),
+  removeAlwaysAllowedPath: vi.fn(async () => undefined),
+  promoteSessionPathToGlobal: vi.fn(async () => undefined),
+  openFolderDialog: vi.fn(async () => null),
 }))
 
 describe('PermissionsSettings', () => {
@@ -54,9 +70,9 @@ describe('PermissionsSettings', () => {
   })
 
   it('renders empty states when both lists are empty', async () => {
-    const bridge = await import('@/lib/tauri-bridge')
-    vi.mocked(bridge.listPermissionRules).mockResolvedValueOnce([])
-    vi.mocked(bridge.listPermissionAudit).mockResolvedValueOnce([])
+    const { settingsBridge } = await import('../../../lib/bridge/settings')
+    vi.mocked(settingsBridge.listPermissionRules).mockResolvedValueOnce([])
+    vi.mocked(settingsBridge.listPermissionAudit).mockResolvedValueOnce([])
     renderWithProviders(<PermissionsSettings />)
     await waitFor(() => {
       expect(screen.getByText('暂无规则')).toBeInTheDocument()
@@ -77,7 +93,7 @@ describe('PermissionsSettings', () => {
   })
 
   it('removeAutoApprovedTool is called when whitelist row trash button clicked', async () => {
-    const bridge = await import('@/lib/tauri-bridge')
+    const { settingsBridge } = await import('../../../lib/bridge/settings')
     const { user } = renderWithProviders(<PermissionsSettings />)
     await waitFor(() => expect(screen.getByText('grep')).toBeInTheDocument())
     // Find the row containing 'grep' and click its (hover-revealed) Trash button
@@ -85,6 +101,6 @@ describe('PermissionsSettings', () => {
     const trashButton = row.querySelector('button[title="移除"]') as HTMLButtonElement
     expect(trashButton).not.toBeNull()
     await user.click(trashButton)
-    expect(bridge.removeAutoApprovedTool).toHaveBeenCalledWith({ toolName: 'grep' })
+    expect(settingsBridge.removeAutoApprovedTool).toHaveBeenCalledWith({ toolName: 'grep' })
   })
 })
