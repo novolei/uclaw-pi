@@ -50,6 +50,20 @@ pub fn write_skill_files(skills_root: &Path, slug: &str, detail: &SkillDetail) -
     Ok(dir)
 }
 
+/// Remove a marketplace skill's install dir (`<skills_root>/_marketplace/<slug>/`)
+/// and return that path (for registry `remove_scan_dir`). Slug-guarded; a missing
+/// dir is a no-op (idempotent uninstall).
+pub fn remove_skill_dir(skills_root: &Path, slug: &str) -> Result<PathBuf, MarketplaceError> {
+    if !is_safe_component(slug) {
+        return Err(MarketplaceError::Invalid(format!("unsafe slug: {slug}")));
+    }
+    let dir = skills_root.join("_marketplace").join(slug);
+    if dir.exists() {
+        std::fs::remove_dir_all(&dir).map_err(|e| MarketplaceError::Install(e.to_string()))?;
+    }
+    Ok(dir)
+}
+
 /// Create <workspace>/.uclaw/skills/<slug> -> <global_dir> (symlink, visibility only).
 pub fn link_into_workspace(workspace: &Path, slug: &str, global_dir: &Path) -> Result<(), MarketplaceError> {
     if !is_safe_component(slug) {
@@ -267,6 +281,22 @@ mod tests {
             .and_then(|t| t.as_sequence())
             .expect("activation.tags is a sequence");
         assert!(tags.iter().any(|v| v.as_str() == Some("ws-alpha")));
+    }
+
+    #[test]
+    fn remove_skill_dir_deletes_install_and_guards_slug() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("skills");
+        let dir = write_skill_files(&root, "o__r__s", &detail("o/r/s")).unwrap();
+        assert!(dir.exists());
+        let removed = remove_skill_dir(&root, "o__r__s").unwrap();
+        assert_eq!(removed, dir);
+        assert!(!dir.exists(), "dir removed");
+        // Idempotent: removing again (missing dir) is Ok.
+        assert!(remove_skill_dir(&root, "o__r__s").is_ok());
+        // Unsafe slug rejected (no traversal).
+        assert!(remove_skill_dir(&root, "..").is_err());
+        assert!(remove_skill_dir(&root, "a/b").is_err());
     }
 
     fn mem_conn() -> rusqlite::Connection {

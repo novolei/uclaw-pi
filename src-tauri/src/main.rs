@@ -1082,6 +1082,7 @@ fn main() {
             uclaw_core::commands::skills_marketplace::get_skill_marketplace_audit,
             uclaw_core::commands::skills_marketplace::check_skill_marketplace_update,
             uclaw_core::commands::skills_marketplace::install_skill_from_marketplace,
+            uclaw_core::commands::skills_marketplace::uninstall_skill_from_marketplace,
             // Channels
             uclaw_core::commands::channel::list_channels,
             uclaw_core::commands::channel::add_channel,
