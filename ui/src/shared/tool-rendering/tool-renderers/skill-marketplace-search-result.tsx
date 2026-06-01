@@ -8,6 +8,7 @@ import * as React from 'react'
 import { useAtomValue } from 'jotai'
 import { activeWorkspaceIdAtom } from '@/atoms/workspace'
 import { installSkillFromMarketplace } from '@/lib/bridge/skills'
+import type { MarketplaceProvider } from '@/lib/types'
 
 interface SkillRow {
   id: string
@@ -15,6 +16,7 @@ interface SkillRow {
   source: string
   installs?: number
   installUrl?: string
+  description?: string
 }
 type RowState =
   | { kind: 'idle' }
@@ -34,7 +36,11 @@ export function SkillMarketplaceSearchResultCard({
 
   const parsed = React.useMemo(() => {
     try {
-      return JSON.parse(result) as { results?: SkillRow[]; note?: string }
+      return JSON.parse(result) as {
+        results?: SkillRow[]
+        note?: string
+        provider?: MarketplaceProvider
+      }
     } catch {
       return null
     }
@@ -48,19 +54,30 @@ export function SkillMarketplaceSearchResultCard({
     )
   }
   const rows = parsed.results ?? []
+  // The tool result now carries a top-level provider; default to 'skillsmp'
+  // (the keyless search-only provider) for older results that predate the field.
+  const provider: MarketplaceProvider = parsed.provider ?? 'skillsmp'
   if (rows.length === 0) {
     return <div className="text-xs text-muted-foreground px-1 py-1">skills.sh 无匹配结果。</div>
   }
 
   // rowKey (id + index) de-collides the rare case of two results sharing an id,
-  // so one row's install state can never drive another's spinner.
-  const install = async (rowKey: string, id: string, scope: 'global' | 'workspace') => {
+  // so one row's install state can never drive another's spinner. `source` is the
+  // row's installUrl (skillsmp installs/previews from the GitHub URL).
+  const install = async (
+    rowKey: string,
+    id: string,
+    scope: 'global' | 'workspace',
+    source?: string,
+  ) => {
     setStates((s) => ({ ...s, [rowKey]: { kind: 'installing', scope } }))
     try {
       await installSkillFromMarketplace(
         id,
         scope,
         scope === 'workspace' ? activeWorkspaceId ?? undefined : undefined,
+        provider,
+        source,
       )
       setStates((s) => ({ ...s, [rowKey]: { kind: 'installed', scope } }))
     } catch (e) {
@@ -86,6 +103,11 @@ export function SkillMarketplaceSearchResultCard({
                 {row.source}
                 {typeof row.installs === 'number' && ` · ${row.installs} installs`}
               </div>
+              {row.description && (
+                <div className="text-xs text-muted-foreground/80 truncate mt-0.5">
+                  {row.description}
+                </div>
+              )}
               {st.kind === 'error' && (
                 <div className="text-xs text-red-400/90 mt-0.5 break-words">{st.message}</div>
               )}
@@ -98,7 +120,7 @@ export function SkillMarketplaceSearchResultCard({
               <div className="shrink-0 flex items-center gap-1.5">
                 <button
                   type="button"
-                  onClick={() => install(rowKey, row.id, 'global')}
+                  onClick={() => install(rowKey, row.id, 'global', row.installUrl)}
                   disabled={busy}
                   className="text-xs px-2.5 py-1 rounded-lg bg-muted text-muted-foreground hover:bg-muted/70 transition-colors disabled:opacity-50"
                 >
@@ -106,7 +128,7 @@ export function SkillMarketplaceSearchResultCard({
                 </button>
                 <button
                   type="button"
-                  onClick={() => install(rowKey, row.id, 'workspace')}
+                  onClick={() => install(rowKey, row.id, 'workspace', row.installUrl)}
                   disabled={busy || !activeWorkspaceId}
                   title={activeWorkspaceId ? '安装到当前工作区' : '无活动工作区'}
                   className="text-xs px-2.5 py-1 rounded-lg bg-muted text-muted-foreground hover:bg-muted/70 transition-colors disabled:opacity-50"
