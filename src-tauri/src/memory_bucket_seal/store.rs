@@ -129,6 +129,38 @@ CREATE TABLE IF NOT EXISTS mem_tree_buffers (
 
 CREATE INDEX IF NOT EXISTS idx_mem_tree_buffers_oldest
     ON mem_tree_buffers(oldest_at_ms);
+
+-- FTS5 virtual table backing keyword search in BucketSealAdapter::recall.
+-- Mirrors a subset of mem_tree_chunks columns; kept in sync via triggers.
+-- NOTE: `content` here is the ≤500-char preview persisted to mem_tree_chunks
+-- (the full body lives on disk at content_path), so FTS matches previews only.
+CREATE VIRTUAL TABLE IF NOT EXISTS mem_tree_chunks_fts USING fts5(
+    chunk_id UNINDEXED,
+    source_id UNINDEXED,
+    content,
+    tokenize = 'porter unicode61'
+);
+
+CREATE TRIGGER IF NOT EXISTS mem_tree_chunks_fts_insert
+    AFTER INSERT ON mem_tree_chunks
+    BEGIN
+        INSERT INTO mem_tree_chunks_fts (chunk_id, source_id, content)
+        VALUES (NEW.id, NEW.source_id, NEW.content);
+    END;
+
+CREATE TRIGGER IF NOT EXISTS mem_tree_chunks_fts_update
+    AFTER UPDATE ON mem_tree_chunks
+    BEGIN
+        UPDATE mem_tree_chunks_fts
+            SET content = NEW.content, source_id = NEW.source_id
+            WHERE chunk_id = NEW.id;
+    END;
+
+CREATE TRIGGER IF NOT EXISTS mem_tree_chunks_fts_delete
+    AFTER DELETE ON mem_tree_chunks
+    BEGIN
+        DELETE FROM mem_tree_chunks_fts WHERE chunk_id = OLD.id;
+    END;
 ";
 
 const DEFAULT_LIST_LIMIT: usize = 100;
@@ -537,5 +569,52 @@ mod tests {
         );
         let sref = got.metadata.source_ref.expect("source_ref should round-trip");
         assert_eq!(sref.value, "provider:abc/xyz");
+    }
+
+    #[test]
+    fn fts5_sync_via_insert_trigger() {
+        let (store, dir) = fresh_store();
+        let chunks = vec![sample_chunk(0)];
+        let staged = stage_chunks(dir.path(), &chunks).unwrap();
+        store.upsert_staged_chunks(&staged).unwrap();
+
+        // Verify the FTS row was created by the trigger.
+        let conn = store.lock_conn().unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM mem_tree_chunks_fts WHERE chunk_id = ?1",
+                rusqlite::params![chunks[0].id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "FTS insert trigger should have fired");
+    }
+
+    #[test]
+    fn fts5_sync_via_delete_trigger() {
+        let (store, dir) = fresh_store();
+        let chunks = vec![sample_chunk(0)];
+        let staged = stage_chunks(dir.path(), &chunks).unwrap();
+        store.upsert_staged_chunks(&staged).unwrap();
+
+        let removed = {
+            let conn = store.lock_conn().unwrap();
+            conn.execute(
+                "DELETE FROM mem_tree_chunks WHERE id = ?1",
+                rusqlite::params![chunks[0].id],
+            )
+            .unwrap()
+        };
+        assert_eq!(removed, 1);
+
+        let conn = store.lock_conn().unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM mem_tree_chunks_fts WHERE chunk_id = ?1",
+                rusqlite::params![chunks[0].id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0, "FTS delete trigger should have fired");
     }
 }
