@@ -50,6 +50,23 @@ pub fn write_skill_files(skills_root: &Path, slug: &str, detail: &SkillDetail) -
     Ok(dir)
 }
 
+/// Remove a marketplace skill's install dir (`<skills_root>/_marketplace/<slug>/`)
+/// and return `(dir, existed)`. `existed=false` means there was no such install
+/// (slug isn't one of ours — e.g. an automation `_standalone/` skill that shares
+/// the V25 table); the caller must then skip V25/registry cleanup. Slug-guarded;
+/// a missing dir is a no-op (idempotent).
+pub fn remove_skill_dir(skills_root: &Path, slug: &str) -> Result<(PathBuf, bool), MarketplaceError> {
+    if !is_safe_component(slug) {
+        return Err(MarketplaceError::Invalid(format!("unsafe slug: {slug}")));
+    }
+    let dir = skills_root.join("_marketplace").join(slug);
+    let existed = dir.exists();
+    if existed {
+        std::fs::remove_dir_all(&dir).map_err(|e| MarketplaceError::Install(e.to_string()))?;
+    }
+    Ok((dir, existed))
+}
+
 /// Create <workspace>/.uclaw/skills/<slug> -> <global_dir> (symlink, visibility only).
 pub fn link_into_workspace(workspace: &Path, slug: &str, global_dir: &Path) -> Result<(), MarketplaceError> {
     if !is_safe_component(slug) {
@@ -68,8 +85,6 @@ pub fn link_into_workspace(workspace: &Path, slug: &str, global_dir: &Path) -> R
     Ok(())
 }
 
-// wired by P2 uninstall command
-#[allow(dead_code)]
 /// Remove the workspace symlink for a slug (workspace-uninstall).
 pub fn unlink_from_workspace(workspace: &Path, slug: &str) {
     let _ = std::fs::remove_file(workspace.join(".uclaw").join("skills").join(slug));
@@ -153,8 +168,6 @@ pub fn read_install_version(conn: &rusqlite::Connection, slug: &str) -> Result<O
     ).optional().map_err(|e| MarketplaceError::Install(e.to_string()))
 }
 
-// wired by P2 uninstall command
-#[allow(dead_code)]
 pub fn remove_install_row(conn: &rusqlite::Connection, slug: &str) -> Result<(), MarketplaceError> {
     conn.execute("DELETE FROM marketplace_standalone_installs WHERE slug=?1 AND item_type='skill'",
         rusqlite::params![slug]).map_err(|e| MarketplaceError::Install(e.to_string()))?;
@@ -267,6 +280,24 @@ mod tests {
             .and_then(|t| t.as_sequence())
             .expect("activation.tags is a sequence");
         assert!(tags.iter().any(|v| v.as_str() == Some("ws-alpha")));
+    }
+
+    #[test]
+    fn remove_skill_dir_deletes_install_and_guards_slug() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("skills");
+        let dir = write_skill_files(&root, "o__r__s", &detail("o/r/s")).unwrap();
+        assert!(dir.exists());
+        let (removed, existed) = remove_skill_dir(&root, "o__r__s").unwrap();
+        assert_eq!(removed, dir);
+        assert!(existed, "dir was present");
+        assert!(!dir.exists(), "dir removed");
+        // Idempotent: removing again reports existed=false (slug isn't ours / gone).
+        let (_, existed2) = remove_skill_dir(&root, "o__r__s").unwrap();
+        assert!(!existed2);
+        // Unsafe slug rejected (no traversal).
+        assert!(remove_skill_dir(&root, "..").is_err());
+        assert!(remove_skill_dir(&root, "a/b").is_err());
     }
 
     fn mem_conn() -> rusqlite::Connection {

@@ -180,3 +180,40 @@ pub async fn install_skill_from_marketplace(
     }
     Ok(slug)
 }
+
+/// Fully uninstall a marketplace skill: delete `_marketplace/<slug>/`, evict it from
+/// the registry (`remove_scan_dir` + `reload` — `discover` alone wouldn't drop it),
+/// remove the V25 row, and best-effort unlink any workspace symlinks. (skills.sh /
+/// skillsmp installs live at `_marketplace/<slug>`, distinct from the automation
+/// marketplace's `_marketplace/_standalone/<slug>` — hence a dedicated command.)
+#[tauri::command]
+pub async fn uninstall_skill_from_marketplace(state: State<'_, AppState>, slug: String) -> Result<(), Error> {
+    let skills_root = state.data_dir.join("skills");
+    let (dir, existed) = install::remove_skill_dir(&skills_root, &slug).map_err(map_err)?;
+    if !existed {
+        // No `_marketplace/<slug>` dir → this slug is not a skills-marketplace install
+        // (e.g. an automation `_standalone/` skill sharing the V25 table). Don't touch
+        // its V25 row / registry — leave it to the surface that installed it.
+        tracing::warn!(slug = %slug, "uninstall: no _marketplace/<slug> install dir; skipping V25/registry cleanup");
+        return Ok(());
+    }
+    {
+        let mut reg = state.skills_registry.write().await;
+        reg.remove_scan_dir(&dir);
+        reg.reload();
+    }
+    if let Ok(conn) = state.db.lock() {
+        if let Err(e) = install::remove_install_row(&conn, &slug) {
+            tracing::warn!(slug = %slug, "skills_marketplace: V25 remove_install_row failed: {e}");
+        }
+        // Best-effort: unlink the visibility symlink from every space with a path.
+        if let Ok(mut stmt) = conn.prepare("SELECT path FROM spaces WHERE path IS NOT NULL AND path <> ''") {
+            if let Ok(rows) = stmt.query_map([], |r| r.get::<_, String>(0)) {
+                for p in rows.flatten() {
+                    install::unlink_from_workspace(std::path::Path::new(&p), &slug);
+                }
+            }
+        }
+    }
+    Ok(())
+}

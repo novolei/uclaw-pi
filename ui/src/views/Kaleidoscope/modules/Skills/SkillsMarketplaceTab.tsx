@@ -20,9 +20,11 @@ import { cn } from '@/lib/utils'
 import { activeWorkspaceIdAtom } from '@/atoms/workspace'
 import {
   installSkillFromMarketplace,
+  uninstallSkillFromMarketplace,
   listSkillsMarketplace,
   searchSkillsMarketplace,
 } from '@/lib/bridge/skills'
+import { listStandaloneInstalls, type StandaloneInstall } from '@/lib/tauri-bridge'
 import type { MarketplaceProvider, MarketplaceSkillSummary } from '@/lib/types'
 import { SkillMarketplaceDetailDrawer } from './SkillMarketplaceDetailDrawer'
 
@@ -30,6 +32,14 @@ type RowState =
   | { kind: 'idle' }
   | { kind: 'installing'; scope: 'global' | 'workspace' }
   | { kind: 'installed'; scope: 'global' | 'workspace' }
+  | { kind: 'error'; message: string }
+
+// Per-row state for the "已安装" list. `confirming` is the inline 确认卸载？gate
+// before the destructive call; de-collided by slug (mirrors the install RowState).
+type UninstallState =
+  | { kind: 'idle' }
+  | { kind: 'confirming' }
+  | { kind: 'uninstalling' }
   | { kind: 'error'; message: string }
 
 const PROVIDER_TABS: { value: MarketplaceProvider; label: string }[] = [
@@ -67,6 +77,12 @@ export function SkillsMarketplaceTab({
   const [detailId, setDetailId] = React.useState<string | null>(null)
   const [detailSource, setDetailSource] = React.useState<string | undefined>(undefined)
   const [detailOpen, setDetailOpen] = React.useState(false)
+  // "已安装" list (V25 source of truth, filtered to itemType === 'skill') + its
+  // per-row uninstall states. `refreshKey` is bumped after any install/uninstall
+  // so the fetch effect re-runs and the list stays current.
+  const [installed, setInstalled] = React.useState<StandaloneInstall[]>([])
+  const [uninstallStates, setUninstallStates] = React.useState<Record<string, UninstallState>>({})
+  const [refreshKey, setRefreshKey] = React.useState(0)
 
   // skills.sh: empty query → trending list; non-empty → debounced (~300ms) search.
   // skillsmp: no list → empty query shows a hint (no fetch); non-empty → debounced
@@ -135,6 +151,25 @@ export function SkillsMarketplaceTab({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [query, provider])
 
+  // Fetch the "已安装" list (marketplace skills only). Re-runs on every refreshKey
+  // bump (post-install / post-uninstall). On error we just show nothing — the
+  // 已安装 section is auxiliary and must never break the search/install tab.
+  React.useEffect(() => {
+    let cancelled = false
+    listStandaloneInstalls()
+      .then((all) => {
+        if (cancelled) return
+        setInstalled(all.filter((it) => it.itemType === 'skill'))
+      })
+      .catch(() => {
+        if (cancelled) return
+        setInstalled([])
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [refreshKey])
+
   // rowKey (id + index) de-collides the rare case of two results sharing an id,
   // so one row's install state can never drive another's spinner. (Mirrors the
   // P3 search-result card.) `source` is the row's installUrl — skillsmp installs
@@ -155,8 +190,24 @@ export function SkillsMarketplaceTab({
         source,
       )
       setStates((s) => ({ ...s, [rowKey]: { kind: 'installed', scope } }))
+      // Keep the 已安装 list current after a fresh install.
+      setRefreshKey((k) => k + 1)
     } catch (e) {
       setStates((s) => ({ ...s, [rowKey]: { kind: 'error', message: String(e) } }))
+    }
+  }
+
+  // Uninstall a marketplace skill by slug. Fully removes files + V25 row + registry
+  // entry on the backend; on success we refetch the 已安装 list via refreshKey.
+  // De-collided by slug, mirroring the install state-machine shape.
+  const uninstall = async (slug: string) => {
+    setUninstallStates((s) => ({ ...s, [slug]: { kind: 'uninstalling' } }))
+    try {
+      await uninstallSkillFromMarketplace(slug)
+      setUninstallStates((s) => ({ ...s, [slug]: { kind: 'idle' } }))
+      setRefreshKey((k) => k + 1)
+    } catch (e) {
+      setUninstallStates((s) => ({ ...s, [slug]: { kind: 'error', message: String(e) } }))
     }
   }
 
@@ -168,6 +219,69 @@ export function SkillsMarketplaceTab({
 
   return (
     <div className="titlebar-no-drag flex-1 min-h-0 overflow-y-auto px-5 md:px-8 py-4">
+      {/* "已安装" — marketplace skills from the V25 table. Shown only when non-empty,
+          above the provider toggle / search results. Each row: slug (+version) with a
+          卸载 button that gates on an inline 确认卸载？ before the destructive call. */}
+      {installed.length > 0 && (
+        <div className="mb-4">
+          <div className="text-xs font-medium text-muted-foreground mb-1.5 px-1">已安装</div>
+          <div className="flex flex-col gap-1.5">
+            {installed.map((it) => {
+              const ust: UninstallState = uninstallStates[it.slug] ?? { kind: 'idle' }
+              const busy = ust.kind === 'uninstalling'
+              return (
+                <div
+                  key={it.slug}
+                  className="rounded-lg border border-border px-3 py-2 flex items-center justify-between gap-3"
+                >
+                  <div className="min-w-0">
+                    <div className="text-sm text-foreground truncate">{it.slug}</div>
+                    {it.version && (
+                      <div className="text-xs text-muted-foreground truncate">v{it.version}</div>
+                    )}
+                    {ust.kind === 'error' && (
+                      <div className="text-xs text-red-400/90 mt-0.5 break-words">{ust.message}</div>
+                    )}
+                  </div>
+                  {ust.kind === 'confirming' ? (
+                    <div className="shrink-0 flex items-center gap-1.5">
+                      <span className="text-xs text-muted-foreground">确认卸载？</span>
+                      <button
+                        type="button"
+                        onClick={() => void uninstall(it.slug)}
+                        className="text-xs px-2.5 py-1 rounded-lg bg-red-500/15 text-red-400 hover:bg-red-500/25 transition-colors"
+                      >
+                        确认
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setUninstallStates((s) => ({ ...s, [it.slug]: { kind: 'idle' } }))
+                        }
+                        className="text-xs px-2.5 py-1 rounded-lg bg-muted text-muted-foreground hover:bg-muted/70 transition-colors"
+                      >
+                        取消
+                      </button>
+                    </div>
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setUninstallStates((s) => ({ ...s, [it.slug]: { kind: 'confirming' } }))
+                      }
+                      disabled={busy}
+                      className="shrink-0 text-xs px-2.5 py-1 rounded-lg bg-muted text-muted-foreground hover:bg-muted/70 transition-colors disabled:opacity-50"
+                    >
+                      {busy ? '…' : '卸载'}
+                    </button>
+                  )}
+                </div>
+              )
+            })}
+          </div>
+        </div>
+      )}
+
       {/* Provider segmented toggle (mirrors SkillsModule's filter-tab styling). */}
       <div className="flex gap-1 mb-3">
         {PROVIDER_TABS.map((tab) => (

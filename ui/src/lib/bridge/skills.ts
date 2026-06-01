@@ -19,6 +19,7 @@ export {
   createUserSkill,
   deleteUserSkill,
   installSkillFromMarketplace,
+  uninstallSkillFromMarketplace,
   searchSkillsMarketplace,
   listSkillsMarketplace,
   getSkillMarketplaceDetail,
