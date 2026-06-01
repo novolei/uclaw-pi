@@ -1074,14 +1074,16 @@ impl AppState {
             memu_client,
             memory_graph_store,
             memory_adapters,
-            // bucket_seal is REGISTERED (PR9) and reachable via an explicit
-            // backend or the "bucket_seal:" namespace prefix. The global default
-            // stays "legacy_kv" deliberately: BucketSealAdapter currently uses
-            // InertEmbedder/InertSummariser (keyword-only, preview-scoped recall),
-            // so flipping every unspecified-backend caller onto it is deferred to
-            // a follow-up PR that lands a real embedder + summariser.
+            // Default backend for the unified `memory_unified_*` IPC family. (The
+            // agent prompt routes separately via
+            // MemoryRecallConfig.prompt_recall_backend, not this default.) Flipped
+            // to "bucket_seal" now that it is a capable backend: FTS5 + vector
+            // recall over real embeddings (memU FastEmbed) + cascade-sealed
+            // summaries. The flip is inert today (no memory_unified_* callers yet)
+            // and forward-looking; callers can still target any registered backend
+            // explicitly or via a "name:" namespace prefix.
             default_memory_backend: std::sync::Arc::new(std::sync::RwLock::new(
-                "legacy_kv".to_string(),
+                "bucket_seal".to_string(),
             )),
             // Picked above based on `memory_os.wiki_real_synthesizer_enabled`
             // (Phase 6b). Defaults to StubSynthesizer; flipping the flag
