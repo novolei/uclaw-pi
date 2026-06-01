@@ -56,7 +56,9 @@ pub async fn install_skill_from_marketplace(
     }
     if let Ok(conn) = state.db.lock() {
         let now = chrono::Utc::now().timestamp();
-        let _ = install::record_install(&conn, &slug, &detail.hash, now);
+        if let Err(e) = install::record_install(&conn, &slug, &detail.hash, now) {
+            tracing::warn!(slug = %slug, "skills_marketplace: V25 record_install failed: {e}");
+        }
     }
     Ok(slug)
 }

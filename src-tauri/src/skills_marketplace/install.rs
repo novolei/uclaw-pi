@@ -10,9 +10,20 @@ pub fn flatten_slug(id: &str) -> String {
     id.replace('/', "__")
 }
 
+/// A safe single name/slug component: non-empty, not "." or "..", and only
+/// `[A-Za-z0-9._-]`. Blocks "/", "\\", ":" (Windows drive), absolute paths, and
+/// traversal — the install dir can never be escaped.
+fn is_safe_component(s: &str) -> bool {
+    !s.is_empty()
+        && s != "."
+        && s != ".."
+        && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
+}
+
 /// Reject path-traversal / absolute components in a file path.
+/// Splits on '/' and requires every segment to satisfy `is_safe_component`.
 fn safe_rel(path: &str) -> Result<&str, MarketplaceError> {
-    if path.is_empty() || path.starts_with('/') || path.starts_with('\\') || path.contains("..") {
+    if path.is_empty() || path.split('/').any(|seg| !is_safe_component(seg)) {
         return Err(MarketplaceError::Invalid(format!("unsafe path: {path}")));
     }
     Ok(path)
@@ -21,7 +32,7 @@ fn safe_rel(path: &str) -> Result<&str, MarketplaceError> {
 /// Write `detail.files` into <skills_root>/_marketplace/<slug>/ and return that dir.
 /// Overwrites an existing install at that slug.
 pub fn write_skill_files(skills_root: &Path, slug: &str, detail: &SkillDetail) -> Result<PathBuf, MarketplaceError> {
-    if slug.is_empty() || slug.contains('/') || slug.contains("..") {
+    if !is_safe_component(slug) {
         return Err(MarketplaceError::Invalid(format!("unsafe slug: {slug}")));
     }
     let dir = skills_root.join("_marketplace").join(slug);
@@ -41,6 +52,9 @@ pub fn write_skill_files(skills_root: &Path, slug: &str, detail: &SkillDetail) -
 
 /// Create <workspace>/.uclaw/skills/<slug> -> <global_dir> (symlink, visibility only).
 pub fn link_into_workspace(workspace: &Path, slug: &str, global_dir: &Path) -> Result<(), MarketplaceError> {
+    if !is_safe_component(slug) {
+        return Err(MarketplaceError::Invalid(format!("unsafe slug: {slug}")));
+    }
     let link_dir = workspace.join(".uclaw").join("skills");
     std::fs::create_dir_all(&link_dir).map_err(|e| MarketplaceError::Install(e.to_string()))?;
     let link = link_dir.join(slug);
@@ -54,6 +68,8 @@ pub fn link_into_workspace(workspace: &Path, slug: &str, global_dir: &Path) -> R
     Ok(())
 }
 
+// wired by P2 uninstall command
+#[allow(dead_code)]
 /// Remove the workspace symlink for a slug (workspace-uninstall).
 pub fn unlink_from_workspace(workspace: &Path, slug: &str) {
     let _ = std::fs::remove_file(workspace.join(".uclaw").join("skills").join(slug));
@@ -77,6 +93,8 @@ pub fn read_install_version(conn: &rusqlite::Connection, slug: &str) -> Result<O
     ).optional().map_err(|e| MarketplaceError::Install(e.to_string()))
 }
 
+// wired by P2 uninstall command
+#[allow(dead_code)]
 pub fn remove_install_row(conn: &rusqlite::Connection, slug: &str) -> Result<(), MarketplaceError> {
     conn.execute("DELETE FROM marketplace_standalone_installs WHERE slug=?1 AND item_type='skill'",
         rusqlite::params![slug]).map_err(|e| MarketplaceError::Install(e.to_string()))?;
@@ -125,6 +143,23 @@ mod tests {
         d.files[0].path = "../evil.md".into();
         let err = write_skill_files(&tmp.path().join("skills"), "x__y__z", &d);
         assert!(err.is_err());
+    }
+
+    #[test]
+    fn rejects_dot_slug_and_windows_abs_and_backslash() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("skills");
+        // single-dot slug rejected
+        assert!(write_skill_files(&root, ".", &detail("x/y/z")).is_err());
+        // Windows-absolute file path rejected
+        let mut d = detail("x/y/z"); d.files[0].path = "C:/evil.md".into();
+        assert!(write_skill_files(&root, "x__y__z", &d).is_err());
+        // backslash path rejected
+        let mut d2 = detail("x/y/z"); d2.files[0].path = "examples\\evil.md".into();
+        assert!(write_skill_files(&root, "x__y__z2", &d2).is_err());
+        // legit subdir path ALLOWED
+        let mut d3 = detail("x/y/z"); d3.files = vec![crate::skills_marketplace::SkillFile{ path: "examples/app.ts".into(), contents: "x".into() }];
+        assert!(write_skill_files(&root, "x__y__z3", &d3).is_ok());
     }
 
     #[test]

@@ -116,4 +116,18 @@ mod tests {
         assert_eq!(d.files[0].path, "SKILL.md");
         m.assert_async().await;
     }
+
+    #[tokio::test]
+    async fn audit_parses_risk_level() {
+        let mut server = mockito::Server::new_async().await;
+        let m = server.mock("GET", "/api/v1/skills/audit/expo/skills/react-native")
+            .with_status(200)
+            .with_body(r#"{"audits":[{"status":"pass","riskLevel":"LOW","summary":"ok"}]}"#)
+            .create_async().await;
+        let c = SkillsShClient::with_base(server.url(), Some("sk_test".into()));
+        let a = c.audit("expo/skills/react-native").await.unwrap();
+        assert_eq!(a.audits.len(), 1);
+        assert_eq!(a.audits[0].risk_level, "LOW");
+        m.assert_async().await;
+    }
 }
