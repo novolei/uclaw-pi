@@ -85,8 +85,6 @@ pub fn link_into_workspace(workspace: &Path, slug: &str, global_dir: &Path) -> R
     Ok(())
 }
 
-// wired by P2 uninstall command
-#[allow(dead_code)]
 /// Remove the workspace symlink for a slug (workspace-uninstall).
 pub fn unlink_from_workspace(workspace: &Path, slug: &str) {
     let _ = std::fs::remove_file(workspace.join(".uclaw").join("skills").join(slug));
@@ -170,8 +168,6 @@ pub fn read_install_version(conn: &rusqlite::Connection, slug: &str) -> Result<O
     ).optional().map_err(|e| MarketplaceError::Install(e.to_string()))
 }
 
-// wired by P2 uninstall command
-#[allow(dead_code)]
 pub fn remove_install_row(conn: &rusqlite::Connection, slug: &str) -> Result<(), MarketplaceError> {
     conn.execute("DELETE FROM marketplace_standalone_installs WHERE slug=?1 AND item_type='skill'",
         rusqlite::params![slug]).map_err(|e| MarketplaceError::Install(e.to_string()))?;
