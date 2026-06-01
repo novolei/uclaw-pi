@@ -2,7 +2,7 @@
 //! to Tauri's `AppHandle::emit`, so `PiEngine`'s `chat:stream-*` events reach the
 //! frontend (`useGlobalAgentListeners`). See docs/R1-wiring-plan.md §3.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock, Weak};
 
 use tauri::{AppHandle, Emitter, Manager};
 use uclaw_pi_engine::EventSink;
@@ -140,25 +140,157 @@ impl EventSink for TauriEventSink {
     }
 }
 
-/// [R4 IO 桥 — stub] The uClaw side of the IO-tool bridge seam. The engine calls
-/// `request(...)` when pi invokes a wrapped IO tool; the real executor will
-/// dispatch to `mcp.rs` / browser / skills (on tokio) and reply via
-/// `EngineCmd::ToolResult`. This stub declares **no** IO tools yet (so only pi
-/// built-ins + `ExitPlanTool` are active) and logs any request — the seam is
-/// connected and ready for the real executor.
-pub struct StubToolRequestSink;
+use crate::agent::tools::builtin::{load_skill, skill_marketplace, skill_search};
+use crate::agent::tools::tool::{Tool, ToolError, ToolOutput};
+use crate::app::AppState;
 
-impl uclaw_pi_engine::ToolRequestSink for StubToolRequestSink {
-    fn io_tool_specs(&self) -> Vec<uclaw_pi_engine::IoToolSpec> {
-        Vec::new()
+/// Fixed conversation id for pi-invoked skill tools. The bridge's `request()`
+/// carries no conversation context, so events these tools emit use this
+/// placeholder; threading the real per-conversation id is a follow-up.
+const PI_TOOL_CONV: &str = "pi-agent";
+
+/// The skill tools pi may call, in advertised order.
+const PI_SKILL_TOOLS: &[&str] = &["skill_search", "load_skill", "skill_marketplace_search"];
+
+/// [R4 IO 桥] The real uClaw tool executor for pi. `io_tool_specs()` advertises the
+/// skill tools; `request()` runs the named async `Tool::execute` on Tauri's tokio
+/// runtime (the engine thread is asupersync — not a tokio reactor) and replies via
+/// `EngineCmd::ToolResult`. The engine reply-handle is injected post-spawn
+/// (`attach_engine`) as a `Weak` to avoid a sink↔engine ownership cycle.
+pub struct RealToolRequestSink {
+    app: AppHandle,
+    engine: OnceLock<Weak<uclaw_pi_engine::PiEngine>>,
+}
+
+impl RealToolRequestSink {
+    #[must_use]
+    pub fn new(app: AppHandle) -> Self {
+        Self {
+            app,
+            engine: OnceLock::new(),
+        }
     }
 
-    fn request(&self, request_id: &str, tool_name: &str, _input: &serde_json::Value) {
-        tracing::warn!(
-            request_id,
-            tool_name,
-            "PiEngine IO tool requested but the tokio executor is not wired yet (stub)"
-        );
+    /// Give the sink a weak handle to the spawned engine so `request()` can reply.
+    /// Call once, right after `PiEngine::spawn`; later calls are no-ops.
+    pub fn attach_engine(&self, engine: Weak<uclaw_pi_engine::PiEngine>) {
+        let _ = self.engine.set(engine);
+    }
+}
+
+/// Map a uClaw `Tool`'s metadata into a pi `IoToolSpec` (the bridge wraps each as a
+/// `BridgedIoTool`). Pure — unit-tested.
+fn spec_from_tool(tool: &dyn Tool) -> uclaw_pi_engine::IoToolSpec {
+    uclaw_pi_engine::IoToolSpec {
+        name: tool.name().to_string(),
+        label: tool.name().to_string(),
+        description: tool.description().to_string(),
+        parameters: tool.parameters_schema(),
+    }
+}
+
+/// Flatten a tool execution into `(text, is_error)` for `EngineCmd::ToolResult`:
+/// success → the result JSON serialized; error → the error's Display. Pure — tested.
+fn tool_result_text(result: Result<ToolOutput, ToolError>) -> (String, bool) {
+    match result {
+        Ok(output) => (
+            serde_json::to_string(&output.result).unwrap_or_else(|_| "{}".to_string()),
+            false,
+        ),
+        Err(e) => (format!("{e}"), true),
+    }
+}
+
+/// Construct the named skill tool from `AppState` handles, or `None` for an unknown
+/// name. Used by both `io_tool_specs` (metadata) and `request` (execution).
+fn build_skill_tool(name: &str, state: &AppState, app: &AppHandle) -> Option<Box<dyn Tool>> {
+    // `let _: Box<dyn Tool> = match …` makes each arm a trait-object coercion site.
+    let tool: Box<dyn Tool> = match name {
+        "skill_search" => Box::new(
+            skill_search::SkillSearchTool::new(
+                Arc::clone(&state.skills_registry),
+                Arc::clone(&state.memory_graph_store),
+                app.clone(),
+                PI_TOOL_CONV.to_string(),
+                "default".to_string(),
+            )
+            .with_memu(state.memu_client.clone()),
+        ),
+        "load_skill" => Box::new(load_skill::LoadSkillTool::new(
+            Arc::clone(&state.skills_registry),
+            Arc::clone(&state.memory_graph_store),
+            app.clone(),
+            PI_TOOL_CONV.to_string(),
+            "default".to_string(),
+        )),
+        "skill_marketplace_search" => {
+            let api_key = state.db.lock().ok().and_then(|c| {
+                c.query_row(
+                    "SELECT value FROM settings WHERE key='skills_sh_api_key'",
+                    [],
+                    |r| r.get::<_, String>(0),
+                )
+                .ok()
+            });
+            Box::new(skill_marketplace::SkillMarketplaceSearchTool::new(api_key))
+        }
+        _ => return None,
+    };
+    Some(tool)
+}
+
+/// Build + execute the named tool, returning `(text, is_error)`. The `AppState`
+/// guard is dropped before the `.await` (it is not `Send`).
+async fn run_skill_tool(app: &AppHandle, tool_name: &str, input: serde_json::Value) -> (String, bool) {
+    let tool = {
+        let Some(state) = app.try_state::<AppState>() else {
+            return ("agent state unavailable".to_string(), true);
+        };
+        build_skill_tool(tool_name, &state, app)
+    };
+    match tool {
+        Some(tool) => tool_result_text(tool.execute(input).await),
+        None => (format!("unknown IO tool: {tool_name}"), true),
+    }
+}
+
+impl uclaw_pi_engine::ToolRequestSink for RealToolRequestSink {
+    fn io_tool_specs(&self) -> Vec<uclaw_pi_engine::IoToolSpec> {
+        let Some(state) = self.app.try_state::<AppState>() else {
+            return Vec::new();
+        };
+        PI_SKILL_TOOLS
+            .iter()
+            .filter_map(|name| build_skill_tool(name, &state, &self.app))
+            .map(|t| spec_from_tool(t.as_ref()))
+            .collect()
+    }
+
+    fn request(&self, request_id: &str, tool_name: &str, input: &serde_json::Value) {
+        let app = self.app.clone();
+        let engine = self.engine.get().cloned();
+        let request_id = request_id.to_string();
+        let tool_name = tool_name.to_string();
+        let input = input.clone();
+        // The engine thread is asupersync — spawn onto Tauri's tokio runtime, NOT
+        // tokio::spawn (no tokio reactor on this thread).
+        tauri::async_runtime::spawn(async move {
+            let (text, is_error) = run_skill_tool(&app, &tool_name, input).await;
+            match engine.and_then(|w| w.upgrade()) {
+                Some(engine) => {
+                    engine.send(uclaw_pi_engine::EngineCmd::ToolResult {
+                        request_id,
+                        text,
+                        is_error,
+                    });
+                }
+                None => tracing::warn!(
+                    request_id,
+                    tool_name,
+                    "pi tool result dropped: engine handle not attached"
+                ),
+            }
+        });
     }
 }
 
@@ -210,5 +342,45 @@ mod tests {
         assert!(!pi_engine_enabled(), "override OFF must force legacy");
         // Restore to unset so the global doesn't leak to other code/tests.
         set_pi_engine_override(None);
+    }
+
+    #[test]
+    fn tool_result_text_maps_ok_and_err() {
+        use crate::agent::tools::tool::{ToolError, ToolErrorKind, ToolOutput};
+        let ok = tool_result_text(Ok(ToolOutput::new(serde_json::json!({"hits": 3}), 0)));
+        assert!(!ok.1, "ok is not an error");
+        assert!(ok.0.contains("hits"), "serialized result json: {}", ok.0);
+        let err = tool_result_text(Err(ToolError::kinded(ToolErrorKind::Other, "boom")));
+        assert!(err.1, "err flagged");
+        assert!(err.0.contains("boom"), "err text: {}", err.0);
+    }
+
+    #[test]
+    fn spec_from_tool_maps_metadata() {
+        use crate::agent::tools::tool::{Tool, ToolError, ToolOutput};
+        struct FakeTool;
+        #[async_trait::async_trait]
+        impl Tool for FakeTool {
+            fn name(&self) -> &str {
+                "skill_search"
+            }
+            fn description(&self) -> &str {
+                "search skills"
+            }
+            fn parameters_schema(&self) -> serde_json::Value {
+                serde_json::json!({"type": "object", "properties": {"query": {"type": "string"}}})
+            }
+            async fn execute(
+                &self,
+                _p: serde_json::Value,
+            ) -> Result<ToolOutput, ToolError> {
+                Ok(ToolOutput::new(serde_json::json!({}), 0))
+            }
+        }
+        let spec = spec_from_tool(&FakeTool);
+        assert_eq!(spec.name, "skill_search");
+        assert_eq!(spec.label, "skill_search");
+        assert_eq!(spec.description, "search skills");
+        assert_eq!(spec.parameters["properties"]["query"]["type"], "string");
     }
 }

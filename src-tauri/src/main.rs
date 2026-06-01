@@ -238,22 +238,27 @@ fn main() {
             // thread; its chat:stream-* events reach the frontend via TauriEventSink.
             {
                 let sink = uclaw_core::engine_sink::TauriEventSink::new(app.handle().clone());
-                // [R4 IO 桥] Pass the uClaw tool-request seam. The stub declares no
-                // IO tools yet (built-ins + ExitPlanTool only); the real tokio
-                // executor (mcp.rs/browser/skill dispatch → EngineCmd::ToolResult)
-                // is the integration that replaces it.
+                // [R4 IO 桥] The real uClaw tool executor: skill_search / load_skill /
+                // skill_marketplace_search run on tokio and reply via EngineCmd::ToolResult
+                // (replaces the no-op StubToolRequestSink).
+                let real_sink = std::sync::Arc::new(
+                    uclaw_core::engine_sink::RealToolRequestSink::new(app.handle().clone()),
+                );
                 let tool_request_sink: std::sync::Arc<dyn uclaw_pi_engine::ToolRequestSink> =
-                    std::sync::Arc::new(uclaw_core::engine_sink::StubToolRequestSink);
-                let pi_engine = uclaw_pi_engine::PiEngine::spawn(
+                    real_sink.clone();
+                let pi_engine = std::sync::Arc::new(uclaw_pi_engine::PiEngine::spawn(
                     sink,
                     Some(tool_request_sink),
                     uclaw_pi_engine::EngineConfig {
                         no_session: true,
                         ..Default::default()
                     },
-                );
-                app.manage(std::sync::Arc::new(pi_engine));
-                tracing::info!("[R1] PiEngine spawned (stateless) and managed");
+                ));
+                // Hand the sink a Weak engine handle so its tokio executor can reply
+                // (Weak avoids the sink↔engine ownership cycle). Must precede any prompt.
+                real_sink.attach_engine(std::sync::Arc::downgrade(&pi_engine));
+                app.manage(pi_engine);
+                tracing::info!("[R4] PiEngine spawned with RealToolRequestSink (skill tools wired)");
             }
 
             // ─── Debug 菜单（仅 debug 模式可见） ────────────────────
