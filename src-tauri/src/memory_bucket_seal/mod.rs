@@ -446,4 +446,79 @@ mod tests {
         assert!(refreshed.max_level >= 1, "max_level must reach at least 1");
         assert!(refreshed.root_id.is_some(), "root_id must be set after first seal");
     }
+
+    /// End-to-end round trip through the `Arc<dyn MemoryAdapter>` trait surface:
+    /// store → recall → get → list → namespace_summaries → delete → clear.
+    /// This is the contract the unified `memory.unified.*` IPC layer drives.
+    #[tokio::test]
+    async fn end_to_end_bucket_seal_adapter_via_trait_surface() {
+        use crate::memory_adapter::{MemoryAdapter, MemoryCategory, RecallOpts};
+        use crate::memory_bucket_seal::adapter::BucketSealAdapter;
+        use crate::memory_bucket_seal::score::embed::{Embedder, InertEmbedder};
+        use crate::memory_bucket_seal::store::BucketSealStore;
+        use crate::memory_bucket_seal::tree_source::{InertSummariser, Summariser};
+        use std::sync::Arc;
+
+        let dir = TempDir::new().unwrap();
+        let store = Arc::new(BucketSealStore::open(&dir.path().join("chunks.db")).unwrap());
+        store.ensure_schema().unwrap();
+        let embedder: Arc<dyn Embedder> = Arc::new(InertEmbedder::new());
+        let summariser: Arc<dyn Summariser> = Arc::new(InertSummariser::new());
+        let adapter: Arc<dyn MemoryAdapter> = Arc::new(BucketSealAdapter::new(
+            store,
+            dir.path().join("content"),
+            embedder,
+            summariser,
+        ));
+
+        // store → recall → get → list → namespace_summaries → delete → clear
+        adapter
+            .store(
+                "e2e_ns",
+                "k1",
+                "Project Phoenix launch plan and milestones.",
+                MemoryCategory::Core,
+                Some("sess1"),
+            )
+            .await
+            .unwrap();
+        adapter
+            .store(
+                "e2e_ns",
+                "k2",
+                "Unrelated weather note today.",
+                MemoryCategory::Daily,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let opts = RecallOpts {
+            namespace: Some("e2e_ns"),
+            category: None,
+            session_id: None,
+            min_score: None,
+        };
+        let recalled = adapter.recall("Phoenix", 10, opts).await.unwrap();
+        assert!(!recalled.is_empty(), "FTS should match 'Phoenix'");
+
+        let got = adapter.get("e2e_ns", "k1").await.unwrap();
+        assert!(got.is_some());
+
+        let listed = adapter.list(Some("e2e_ns"), None, None).await.unwrap();
+        assert!(listed.len() >= 2);
+
+        let summaries = adapter.namespace_summaries().await.unwrap();
+        assert!(summaries.iter().any(|s| s.namespace == "e2e_ns"));
+
+        let deleted = adapter.delete("e2e_ns", "k1").await.unwrap();
+        assert!(deleted);
+
+        let cleared = adapter.clear_namespace("e2e_ns").await.unwrap();
+        assert!(cleared >= 1);
+
+        // After clear, list is empty.
+        let listed_after = adapter.list(Some("e2e_ns"), None, None).await.unwrap();
+        assert!(listed_after.is_empty());
+    }
 }
