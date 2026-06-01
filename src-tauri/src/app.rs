@@ -998,8 +998,16 @@ impl AppState {
             .ensure_schema()
             .expect("apply bucket_seal SCHEMA");
 
+        // bucket_seal's seal pipeline + the adapter's vector recall use this
+        // embedder. Reuse memU's FastEmbed (384-dim) when memU is up; else fall
+        // back to InertEmbedder (vector recall then degrades to FTS5-only).
         let bucket_seal_embedder: std::sync::Arc<dyn crate::memory_bucket_seal::Embedder> =
-            std::sync::Arc::new(crate::memory_bucket_seal::InertEmbedder::new());
+            match &memu_client {
+                Some(memu) => {
+                    std::sync::Arc::new(crate::memory_bucket_seal::MemUEmbedder::new(memu.clone()))
+                }
+                None => std::sync::Arc::new(crate::memory_bucket_seal::InertEmbedder::new()),
+            };
         let bucket_seal_summariser: std::sync::Arc<dyn crate::memory_bucket_seal::Summariser> =
             std::sync::Arc::new(crate::memory_bucket_seal::InertSummariser::new());
 
