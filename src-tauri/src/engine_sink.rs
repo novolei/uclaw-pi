@@ -278,11 +278,20 @@ impl uclaw_pi_engine::ToolRequestSink for RealToolRequestSink {
             let (text, is_error) = run_skill_tool(&app, &tool_name, input).await;
             match engine.and_then(|w| w.upgrade()) {
                 Some(engine) => {
-                    engine.send(uclaw_pi_engine::EngineCmd::ToolResult {
-                        request_id,
+                    let sent = engine.send(uclaw_pi_engine::EngineCmd::ToolResult {
+                        request_id: request_id.clone(),
                         text,
                         is_error,
                     });
+                    if !sent {
+                        // Channel full (1024-deep) or engine gone: the awaiting tool
+                        // fail-closes to a timeout. Warn so the drop is diagnosable.
+                        tracing::warn!(
+                            request_id,
+                            tool_name,
+                            "pi tool result dropped: engine command channel full or closed"
+                        );
+                    }
                 }
                 None => tracing::warn!(
                     request_id,
