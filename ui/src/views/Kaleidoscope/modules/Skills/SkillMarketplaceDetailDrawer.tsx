@@ -65,6 +65,7 @@ export function SkillMarketplaceDetailDrawer({
   const [detailErr, setDetailErr] = React.useState<string | null>(null)
   const [installState, setInstallState] = React.useState<RowState>({ kind: 'idle' })
   const [confirmingHighRisk, setConfirmingHighRisk] = React.useState(false)
+  const [pendingScope, setPendingScope] = React.useState<'global' | 'workspace' | null>(null)
 
   React.useEffect(() => {
     if (!open || !id) return
@@ -75,6 +76,7 @@ export function SkillMarketplaceDetailDrawer({
     setDetailErr(null)
     setInstallState({ kind: 'idle' })
     setConfirmingHighRisk(false)
+    setPendingScope(null)
 
     const run = async () => {
       // Detail + audit fetch in parallel; each settles independently so an audit
@@ -128,7 +130,6 @@ export function SkillMarketplaceDetailDrawer({
 
   // HIGH-risk guard: clicking install first surfaces an inline confirm; the
   // pending scope is captured so 确认 installs to the right scope.
-  const [pendingScope, setPendingScope] = React.useState<'global' | 'workspace' | null>(null)
   const requestInstall = (scope: 'global' | 'workspace') => {
     if (risk === 'HIGH') {
       setPendingScope(scope)
