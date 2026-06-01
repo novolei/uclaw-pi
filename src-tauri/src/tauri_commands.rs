@@ -5748,138 +5748,30 @@ pub async fn send_agent_message(
                 recall_config,
             );
             let recall_space_id = "default";
-            let composed: Option<String> = match recall_engine
-                .build_recall_plan(recall_space_id, &user_msg_for_recall, false)
-                .await
-            {
-                Ok(plan) => {
-                    let total = plan.boot.len()
-                        + plan.triggered.len()
-                        + plan.relevant.len()
-                        + plan.expanded.len()
-                        + plan.recent.len();
+            // Browser-task memory: the background task has no AppState, so it
+            // uses the narrow heuristic fn (not build_browser_task_memory_context).
+            let browser_task_memory_ctx =
+                browser_task_memory_for_query(&memory_store_for_recall, &user_msg_for_recall);
+            // Suppress "unused" warning for the not-yet-wired db + workspace
+            // handles — kept for future expansion.
+            let _ = (&state_db_for_browser, &workspace_root_for_browser);
 
-                    // Session-scoped memory (LIKE match) — independent of graph total.
-                    let session_memory_ctx = {
-                        let session_ns = format!("session:{}", session_id_for_recall);
-                        let session_memories =
-                            memory_store_for_recall.search(&user_msg_for_recall, Some(&session_ns), 5);
-                        if !session_memories.is_empty() {
-                            let mut ctx = String::from("<session_memories>\n");
-                            for m in &session_memories {
-                                ctx.push_str(&format!("- [{}] {}\n", m.kind, m.value));
-                            }
-                            ctx.push_str("</session_memories>\n");
-                            tracing::info!(
-                                session_memories = session_memories.len(),
-                                "Session-scoped memories ready (agent, background)"
-                            );
-                            Some(ctx)
-                        } else {
-                            None
-                        }
-                    };
-                    // Browser-task memory needs a full `AppState`-like
-                    // surface today. The background task only has the
-                    // DB + workspace root, so we re-implement the
-                    // narrow heuristic match inline. Keeps this off the
-                    // critical path without leaking state lifetimes.
-                    let browser_task_memory_ctx = browser_task_memory_for_query(
-                        &memory_store_for_recall,
-                        &user_msg_for_recall,
-                    );
-                    // Suppress "unused" warning for the not-yet-wired
-                    // db + workspace handles — kept for future expansion.
-                    let _ = (&state_db_for_browser, &workspace_root_for_browser);
-
-                    if total > 0 {
-                        let budget = recall_engine.config().token_budget;
-                        let mut memory_ctx =
-                            crate::memory_graph::recall::MemoryRecallEngine::format_recall_for_prompt(
-                                &plan, budget,
-                            );
-                        if let Some(ref sess_ctx) = session_memory_ctx {
-                            memory_ctx.push_str(sess_ctx);
-                        }
-                        if let Some(ref browser_ctx) = browser_task_memory_ctx {
-                            memory_ctx.push_str(browser_ctx);
-                        }
-                        tracing::info!(
-                            total_candidates = total,
-                            "Memory recall composed (agent, background)"
-                        );
-
-                        // Emit chip event so the UI badge shows even if
-                        // we missed the synchronous deadline below.
-                        let skills_count = plan
-                            .boot
-                            .iter()
-                            .chain(plan.triggered.iter())
-                            .chain(plan.relevant.iter())
-                            .chain(plan.expanded.iter())
-                            .filter(|c| {
-                                c.kind == crate::memory_graph::models::MemoryNodeKind::Procedure
-                            })
-                            .count();
-                        let items: Vec<serde_json::Value> = plan
-                            .boot
-                            .iter()
-                            .chain(plan.triggered.iter())
-                            .chain(plan.relevant.iter())
-                            .chain(plan.expanded.iter())
-                            .take(20)
-                            .map(|c| {
-                                serde_json::json!({
-                                    "nodeId": c.node_id,
-                                    "title": c.title,
-                                    "kind": c.kind,
-                                    "source": c.source,
-                                })
-                            })
-                            .collect();
-                        let _ = app_handle_for_recall.emit(
-                            "agent:memory-recall",
-                            serde_json::json!({
-                                "totalCandidates": total,
-                                "skillsCount": skills_count,
-                                "bootCount": plan.boot.len(),
-                                "triggeredCount": plan.triggered.len(),
-                                "relevantCount": plan.relevant.len(),
-                                "expandedCount": plan.expanded.len(),
-                                "recentCount": plan.recent.len(),
-                                "items": items,
-                                "conversationId": session_id_for_recall,
-                                "timestamp": chrono::Utc::now().to_rfc3339(),
-                            }),
-                        );
-                        recall_engine.record_used_skills(&plan);
-                        Some(memory_ctx)
-                    } else {
-                        let mut memory_ctx = String::new();
-                        if let Some(sess_ctx) = session_memory_ctx {
-                            memory_ctx.push_str(&sess_ctx);
-                        }
-                        if let Some(browser_ctx) = browser_task_memory_ctx {
-                            memory_ctx.push_str(&browser_ctx);
-                        }
-                        if !memory_ctx.is_empty() {
-                            tracing::info!(
-                                "Auxiliary memories composed (agent, background, no graph recall)"
-                            );
-                            Some(memory_ctx)
-                        } else {
-                            None
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        "Memory recall failed in background task, agent will proceed without it"
-                    );
-                    None
-                }
-            };
+            // Consolidated memory assembly — see agent::memory_context::load_context.
+            let loaded = crate::agent::memory_context::load_context(
+                crate::agent::memory_context::MemoryContextInputs {
+                    recall_engine: &recall_engine,
+                    memory_store: &memory_store_for_recall,
+                    space_id: recall_space_id,
+                    conversation_id: &session_id_for_recall,
+                    query: &user_msg_for_recall,
+                    browser_ctx: browser_task_memory_ctx,
+                },
+            )
+            .await;
+            if let Some(ev) = loaded.recall_event {
+                let _ = app_handle_for_recall.emit("agent:memory-recall", ev);
+            }
+            let composed: Option<String> = loaded.context;
             // Bundle 20 — stash the composed ctx in the per-session
             // cache BEFORE sending on the oneshot. If the main path
             // already timed out (very common because memU recall
