@@ -366,8 +366,11 @@ impl MemoryAdapter for BucketSealAdapter {
             params.push(Box::new(ns.to_string()));
         }
         if let Some(s) = session_id {
-            sql.push_str(" AND tags_json LIKE ?");
-            params.push(Box::new(format!("%\"session:{s}\"%")));
+            // Escape LIKE wildcards in the session id so e.g. "a_b" can't
+            // wildcard-match "aXb". Escape '\' first, then '%' and '_'.
+            sql.push_str(" AND tags_json LIKE ? ESCAPE '\\'");
+            let esc = s.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+            params.push(Box::new(format!("%\"session:{esc}\"%")));
         }
 
         sql.push_str(" ORDER BY timestamp_ms DESC LIMIT ?");
@@ -392,6 +395,10 @@ impl MemoryAdapter for BucketSealAdapter {
     }
 
     async fn delete(&self, namespace: &str, key: &str) -> Result<bool> {
+        // Serialise with store()'s per-tree append_leaf (PR8 contract) so a
+        // concurrent seal can't hydrate chunks this delete is removing.
+        let tree_mutex = self.tree_mutex(namespace).await;
+        let _guard = tree_mutex.lock().await;
         let mut conn = self.store.lock_conn()?;
         let tx = conn.transaction()?;
         // mem_tree_score has an FK → mem_tree_chunks(id) with no ON DELETE
@@ -415,6 +422,9 @@ impl MemoryAdapter for BucketSealAdapter {
     }
 
     async fn clear_namespace(&self, namespace: &str) -> Result<u64> {
+        // Serialise with store()'s per-tree append_leaf, as delete() does.
+        let tree_mutex = self.tree_mutex(namespace).await;
+        let _guard = tree_mutex.lock().await;
         let mut conn = self.store.lock_conn()?;
         let tx = conn.transaction()?;
         // Same FK ordering as delete(): score rows first, then chunks.
@@ -946,5 +956,46 @@ mod tests {
         let q = vec![0.0_f32, 0.0, 0.0];
         let cands = vec![("a".to_string(), "x".to_string(), vec![1.0_f32, 2.0, 3.0])];
         assert!(rank_by_cosine(&q, cands, 10).is_empty());
+    }
+
+    #[tokio::test]
+    async fn recall_matches_on_key_via_title() {
+        let (adapter, _dir) = fresh_adapter();
+        // The key is passed as the document title; canonicalise now prepends it
+        // to the indexed markdown, so recall must match on the key token even
+        // when it is absent from the body.
+        adapter
+            .store(
+                "k_ns",
+                "zeppelinblueprint",
+                "Some unrelated body text about the weather today.",
+                MemoryCategory::Core,
+                None,
+            )
+            .await
+            .unwrap();
+        let opts = RecallOpts {
+            namespace: Some("k_ns"),
+            category: None,
+            session_id: None,
+            min_score: None,
+        };
+        let hits = adapter.recall("zeppelinblueprint", 10, opts).await.unwrap();
+        assert!(!hits.is_empty(), "recall should match on the key/title token");
+    }
+
+    #[tokio::test]
+    async fn list_session_filter_escapes_like_wildcards() {
+        let (adapter, _dir) = fresh_adapter();
+        adapter
+            .store("esc_ns", "k1", "content for session aXb", MemoryCategory::Core, Some("aXb"))
+            .await
+            .unwrap();
+        // "a_b" must NOT wildcard-match the stored "aXb" session (the '_' is escaped).
+        let listed = adapter.list(Some("esc_ns"), None, Some("a_b")).await.unwrap();
+        assert!(listed.is_empty(), "underscore must not wildcard-match a different session");
+        // Sanity: the exact session id still matches.
+        let exact = adapter.list(Some("esc_ns"), None, Some("aXb")).await.unwrap();
+        assert!(!exact.is_empty(), "exact session id should match");
     }
 }
