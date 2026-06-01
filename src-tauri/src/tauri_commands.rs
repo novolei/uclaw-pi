@@ -1940,6 +1940,23 @@ pub async fn send_message(
         );
         // Consolidated memory assembly — see agent::memory_context::load_context.
         // The browser ctx uses the AppState-backed fn on this (main) path.
+        let prompt_backend = recall_engine.config().prompt_recall_backend.clone();
+        let prompt_limit = recall_engine.config().prompt_recall_limit;
+        let default_backend_str = state
+            .default_memory_backend
+            .read()
+            .ok()
+            .map(|g| g.clone())
+            .unwrap_or_else(|| "legacy_kv".to_string());
+        let adapter_recall = prompt_backend
+            .as_deref()
+            .filter(|b| !b.is_empty())
+            .map(|backend| crate::agent::memory_context::AdapterRecall {
+                adapters: &state.memory_adapters,
+                default_backend: &default_backend_str,
+                backend,
+                limit: prompt_limit,
+            });
         let loaded = crate::agent::memory_context::load_context(
             crate::agent::memory_context::MemoryContextInputs {
                 recall_engine: &recall_engine,
@@ -1948,6 +1965,7 @@ pub async fn send_message(
                 conversation_id: &input.conversation_id,
                 query: &input.content,
                 browser_ctx: build_browser_task_memory_context(&state, &input.content),
+                adapter_recall,
             },
         )
         .await;
@@ -5739,6 +5757,13 @@ pub async fn send_agent_message(
         let app_handle_for_recall = app_handle.clone();
         let state_db_for_browser = Arc::clone(&state.db);
         let workspace_root_for_browser = state.workspace_root.clone();
+        let memory_adapters_for_recall = Arc::clone(&state.memory_adapters);
+        let default_backend_for_recall = state
+            .default_memory_backend
+            .read()
+            .ok()
+            .map(|g| g.clone())
+            .unwrap_or_else(|| "legacy_kv".to_string());
         // Bundle 20 — clone the per-session recall cache handle. The
         // bg task writes the freshly-composed memory_context here AFTER
         // sending on the oneshot so even if the main path's 400ms
@@ -5763,6 +5788,17 @@ pub async fn send_agent_message(
             let _ = (&state_db_for_browser, &workspace_root_for_browser);
 
             // Consolidated memory assembly — see agent::memory_context::load_context.
+            let prompt_backend = recall_engine.config().prompt_recall_backend.clone();
+            let prompt_limit = recall_engine.config().prompt_recall_limit;
+            let adapter_recall = prompt_backend
+                .as_deref()
+                .filter(|b| !b.is_empty())
+                .map(|backend| crate::agent::memory_context::AdapterRecall {
+                    adapters: &memory_adapters_for_recall,
+                    default_backend: &default_backend_for_recall,
+                    backend,
+                    limit: prompt_limit,
+                });
             let loaded = crate::agent::memory_context::load_context(
                 crate::agent::memory_context::MemoryContextInputs {
                     recall_engine: &recall_engine,
@@ -5771,6 +5807,7 @@ pub async fn send_agent_message(
                     conversation_id: &session_id_for_recall,
                     query: &user_msg_for_recall,
                     browser_ctx: browser_task_memory_ctx,
+                    adapter_recall,
                 },
             )
             .await;

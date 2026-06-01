@@ -8,10 +8,24 @@
 //! a pre-computed `browser_ctx`) so the function serves both the `AppState`
 //! main path and the background `tokio::spawn` task that has no `AppState`.
 
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use serde_json::Value;
 
 use crate::memory::MemoryStore;
+use crate::memory_adapter::MemoryAdapter;
 use crate::memory_graph::recall::MemoryRecallEngine;
+
+/// Optional adapter-recall supplement (off when `MemoryContextInputs.adapter_recall`
+/// is `None`). AppState-free — holds the adapters map directly so the background
+/// path can use it too. Routes via `memory_adapter::router::route_recall_in`.
+pub struct AdapterRecall<'a> {
+    pub adapters: &'a HashMap<String, Arc<dyn MemoryAdapter>>,
+    pub default_backend: &'a str,
+    pub backend: &'a str,
+    pub limit: usize,
+}
 
 /// Narrow inputs both call sites can supply. The caller pre-builds
 /// `recall_engine` (the build deps differ per site) and `browser_ctx` (the two
@@ -25,6 +39,9 @@ pub struct MemoryContextInputs<'a> {
     pub query: &'a str,
     /// Pre-computed per site.
     pub browser_ctx: Option<String>,
+    /// When `Some`, append a `<recalled_memories>` block from this adapter
+    /// backend (off when `None` → unchanged behavior).
+    pub adapter_recall: Option<AdapterRecall<'a>>,
 }
 
 /// Result of [`load_context`]. The caller emits `recall_event` with its own
@@ -40,6 +57,7 @@ fn compose_memory_context(
     graph_block: Option<String>,
     session_block: Option<&str>,
     browser_block: Option<&str>,
+    adapter_block: Option<&str>,
 ) -> Option<String> {
     let mut out = graph_block.unwrap_or_default();
     if let Some(s) = session_block {
@@ -48,11 +66,48 @@ fn compose_memory_context(
     if let Some(b) = browser_block {
         out.push_str(b);
     }
+    if let Some(a) = adapter_block {
+        out.push_str(a);
+    }
     if out.is_empty() {
         None
     } else {
         Some(out)
     }
+}
+
+/// Recall from the configured adapter backend and format a bounded
+/// `<recalled_memories>` block. Best-effort: any router/adapter error logs a
+/// warning and yields `None` (never fails the turn).
+async fn recall_adapter_block(ar: &AdapterRecall<'_>, query: &str) -> Option<String> {
+    let opts = crate::memory_adapter::RecallOptsIpc::default();
+    let hits = match crate::memory_adapter::route_recall_in(
+        ar.adapters,
+        ar.default_backend,
+        Some(ar.backend),
+        "global",
+        query,
+        ar.limit,
+        &opts,
+    )
+    .await
+    {
+        Ok(h) => h,
+        Err(e) => {
+            tracing::warn!(backend = %ar.backend, error = %e, "adapter recall supplement failed; skipping");
+            return None;
+        }
+    };
+    if hits.is_empty() {
+        return None;
+    }
+    let mut block = String::from("<recalled_memories>\n");
+    for h in &hits {
+        let snippet: String = h.content.chars().take(200).collect();
+        block.push_str(&format!("- [{}] {}: {}\n", h.category, h.key, snippet));
+    }
+    block.push_str("</recalled_memories>\n");
+    Some(block)
 }
 
 /// Assemble the prompt memory block from graph recall + session KV + the
@@ -98,6 +153,12 @@ pub async fn load_context(inputs: MemoryContextInputs<'_>) -> LoadedMemoryContex
         }
     };
 
+    // Optional adapter-recall supplement (off unless inputs.adapter_recall set).
+    let adapter_block: Option<String> = match &inputs.adapter_recall {
+        Some(ar) => recall_adapter_block(ar, inputs.query).await,
+        None => None,
+    };
+
     if total > 0 {
         let budget = inputs.recall_engine.config().token_budget;
         let graph_block = MemoryRecallEngine::format_recall_for_prompt(&plan, budget);
@@ -105,6 +166,7 @@ pub async fn load_context(inputs: MemoryContextInputs<'_>) -> LoadedMemoryContex
             Some(graph_block),
             session_block.as_deref(),
             inputs.browser_ctx.as_deref(),
+            adapter_block.as_deref(),
         );
 
         let skills_count = plan
@@ -152,9 +214,13 @@ pub async fn load_context(inputs: MemoryContextInputs<'_>) -> LoadedMemoryContex
         }
         LoadedMemoryContext { context, recall_event }
     } else {
-        // No graph recall — still inject session + browser aux memory if present.
-        let context =
-            compose_memory_context(None, session_block.as_deref(), inputs.browser_ctx.as_deref());
+        // No graph recall — still inject session + browser + adapter aux memory.
+        let context = compose_memory_context(
+            None,
+            session_block.as_deref(),
+            inputs.browser_ctx.as_deref(),
+            adapter_block.as_deref(),
+        );
         LoadedMemoryContext { context, recall_event: None }
     }
 }
@@ -165,30 +231,85 @@ mod tests {
 
     #[test]
     fn compose_orders_graph_session_browser() {
-        let out = compose_memory_context(Some("<g>\n".into()), Some("<s>\n"), Some("<b>\n")).unwrap();
+        let out =
+            compose_memory_context(Some("<g>\n".into()), Some("<s>\n"), Some("<b>\n"), None).unwrap();
         assert_eq!(out, "<g>\n<s>\n<b>\n");
     }
 
     #[test]
     fn compose_all_none_is_none() {
-        assert!(compose_memory_context(None, None, None).is_none());
+        assert!(compose_memory_context(None, None, None, None).is_none());
     }
 
     #[test]
     fn compose_session_only_when_no_graph() {
-        let out = compose_memory_context(None, Some("<s>\n"), None).unwrap();
+        let out = compose_memory_context(None, Some("<s>\n"), None, None).unwrap();
         assert_eq!(out, "<s>\n");
     }
 
     #[test]
     fn compose_browser_only() {
-        let out = compose_memory_context(None, None, Some("<b>\n")).unwrap();
+        let out = compose_memory_context(None, None, Some("<b>\n"), None).unwrap();
         assert_eq!(out, "<b>\n");
     }
 
     #[test]
     fn compose_empty_graph_string_with_no_aux_is_none() {
         // A graph_block of "" (defensive) + no aux → None, not Some("").
-        assert!(compose_memory_context(Some(String::new()), None, None).is_none());
+        assert!(compose_memory_context(Some(String::new()), None, None, None).is_none());
+    }
+
+    #[test]
+    fn compose_appends_adapter_block_last() {
+        let out = compose_memory_context(
+            Some("<g>\n".into()),
+            Some("<s>\n"),
+            Some("<b>\n"),
+            Some("<a>\n"),
+        )
+        .unwrap();
+        assert_eq!(out, "<g>\n<s>\n<b>\n<a>\n");
+    }
+
+    #[tokio::test]
+    async fn recall_adapter_block_formats_hits() {
+        use crate::memory::MemoryStore;
+        use crate::memory_adapter::{LegacyKvAdapter, MemoryCategory};
+        use rusqlite::Connection;
+        use std::sync::Mutex;
+
+        let conn = Connection::open_in_memory().unwrap();
+        let store = MemoryStore::new(Arc::new(Mutex::new(conn)));
+        store.ensure_table();
+        let kv: Arc<dyn MemoryAdapter> = Arc::new(LegacyKvAdapter::new(Arc::new(store)));
+        kv.store("global", "k1", "needle content here", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        let mut adapters: HashMap<String, Arc<dyn MemoryAdapter>> = HashMap::new();
+        adapters.insert(kv.name().to_string(), kv);
+
+        let ar = AdapterRecall {
+            adapters: &adapters,
+            default_backend: "legacy_kv",
+            backend: "legacy_kv",
+            limit: 5,
+        };
+        let block = recall_adapter_block(&ar, "needle")
+            .await
+            .expect("should find the stored entry");
+        assert!(block.contains("<recalled_memories>"));
+        assert!(block.contains("needle content"));
+    }
+
+    #[tokio::test]
+    async fn recall_adapter_block_unknown_backend_is_none() {
+        let adapters: HashMap<String, Arc<dyn MemoryAdapter>> = HashMap::new();
+        let ar = AdapterRecall {
+            adapters: &adapters,
+            default_backend: "legacy_kv",
+            backend: "ghost",
+            limit: 5,
+        };
+        assert!(recall_adapter_block(&ar, "q").await.is_none());
     }
 }
