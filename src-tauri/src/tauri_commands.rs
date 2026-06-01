@@ -1810,7 +1810,19 @@ pub async fn send_message(
         }
 
         let registry = state.skills_registry.read().await;
-        let manifest = registry.format_for_system_prompt_xml();
+        // Budget-capped manifest. Replaces the uncapped
+        // format_for_system_prompt_xml (all skills × full desc + abs path,
+        // ~34KB/turn); see SYSTEM_PROMPT_MANIFEST_MAX_TOKENS. Skills beyond the
+        // budget stay reachable via skill_search / load_skill.
+        let manifest = crate::skills_manifest::build_skills_manifest(
+            &registry,
+            &state.memory_graph_store,
+            &space_id,
+            crate::skills_manifest::SYSTEM_PROMPT_MANIFEST_MAX_ENTRIES,
+            crate::skills_manifest::SYSTEM_PROMPT_MANIFEST_MAX_TOKENS,
+            crate::skills_manifest::StrategyBias::Balanced,
+            None,
+        );
         delegate.set_skills_manifest_block(manifest);
     }
 
@@ -6085,7 +6097,19 @@ pub async fn send_agent_message(
         // Build skill manifest and inject into system prompt (async: needs registry.read()).
         {
             let registry = skills_registry_for_manifest.read().await;
-            let manifest = registry.format_for_system_prompt_xml();
+            // Budget-capped manifest (mirrors the chat path). Replaces the
+            // uncapped format_for_system_prompt_xml (~34KB/turn for ~100 skills);
+            // see SYSTEM_PROMPT_MANIFEST_MAX_TOKENS. Skills beyond the budget stay
+            // reachable via skill_search / load_skill.
+            let manifest = crate::skills_manifest::build_skills_manifest(
+                &registry,
+                &memory_graph_store_for_manifest,
+                "default",
+                crate::skills_manifest::SYSTEM_PROMPT_MANIFEST_MAX_ENTRIES,
+                crate::skills_manifest::SYSTEM_PROMPT_MANIFEST_MAX_TOKENS,
+                crate::skills_manifest::StrategyBias::Balanced,
+                None,
+            );
             delegate.set_skills_manifest_block(manifest);
         }
 
