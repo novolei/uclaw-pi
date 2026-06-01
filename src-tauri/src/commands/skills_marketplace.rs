@@ -68,9 +68,20 @@ pub async fn install_skill_from_marketplace(
                         if !tags.iter().any(|t| t == &tag) {
                             tags.push(tag.clone());
                             match serde_json::to_string(&tags) {
-                                Ok(json) => {
-                                    let _ = DbWorkspace.set_skill_tags(&conn, space_id, &json);
-                                }
+                                Ok(json) => match DbWorkspace.set_skill_tags(&conn, space_id, &json) {
+                                    // 0 rows ⇒ unknown space id: the skill got tagged but the
+                                    // space did not, so it will NOT activate here. Warn so the
+                                    // failed activation is diagnosable (was silently swallowed).
+                                    Ok(0) => tracing::warn!(
+                                        space_id = %space_id,
+                                        "skills_marketplace: workspace skill_tags not stored (unknown space id) — skill will not activate in this workspace"
+                                    ),
+                                    Ok(_) => {}
+                                    Err(e) => tracing::warn!(
+                                        space_id = %space_id,
+                                        "skills_marketplace: persist workspace skill_tags failed: {e} — skill may not activate"
+                                    ),
+                                },
                                 Err(e) => tracing::warn!(
                                     "skills_marketplace: serialize skill_tags failed: {e}"
                                 ),
