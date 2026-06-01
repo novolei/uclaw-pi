@@ -162,14 +162,53 @@ impl uclaw_pi_engine::ToolRequestSink for StubToolRequestSink {
     }
 }
 
+/// Runtime override for the agent engine backend, set from Settings (the
+/// `set_pi_engine_enabled` command) and seeded once at startup from the persisted
+/// `pi_engine_enabled` setting. `0` = unset (fall back to the `UCLAW_PI_ENGINE`
+/// env var), `1` = ON (PiEngine), `2` = OFF (legacy loop).
+static PI_ENGINE_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
 /// [R1 Done-when#3] Whether the agent chat commands (`send_message`/`stop_agent`)
 /// route through `PiEngine`.
 ///
-/// Gated by the `UCLAW_PI_ENGINE` env var during the R1→R2 migration: R1 wires
-/// the path (this flag exercises it end-to-end); R2 makes pi's streaming render
-/// 1:1 with the legacy backend ("不做消息渲染正确性,那是 R2"). The legacy path
-/// stays the default until R2 lands, then we flip the default here.
+/// Read per send (a conversation boundary), so flipping the Settings toggle takes
+/// effect on the next message, never mid-stream. Precedence: the Settings override
+/// (persisted) wins; absent that, the `UCLAW_PI_ENGINE` env var (the R1→R2 migration
+/// default). The legacy path stays the default until R2 lands, then we flip the seed.
 #[must_use]
 pub fn pi_engine_enabled() -> bool {
-    std::env::var_os("UCLAW_PI_ENGINE").is_some()
+    match PI_ENGINE_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => std::env::var_os("UCLAW_PI_ENGINE").is_some(),
+    }
+}
+
+/// Apply the engine-backend choice at runtime (called by `set_pi_engine_enabled`
+/// and the startup seed). `Some(true|false)` forces the backend; `None` clears the
+/// override so `pi_engine_enabled()` falls back to the env var.
+pub fn set_pi_engine_override(enabled: Option<bool>) {
+    PI_ENGINE_OVERRIDE.store(
+        match enabled {
+            Some(true) => 1,
+            Some(false) => 2,
+            None => 0,
+        },
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pi_engine_override_forces_backend() {
+        set_pi_engine_override(Some(true));
+        assert!(pi_engine_enabled(), "override ON must force pi");
+        set_pi_engine_override(Some(false));
+        assert!(!pi_engine_enabled(), "override OFF must force legacy");
+        // Restore to unset so the global doesn't leak to other code/tests.
+        set_pi_engine_override(None);
+    }
 }

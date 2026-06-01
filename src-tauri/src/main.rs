@@ -178,6 +178,19 @@ fn main() {
                     use uclaw_core::services::settings_service::SettingsService as _;
                     uclaw_core::services::settings_service::DbSettings.http_api_enabled(&conn)
                 });
+
+            // Seed the agent-engine backend override from the persisted
+            // `pi_engine_enabled` setting (falling back to the UCLAW_PI_ENGINE env
+            // var). Read once at startup; the Settings toggle then updates the
+            // runtime override directly (set_pi_engine_enabled), applying on the
+            // next message without a restart.
+            let pi_engine_seed = std::env::var_os("UCLAW_PI_ENGINE").is_some()
+                || app_state.db.lock().ok().is_some_and(|conn| {
+                    use uclaw_core::services::settings_service::SettingsService as _;
+                    uclaw_core::services::settings_service::DbSettings.pi_engine_enabled(&conn)
+                });
+            uclaw_core::engine_sink::set_pi_engine_override(Some(pi_engine_seed));
+
             if http_api_enabled {
                 std::thread::spawn(move || {
                     let rt = match tokio::runtime::Runtime::new() {
@@ -948,6 +961,8 @@ fn main() {
             uclaw_core::commands::bootstrap::get_settings,
             uclaw_core::commands::settings::get_http_api_enabled,
             uclaw_core::commands::settings::set_http_api_enabled,
+            uclaw_core::commands::settings::get_pi_engine_enabled,
+            uclaw_core::commands::settings::set_pi_engine_enabled,
             uclaw_core::commands::bootstrap::patch_settings,
             uclaw_core::browser::runtime_pack_ipc::get_browser_runtime_status,
             uclaw_core::browser::runtime_pack_ipc::get_browser_runtime_control_center,
