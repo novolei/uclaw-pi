@@ -579,7 +579,8 @@ mod tests {
         use crate::skills_marketplace::SkillSummary;
         let s = SkillSummary { id: "expo/skills/rn".into(), slug: "rn".into(), name: "RN".into(),
             source: "expo/skills".into(), installs: 42, source_type: "github".into(),
-            install_url: "https://github.com/expo/skills".into(), url: String::new() };
+            install_url: "https://github.com/expo/skills".into(), url: String::new(),
+            description: String::new() };
         let rows = super::to_result_json(&[s]);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["id"], "expo/skills/rn");
