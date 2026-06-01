@@ -49,7 +49,7 @@ export function SkillMarketplaceSearchResultCard({
   if (isError || !parsed) {
     return (
       <div className="text-xs text-red-400/90 bg-red-400/10 rounded-lg px-3 py-2">
-        skills.sh 搜索失败{!parsed && '（结果解析失败）'}。本地 skill_search 不受影响。
+        市场搜索失败{!parsed && '（结果解析失败）'}。本地 skill_search 不受影响。
       </div>
     )
   }
@@ -58,7 +58,7 @@ export function SkillMarketplaceSearchResultCard({
   // (the keyless search-only provider) for older results that predate the field.
   const provider: MarketplaceProvider = parsed.provider ?? 'skillsmp'
   if (rows.length === 0) {
-    return <div className="text-xs text-muted-foreground px-1 py-1">skills.sh 无匹配结果。</div>
+    return <div className="text-xs text-muted-foreground px-1 py-1">无匹配结果。</div>
   }
 
   // rowKey (id + index) de-collides the rare case of two results sharing an id,
