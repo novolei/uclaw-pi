@@ -20,6 +20,13 @@ pub trait SettingsService {
     /// Persist the engine-backend choice. The runtime override is updated
     /// separately (by the command) so the change applies without a restart.
     fn set_pi_engine_enabled(&self, conn: &Connection, enabled: bool) -> rusqlite::Result<()>;
+    /// Whether a non-empty skills.sh API key is stored. Status only — the key
+    /// itself is never returned to the frontend (only whether one is set).
+    fn skills_sh_api_key_set(&self, conn: &Connection) -> bool;
+    /// Store (or clear, with an empty string) the skills.sh API key the
+    /// marketplace client authenticates with. Whitespace-trimmed; empty ⇒ the
+    /// row is deleted (back to "unset").
+    fn set_skills_sh_api_key(&self, conn: &Connection, key: &str) -> rusqlite::Result<()>;
 }
 
 /// The SQLite-backed implementation (the only one in production).
@@ -61,6 +68,29 @@ impl SettingsService for DbSettings {
         )?;
         Ok(())
     }
+
+    fn skills_sh_api_key_set(&self, conn: &Connection) -> bool {
+        conn.query_row(
+            "SELECT value FROM settings WHERE key = 'skills_sh_api_key'",
+            [],
+            |r| r.get::<_, String>(0),
+        )
+        .ok()
+        .is_some_and(|v| !v.trim().is_empty())
+    }
+
+    fn set_skills_sh_api_key(&self, conn: &Connection, key: &str) -> rusqlite::Result<()> {
+        let key = key.trim();
+        if key.is_empty() {
+            conn.execute("DELETE FROM settings WHERE key = 'skills_sh_api_key'", [])?;
+        } else {
+            conn.execute(
+                "INSERT OR REPLACE INTO settings (key, value) VALUES ('skills_sh_api_key', ?1)",
+                [key],
+            )?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -92,5 +122,21 @@ mod tests {
         assert!(DbSettings.pi_engine_enabled(&c));
         DbSettings.set_pi_engine_enabled(&c, false).unwrap();
         assert!(!DbSettings.pi_engine_enabled(&c));
+    }
+
+    #[test]
+    fn skills_sh_api_key_defaults_unset_round_trips_and_clears() {
+        let c = conn();
+        assert!(!DbSettings.skills_sh_api_key_set(&c), "default must be unset");
+        DbSettings.set_skills_sh_api_key(&c, "sk_live_abc").unwrap();
+        assert!(DbSettings.skills_sh_api_key_set(&c), "set after store");
+        // Empty (or whitespace) clears back to unset.
+        DbSettings.set_skills_sh_api_key(&c, "   ").unwrap();
+        assert!(!DbSettings.skills_sh_api_key_set(&c), "whitespace clears");
+        // A whitespace-padded key is trimmed and still counts as set.
+        DbSettings.set_skills_sh_api_key(&c, "  sk_live_xyz  ").unwrap();
+        assert!(DbSettings.skills_sh_api_key_set(&c));
+        DbSettings.set_skills_sh_api_key(&c, "").unwrap();
+        assert!(!DbSettings.skills_sh_api_key_set(&c), "empty clears");
     }
 }

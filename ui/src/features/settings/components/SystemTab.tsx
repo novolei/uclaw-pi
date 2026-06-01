@@ -7,6 +7,7 @@ import { DiagnosticsCard } from './system/DiagnosticsCard'
 import { ServicesCard } from './system/ServicesCard'
 import { HttpApiToggleCard } from './system/HttpApiToggleCard'
 import { PiEngineToggleCard } from './system/PiEngineToggleCard'
+import { SkillsApiKeyCard } from './system/SkillsApiKeyCard'
 import { EvalsCard } from './system/EvalsCard'
 // Tunable sections (migrated into the feature in P3a). Feature-local imports.
 import { EmbeddingEndpointSection } from './EmbeddingEndpointSection'
@@ -24,6 +25,7 @@ export function SystemTab() {
       <DiagnosticsCard onError={setError} />
       <HttpApiToggleCard onError={setError} />
       <PiEngineToggleCard onError={setError} />
+      <SkillsApiKeyCard onError={setError} />
       <EvalsCard onError={setError} />
       <ServicesCard onError={setError} />
 

@@ -76,6 +76,11 @@ export const settingsBridge = {
   /** Switch the agent engine backend (pi vs legacy); persisted + applied on the next message. */
   setPiEngineEnabled: (enabled: boolean): Promise<void> =>
     invoke<void>('set_pi_engine_enabled', { enabled }),
+  /** Whether a skills.sh API key is stored (status only — the key is never returned). */
+  getSkillsShApiKeySet: (): Promise<boolean> => invoke<boolean>('get_skills_sh_api_key_set'),
+  /** Store (or clear, with `''`) the skills.sh API key the marketplace client uses. */
+  setSkillsShApiKey: (key: string): Promise<void> =>
+    invoke<void>('set_skills_sh_api_key', { key }),
   /** Snapshot the system-diagnostics report (health, bridges, services, processes). */
   getSystemDiagnostics: <T = unknown>(): Promise<T> => invoke<T>('get_system_diagnostics'),
   /** Run an eval suite by its command name (e.g. `run_agent_control_plane_eval`). */
