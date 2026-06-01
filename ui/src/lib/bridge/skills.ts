@@ -18,4 +18,5 @@ export {
   getSkillVersions,
   createUserSkill,
   deleteUserSkill,
+  installSkillFromMarketplace,
 } from '../tauri-bridge'

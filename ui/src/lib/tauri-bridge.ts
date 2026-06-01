@@ -843,6 +843,15 @@ export const createUserSkill = async (input: CreateUserSkillInput): Promise<stri
 export const deleteUserSkill = async (name: string): Promise<void> =>
   invoke('delete_user_skill', { name });
 
+/** Install a skill from skills.sh. scope 'global' = active everywhere (untagged);
+ *  'workspace' = active in `workspaceId` only (tag-scoped). Returns a status slug. */
+export const installSkillFromMarketplace = (
+  id: string,
+  scope: 'global' | 'workspace',
+  workspaceId?: string,
+): Promise<string> =>
+  invoke('install_skill_from_marketplace', { id, scope, workspaceId });
+
 // ─────────────────────────────────────────────────────────
 // GEP Gene Evolution
 // ─────────────────────────────────────────────────────────

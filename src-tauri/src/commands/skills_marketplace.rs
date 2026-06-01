@@ -33,9 +33,14 @@ pub async fn get_skill_marketplace_audit(state: State<'_, AppState>, id: String)
     SkillsShClient::new(read_api_key(&state)).audit(&id).await.map_err(map_err)
 }
 
+/// Install a skill from skills.sh. `scope` = Global → written untagged, so it's
+/// active in every workspace. `scope` = Workspace → the skill's SKILL.md and the
+/// space's `skill_tags` both get the (normalized) `workspace_id` as a tag, so the
+/// V19 `skill_matches_workspace` intersection activates it in that workspace.
+/// (Per V19 semantics, giving a space its first tag turns on tag-filtering there.)
 #[tauri::command]
 pub async fn install_skill_from_marketplace(
-    state: State<'_, AppState>, id: String, scope: InstallScope, workspace: Option<String>,
+    state: State<'_, AppState>, id: String, scope: InstallScope, workspace_id: Option<String>,
 ) -> Result<String, Error> {
     let client = SkillsShClient::new(read_api_key(&state));
     let detail = client.detail(&id).await.map_err(map_err)?;
@@ -44,9 +49,64 @@ pub async fn install_skill_from_marketplace(
     let dir = install::write_skill_files(&skills_root, &slug, &detail).map_err(map_err)?;
 
     if scope == InstallScope::Workspace {
-        if let Some(ws) = workspace.as_deref() {
-            install::link_into_workspace(std::path::Path::new(ws), &slug, &dir).map_err(map_err)?;
-            // TODO(P4): write the workspace tag into dir/SKILL.md activation.tags (frontmatter edit).
+        if let Some(space_id) = workspace_id.as_deref() {
+            // Tag string = normalized space id; the SAME tag goes on the skill and
+            // the space so skill_matches_workspace (intersection) activates it here.
+            let tag = space_id.trim().to_lowercase();
+            if !tag.is_empty() {
+                // 1) Tag the skill in its SKILL.md (best-effort: a skill without
+                //    frontmatter stays untagged/global rather than failing install).
+                if let Err(e) = install::add_activation_tag(&dir, &tag) {
+                    tracing::warn!(slug = %slug, "skills_marketplace: workspace tag write skipped: {e}");
+                }
+                // 2) Add the tag to the space's skill_tags + resolve its path — one
+                //    short SYNC DB section, no await while the lock is held.
+                let ws_path: Option<String> = match state.db.lock() {
+                    Ok(conn) => {
+                        use crate::services::workspace_service::DbWorkspace;
+                        let mut tags = DbWorkspace.get_skill_tags(&conn, space_id);
+                        if !tags.iter().any(|t| t == &tag) {
+                            tags.push(tag.clone());
+                            match serde_json::to_string(&tags) {
+                                Ok(json) => match DbWorkspace.set_skill_tags(&conn, space_id, &json) {
+                                    // 0 rows ⇒ unknown space id: the skill got tagged but the
+                                    // space did not, so it will NOT activate here. Warn so the
+                                    // failed activation is diagnosable (was silently swallowed).
+                                    Ok(0) => tracing::warn!(
+                                        space_id = %space_id,
+                                        "skills_marketplace: workspace skill_tags not stored (unknown space id) — skill will not activate in this workspace"
+                                    ),
+                                    Ok(_) => {}
+                                    Err(e) => tracing::warn!(
+                                        space_id = %space_id,
+                                        "skills_marketplace: persist workspace skill_tags failed: {e} — skill may not activate"
+                                    ),
+                                },
+                                Err(e) => tracing::warn!(
+                                    "skills_marketplace: serialize skill_tags failed: {e}"
+                                ),
+                            }
+                        }
+                        conn.query_row(
+                            "SELECT path FROM spaces WHERE id = ?1",
+                            [space_id],
+                            |r| r.get::<_, Option<String>>(0),
+                        )
+                        .ok()
+                        .flatten()
+                    }
+                    Err(_) => None,
+                };
+                // 3) Best-effort symlink for file-tree visibility (only if the space
+                //    has a filesystem path; tag is what actually activates).
+                if let Some(p) = ws_path {
+                    if let Err(e) =
+                        install::link_into_workspace(std::path::Path::new(&p), &slug, &dir)
+                    {
+                        tracing::warn!(slug = %slug, "skills_marketplace: workspace symlink skipped: {e}");
+                    }
+                }
+            }
         }
     }
     {
