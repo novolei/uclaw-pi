@@ -1023,6 +1023,17 @@ impl AppState {
                     as std::sync::Arc<dyn crate::memory_adapter::MemoryAdapter>;
             memory_adapters_map.insert(memu_adapter.name().to_string(), memu_adapter);
         }
+
+        // 阶段 4: GbrainAdapter exposes gbrain's durable-knowledge search through
+        // the registry. Registered unconditionally — it holds the always-present
+        // mcp_manager and each call checks gbrain availability via gbrain::browse
+        // (NotConnected when offline), so a gbrain connecting after boot becomes
+        // usable without a restart. Point
+        // MemoryRecallConfig.prompt_recall_backend = "gbrain" to use it.
+        let gbrain_adapter =
+            std::sync::Arc::new(crate::memory_adapter::GbrainAdapter::new(mcp_manager.clone()))
+                as std::sync::Arc<dyn crate::memory_adapter::MemoryAdapter>;
+        memory_adapters_map.insert(gbrain_adapter.name().to_string(), gbrain_adapter);
         let memory_adapters = std::sync::Arc::new(memory_adapters_map);
 
         Ok(Self {
