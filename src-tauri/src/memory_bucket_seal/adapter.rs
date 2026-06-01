@@ -35,6 +35,11 @@ use crate::memory_bucket_seal::{stage_chunks, types::SourceKind};
 
 const ADAPTER_NAME: &str = "bucket_seal";
 
+/// Max rows returned by `list()` (the trait takes no limit). A namespace with
+/// more chunks than this is silently truncated — callers needing exhaustive
+/// enumeration should page via a future API.
+const LIST_LIMIT: usize = 200;
+
 pub struct BucketSealAdapter {
     store: Arc<BucketSealStore>,
     content_root: PathBuf,
@@ -141,7 +146,8 @@ impl MemoryAdapter for BucketSealAdapter {
         let mut score_rows: Vec<ScoreRow> = Vec::new();
         for chunk in &chunks {
             let result = score_chunk(chunk, &scoring_config);
-            // Persist the score row regardless of admission (audit trail).
+            // Build a score row for every chunk; only admitted (staged) ones are
+            // persisted below — the mem_tree_score FK requires the chunk row.
             score_rows.push(ScoreRow {
                 chunk_id: result.chunk_id.clone(),
                 total: result.total,
@@ -201,12 +207,26 @@ impl MemoryAdapter for BucketSealAdapter {
         Ok(())
     }
 
+    /// Keyword recall over the FTS5 preview index, scoped by `opts.namespace`
+    /// and (post-filter) `opts.category`.
+    ///
+    /// Limitations (PR9, keyword-only backend): `opts.min_score` is NOT applied
+    /// and `MemoryEntry.score` is always `None`. bucket_seal ranks by FTS5
+    /// relevance internally but does not surface a normalized 0..1 score — the
+    /// persisted `mem_tree_score` is an importance/admission signal, not query
+    /// relevance, so filtering on it would be semantically wrong.
     async fn recall(
         &self,
         query: &str,
         limit: usize,
         opts: RecallOpts<'_>,
     ) -> Result<Vec<MemoryEntry>> {
+        // Arbitrary user text can contain FTS5 operators/quotes/colons that make
+        // MATCH raise a syntax error; phrase-quoting each token makes them match
+        // literally. No usable tokens ⇒ nothing to match.
+        let Some(match_query) = sanitize_fts_query(query) else {
+            return Ok(Vec::new());
+        };
         let conn = self.store.lock_conn()?;
         let mut stmt = conn.prepare(
             "SELECT c.id, c.source_id, c.source_ref, c.content, c.timestamp_ms, c.tags_json
@@ -220,7 +240,7 @@ impl MemoryAdapter for BucketSealAdapter {
 
         let ns_param = opts.namespace.map(|s| s.to_string());
         let rows = stmt.query_map(
-            rusqlite::params![query, ns_param, limit as i64],
+            rusqlite::params![match_query, ns_param, limit as i64],
             row_to_memory_entry,
         )?;
 
@@ -278,7 +298,8 @@ impl MemoryAdapter for BucketSealAdapter {
             params.push(Box::new(format!("%\"session:{s}\"%")));
         }
 
-        sql.push_str(" ORDER BY timestamp_ms DESC LIMIT 200");
+        sql.push_str(" ORDER BY timestamp_ms DESC LIMIT ?");
+        params.push(Box::new(LIST_LIMIT as i64));
 
         let mut stmt = conn.prepare(&sql)?;
         let params_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|b| b.as_ref()).collect();
@@ -381,6 +402,25 @@ fn build_tags(category: &MemoryCategory, session_id: Option<&str>) -> Vec<String
         tags.push(format!("session:{s}"));
     }
     tags
+}
+
+/// Turn arbitrary user text into a safe FTS5 MATCH expression: split on
+/// whitespace, escape embedded `"`, wrap each token as a quoted phrase (so any
+/// FTS5 operator/colon/paren inside matches literally instead of raising a
+/// syntax error), and AND the tokens together. Returns `None` when no usable
+/// token remains, so the caller can return an empty result rather than letting
+/// an empty MATCH error.
+fn sanitize_fts_query(query: &str) -> Option<String> {
+    let quoted: Vec<String> = query
+        .split_whitespace()
+        .filter(|tok| !tok.is_empty())
+        .map(|tok| format!("\"{}\"", tok.replace('"', "\"\"")))
+        .collect();
+    if quoted.is_empty() {
+        None
+    } else {
+        Some(quoted.join(" "))
+    }
 }
 
 /// Reverse [`build_tags`]: pull the `MemoryCategory` + optional session id back
@@ -742,5 +782,41 @@ mod tests {
         };
         let hits = adapter.recall("unique", 10, opts).await.unwrap();
         assert!(hits.is_empty(), "delete trigger should have cleared FTS row");
+    }
+
+    #[tokio::test]
+    async fn recall_tolerates_punctuation_and_empty_queries() {
+        let (adapter, _dir) = fresh_adapter();
+        adapter
+            .store(
+                "punc_ns",
+                "k1",
+                "Visit https://example.com about the phoenix launch.",
+                MemoryCategory::Core,
+                None,
+            )
+            .await
+            .unwrap();
+        let opts = RecallOpts {
+            namespace: Some("punc_ns"),
+            category: None,
+            session_id: None,
+            min_score: None,
+        };
+
+        // FTS5 operators / colons / dashes / parens / quotes must NOT raise an error.
+        for q in ["https://example.com", "phoenix -launch", "a:b", "well (being", "\""] {
+            assert!(
+                adapter.recall(q, 10, opts.clone()).await.is_ok(),
+                "query {q:?} must not raise an FTS5 error"
+            );
+        }
+
+        // Empty / whitespace-only query returns an empty result, not an error.
+        assert!(adapter.recall("   ", 10, opts.clone()).await.unwrap().is_empty());
+
+        // A normal token still matches.
+        let hits = adapter.recall("phoenix", 10, opts.clone()).await.unwrap();
+        assert!(!hits.is_empty(), "plain token should still match after sanitisation");
     }
 }
