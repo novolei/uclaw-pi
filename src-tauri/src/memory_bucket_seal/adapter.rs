@@ -366,8 +366,11 @@ impl MemoryAdapter for BucketSealAdapter {
             params.push(Box::new(ns.to_string()));
         }
         if let Some(s) = session_id {
-            sql.push_str(" AND tags_json LIKE ?");
-            params.push(Box::new(format!("%\"session:{s}\"%")));
+            // Escape LIKE wildcards in the session id so e.g. "a_b" can't
+            // wildcard-match "aXb". Escape '\' first, then '%' and '_'.
+            sql.push_str(" AND tags_json LIKE ? ESCAPE '\\'");
+            let esc = s.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+            params.push(Box::new(format!("%\"session:{esc}\"%")));
         }
 
         sql.push_str(" ORDER BY timestamp_ms DESC LIMIT ?");
@@ -979,5 +982,20 @@ mod tests {
         };
         let hits = adapter.recall("zeppelinblueprint", 10, opts).await.unwrap();
         assert!(!hits.is_empty(), "recall should match on the key/title token");
+    }
+
+    #[tokio::test]
+    async fn list_session_filter_escapes_like_wildcards() {
+        let (adapter, _dir) = fresh_adapter();
+        adapter
+            .store("esc_ns", "k1", "content for session aXb", MemoryCategory::Core, Some("aXb"))
+            .await
+            .unwrap();
+        // "a_b" must NOT wildcard-match the stored "aXb" session (the '_' is escaped).
+        let listed = adapter.list(Some("esc_ns"), None, Some("a_b")).await.unwrap();
+        assert!(listed.is_empty(), "underscore must not wildcard-match a different session");
+        // Sanity: the exact session id still matches.
+        let exact = adapter.list(Some("esc_ns"), None, Some("aXb")).await.unwrap();
+        assert!(!exact.is_empty(), "exact session id should match");
     }
 }
