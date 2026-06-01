@@ -15,6 +15,23 @@ use std::hash::{Hash, Hasher};
 
 const APPROX_TOKENS_PER_CHAR: f64 = 0.25;
 
+/// Token budget for the skills manifest injected into the agent/chat system
+/// prompt. `build_skills_manifest` truncates each summary (100 chars) and stops
+/// adding entries once this budget is hit, surfacing the highest-ranked skills
+/// compactly; every other skill stays reachable through the `skill_search` /
+/// `load_skill` tools (the manifest footer teaches that flow).
+///
+/// Replaces the previously-uncapped `SkillsRegistry::format_for_system_prompt_xml`
+/// path, which rendered ALL skills with full descriptions + absolute `<location>`
+/// paths (~34KB / ~9–10K tokens for ~100 skills, re-sent every turn until the
+/// agent first calls `skill_search`). Tune this down to trade manifest coverage
+/// for fewer per-turn tokens.
+pub const SYSTEM_PROMPT_MANIFEST_MAX_TOKENS: usize = 1500;
+
+/// Hard cap on manifest entry count — a safety bound independent of the token
+/// budget above. Set high enough that the token budget is the effective limit.
+pub const SYSTEM_PROMPT_MANIFEST_MAX_ENTRIES: usize = 200;
+
 /// Manifest re-ranking bias: learned skills whose `metadata.category` matches
 /// the active strategy receive +3.0 score bonus and float to the top of the
 /// learned block (stable sort preserves E3 order within tied score groups).
@@ -580,6 +597,39 @@ mod tests {
 
         let lines = manifest.matches("\n- **").count();
         assert!(lines < 30, "expected token budget to drop entries; got {} lines", lines);
+    }
+
+    #[test]
+    fn system_prompt_budget_consts_bound_manifest_size() {
+        // With far more skills than the budget can hold, the live agent/chat
+        // manifest must stay bounded by SYSTEM_PROMPT_MANIFEST_MAX_TOKENS rather
+        // than growing unbounded like the old format_for_system_prompt_xml path.
+        let store = fresh_store();
+        for i in 0..300 {
+            make_learned_node(&store, &format!("skill-{i:03}"), "a representative skill summary", 0, 0);
+        }
+        let registry = SkillsRegistry::new();
+        let manifest = build_skills_manifest(
+            &registry,
+            &store,
+            "default",
+            SYSTEM_PROMPT_MANIFEST_MAX_ENTRIES,
+            SYSTEM_PROMPT_MANIFEST_MAX_TOKENS,
+            StrategyBias::Balanced,
+            None,
+        );
+
+        assert!(!manifest.is_empty(), "manifest should render some entries");
+        // budget_chars = max_tokens / APPROX_TOKENS_PER_CHAR, plus header/footer slack.
+        let budget_chars = (SYSTEM_PROMPT_MANIFEST_MAX_TOKENS as f64 / APPROX_TOKENS_PER_CHAR) as usize;
+        assert!(
+            manifest.len() <= budget_chars + 1024,
+            "manifest len {} should stay within budget {} (+slack)",
+            manifest.len(),
+            budget_chars,
+        );
+        // Footer must teach progressive disclosure so dropped skills remain reachable.
+        assert!(manifest.contains("skill_search"), "footer should mention skill_search");
     }
 
     #[test]
