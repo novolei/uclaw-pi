@@ -1012,6 +1012,17 @@ impl AppState {
             as std::sync::Arc<dyn crate::memory_adapter::MemoryAdapter>;
 
         memory_adapters_map.insert(bucket_seal_adapter.name().to_string(), bucket_seal_adapter);
+
+        // 阶段 4: MemUAdapter exposes memU's semantic recall through the registry,
+        // registered only when memU initialised. Point
+        // MemoryRecallConfig.prompt_recall_backend = "memu" to use it as the
+        // agent prompt's semantic-recall source (via the piece-2 supplement).
+        if let Some(ref memu) = memu_client {
+            let memu_adapter =
+                std::sync::Arc::new(crate::memory_adapter::MemUAdapter::new(memu.clone()))
+                    as std::sync::Arc<dyn crate::memory_adapter::MemoryAdapter>;
+            memory_adapters_map.insert(memu_adapter.name().to_string(), memu_adapter);
+        }
         let memory_adapters = std::sync::Arc::new(memory_adapters_map);
 
         Ok(Self {
