@@ -131,6 +131,14 @@ pub struct MemoryRecallConfig {
     /// auto-link has populated enough edges for the signal to mean
     /// something.
     pub backlink_boost_weight: f32,
+
+    /// When set (non-empty), load_context ALSO recalls from this MemoryAdapter
+    /// backend and appends a `<recalled_memories>` block. None/empty = off (no
+    /// behavior change). Adapter-routing, not graph-recall tuning, but lives
+    /// here because this config is already threaded to both recall sites.
+    pub prompt_recall_backend: Option<String>,
+    /// Max entries pulled for the adapter-recall supplement. Default 5.
+    pub prompt_recall_limit: usize,
 }
 
 // Standalone default functions retained: used both by
@@ -170,6 +178,8 @@ impl Default for MemoryRecallConfig {
             // until the user opts in via memory_recall_config IPC.
             entity_page_boost: default_entity_page_boost(),
             backlink_boost_weight: default_backlink_boost_weight(),
+            prompt_recall_backend: None,
+            prompt_recall_limit: 5,
         }
     }
 }
@@ -219,6 +229,10 @@ pub struct MemoryRecallConfigDto {
     /// Memory OS Phase 5 — backlink-count log-weight (default 0.0).
     #[serde(default)]
     pub backlink_boost_weight: Option<f32>,
+    #[serde(default)]
+    pub prompt_recall_backend: Option<String>,
+    #[serde(default)]
+    pub prompt_recall_limit: Option<usize>,
 }
 
 impl From<MemoryRecallConfigDto> for MemoryRecallConfig {
@@ -243,6 +257,8 @@ impl From<MemoryRecallConfigDto> for MemoryRecallConfig {
             boot_user_profile_limit: dto.boot_user_profile_limit.unwrap_or(default.boot_user_profile_limit),
             entity_page_boost: dto.entity_page_boost.unwrap_or(default.entity_page_boost),
             backlink_boost_weight: dto.backlink_boost_weight.unwrap_or(default.backlink_boost_weight),
+            prompt_recall_backend: dto.prompt_recall_backend.or(default.prompt_recall_backend),
+            prompt_recall_limit: dto.prompt_recall_limit.unwrap_or(default.prompt_recall_limit),
         }
     }
 }
@@ -268,6 +284,8 @@ impl From<MemoryRecallConfig> for MemoryRecallConfigDto {
             boot_user_profile_limit: Some(cfg.boot_user_profile_limit),
             entity_page_boost: Some(cfg.entity_page_boost),
             backlink_boost_weight: Some(cfg.backlink_boost_weight),
+            prompt_recall_backend: cfg.prompt_recall_backend,
+            prompt_recall_limit: Some(cfg.prompt_recall_limit),
         }
     }
 }
