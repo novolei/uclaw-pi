@@ -299,6 +299,11 @@ Constraints:
   - 进程内 only(F3),无 SessionTransport 切换。
   - key/配置对齐 if2pi(F7):auth 经 SessionOptions.api_key 注入,不读共享 ~/.pi/agent/auth.json;models/settings 全在 ~/.uclaw/if2pi/。
   - provider/sse/工具等若 SDK 未暴露,可直接复制 pi 内部模块替代包装(F8,用户自有仓库无许可负担);加 vendored 来源标记。
+  - **[token 纪律 · PR #16/#17/#18]** 给 pi 注入技能/上下文时,技能清单必须走带预算的
+    `skills_manifest::build_skills_manifest`(封顶 + 描述截断 + `skill_search` 渐进披露),
+    **禁止**复用未封顶的 `SkillsRegistry::format_for_system_prompt_xml`(全量 ~100 技能 ×
+    完整描述 + 绝对路径 ≈ 34KB/轮)——legacy 已在 PR #16 修复,pi 集成不得重新引入该 bloat。
+    memory 同理:走稳定可缓存前缀、勿 ladder tier-pad(参 PR #17/#18)。
 
 Done when:
   1. 各工具渲染器(bash/read/write/edit/screenshot)从 pi 驱动的 ToolOutput 正确显示;附证据。
@@ -306,16 +311,18 @@ Done when:
   3. MCP 工具经包装的 impl pi::sdk::Tool 用 uClaw mcp.rs 客户端回路。
   4. `cargo build --release` + `npm run build` + 测试退出 0。
   5. 配置隔离(F7)保持:provider/key 配置后 ~/.pi/agent/ 仍零改写,auth/models 落 ~/.uclaw/if2pi/(粘证据)。
+  6. **token 纪律(PR #16/#17/#18)**:抽一轮 pi 消息看 `system_prompt_tokens`/`input_tokens`,确认系统提示与 legacy 同量级(~4–5K,非回到 ~16.9K)——技能清单封顶、memory 可缓存、无 tier-pad。
 
 Stop if:
   - 内置工具被重新实现而非用 pi 的(违反 F5)。
   - ToolOutput 形状不符致渲染器空白——修映射不修 renderer。
   - 测试 regress。
+  - 技能清单用未封顶的 `format_for_system_prompt_xml` 注入 pi(token bloat 回归,违反 PR #16 纪律)。
 
 Use a token budget of 150000 tokens for this goal.
 ```
 
-**R4 门禁（过则解锁 R5）：** Done-when 1–5 全绿 + 各工具卡正确渲染 + set_model 可用 + 配置隔离保持(F7)。
+**R4 门禁（过则解锁 R5）：** Done-when 1–6 全绿 + 各工具卡正确渲染 + set_model 可用 + 配置隔离保持(F7) + **token 纪律**:技能清单经 `build_skills_manifest` 封顶(非全量 XML),pi 系统提示不回到 ~16.9K。
 
 ---
 
