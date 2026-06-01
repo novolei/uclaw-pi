@@ -88,7 +88,8 @@ import type {
   McpServerInput,
   // Built-in Skills
   SkillInfo,
-  // skills.sh marketplace
+  // skills.sh / skillsmp marketplace
+  MarketplaceProvider,
   MarketplaceSkillSummary,
   MarketplaceSkillDetail,
   MarketplaceSkillAudit,
@@ -847,36 +848,54 @@ export const createUserSkill = async (input: CreateUserSkillInput): Promise<stri
 export const deleteUserSkill = async (name: string): Promise<void> =>
   invoke('delete_user_skill', { name });
 
-/** Install a skill from skills.sh. scope 'global' = active everywhere (untagged);
- *  'workspace' = active in `workspaceId` only (tag-scoped). Returns a status slug. */
+/** Install a skill from a marketplace. scope 'global' = active everywhere
+ *  (untagged); 'workspace' = active in `workspaceId` only (tag-scoped). For
+ *  skillsmp pass provider 'skillsmp' + `source` = the row's installUrl (githubUrl).
+ *  Returns a status slug. */
 export const installSkillFromMarketplace = (
   id: string,
   scope: 'global' | 'workspace',
   workspaceId?: string,
+  provider?: MarketplaceProvider,
+  source?: string,
 ): Promise<string> =>
-  invoke('install_skill_from_marketplace', { id, scope, workspaceId });
+  invoke('install_skill_from_marketplace', { id, scope, workspaceId, provider, source });
 
-/** Search skills.sh by free-text query. */
+/** Search a marketplace by free-text query (backend default skills_sh; the UI
+ *  passes 'skillsmp' explicitly). */
 export const searchSkillsMarketplace = (
   query: string,
   limit?: number,
+  provider?: MarketplaceProvider,
 ): Promise<MarketplaceSkillSummary[]> =>
-  invoke('search_skill_marketplace', { query, limit });
-/** List skills.sh (view = 'trending' | 'hot' | 'all-time'). */
+  invoke('search_skill_marketplace', { query, limit, provider });
+/** List a marketplace (skills.sh views; skillsmp has no list → empty). */
 export const listSkillsMarketplace = (
   view?: string,
   page?: number,
+  provider?: MarketplaceProvider,
 ): Promise<MarketplaceSkillSummary[]> =>
-  invoke('list_skill_marketplace', { view, page });
-/** Fetch a skill's detail (inline files) by id. */
-export const getSkillMarketplaceDetail = (id: string): Promise<MarketplaceSkillDetail> =>
-  invoke('get_skill_marketplace_detail', { id });
-/** Fetch a skill's audit verdicts by id. */
-export const getSkillMarketplaceAudit = (id: string): Promise<MarketplaceSkillAudit> =>
-  invoke('get_skill_marketplace_audit', { id });
-/** Whether an installed marketplace skill has a newer version on skills.sh. */
-export const checkSkillMarketplaceUpdate = (id: string): Promise<boolean> =>
-  invoke('check_skill_marketplace_update', { id });
+  invoke('list_skill_marketplace', { view, page, provider });
+/** Fetch a skill's detail (inline files). skillsmp needs `source` (the githubUrl). */
+export const getSkillMarketplaceDetail = (
+  id: string,
+  provider?: MarketplaceProvider,
+  source?: string,
+): Promise<MarketplaceSkillDetail> =>
+  invoke('get_skill_marketplace_detail', { id, provider, source });
+/** Fetch a skill's audit verdicts (skillsmp has none → empty). */
+export const getSkillMarketplaceAudit = (
+  id: string,
+  provider?: MarketplaceProvider,
+): Promise<MarketplaceSkillAudit> =>
+  invoke('get_skill_marketplace_audit', { id, provider });
+/** Whether an installed marketplace skill has a newer version. skillsmp needs `source`. */
+export const checkSkillMarketplaceUpdate = (
+  id: string,
+  provider?: MarketplaceProvider,
+  source?: string,
+): Promise<boolean> =>
+  invoke('check_skill_marketplace_update', { id, provider, source });
 
 // ─────────────────────────────────────────────────────────
 // GEP Gene Evolution

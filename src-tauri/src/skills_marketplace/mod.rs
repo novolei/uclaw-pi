@@ -2,7 +2,9 @@
 //! See docs/superpowers/specs/2026-06-01-skills-sh-marketplace-design.md.
 
 pub mod client;
+pub mod github;
 pub mod install;
+pub mod skillsmp;
 
 use serde::{Deserialize, Serialize};
 
@@ -21,6 +23,9 @@ pub struct SkillSummary {
     pub install_url: String,
     #[serde(default)]
     pub url: String,
+    /// Short description (skillsmp.com returns one; skills.sh search does not → "").
+    #[serde(default)]
+    pub description: String,
 }
 
 /// One file from the detail endpoint.
@@ -63,6 +68,20 @@ pub struct SkillAuditEntry {
 pub enum InstallScope {
     Global,
     Workspace,
+}
+
+/// Which marketplace backend a command targets. `Default` = `SkillsSh` for
+/// back-compat (legacy callers that omit a provider keep their skills.sh
+/// behavior, which needs no `source`); the FRONTEND provider selector defaults
+/// to skillsmp (keyless) and always passes an explicit provider.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MarketplaceProvider {
+    /// skills.sh /api/v1 — Bearer key required; inline-file detail + audit.
+    #[default]
+    SkillsSh,
+    /// skillsmp.com /api/v1 — search-only, keyless; install/preview via GitHub.
+    Skillsmp,
 }
 
 /// Errors surfaced to the UI.

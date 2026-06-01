@@ -900,9 +900,11 @@ export interface SkillInfo {
   provenance?: 'bundled' | 'user' | 'project' | 'marketplace';
 }
 
-// ── skills.sh marketplace types (mirror the Rust `skills_marketplace` serde
-// shapes; camelCase fields match the `#[serde(rename)]`s on the Rust side). ──
-/** skills.sh search/list row (mirrors Rust `SkillSummary`). */
+// ── skills.sh / skillsmp.com marketplace types (mirror the Rust
+// `skills_marketplace` serde shapes; camelCase fields match the `#[serde(rename)]`s). ──
+/** Which marketplace backend a command targets (mirrors Rust `MarketplaceProvider`). */
+export type MarketplaceProvider = 'skills_sh' | 'skillsmp';
+/** A marketplace search/list row (mirrors Rust `SkillSummary`). */
 export interface MarketplaceSkillSummary {
   id: string;
   slug: string;
@@ -912,6 +914,8 @@ export interface MarketplaceSkillSummary {
   sourceType: string;
   installUrl: string;
   url: string;
+  /** Short description (skillsmp returns one; skills.sh search leaves it ""). */
+  description?: string;
 }
 /** One inline file from the detail endpoint (mirrors Rust `SkillFile`). */
 export interface MarketplaceSkillFile {

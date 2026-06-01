@@ -2,50 +2,91 @@
 use tauri::State;
 use crate::app::AppState;
 use crate::error::Error;
-use crate::skills_marketplace::{client::SkillsShClient, install, InstallScope, SkillSummary, SkillDetail, SkillAudit, MarketplaceError};
+use crate::skills_marketplace::{client::SkillsShClient, github, install, skillsmp::SkillsmpClient, InstallScope, MarketplaceProvider, SkillSummary, SkillDetail, SkillAudit, MarketplaceError};
 
 fn map_err(e: MarketplaceError) -> Error { Error::Internal(e.to_string()) }
 
-fn read_api_key(state: &AppState) -> Option<String> {
+/// Read the API key for a provider from `settings` (`skills_sh_api_key` /
+/// `skillsmp_api_key`). skillsmp's key is optional (anonymous tier if absent).
+fn read_api_key(state: &AppState, provider: MarketplaceProvider) -> Option<String> {
+    let key_name = match provider {
+        MarketplaceProvider::SkillsSh => "skills_sh_api_key",
+        MarketplaceProvider::Skillsmp => "skillsmp_api_key",
+    };
     let conn = state.db.lock().ok()?;
-    conn.query_row("SELECT value FROM settings WHERE key='skills_sh_api_key'", [], |r| r.get::<_, String>(0)).ok()
+    conn.query_row("SELECT value FROM settings WHERE key=?1", [key_name], |r| r.get::<_, String>(0)).ok()
+}
+
+/// Produce a `SkillDetail` for a skill regardless of provider: skills.sh from its
+/// detail endpoint; skillsmp from the row's `githubUrl` (`source`) via the GitHub
+/// contents API. After this, install/preview are provider-agnostic. (The DB lock
+/// inside `read_api_key` is released before any await.)
+async fn provider_detail(
+    state: &AppState,
+    id: &str,
+    provider: MarketplaceProvider,
+    source: Option<&str>,
+) -> Result<SkillDetail, Error> {
+    match provider {
+        MarketplaceProvider::SkillsSh => {
+            SkillsShClient::new(read_api_key(state, provider)).detail(id).await.map_err(map_err)
+        }
+        MarketplaceProvider::Skillsmp => {
+            let gh = source.ok_or_else(|| {
+                Error::Internal("skillsmp install/detail needs a github source (install_url)".into())
+            })?;
+            github::fetch_github_skill(gh).await.map_err(map_err)
+        }
+    }
 }
 
 #[tauri::command]
-pub async fn search_skill_marketplace(state: State<'_, AppState>, query: String, limit: Option<usize>) -> Result<Vec<SkillSummary>, Error> {
-    let client = SkillsShClient::new(read_api_key(&state));
-    client.search(&query, limit.unwrap_or(20)).await.map_err(map_err)
+pub async fn search_skill_marketplace(state: State<'_, AppState>, query: String, limit: Option<usize>, provider: Option<MarketplaceProvider>) -> Result<Vec<SkillSummary>, Error> {
+    let provider = provider.unwrap_or_default();
+    let limit = limit.unwrap_or(20);
+    match provider {
+        MarketplaceProvider::SkillsSh => SkillsShClient::new(read_api_key(&state, provider)).search(&query, limit).await.map_err(map_err),
+        MarketplaceProvider::Skillsmp => SkillsmpClient::new(read_api_key(&state, provider)).search(&query, limit).await.map_err(map_err),
+    }
 }
 
 #[tauri::command]
-pub async fn list_skill_marketplace(state: State<'_, AppState>, view: Option<String>, page: Option<usize>) -> Result<Vec<SkillSummary>, Error> {
-    let client = SkillsShClient::new(read_api_key(&state));
-    client.list(view.as_deref().unwrap_or("trending"), page.unwrap_or(0), 60).await.map_err(map_err)
+pub async fn list_skill_marketplace(state: State<'_, AppState>, view: Option<String>, page: Option<usize>, provider: Option<MarketplaceProvider>) -> Result<Vec<SkillSummary>, Error> {
+    match provider.unwrap_or_default() {
+        MarketplaceProvider::SkillsSh => SkillsShClient::new(read_api_key(&state, MarketplaceProvider::SkillsSh)).list(view.as_deref().unwrap_or("trending"), page.unwrap_or(0), 60).await.map_err(map_err),
+        // skillsmp.com exposes no list/trending endpoint — only search.
+        MarketplaceProvider::Skillsmp => Ok(Vec::new()),
+    }
 }
 
 #[tauri::command]
-pub async fn get_skill_marketplace_detail(state: State<'_, AppState>, id: String) -> Result<SkillDetail, Error> {
-    SkillsShClient::new(read_api_key(&state)).detail(&id).await.map_err(map_err)
+pub async fn get_skill_marketplace_detail(state: State<'_, AppState>, id: String, provider: Option<MarketplaceProvider>, source: Option<String>) -> Result<SkillDetail, Error> {
+    provider_detail(&state, &id, provider.unwrap_or_default(), source.as_deref()).await
 }
 
 #[tauri::command]
-pub async fn get_skill_marketplace_audit(state: State<'_, AppState>, id: String) -> Result<SkillAudit, Error> {
-    SkillsShClient::new(read_api_key(&state)).audit(&id).await.map_err(map_err)
+pub async fn get_skill_marketplace_audit(state: State<'_, AppState>, id: String, provider: Option<MarketplaceProvider>) -> Result<SkillAudit, Error> {
+    match provider.unwrap_or_default() {
+        MarketplaceProvider::SkillsSh => SkillsShClient::new(read_api_key(&state, MarketplaceProvider::SkillsSh)).audit(&id).await.map_err(map_err),
+        // skillsmp.com has no audit endpoint → empty (UI shows 未审计).
+        MarketplaceProvider::Skillsmp => Ok(SkillAudit { audits: Vec::new() }),
+    }
 }
 
 /// Whether an installed marketplace skill has a newer version on skills.sh.
 /// `true` iff the slug is tracked-installed (V25) AND its stored hash differs from
 /// the latest detail hash. Not-installed ⇒ `false` (nothing to update).
 #[tauri::command]
-pub async fn check_skill_marketplace_update(state: State<'_, AppState>, id: String) -> Result<bool, Error> {
-    let detail = SkillsShClient::new(read_api_key(&state)).detail(&id).await.map_err(map_err)?;
+pub async fn check_skill_marketplace_update(state: State<'_, AppState>, id: String, provider: Option<MarketplaceProvider>, source: Option<String>) -> Result<bool, Error> {
+    let detail = provider_detail(&state, &id, provider.unwrap_or_default(), source.as_deref()).await?;
     let slug = install::flatten_slug(&id);
     let conn = state.db.lock().map_err(|e| Error::Internal(format!("DB lock: {e}")))?;
     let installed = install::read_install_version(&conn, &slug).ok().flatten();
     Ok(installed.is_some_and(|h| h != detail.hash))
 }
 
-/// Install a skill from skills.sh. `scope` = Global → written untagged, so it's
+/// Install a skill from the marketplace (skills.sh, or skillsmp.com via its
+/// `source` githubUrl). `scope` = Global → written untagged, so it's
 /// active in every workspace. `scope` = Workspace → the skill's SKILL.md and the
 /// space's `skill_tags` both get the (normalized) `workspace_id` as a tag, so the
 /// V19 `skill_matches_workspace` intersection activates it in that workspace.
@@ -53,9 +94,9 @@ pub async fn check_skill_marketplace_update(state: State<'_, AppState>, id: Stri
 #[tauri::command]
 pub async fn install_skill_from_marketplace(
     state: State<'_, AppState>, id: String, scope: InstallScope, workspace_id: Option<String>,
+    provider: Option<MarketplaceProvider>, source: Option<String>,
 ) -> Result<String, Error> {
-    let client = SkillsShClient::new(read_api_key(&state));
-    let detail = client.detail(&id).await.map_err(map_err)?;
+    let detail = provider_detail(&state, &id, provider.unwrap_or_default(), source.as_deref()).await?;
     let slug = install::flatten_slug(&id);
     let skills_root = state.data_dir.join("skills");
     let dir = install::write_skill_files(&skills_root, &slug, &detail).map_err(map_err)?;

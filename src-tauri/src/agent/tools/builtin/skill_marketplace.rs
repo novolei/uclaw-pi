@@ -35,7 +35,7 @@ use crate::agent::tools::tool::{
     ApprovalRequirement, Tool, ToolError, ToolErrorKind, ToolOutput,
 };
 use crate::skills::SkillsRegistry;
-use crate::skills_marketplace::{client::SkillsShClient, MarketplaceError, SkillSummary};
+use crate::skills_marketplace::{client::SkillsShClient, skillsmp::SkillsmpClient, MarketplaceError, SkillSummary};
 
 const USER_AGENT: &str = "uClaw/0.1";
 const INSTALL_TIMEOUT_MS: u64 = 30_000;
@@ -47,15 +47,19 @@ const MAX_FILES_PER_SKILL: usize = 32;
 // ───────────────────────────────────────────────────────────────────
 
 pub struct SkillMarketplaceSearchTool {
-    /// skills.sh API key, read from settings at registration. None → search returns a "set a key" hint.
-    api_key: Option<String>,
+    /// skills.sh API key (that provider requires it). Read from settings at registration.
+    skills_sh_key: Option<String>,
+    /// skillsmp.com API key — OPTIONAL (the anonymous tier works without it).
+    skillsmp_key: Option<String>,
 }
 impl SkillMarketplaceSearchTool {
     #[must_use]
-    pub fn new(api_key: Option<String>) -> Self { Self { api_key } }
+    pub fn new(skills_sh_key: Option<String>, skillsmp_key: Option<String>) -> Self {
+        Self { skills_sh_key, skillsmp_key }
+    }
 }
 impl Default for SkillMarketplaceSearchTool {
-    fn default() -> Self { Self::new(None) }
+    fn default() -> Self { Self::new(None, None) }
 }
 
 #[async_trait]
@@ -65,7 +69,7 @@ impl Tool for SkillMarketplaceSearchTool {
     }
 
     fn description(&self) -> &str {
-        "Search skills.sh (the open agent-skills directory) for installable skills matching a query. Use when the user asks \"is there a skill for X\" or local skill_search finds nothing. Returns candidates {id, name, source, installs}. Do NOT install silently — surface the candidates so the USER can choose to Install (global or this workspace)."
+        "Search a skill marketplace for installable skills matching a query. Default provider \"skillsmp\" (skillsmp.com — NO API key needed); pass provider=\"skills_sh\" for skills.sh (needs a key). Use when the user asks \"is there a skill for X\" or local skill_search finds nothing. Returns candidates {id, name, source, installs}. Do NOT install silently — surface the candidates so the USER can choose to Install (global or this workspace)."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -82,6 +86,12 @@ impl Tool for SkillMarketplaceSearchTool {
                     "default": 8,
                     "minimum": 1,
                     "maximum": 20
+                },
+                "provider": {
+                    "type": "string",
+                    "enum": ["skillsmp", "skills_sh"],
+                    "description": "Marketplace to search. Default \"skillsmp\" (no API key needed). \"skills_sh\" needs a skills.sh API key.",
+                    "default": "skillsmp"
                 }
             },
             "required": ["query"]
@@ -115,8 +125,13 @@ impl Tool for SkillMarketplaceSearchTool {
             .and_then(|v| v.as_u64())
             .map(|n| n.clamp(1, 20) as usize)
             .unwrap_or(8);
+        // Default skillsmp (keyless); only skills_sh needs a key. Unknown → skillsmp.
+        let provider = match params.get("provider").and_then(|v| v.as_str()) {
+            Some("skills_sh") => "skills_sh",
+            _ => "skillsmp",
+        };
 
-        let results = query_skillssh(&query, limit, self.api_key.clone()).await?;
+        let results = query_provider(&query, limit, provider, &self.skills_sh_key, &self.skillsmp_key).await?;
         let result_count = results.len();
         let elapsed = started.elapsed().as_millis() as u64;
 
@@ -125,12 +140,13 @@ impl Tool for SkillMarketplaceSearchTool {
                 "ok": true,
                 "query": query,
                 "limit": limit,
+                "provider": provider,
                 "resultCount": result_count,
                 "results": results,
                 "note": if result_count == 0 {
-                    "No skills.sh matches. Try different keywords, or check local skills via skill_search."
+                    "No marketplace matches. Try different keywords, or check local skills via skill_search."
                 } else {
-                    "These are installable from skills.sh. Surface them ({id, name, source, installs}) and let the USER click Install (global or this workspace) — do NOT install silently."
+                    "These are installable. Surface them ({id, name, source, installs}) and let the USER click Install (global or this workspace) — do NOT install silently."
                 },
             }),
             elapsed,
@@ -138,24 +154,35 @@ impl Tool for SkillMarketplaceSearchTool {
     }
 }
 
-/// Search skills.sh for skills matching `query`. Returns the candidate rows the
-/// LLM (and the P3 install card) consume.
-async fn query_skillssh(query: &str, limit: usize, api_key: Option<String>) -> Result<Vec<serde_json::Value>, ToolError> {
-    let client = SkillsShClient::new(api_key);
-    let results = client.search(query, limit).await.map_err(|e| match e {
+/// Search the chosen marketplace for `query`. Returns the candidate rows the LLM
+/// (and the P3 install card) consume. skillsmp is keyless; skills.sh needs a key.
+async fn query_provider(
+    query: &str,
+    limit: usize,
+    provider: &str,
+    skills_sh_key: &Option<String>,
+    skillsmp_key: &Option<String>,
+) -> Result<Vec<serde_json::Value>, ToolError> {
+    let results = match provider {
+        "skills_sh" => SkillsShClient::new(skills_sh_key.clone()).search(query, limit).await,
+        _ => SkillsmpClient::new(skillsmp_key.clone()).search(query, limit).await,
+    }
+    .map_err(|e| match e {
         MarketplaceError::MissingApiKey => ToolError::kinded(
             ToolErrorKind::InvalidInput,
-            "skills.sh API key not set — ask the user to add it in Settings (skills_sh_api_key). Local skill_search still works.",
+            "skills.sh API key not set — add it in Settings, or use provider=\"skillsmp\" (no key needed). Local skill_search still works.",
         ),
-        other => ToolError::kinded(ToolErrorKind::NetworkError, format!("skills.sh search failed: {other}")),
+        other => ToolError::kinded(ToolErrorKind::NetworkError, format!("marketplace search failed: {other}")),
     })?;
     Ok(to_result_json(&results))
 }
 
-/// Map skills.sh `SkillSummary`s to the JSON rows surfaced to the LLM / install card.
+/// Map `SkillSummary`s to the JSON rows surfaced to the LLM / install card.
+/// `installUrl` is the install source (the githubUrl for skillsmp).
 fn to_result_json(results: &[SkillSummary]) -> Vec<serde_json::Value> {
     results.iter().map(|s| json!({
-        "id": s.id, "name": s.name, "source": s.source, "installs": s.installs, "installUrl": s.install_url,
+        "id": s.id, "name": s.name, "source": s.source, "installs": s.installs,
+        "installUrl": s.install_url, "description": s.description,
     })).collect()
 }
 
@@ -559,7 +586,7 @@ mod tests {
 
     #[tokio::test]
     async fn skill_marketplace_search_rejects_empty_query() {
-        let tool = SkillMarketplaceSearchTool::new(None);
+        let tool = SkillMarketplaceSearchTool::new(None, None);
         let err = tool
             .execute(json!({ "query": "" }))
             .await
@@ -569,7 +596,7 @@ mod tests {
 
     #[tokio::test]
     async fn skill_marketplace_search_rejects_missing_query() {
-        let tool = SkillMarketplaceSearchTool::new(None);
+        let tool = SkillMarketplaceSearchTool::new(None, None);
         let err = tool.execute(json!({})).await.unwrap_err();
         assert!(format!("{err}").contains("query"));
     }
@@ -579,7 +606,8 @@ mod tests {
         use crate::skills_marketplace::SkillSummary;
         let s = SkillSummary { id: "expo/skills/rn".into(), slug: "rn".into(), name: "RN".into(),
             source: "expo/skills".into(), installs: 42, source_type: "github".into(),
-            install_url: "https://github.com/expo/skills".into(), url: String::new() };
+            install_url: "https://github.com/expo/skills".into(), url: String::new(),
+            description: String::new() };
         let rows = super::to_result_json(&[s]);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["id"], "expo/skills/rn");

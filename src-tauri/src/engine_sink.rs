@@ -224,15 +224,25 @@ fn build_skill_tool(name: &str, state: &AppState, app: &AppHandle) -> Option<Box
             "default".to_string(),
         )),
         "skill_marketplace_search" => {
-            let api_key = state.db.lock().ok().and_then(|c| {
-                c.query_row(
-                    "SELECT value FROM settings WHERE key='skills_sh_api_key'",
-                    [],
-                    |r| r.get::<_, String>(0),
-                )
+            // Both keys: skillsmp is the keyless default; skills.sh needs its key.
+            let (skills_sh_key, skillsmp_key) = state
+                .db
+                .lock()
                 .ok()
-            });
-            Box::new(skill_marketplace::SkillMarketplaceSearchTool::new(api_key))
+                .map(|c| {
+                    let read = |k: &str| {
+                        c.query_row("SELECT value FROM settings WHERE key=?1", [k], |r| {
+                            r.get::<_, String>(0)
+                        })
+                        .ok()
+                    };
+                    (read("skills_sh_api_key"), read("skillsmp_api_key"))
+                })
+                .unwrap_or((None, None));
+            Box::new(skill_marketplace::SkillMarketplaceSearchTool::new(
+                skills_sh_key,
+                skillsmp_key,
+            ))
         }
         _ => return None,
     };

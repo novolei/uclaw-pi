@@ -17,7 +17,11 @@ import {
   getSkillMarketplaceDetail,
   installSkillFromMarketplace,
 } from '@/lib/bridge/skills'
-import type { MarketplaceSkillAudit, MarketplaceSkillDetail } from '@/lib/types'
+import type {
+  MarketplaceProvider,
+  MarketplaceSkillAudit,
+  MarketplaceSkillDetail,
+} from '@/lib/types'
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from '@/components/ui/sheet'
 import { cn } from '@/lib/utils'
 
@@ -49,11 +53,16 @@ const RISK_BADGE: Record<'HIGH' | 'MEDIUM' | 'LOW' | 'NONE', { label: string; cl
 
 export function SkillMarketplaceDetailDrawer({
   id,
+  provider,
+  source,
   open,
   onOpenChange,
   onError,
 }: {
   id: string | null
+  provider: MarketplaceProvider
+  /** skillsmp needs the row's installUrl (githubUrl) to fetch detail / install. */
+  source?: string
   open: boolean
   onOpenChange: (open: boolean) => void
   onError?: (m: string) => void
@@ -82,8 +91,8 @@ export function SkillMarketplaceDetailDrawer({
       // Detail + audit fetch in parallel; each settles independently so an audit
       // failure still shows the SKILL.md preview (and vice-versa).
       const [d, a] = await Promise.allSettled([
-        getSkillMarketplaceDetail(id),
-        getSkillMarketplaceAudit(id),
+        getSkillMarketplaceDetail(id, provider, source),
+        getSkillMarketplaceAudit(id, provider),
       ])
       if (cancelled) return
       if (d.status === 'fulfilled') {
@@ -102,7 +111,7 @@ export function SkillMarketplaceDetailDrawer({
       cancelled = true
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open, id])
+  }, [open, id, provider, source])
 
   const risk = highestRisk(audit)
   const badge = RISK_BADGE[risk ?? 'NONE']
@@ -121,6 +130,8 @@ export function SkillMarketplaceDetailDrawer({
         id,
         scope,
         scope === 'workspace' ? activeWorkspaceId ?? undefined : undefined,
+        provider,
+        source,
       )
       setInstallState({ kind: 'installed', scope })
     } catch (e) {

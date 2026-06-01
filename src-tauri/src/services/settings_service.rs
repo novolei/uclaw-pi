@@ -27,6 +27,11 @@ pub trait SettingsService {
     /// marketplace client authenticates with. Whitespace-trimmed; empty ⇒ the
     /// row is deleted (back to "unset").
     fn set_skills_sh_api_key(&self, conn: &Connection, key: &str) -> rusqlite::Result<()>;
+    /// Whether a non-empty skillsmp.com API key is stored (status only).
+    fn skillsmp_api_key_set(&self, conn: &Connection) -> bool;
+    /// Store (or clear) the skillsmp.com API key. OPTIONAL — it only raises the
+    /// rate limit (search works anonymously). Whitespace-trimmed; empty ⇒ deleted.
+    fn set_skillsmp_api_key(&self, conn: &Connection, key: &str) -> rusqlite::Result<()>;
 }
 
 /// The SQLite-backed implementation (the only one in production).
@@ -91,6 +96,29 @@ impl SettingsService for DbSettings {
         }
         Ok(())
     }
+
+    fn skillsmp_api_key_set(&self, conn: &Connection) -> bool {
+        conn.query_row(
+            "SELECT value FROM settings WHERE key = 'skillsmp_api_key'",
+            [],
+            |r| r.get::<_, String>(0),
+        )
+        .ok()
+        .is_some_and(|v| !v.trim().is_empty())
+    }
+
+    fn set_skillsmp_api_key(&self, conn: &Connection, key: &str) -> rusqlite::Result<()> {
+        let key = key.trim();
+        if key.is_empty() {
+            conn.execute("DELETE FROM settings WHERE key = 'skillsmp_api_key'", [])?;
+        } else {
+            conn.execute(
+                "INSERT OR REPLACE INTO settings (key, value) VALUES ('skillsmp_api_key', ?1)",
+                [key],
+            )?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -138,5 +166,15 @@ mod tests {
         assert!(DbSettings.skills_sh_api_key_set(&c));
         DbSettings.set_skills_sh_api_key(&c, "").unwrap();
         assert!(!DbSettings.skills_sh_api_key_set(&c), "empty clears");
+    }
+
+    #[test]
+    fn skillsmp_api_key_defaults_unset_round_trips_and_clears() {
+        let c = conn();
+        assert!(!DbSettings.skillsmp_api_key_set(&c), "default unset");
+        DbSettings.set_skillsmp_api_key(&c, "sk_live_mp").unwrap();
+        assert!(DbSettings.skillsmp_api_key_set(&c));
+        DbSettings.set_skillsmp_api_key(&c, "  ").unwrap();
+        assert!(!DbSettings.skillsmp_api_key_set(&c), "whitespace clears");
     }
 }

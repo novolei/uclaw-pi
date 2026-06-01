@@ -82,3 +82,27 @@ pub async fn set_skills_sh_api_key(state: State<'_, AppState>, key: String) -> R
         .set_skills_sh_api_key(&conn, &key)
         .map_err(Error::Database)
 }
+
+/// Whether a skillsmp.com API key is stored (status only). The Settings card uses
+/// this to show 已设置/未设置. The key is OPTIONAL (only raises the rate limit).
+#[tauri::command]
+pub async fn get_skillsmp_api_key_set(state: State<'_, AppState>) -> Result<bool, Error> {
+    let conn = state
+        .db
+        .lock()
+        .map_err(|e| Error::Internal(format!("DB lock: {e}")))?;
+    Ok(DbSettings.skillsmp_api_key_set(&conn))
+}
+
+/// Store (or clear, with an empty string) the skillsmp.com API key. Persisted in
+/// the `settings` table; applies on the next marketplace search (read per request).
+#[tauri::command]
+pub async fn set_skillsmp_api_key(state: State<'_, AppState>, key: String) -> Result<(), Error> {
+    let conn = state
+        .db
+        .lock()
+        .map_err(|e| Error::Internal(format!("DB lock: {e}")))?;
+    DbSettings
+        .set_skillsmp_api_key(&conn, &key)
+        .map_err(Error::Database)
+}
