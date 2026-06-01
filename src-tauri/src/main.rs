@@ -1067,6 +1067,11 @@ fn main() {
             uclaw_core::commands::skills::list_active_manifest_skills,
             uclaw_core::commands::skills::get_skill_detail,
             uclaw_core::commands::skills::match_skills,
+            uclaw_core::commands::skills_marketplace::search_skill_marketplace,
+            uclaw_core::commands::skills_marketplace::list_skill_marketplace,
+            uclaw_core::commands::skills_marketplace::get_skill_marketplace_detail,
+            uclaw_core::commands::skills_marketplace::get_skill_marketplace_audit,
+            uclaw_core::commands::skills_marketplace::install_skill_from_marketplace,
             // Channels
             uclaw_core::commands::channel::list_channels,
             uclaw_core::commands::channel::add_channel,
