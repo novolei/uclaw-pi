@@ -57,3 +57,28 @@ pub async fn set_pi_engine_enabled(state: State<'_, AppState>, enabled: bool) ->
     crate::engine_sink::set_pi_engine_override(Some(enabled));
     Ok(())
 }
+
+/// Whether a skills.sh API key is stored (status only — the key itself is never
+/// returned to the frontend). The Settings card uses this to show 已设置/未设置.
+#[tauri::command]
+pub async fn get_skills_sh_api_key_set(state: State<'_, AppState>) -> Result<bool, Error> {
+    let conn = state
+        .db
+        .lock()
+        .map_err(|e| Error::Internal(format!("DB lock: {e}")))?;
+    Ok(DbSettings.skills_sh_api_key_set(&conn))
+}
+
+/// Store (or clear, with an empty string) the skills.sh API key the marketplace
+/// client authenticates with. Persisted in the `settings` table; applies on the
+/// next marketplace search/install (the key is read per request).
+#[tauri::command]
+pub async fn set_skills_sh_api_key(state: State<'_, AppState>, key: String) -> Result<(), Error> {
+    let conn = state
+        .db
+        .lock()
+        .map_err(|e| Error::Internal(format!("DB lock: {e}")))?;
+    DbSettings
+        .set_skills_sh_api_key(&conn, &key)
+        .map_err(Error::Database)
+}
