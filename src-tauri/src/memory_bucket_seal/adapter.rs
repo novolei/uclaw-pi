@@ -16,6 +16,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::{TimeZone, Utc};
+use rusqlite::OptionalExtension;
 use tokio::sync::Mutex;
 
 use crate::memory_adapter::{
@@ -237,17 +238,64 @@ impl MemoryAdapter for BucketSealAdapter {
         Ok(out)
     }
 
-    async fn get(&self, _namespace: &str, _key: &str) -> Result<Option<MemoryEntry>> {
-        anyhow::bail!("BucketSealAdapter::get not yet implemented (PR9.5)")
+    async fn get(&self, namespace: &str, key: &str) -> Result<Option<MemoryEntry>> {
+        let conn = self.store.lock_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, source_id, source_ref, content, timestamp_ms, tags_json
+               FROM mem_tree_chunks
+              WHERE source_id = ?1 AND source_ref = ?2
+              ORDER BY created_at_ms DESC
+              LIMIT 1",
+        )?;
+        let entry: Option<MemoryEntry> = stmt
+            .query_row(rusqlite::params![namespace, key], row_to_memory_entry)
+            .optional()
+            .context("get_chunk")?;
+        Ok(entry)
     }
 
     async fn list(
         &self,
-        _namespace: Option<&str>,
-        _category: Option<&MemoryCategory>,
-        _session_id: Option<&str>,
+        namespace: Option<&str>,
+        category: Option<&MemoryCategory>,
+        session_id: Option<&str>,
     ) -> Result<Vec<MemoryEntry>> {
-        anyhow::bail!("BucketSealAdapter::list not yet implemented (PR9.5)")
+        let conn = self.store.lock_conn()?;
+
+        let mut sql = String::from(
+            "SELECT id, source_id, source_ref, content, timestamp_ms, tags_json
+               FROM mem_tree_chunks
+              WHERE 1=1",
+        );
+        let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+
+        if let Some(ns) = namespace {
+            sql.push_str(" AND source_id = ?");
+            params.push(Box::new(ns.to_string()));
+        }
+        if let Some(s) = session_id {
+            sql.push_str(" AND tags_json LIKE ?");
+            params.push(Box::new(format!("%\"session:{s}\"%")));
+        }
+
+        sql.push_str(" ORDER BY timestamp_ms DESC LIMIT 200");
+
+        let mut stmt = conn.prepare(&sql)?;
+        let params_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|b| b.as_ref()).collect();
+        let rows = stmt.query_map(&params_refs[..], row_to_memory_entry)?;
+
+        let mut out: Vec<MemoryEntry> = Vec::new();
+        for row in rows {
+            let entry = row?;
+            // Category filter is applied in Rust (encoded in tags_json, not a column).
+            if let Some(filter) = category {
+                if entry.category != *filter {
+                    continue;
+                }
+            }
+            out.push(entry);
+        }
+        Ok(out)
     }
 
     async fn delete(&self, _namespace: &str, _key: &str) -> Result<bool> {
@@ -259,7 +307,30 @@ impl MemoryAdapter for BucketSealAdapter {
     }
 
     async fn namespace_summaries(&self) -> Result<Vec<NamespaceSummary>> {
-        anyhow::bail!("BucketSealAdapter::namespace_summaries not yet implemented (PR9.6)")
+        let conn = self.store.lock_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT source_id, COUNT(*), MAX(timestamp_ms)
+               FROM mem_tree_chunks
+              GROUP BY source_id
+              ORDER BY source_id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let namespace: String = row.get(0)?;
+            let count: i64 = row.get(1)?;
+            let last_updated_ms: Option<i64> = row.get(2)?;
+            let last_updated = last_updated_ms
+                .and_then(|ms| Utc.timestamp_millis_opt(ms).single().map(|dt| dt.to_rfc3339()));
+            Ok(NamespaceSummary {
+                namespace,
+                count: count.max(0) as usize,
+                last_updated,
+            })
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
     }
 }
 
@@ -524,5 +595,63 @@ mod tests {
         };
         let hits = adapter.recall("unique", 2, opts).await.unwrap();
         assert!(hits.len() <= 2);
+    }
+
+    #[tokio::test]
+    async fn get_returns_most_recent_chunk_for_key() {
+        let (adapter, _dir) = fresh_adapter();
+        adapter
+            .store("ns_g", "the_key", "First version content.", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        adapter
+            .store("ns_g", "the_key", "Second version updated content.", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        let got = adapter.get("ns_g", "the_key").await.unwrap();
+        assert!(got.is_some());
+        // Most-recent ordering means the second store wins.
+        let entry = got.unwrap();
+        assert!(entry.content.contains("Second") || entry.content.contains("updated"));
+    }
+
+    #[tokio::test]
+    async fn list_filters_by_namespace_and_category() {
+        let (adapter, _dir) = fresh_adapter();
+        adapter
+            .store("nslA", "k1", "Note A1 substantive content.", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        adapter
+            .store("nslA", "k2", "Note A2 substantive content.", MemoryCategory::Conversation, None)
+            .await
+            .unwrap();
+        adapter
+            .store("nslB", "k3", "Note B substantive content.", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        let listed = adapter
+            .list(Some("nslA"), Some(&MemoryCategory::Core), None)
+            .await
+            .unwrap();
+        assert!(listed.iter().all(|e| e.namespace.as_deref() == Some("nslA")));
+        assert!(listed.iter().all(|e| matches!(e.category, MemoryCategory::Core)));
+    }
+
+    #[tokio::test]
+    async fn namespace_summaries_groups_by_source() {
+        let (adapter, _dir) = fresh_adapter();
+        adapter
+            .store("nsA", "k1", "Note in nsA with substance.", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        adapter
+            .store("nsB", "k2", "Note in nsB with substance.", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        let summaries = adapter.namespace_summaries().await.unwrap();
+        assert!(summaries.iter().any(|s| s.namespace == "nsA"));
+        assert!(summaries.iter().any(|s| s.namespace == "nsB"));
     }
 }
