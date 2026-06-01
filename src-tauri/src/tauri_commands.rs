@@ -212,6 +212,12 @@ pub async fn patch_memory_recall_config(
             0.0,
             1.0,
         ),
+        prompt_recall_backend: input.prompt_recall_backend.or(existing.prompt_recall_backend),
+        prompt_recall_limit: clamp_opt_usize(
+            input.prompt_recall_limit.or(existing.prompt_recall_limit),
+            0,
+            50,
+        ),
     };
 
     settings.memory_recall_config = Some(merged.clone());
