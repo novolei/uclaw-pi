@@ -4,7 +4,12 @@ use crate::app::AppState;
 use crate::error::Error;
 use crate::skills_marketplace::{client::SkillsShClient, github, install, skillsmp::SkillsmpClient, InstallScope, MarketplaceProvider, SkillSummary, SkillDetail, SkillAudit, MarketplaceError};
 
-fn map_err(e: MarketplaceError) -> Error { Error::Internal(e.to_string()) }
+fn map_err(e: MarketplaceError) -> Error {
+    // Surface the real cause in the log — the UI necessarily shows a generic
+    // message, so without this the actual error (401, decode, timeout…) is lost.
+    tracing::warn!("skills_marketplace: {e}");
+    Error::Internal(e.to_string())
+}
 
 /// Read the API key for a provider from `settings` (`skills_sh_api_key` /
 /// `skillsmp_api_key`). skillsmp's key is optional (anonymous tier if absent).
