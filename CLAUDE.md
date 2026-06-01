@@ -4,10 +4,9 @@ Top-level entry file for Claude Code (Cowork, any IDE) working in uClaw.
 
 The full multi-session behavior contract is in **`@BEHAVIOR.md`** — consult it
 before non-trivial or policy-sensitive work. Detailed project reference
-material is in **`@CONTEXT.md`**. The strategic baseline is
-**`@docs/adr/2026-05-28-uclaw-pi-lightweight-product-philosophy.md`** (Pi-lightweight
-product philosophy), which **supersedes the "Agent OS v2" heavyweight positioning** of
-`@docs/adr/2026-05-20-uclaw-agent-platform-north-star.md` (retained for history).
+material is in **`@CONTEXT.md`**. The strategic baseline — the **Pi-lightweight product
+philosophy** (which superseded the earlier "Agent OS v2" heavyweight positioning) — is
+summarized inline just below; its source ADRs were removed in the `a11d57dc` repo cleanup.
 
 **Product philosophy (2026-05-28)**: uClaw is a **Pi-style lightweight, pluggable,
 domain-blind agent kernel** serving **everyday/office users + vibe-coding users**.
@@ -19,16 +18,20 @@ modernize via openhuman ideas behind one `MemoryAdapter` (detailed gbrain↔open
 architecture deferred to a dedicated effort). Borrow Pi (kernel/plugins), openhuman
 (memory), hermes (coding edits) — no language migration.
 
-**Agent framework direction**: Any work touching `src-tauri/src/agent/` should consult
-the philosophy ADR above + the gap audit `docs/superpowers/specs/2026-05-27-pi-convergence-gap-audit.md`
-(current-state flaws + 5-phase remediation) and the Pi 8-axis design
-`docs/superpowers/specs/2026-05-26-agent-framework-pi-upgrade-design.md`. Already-landed
-Pi patterns (dual queues, iterative compaction + split-turn, FileOps) are real; the open
-debts are: collapse 4 registries → one handle, one safety chokepoint, thread
-`CancellationToken` to flight points, kill dead skeleton, rename eval `harness/`.
+**Agent framework direction**: The 2026-05-27 pi-convergence gap audit's 5-phase
+remediation is **fully landed** — one `AgentApi` handle (`agent/api/mod.rs`), one safety
+chokepoint (`agent/tool_dispatch`), `CancellationToken` threaded to the flight points
+(`agent/llm_stream.rs`, `agent/tool_dispatch`), and the dead skeleton + eval `harness/`
+deleted (R5, `lib.rs`). **Treat that audit as resolved history, not a TODO.** The Pi
+patterns (dual queues, iterative compaction + split-turn, FileOps) are also in. The next
+strategic debt is the **memory layer** (8+ loosely-coordinated stores — kv / memory_graph /
+gbrain / memu / memorization / learning → one `MemoryAdapter` / openhuman bucket-seal), a
+deferred dedicated effort. (The 2026-05-2x gap-audit / agent-design specs + the strategy
+ADRs were removed in the `a11d57dc` repo cleanup; use `@CONTEXT.md` + `@BEHAVIOR.md` for
+surviving design context.)
 
-Other agents (Codex, Cursor, Copilot, …) get equivalent entry files
-(`AGENTS.md`, `.cursorrules`, `.github/copilot-instructions.md`) that point
+Other agents (Codex, Copilot, …) get equivalent entry files
+(`AGENTS.md`, `.github/copilot-instructions.md`) that point
 to the same `BEHAVIOR.md` so behavior stays uniform across sessions.
 
 ---
@@ -37,8 +40,9 @@ to the same `BEHAVIOR.md` so behavior stays uniform across sessions.
 
 If the user mentions "推进主线", "continue main line", M2/M3/M4/M5+ work,
 C1/C2/C3, Bundle wire-up, milestone closeout, next slice, or queue-next work,
-load `uclaw-milestone-closed-loop` and follow
-`docs/agents/milestone-closed-loop.md`.
+load the `uclaw-milestone-closed-loop` skill if it's available. (Its companion
+doc `docs/agents/milestone-closed-loop.md` was removed in the `a11d57dc` cleanup;
+`@BEHAVIOR.md` holds the multi-session contract.)
 
 ---
 
@@ -89,8 +93,8 @@ PR shape: one branch per plan, one commit per plan task, one PR with a `## Commi
 Beyond the superpowers loop, reach for these at the matching stage:
 
 - **Entering ideation** — `to-prd` (PRD on GitHub) or `grill-me` (stress-test a half-formed plan).
-- **Aligning with domain** — `grill-with-docs` challenges a plan against `@CONTEXT.md` + `docs/adr/`.
-- **Investigation** — `zoom-out` for system-level context on `automation/`, `memu/`, `proactive/`, `harness/`, `memory_graph/`. `prototype` for throwaway design validation.
+- **Aligning with domain** — `grill-with-docs` challenges a plan against `@CONTEXT.md`.
+- **Investigation** — `zoom-out` for system-level context on `automation/`, `memu/`, `proactive/`, `memory_graph/`. `prototype` for throwaway design validation.
 - **Planning fan-out** — `to-issues` slices a plan into independently-grabbable GitHub issues.
 - **Refactor pass** — `improve-codebase-architecture` hunts consolidation / testability wins.
 - **Inbox** — `triage` walks incoming GitHub issues through a state machine.
@@ -102,16 +106,15 @@ Overlaps: prefer `superpowers:test-driven-development` over `tdd`, `superpowers:
 
 ### Issue tracker
 
-GitHub Issues for `novolei/uclaw-new`. See `docs/agents/issue-tracker.md`.
-
-### Triage labels
-
-Use the repo label vocabulary in `docs/agents/triage-labels.md`.
+GitHub Issues live on `novolei/uclaw-pi` (the `gh` default in this repo). The
+`docs/agents/issue-tracker.md` + `triage-labels.md` playbooks were removed in the
+`a11d57dc` cleanup; the repo currently carries only the default GitHub labels
+(`bug`, `enhancement`, `documentation`, …).
 
 ### Domain docs
 
-Single-context repo: `CONTEXT.md`, `BEHAVIOR.md`, and `docs/adr/`. See
-`docs/agents/domain.md`.
+Single-context repo: the design context lives in `@CONTEXT.md` + `@BEHAVIOR.md`
+(the `docs/adr/` ADRs + `docs/agents/domain.md` were removed in `a11d57dc`).
 
 ## Real bugs found mid-task
 
@@ -123,11 +126,10 @@ If you discover a bug outside the current task's scope with a confident root cau
 
 - **Behavior spec (canonical multi-session contract)** → `@BEHAVIOR.md`
 - **Project reference (architecture, build, migration registry)** → `@CONTEXT.md`
-- **Strategic baseline (Pi-lightweight product philosophy)** → `@docs/adr/2026-05-28-uclaw-pi-lightweight-product-philosophy.md` (supersedes the Agent OS v2 North Star → `@docs/adr/2026-05-20-uclaw-agent-platform-north-star.md`, retained for history)
-- **Pi-convergence gap audit (flaws + 5-phase remediation)** → `@docs/superpowers/specs/2026-05-27-pi-convergence-gap-audit.md`
-- **License & derivation procedure** → `LICENSE`, `NOTICE`, `docs/THIRD_PARTY.md`
+- **Strategic baseline (Pi-lightweight product philosophy)** → the *Product philosophy* section above (its source ADRs + the pi-convergence gap-audit spec were removed in the `a11d57dc` cleanup; the audit is resolved — see *Agent framework direction* above)
+- **License & derivation procedure** → `LICENSE`, `NOTICE`
 - **Pre-commit hooks (block memory_graph::write, dirs::home_dir for .uclaw, missing SPDX)** → `scripts/git-hooks/README.md`
-- **Other IDE entry files** → `AGENTS.md` (Codex), `.cursorrules` (Cursor), `.github/copilot-instructions.md` (Copilot)
+- **Other IDE entry files** → `AGENTS.md` (Codex), `.github/copilot-instructions.md` (Copilot)
 
 <!-- gitnexus:start -->
 <!-- gitnexus:keep -->
