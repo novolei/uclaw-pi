@@ -8,11 +8,8 @@
 //! their host agent to do:
 //!
 //! 1. `skill_marketplace_search` — discover candidate skills by
-//!    keyword. Queries GitHub Code Search for SKILL.md files
-//!    containing the query terms, returns name + path + repo + stars.
-//!    (skills.sh has no documented public API; GitHub search is the
-//!    canonical fallback. If skills.sh ships an API we wire it later
-//!    by extending `query_marketplace`.)
+//!    keyword. Queries skills.sh via `crate::skills_marketplace::client`
+//!    (P1 client). API key read from settings at registration.
 //!
 //! 2. `skill_install_from_marketplace` — fetch a specific
 //!    `owner/repo/<path-to-skill>` from GitHub raw, validate the
@@ -38,9 +35,9 @@ use crate::agent::tools::tool::{
     ApprovalRequirement, Tool, ToolError, ToolErrorKind, ToolOutput,
 };
 use crate::skills::SkillsRegistry;
+use crate::skills_marketplace::{client::SkillsShClient, MarketplaceError, SkillSummary};
 
 const USER_AGENT: &str = "uClaw/0.1";
-const SEARCH_TIMEOUT_MS: u64 = 10_000;
 const INSTALL_TIMEOUT_MS: u64 = 30_000;
 const MAX_FILE_BYTES: usize = 512 * 1024; // 512 KB per file. Skills should be small.
 const MAX_FILES_PER_SKILL: usize = 32;
@@ -49,18 +46,16 @@ const MAX_FILES_PER_SKILL: usize = 32;
 // Tool 1 — skill_marketplace_search
 // ───────────────────────────────────────────────────────────────────
 
-pub struct SkillMarketplaceSearchTool {}
-
-impl SkillMarketplaceSearchTool {
-    pub fn new() -> Self {
-        Self {}
-    }
+pub struct SkillMarketplaceSearchTool {
+    /// skills.sh API key, read from settings at registration. None → search returns a "set a key" hint.
+    api_key: Option<String>,
 }
-
+impl SkillMarketplaceSearchTool {
+    #[must_use]
+    pub fn new(api_key: Option<String>) -> Self { Self { api_key } }
+}
 impl Default for SkillMarketplaceSearchTool {
-    fn default() -> Self {
-        Self::new()
-    }
+    fn default() -> Self { Self::new(None) }
 }
 
 #[async_trait]
@@ -70,7 +65,7 @@ impl Tool for SkillMarketplaceSearchTool {
     }
 
     fn description(&self) -> &str {
-        "Search the open agent-skills ecosystem (skills.sh / GitHub) for skills that match a query. Returns candidate skill names + descriptions + repos + stars + install commands. Use when the user asks \"is there a skill for X\" or \"find a skill that does X\". Pair with skill_install_from_marketplace to actually install a candidate (which requires user approval)."
+        "Search skills.sh (the open agent-skills directory) for installable skills matching a query. Use when the user asks \"is there a skill for X\" or local skill_search finds nothing. Returns candidates {id, name, source, installs}. Do NOT install silently — surface the candidates so the USER can choose to Install (global or this workspace)."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -121,7 +116,7 @@ impl Tool for SkillMarketplaceSearchTool {
             .map(|n| n.clamp(1, 20) as usize)
             .unwrap_or(8);
 
-        let results = query_marketplace(&query, limit).await?;
+        let results = query_skillssh(&query, limit, self.api_key.clone()).await?;
         let result_count = results.len();
         let elapsed = started.elapsed().as_millis() as u64;
 
@@ -133,9 +128,9 @@ impl Tool for SkillMarketplaceSearchTool {
                 "resultCount": result_count,
                 "results": results,
                 "note": if result_count == 0 {
-                    "No skills found. Try a different query, or check if a relevant skill already exists locally via skill_search."
+                    "No skills.sh matches. Try different keywords, or check local skills via skill_search."
                 } else {
-                    "To install one, call skill_install_from_marketplace with the `source` field set to `<owner>/<repo>/<path>` from a result. The install will require user approval."
+                    "These are installable from skills.sh. Surface them ({id, name, source, installs}) and let the USER click Install (global or this workspace) — do NOT install silently."
                 },
             }),
             elapsed,
@@ -143,142 +138,25 @@ impl Tool for SkillMarketplaceSearchTool {
     }
 }
 
-/// Run the actual search against GitHub Code Search. We look for
-/// SKILL.md files mentioning the query terms across all public
-/// repos. This is the highest-recall path without depending on
-/// skills.sh having a public API.
-async fn query_marketplace(
-    query: &str,
-    limit: usize,
-) -> Result<Vec<serde_json::Value>, ToolError> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_millis(SEARCH_TIMEOUT_MS))
-        .user_agent(USER_AGENT)
-        .build()
-        .map_err(|e| {
-            ToolError::kinded(
-                ToolErrorKind::NetworkError,
-                format!("failed to build http client: {e}"),
-            )
-        })?;
-
-    // GitHub code search query: filename:SKILL.md + the user's
-    // query terms. Public, no auth required for low-rate access
-    // (60 req/hr per IP); we don't hammer it.
-    let gh_query = format!("{} filename:SKILL.md", query);
-    let url = format!(
-        "https://api.github.com/search/code?q={}&per_page={}",
-        urlencoding::encode(&gh_query),
-        limit
-    );
-
-    let resp = client
-        .get(&url)
-        .header("Accept", "application/vnd.github+json")
-        .send()
-        .await
-        .map_err(|e| {
-            ToolError::kinded(
-                ToolErrorKind::NetworkError,
-                format!("github search request failed: {e}"),
-            )
-        })?;
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        let kind = if status.as_u16() == 429 {
-            ToolErrorKind::RateLimited
-        } else if status.as_u16() == 403 {
-            // GitHub returns 403 for auth-required code search
-            // without a token. The error message should tell the
-            // LLM not to retry blindly.
-            ToolErrorKind::PermissionDenied
-        } else {
-            ToolErrorKind::UpstreamError
-        };
-        return Err(ToolError::kinded(
-            kind,
-            format!(
-                "github search returned {status}: {}. Note: GitHub code search \
-                 may require authentication for unauthenticated rate-limited \
-                 use. Skill discovery via uClaw works best when the user \
-                 already has a target skill in mind.",
-                truncate_for_error(&body, 200),
-            ),
-        ));
-    }
-
-    let body: serde_json::Value = resp.json().await.map_err(|e| {
-        ToolError::kinded(
-            ToolErrorKind::ParseError,
-            format!("github search returned malformed JSON: {e}"),
-        )
+/// Search skills.sh for skills matching `query`. Returns the candidate rows the
+/// LLM (and the P3 install card) consume.
+async fn query_skillssh(query: &str, limit: usize, api_key: Option<String>) -> Result<Vec<serde_json::Value>, ToolError> {
+    let client = SkillsShClient::new(api_key);
+    let results = client.search(query, limit).await.map_err(|e| match e {
+        MarketplaceError::MissingApiKey => ToolError::kinded(
+            ToolErrorKind::InvalidInput,
+            "skills.sh API key not set — ask the user to add it in Settings (skills_sh_api_key). Local skill_search still works.",
+        ),
+        other => ToolError::kinded(ToolErrorKind::NetworkError, format!("skills.sh search failed: {other}")),
     })?;
+    Ok(to_result_json(&results))
+}
 
-    let empty_items: Vec<serde_json::Value> = Vec::new();
-    let items = body
-        .get("items")
-        .and_then(|v| v.as_array())
-        .unwrap_or(&empty_items);
-
-    let mut results: Vec<serde_json::Value> = Vec::new();
-    for item in items.iter().take(limit) {
-        let path = item
-            .get("path")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_string();
-        let repo_full = item
-            .get("repository")
-            .and_then(|r| r.get("full_name"))
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_string();
-        let stars = item
-            .get("repository")
-            .and_then(|r| r.get("stargazers_count"))
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0);
-        let html_url = item
-            .get("html_url")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_string();
-
-        // Derive the skill slug from the path: typical layout
-        // `skill-name/SKILL.md` or `skills/skill-name/SKILL.md`.
-        let slug = path
-            .rsplit_once('/')
-            .and_then(|(parent, _file)| parent.rsplit_once('/').map(|(_, last)| last.to_string()))
-            .or_else(|| {
-                path.rsplit_once('/').map(|(parent, _)| parent.to_string())
-            })
-            .unwrap_or_else(|| path.clone());
-
-        // Compose the install source string. Caller passes this to
-        // skill_install_from_marketplace.
-        let install_source = if path.ends_with("/SKILL.md") {
-            let dir = path.strip_suffix("/SKILL.md").unwrap_or(&path);
-            format!("{}/{}", repo_full, dir)
-        } else {
-            format!("{}/{}", repo_full, path)
-        };
-
-        results.push(json!({
-            "slug": slug,
-            "repo": repo_full,
-            "path": path,
-            "stars": stars,
-            "htmlUrl": html_url,
-            "installSource": install_source,
-            "installCommand": format!(
-                "Call skill_install_from_marketplace with source=\"{}\"",
-                install_source
-            ),
-        }));
-    }
-    Ok(results)
+/// Map skills.sh `SkillSummary`s to the JSON rows surfaced to the LLM / install card.
+fn to_result_json(results: &[SkillSummary]) -> Vec<serde_json::Value> {
+    results.iter().map(|s| json!({
+        "id": s.id, "name": s.name, "source": s.source, "installs": s.installs, "installUrl": s.install_url,
+    })).collect()
 }
 
 fn truncate_for_error(s: &str, n: usize) -> String {
@@ -674,13 +552,14 @@ mod tests {
     #[test]
     fn truncate_for_error_long() {
         let out = truncate_for_error(&"a".repeat(500), 50);
-        assert_eq!(out.len(), 51); // 50 + '…'
+        // '…' is 3 UTF-8 bytes, so byte len = 50 + 3 = 53.
+        assert_eq!(out.len(), 53);
         assert!(out.ends_with('…'));
     }
 
     #[tokio::test]
     async fn skill_marketplace_search_rejects_empty_query() {
-        let tool = SkillMarketplaceSearchTool::new();
+        let tool = SkillMarketplaceSearchTool::new(None);
         let err = tool
             .execute(json!({ "query": "" }))
             .await
@@ -690,8 +569,21 @@ mod tests {
 
     #[tokio::test]
     async fn skill_marketplace_search_rejects_missing_query() {
-        let tool = SkillMarketplaceSearchTool::new();
+        let tool = SkillMarketplaceSearchTool::new(None);
         let err = tool.execute(json!({})).await.unwrap_err();
         assert!(format!("{err}").contains("query"));
+    }
+
+    #[test]
+    fn to_result_json_maps_fields() {
+        use crate::skills_marketplace::SkillSummary;
+        let s = SkillSummary { id: "expo/skills/rn".into(), slug: "rn".into(), name: "RN".into(),
+            source: "expo/skills".into(), installs: 42, source_type: "github".into(),
+            install_url: "https://github.com/expo/skills".into(), url: String::new() };
+        let rows = super::to_result_json(&[s]);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["id"], "expo/skills/rn");
+        assert_eq!(rows[0]["installs"], 42);
+        assert_eq!(rows[0]["source"], "expo/skills");
     }
 }

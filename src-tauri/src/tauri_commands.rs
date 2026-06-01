@@ -5502,9 +5502,11 @@ pub async fn send_agent_message(
         app_handle.clone(),
         input.session_id.clone(),
     ));
-    // Bundle 21-E — `skill_marketplace_search`: query GitHub for
-    // SKILL.md files matching a free-text query. Read-only.
-    tools.register(builtin::skill_marketplace::SkillMarketplaceSearchTool::new());
+    // skill_marketplace_search now queries skills.sh; read its API key from settings.
+    let skills_sh_key = state.db.lock().ok().and_then(|c| {
+        c.query_row("SELECT value FROM settings WHERE key='skills_sh_api_key'", [], |r| r.get::<_, String>(0)).ok()
+    });
+    tools.register(builtin::skill_marketplace::SkillMarketplaceSearchTool::new(skills_sh_key));
     // Bundle 21-D — `skill_install_from_marketplace`: install a
     // specific owner/repo/<skill-dir> into
     // ~/.uclaw/skills/_marketplace/. Approval-gated; persists.
