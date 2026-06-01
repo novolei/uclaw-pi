@@ -13,6 +13,7 @@
 //!
 //! Until then, `AppState.memory_adapters` is an empty `HashMap`.
 
+mod gbrain_adapter;
 mod legacy_kv;
 mod legacy_steward;
 mod memu_adapter;
@@ -20,6 +21,7 @@ mod router;
 mod traits;
 mod types;
 
+pub use gbrain_adapter::GbrainAdapter;
 pub use legacy_kv::LegacyKvAdapter;
 pub use legacy_steward::LegacyStewardAdapter;
 pub use memu_adapter::MemUAdapter;
