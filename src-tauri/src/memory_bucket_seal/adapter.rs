@@ -298,12 +298,44 @@ impl MemoryAdapter for BucketSealAdapter {
         Ok(out)
     }
 
-    async fn delete(&self, _namespace: &str, _key: &str) -> Result<bool> {
-        anyhow::bail!("BucketSealAdapter::delete not yet implemented (PR9.6)")
+    async fn delete(&self, namespace: &str, key: &str) -> Result<bool> {
+        let mut conn = self.store.lock_conn()?;
+        let tx = conn.transaction()?;
+        // mem_tree_score has an FK → mem_tree_chunks(id) with no ON DELETE
+        // CASCADE (foreign_keys=ON), so clear the score rows before deleting
+        // the chunks they reference. The FTS delete trigger then prunes
+        // mem_tree_chunks_fts. (Stale L0-buffer item_ids are tolerated — the
+        // seal path skips missing chunks.)
+        tx.execute(
+            "DELETE FROM mem_tree_score
+              WHERE chunk_id IN (
+                  SELECT id FROM mem_tree_chunks WHERE source_id = ?1 AND source_ref = ?2
+              )",
+            rusqlite::params![namespace, key],
+        )?;
+        let n = tx.execute(
+            "DELETE FROM mem_tree_chunks WHERE source_id = ?1 AND source_ref = ?2",
+            rusqlite::params![namespace, key],
+        )?;
+        tx.commit()?;
+        Ok(n > 0)
     }
 
-    async fn clear_namespace(&self, _namespace: &str) -> Result<u64> {
-        anyhow::bail!("BucketSealAdapter::clear_namespace not yet implemented (PR9.6)")
+    async fn clear_namespace(&self, namespace: &str) -> Result<u64> {
+        let mut conn = self.store.lock_conn()?;
+        let tx = conn.transaction()?;
+        // Same FK ordering as delete(): score rows first, then chunks.
+        tx.execute(
+            "DELETE FROM mem_tree_score
+              WHERE chunk_id IN (SELECT id FROM mem_tree_chunks WHERE source_id = ?1)",
+            rusqlite::params![namespace],
+        )?;
+        let n = tx.execute(
+            "DELETE FROM mem_tree_chunks WHERE source_id = ?1",
+            rusqlite::params![namespace],
+        )?;
+        tx.commit()?;
+        Ok(n as u64)
     }
 
     async fn namespace_summaries(&self) -> Result<Vec<NamespaceSummary>> {
@@ -653,5 +685,62 @@ mod tests {
         let summaries = adapter.namespace_summaries().await.unwrap();
         assert!(summaries.iter().any(|s| s.namespace == "nsA"));
         assert!(summaries.iter().any(|s| s.namespace == "nsB"));
+    }
+
+    #[tokio::test]
+    async fn delete_returns_true_then_false() {
+        let (adapter, _dir) = fresh_adapter();
+        adapter
+            .store("ns_d", "the_key", "Content to delete.", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        // The store may have produced multiple chunks for one (namespace, key)
+        // if re-stored. First delete removes all matching; second returns false.
+        let first = adapter.delete("ns_d", "the_key").await.unwrap();
+        let second = adapter.delete("ns_d", "the_key").await.unwrap();
+        assert!(first);
+        assert!(!second);
+    }
+
+    #[tokio::test]
+    async fn clear_namespace_removes_chunks_in_scope_only() {
+        let (adapter, _dir) = fresh_adapter();
+        adapter
+            .store("ns_keep", "k1", "Content to keep substantively.", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        adapter
+            .store("ns_drop", "k2", "Content to drop substantively.", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        let removed = adapter.clear_namespace("ns_drop").await.unwrap();
+        assert!(removed >= 1, "expected at least one chunk removed");
+
+        // ns_keep entries should still exist.
+        let kept = adapter.list(Some("ns_keep"), None, None).await.unwrap();
+        assert!(!kept.is_empty());
+        let dropped = adapter.list(Some("ns_drop"), None, None).await.unwrap();
+        assert!(dropped.is_empty());
+    }
+
+    #[tokio::test]
+    async fn delete_propagates_to_fts() {
+        let (adapter, _dir) = fresh_adapter();
+        adapter
+            .store("ns_fts", "k1", "Unique searchable keyword payload.", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        adapter.delete("ns_fts", "k1").await.unwrap();
+
+        // The FTS index should no longer return the row.
+        let opts = RecallOpts {
+            namespace: Some("ns_fts"),
+            category: None,
+            session_id: None,
+            min_score: None,
+        };
+        let hits = adapter.recall("unique", 10, opts).await.unwrap();
+        assert!(hits.is_empty(), "delete trigger should have cleared FTS row");
     }
 }
