@@ -1,12 +1,12 @@
 //! Phase 4 embedding layer.
 //!
 //! Produces a fixed-dimension vector per chunk / summary so retrieval can
-//! rerank candidates by semantic similarity. Phase 4's default backend is a
-//! local [Ollama](https://ollama.com) endpoint running `bge-m3`;
-//! tests use the deterministic [`InertEmbedder`] so no network is required.
+//! rerank candidates by semantic similarity. The real backend reuses memU's
+//! FastEmbed ([`MemUEmbedder`], `bge-small-en-v1.5`); tests use the
+//! deterministic [`InertEmbedder`] so no network is required.
 //!
-//! Dimension is hard-coded at [`EMBEDDING_DIM`] (1024) — matches the
-//! bge-m3 output and keeps the blob layout on `mem_tree_chunks` /
+//! Dimension is fixed at [`EMBEDDING_DIM`] (384) and keeps the blob layout on
+//! `mem_tree_chunks` /
 //! `mem_tree_summaries` consistent across providers. Mixing dimensions
 //! mid-run would corrupt cosine comparisons; we catch that at the trait
 //! level rather than deferring to retrieval-time diagnostics.
@@ -33,16 +33,20 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 
 pub mod inert;
+pub mod memu;
 
 pub use inert::InertEmbedder;
+pub use memu::MemUEmbedder;
 
 /// Embedding dimensionality used across the memory tree.
 ///
-/// Hard-coded to match `bge-m3`; swapping providers requires a matching
-/// dimension or the trait's post-call validation will bail. Any change
-/// to this constant breaks on-disk compatibility with existing
-/// `mem_tree_chunks.embedding` / `mem_tree_summaries.embedding` blobs.
-pub const EMBEDDING_DIM: usize = 1024;
+/// Matches memU's FastEmbed `bge-small-en-v1.5` (384-dim), reused as
+/// bucket_seal's real embedder ([`memu::MemUEmbedder`]). Swapping providers
+/// requires a matching dimension or the trait's post-call validation will
+/// bail. Changing this constant invalidates existing
+/// `mem_tree_chunks.embedding` / `mem_tree_summaries.embedding` blobs — the
+/// prior 1024-dim (bge-m3) blobs must be wiped or re-sealed.
+pub const EMBEDDING_DIM: usize = 384;
 
 /// Trait backing all Phase 4 embedders. Implementations MUST produce
 /// exactly [`EMBEDDING_DIM`] floats per call — callers that persist the
@@ -214,7 +218,7 @@ mod tests {
     #[test]
     fn unpack_wrong_dim_errors() {
         // Correct byte multiple, but wrong float count.
-        let bad = vec![0u8; 16]; // 4 floats, expected EMBEDDING_DIM (1024)
+        let bad = vec![0u8; 16]; // 4 floats, expected EMBEDDING_DIM (384)
         let err = unpack_embedding(&bad).unwrap_err().to_string();
         assert!(
             err.contains(&format!("expected {EMBEDDING_DIM}")),
