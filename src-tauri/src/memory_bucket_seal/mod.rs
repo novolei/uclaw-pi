@@ -9,6 +9,7 @@
 //! SQLite). Summaries, scoring, entity index, jobs, and the topic/global
 //! trees follow in later PRs.
 
+pub mod adapter;
 pub mod atomic;
 pub mod canonicalize;
 pub mod chunker;
@@ -19,6 +20,7 @@ pub mod tree_source;
 pub mod types;
 pub mod util;
 
+pub use adapter::BucketSealAdapter;
 pub use canonicalize::{CanonicalisedSource, CanonicaliseRequest, normalize_source_ref};
 pub use chunker::{chunk_markdown, ChunkerInput, ChunkerOptions, DEFAULT_CHUNK_MAX_TOKENS};
 pub use score::embed::{Embedder, InertEmbedder, EMBEDDING_DIM};
