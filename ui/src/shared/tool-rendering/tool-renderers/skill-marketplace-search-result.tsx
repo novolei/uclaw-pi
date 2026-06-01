@@ -52,29 +52,32 @@ export function SkillMarketplaceSearchResultCard({
     return <div className="text-xs text-muted-foreground px-1 py-1">skills.sh 无匹配结果。</div>
   }
 
-  const install = async (row: SkillRow, scope: 'global' | 'workspace') => {
-    setStates((s) => ({ ...s, [row.id]: { kind: 'installing', scope } }))
+  // rowKey (id + index) de-collides the rare case of two results sharing an id,
+  // so one row's install state can never drive another's spinner.
+  const install = async (rowKey: string, id: string, scope: 'global' | 'workspace') => {
+    setStates((s) => ({ ...s, [rowKey]: { kind: 'installing', scope } }))
     try {
       await installSkillFromMarketplace(
-        row.id,
+        id,
         scope,
         scope === 'workspace' ? activeWorkspaceId ?? undefined : undefined,
       )
-      setStates((s) => ({ ...s, [row.id]: { kind: 'installed', scope } }))
+      setStates((s) => ({ ...s, [rowKey]: { kind: 'installed', scope } }))
     } catch (e) {
-      setStates((s) => ({ ...s, [row.id]: { kind: 'error', message: String(e) } }))
+      setStates((s) => ({ ...s, [rowKey]: { kind: 'error', message: String(e) } }))
     }
   }
 
   return (
     <div className="flex flex-col gap-1.5">
-      {rows.map((row) => {
-        const st: RowState = states[row.id] ?? { kind: 'idle' }
+      {rows.map((row, i) => {
+        const rowKey = `${row.id}__${i}`
+        const st: RowState = states[rowKey] ?? { kind: 'idle' }
         const busy = st.kind === 'installing'
         const done = st.kind === 'installed'
         return (
           <div
-            key={row.id}
+            key={rowKey}
             className="rounded-lg border border-border px-3 py-2 flex items-center justify-between gap-3"
           >
             <div className="min-w-0">
@@ -95,7 +98,7 @@ export function SkillMarketplaceSearchResultCard({
               <div className="shrink-0 flex items-center gap-1.5">
                 <button
                   type="button"
-                  onClick={() => install(row, 'global')}
+                  onClick={() => install(rowKey, row.id, 'global')}
                   disabled={busy}
                   className="text-xs px-2.5 py-1 rounded-lg bg-muted text-muted-foreground hover:bg-muted/70 transition-colors disabled:opacity-50"
                 >
@@ -103,7 +106,7 @@ export function SkillMarketplaceSearchResultCard({
                 </button>
                 <button
                   type="button"
-                  onClick={() => install(row, 'workspace')}
+                  onClick={() => install(rowKey, row.id, 'workspace')}
                   disabled={busy || !activeWorkspaceId}
                   title={activeWorkspaceId ? '安装到当前工作区' : '无活动工作区'}
                   className="text-xs px-2.5 py-1 rounded-lg bg-muted text-muted-foreground hover:bg-muted/70 transition-colors disabled:opacity-50"
