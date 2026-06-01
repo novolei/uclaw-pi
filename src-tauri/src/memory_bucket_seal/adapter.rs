@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{TimeZone, Utc};
 use tokio::sync::Mutex;
 
 use crate::memory_adapter::{
@@ -202,11 +202,39 @@ impl MemoryAdapter for BucketSealAdapter {
 
     async fn recall(
         &self,
-        _query: &str,
-        _limit: usize,
-        _opts: RecallOpts<'_>,
+        query: &str,
+        limit: usize,
+        opts: RecallOpts<'_>,
     ) -> Result<Vec<MemoryEntry>> {
-        anyhow::bail!("BucketSealAdapter::recall not yet implemented (PR9.4)")
+        let conn = self.store.lock_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT c.id, c.source_id, c.source_ref, c.content, c.timestamp_ms, c.tags_json
+               FROM mem_tree_chunks_fts AS fts
+               JOIN mem_tree_chunks    AS c ON c.id = fts.chunk_id
+              WHERE fts.content MATCH ?1
+                AND (?2 IS NULL OR fts.source_id = ?2)
+              ORDER BY rank
+              LIMIT ?3",
+        )?;
+
+        let ns_param = opts.namespace.map(|s| s.to_string());
+        let rows = stmt.query_map(
+            rusqlite::params![query, ns_param, limit as i64],
+            row_to_memory_entry,
+        )?;
+
+        let mut out: Vec<MemoryEntry> = Vec::new();
+        for row in rows {
+            let entry = row?;
+            // Optional category filter (opts.category is owned).
+            if let Some(filter) = &opts.category {
+                if entry.category != *filter {
+                    continue;
+                }
+            }
+            out.push(entry);
+        }
+        Ok(out)
     }
 
     async fn get(&self, _namespace: &str, _key: &str) -> Result<Option<MemoryEntry>> {
@@ -250,6 +278,74 @@ fn build_tags(category: &MemoryCategory, session_id: Option<&str>) -> Vec<String
         tags.push(format!("session:{s}"));
     }
     tags
+}
+
+/// Reverse [`build_tags`]: pull the `MemoryCategory` + optional session id back
+/// out of a chunk's `tags_json` array. Unknown / missing category tags fall
+/// back to `Custom("unknown")`.
+fn parse_tags(tags: &[String]) -> (MemoryCategory, Option<String>) {
+    let mut category = MemoryCategory::Custom("unknown".to_string());
+    let mut session = None;
+    for tag in tags {
+        if let Some(rest) = tag.strip_prefix("category:") {
+            category = match rest {
+                "core" => MemoryCategory::Core,
+                "daily" => MemoryCategory::Daily,
+                "conversation" => MemoryCategory::Conversation,
+                _ => match rest.strip_prefix("custom:") {
+                    Some(custom) => MemoryCategory::Custom(custom.to_string()),
+                    None => MemoryCategory::Custom(rest.to_string()),
+                },
+            };
+        } else if let Some(rest) = tag.strip_prefix("session:") {
+            session = Some(rest.to_string());
+        }
+    }
+    (category, session)
+}
+
+/// Hydrate a `MemoryEntry` from the `c.*` columns of a recall/get/list query:
+/// `(id, source_id, source_ref, content, timestamp_ms, tags_json)`. The
+/// chunk's `source_id` becomes the entry namespace and `source_ref` the key
+/// (the inverse of `store`'s mapping).
+fn row_to_memory_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryEntry> {
+    let id: String = row.get(0)?;
+    let source_id: String = row.get(1)?;
+    let source_ref: Option<String> = row.get(2)?;
+    let content: String = row.get(3)?;
+    let timestamp_ms: i64 = row.get(4)?;
+    let tags_json: String = row.get(5)?;
+
+    let tags: Vec<String> = serde_json::from_str(&tags_json).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(5, rusqlite::types::Type::Text, Box::new(e))
+    })?;
+    let (category, session_id) = parse_tags(&tags);
+
+    let timestamp = Utc
+        .timestamp_millis_opt(timestamp_ms)
+        .single()
+        .ok_or_else(|| {
+            rusqlite::Error::FromSqlConversionFailure(
+                4,
+                rusqlite::types::Type::Integer,
+                Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "invalid timestamp_ms",
+                )),
+            )
+        })?
+        .to_rfc3339();
+
+    Ok(MemoryEntry {
+        id,
+        key: source_ref.unwrap_or_default(),
+        content,
+        namespace: Some(source_id),
+        category,
+        timestamp,
+        session_id,
+        score: None,
+    })
 }
 
 #[cfg(test)]
@@ -346,5 +442,87 @@ mod tests {
         }
         // All 5 stores should produce ≥5 chunks total.
         assert!(adapter.store.count_chunks().unwrap() >= 5);
+    }
+
+    #[tokio::test]
+    async fn recall_matches_substring_via_fts() {
+        let (adapter, _dir) = fresh_adapter();
+        adapter
+            .store(
+                "recall_ns",
+                "k1",
+                "Project Phoenix launch plan with quarterly milestones.",
+                MemoryCategory::Core,
+                None,
+            )
+            .await
+            .unwrap();
+        adapter
+            .store(
+                "recall_ns",
+                "k2",
+                "Unrelated note about weather patterns.",
+                MemoryCategory::Core,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let opts = RecallOpts {
+            namespace: Some("recall_ns"),
+            category: None,
+            session_id: None,
+            min_score: None,
+        };
+        let hits = adapter.recall("Phoenix", 10, opts).await.unwrap();
+        assert!(!hits.is_empty(), "FTS should find 'Phoenix'");
+        assert!(hits.iter().any(|e| e.content.contains("Phoenix")));
+    }
+
+    #[tokio::test]
+    async fn recall_respects_namespace_filter() {
+        let (adapter, _dir) = fresh_adapter();
+        adapter
+            .store("ns_a", "k1", "Apple banana cherry common keyword.", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        adapter
+            .store("ns_b", "k2", "Apple banana cherry common keyword.", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        let opts_a = RecallOpts {
+            namespace: Some("ns_a"),
+            category: None,
+            session_id: None,
+            min_score: None,
+        };
+        let hits_a = adapter.recall("common", 10, opts_a).await.unwrap();
+        assert!(hits_a.iter().all(|e| e.namespace.as_deref() == Some("ns_a")));
+    }
+
+    #[tokio::test]
+    async fn recall_respects_limit() {
+        let (adapter, _dir) = fresh_adapter();
+        for i in 0..5 {
+            adapter
+                .store(
+                    "limit_ns",
+                    &format!("k{i}"),
+                    &format!("Unique repeatable keyword content line {i}."),
+                    MemoryCategory::Core,
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        let opts = RecallOpts {
+            namespace: Some("limit_ns"),
+            category: None,
+            session_id: None,
+            min_score: None,
+        };
+        let hits = adapter.recall("unique", 2, opts).await.unwrap();
+        assert!(hits.len() <= 2);
     }
 }
