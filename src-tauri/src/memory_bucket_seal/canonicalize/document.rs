@@ -43,8 +43,16 @@ pub fn canonicalise(
     }
 
     let mut md = String::new();
-    // No leading `# provider — title` header. Provider / title info
-    // belongs in the MD front-matter (Phase MD-content).
+    // Include the title as a plain first line (not a `# ` header) so it is
+    // FTS-indexed for recall: bucket_seal's adapter passes the memory key as the
+    // title, and recall must be able to match on it (otherwise key/title text is
+    // unsearchable). A YAML front-matter envelope for richer provenance is
+    // deferred to the MD-content phase.
+    let title = doc.title.trim();
+    if !title.is_empty() {
+        md.push_str(title);
+        md.push_str("\n\n");
+    }
     md.push_str(doc.body.trim());
     md.push('\n');
 

@@ -947,4 +947,30 @@ mod tests {
         let cands = vec![("a".to_string(), "x".to_string(), vec![1.0_f32, 2.0, 3.0])];
         assert!(rank_by_cosine(&q, cands, 10).is_empty());
     }
+
+    #[tokio::test]
+    async fn recall_matches_on_key_via_title() {
+        let (adapter, _dir) = fresh_adapter();
+        // The key is passed as the document title; canonicalise now prepends it
+        // to the indexed markdown, so recall must match on the key token even
+        // when it is absent from the body.
+        adapter
+            .store(
+                "k_ns",
+                "zeppelinblueprint",
+                "Some unrelated body text about the weather today.",
+                MemoryCategory::Core,
+                None,
+            )
+            .await
+            .unwrap();
+        let opts = RecallOpts {
+            namespace: Some("k_ns"),
+            category: None,
+            session_id: None,
+            min_score: None,
+        };
+        let hits = adapter.recall("zeppelinblueprint", 10, opts).await.unwrap();
+        assert!(!hits.is_empty(), "recall should match on the key/title token");
+    }
 }
