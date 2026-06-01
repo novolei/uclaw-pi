@@ -24,7 +24,7 @@ use crate::memory_adapter::{
 };
 use crate::memory_bucket_seal::canonicalize::document::{canonicalise, DocumentInput};
 use crate::memory_bucket_seal::chunker::{chunk_markdown, ChunkerInput, ChunkerOptions};
-use crate::memory_bucket_seal::score::embed::Embedder;
+use crate::memory_bucket_seal::score::embed::{cosine_similarity, unpack_embedding, Embedder};
 use crate::memory_bucket_seal::score::store::{upsert_score, ScoreRow};
 use crate::memory_bucket_seal::score::{score_chunk, ScoringConfig};
 use crate::memory_bucket_seal::store::BucketSealStore;
@@ -72,6 +72,68 @@ impl BucketSealAdapter {
         map.entry(namespace.to_string())
             .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone()
+    }
+
+    /// Semantic recall over the sealed summaries of `namespace`'s tree: embed the
+    /// raw query, cosine-rank the summary embeddings, return the top `limit`.
+    /// Best-effort — returns empty (so `recall` falls back to FTS5) on embed
+    /// error, missing tree/summaries, or zero-signal (e.g. the inert embedder,
+    /// whose zero query vector scores 0 against everything). Never errors.
+    async fn recall_vector(&self, query: &str, namespace: &str, limit: usize) -> Vec<MemoryEntry> {
+        let query_vec = match self.embedder.embed(query).await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::debug!(error = %e, "bucket_seal: query embed failed; skipping vector recall");
+                return Vec::new();
+            }
+        };
+
+        // Gather (id, content, embedding) for this tree's non-deleted, embedded
+        // summaries. Sync block (no await holds the conn lock).
+        let cands: Vec<(String, String, Vec<f32>)> = (|| -> Result<Vec<(String, String, Vec<f32>)>> {
+            let tree = get_or_create_source_tree(&self.store, namespace)?;
+            let conn = self.store.lock_conn()?;
+            let mut stmt = conn.prepare(
+                "SELECT id, content, embedding FROM mem_tree_summaries
+                  WHERE tree_id = ?1 AND embedding IS NOT NULL AND deleted = 0",
+            )?;
+            let rows = stmt.query_map(rusqlite::params![tree.id], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Vec<u8>>(2)?,
+                ))
+            })?;
+            let mut v = Vec::new();
+            for row in rows {
+                let (id, content, blob) = row?;
+                match unpack_embedding(&blob) {
+                    Ok(emb) => v.push((id, content, emb)),
+                    // A stale wrong-dim blob (e.g. a pre-384 inert seal) is
+                    // skipped, not fatal.
+                    Err(e) => tracing::debug!(error = %e, "bucket_seal: skip summary with bad embedding"),
+                }
+            }
+            Ok(v)
+        })()
+        .unwrap_or_else(|e| {
+            tracing::debug!(error = %e, "bucket_seal: vector candidate fetch failed");
+            Vec::new()
+        });
+
+        rank_by_cosine(&query_vec, cands, limit)
+            .into_iter()
+            .map(|(id, content, score)| MemoryEntry {
+                id,
+                key: String::new(),
+                content,
+                namespace: Some(namespace.to_string()),
+                category: MemoryCategory::Core,
+                timestamp: String::new(),
+                session_id: None,
+                score: Some(score as f64),
+            })
+            .collect()
     }
 }
 
@@ -207,54 +269,64 @@ impl MemoryAdapter for BucketSealAdapter {
         Ok(())
     }
 
-    /// Keyword recall over the FTS5 preview index, scoped by `opts.namespace`
-    /// and (post-filter) `opts.category`.
-    ///
-    /// Limitations (PR9, keyword-only backend): `opts.min_score` is NOT applied
-    /// and `MemoryEntry.score` is always `None`. bucket_seal ranks by FTS5
-    /// relevance internally but does not surface a normalized 0..1 score — the
-    /// persisted `mem_tree_score` is an importance/admission signal, not query
-    /// relevance, so filtering on it would be semantically wrong.
+    /// Hybrid recall: semantic (cosine over sealed-summary embeddings, when a
+    /// real embedder + seals are present) merged with FTS5 keyword over chunk
+    /// previews, scoped by `opts.namespace` and (post-filter) `opts.category`.
+    /// Vector hits carry `score = Some(cosine)`; FTS5 hits have `score = None`.
+    /// `opts.min_score` is still not applied. The vector path degrades to empty
+    /// (FTS5-only) on embed error / inert zero-vectors / no seals.
     async fn recall(
         &self,
         query: &str,
         limit: usize,
         opts: RecallOpts<'_>,
     ) -> Result<Vec<MemoryEntry>> {
-        // Arbitrary user text can contain FTS5 operators/quotes/colons that make
-        // MATCH raise a syntax error; phrase-quoting each token makes them match
-        // literally. No usable tokens ⇒ nothing to match.
+        // No usable query text ⇒ nothing (both paths need real query text;
+        // FTS5 phrase-quoting also can't form a MATCH from empty input).
         let Some(match_query) = sanitize_fts_query(query) else {
             return Ok(Vec::new());
         };
-        let conn = self.store.lock_conn()?;
-        let mut stmt = conn.prepare(
-            "SELECT c.id, c.source_id, c.source_ref, c.content, c.timestamp_ms, c.tags_json
-               FROM mem_tree_chunks_fts AS fts
-               JOIN mem_tree_chunks    AS c ON c.id = fts.chunk_id
-              WHERE fts.content MATCH ?1
-                AND (?2 IS NULL OR fts.source_id = ?2)
-              ORDER BY rank
-              LIMIT ?3",
-        )?;
-
-        let ns_param = opts.namespace.map(|s| s.to_string());
-        let rows = stmt.query_map(
-            rusqlite::params![match_query, ns_param, limit as i64],
-            row_to_memory_entry,
-        )?;
 
         let mut out: Vec<MemoryEntry> = Vec::new();
-        for row in rows {
-            let entry = row?;
-            // Optional category filter (opts.category is owned).
-            if let Some(filter) = &opts.category {
-                if entry.category != *filter {
-                    continue;
-                }
-            }
-            out.push(entry);
+
+        // 1) Semantic recall over the namespace tree's sealed summaries. Embeds
+        //    the raw query; degrades to empty on embed error / inert zero-vectors
+        //    / no seals, so it's purely additive over the FTS5 floor below.
+        if let Some(ns) = opts.namespace {
+            out.extend(self.recall_vector(query, ns, limit).await);
         }
+
+        // 2) FTS5 keyword recall over chunk previews; dedup against vector hits.
+        {
+            let conn = self.store.lock_conn()?;
+            let mut stmt = conn.prepare(
+                "SELECT c.id, c.source_id, c.source_ref, c.content, c.timestamp_ms, c.tags_json
+                   FROM mem_tree_chunks_fts AS fts
+                   JOIN mem_tree_chunks    AS c ON c.id = fts.chunk_id
+                  WHERE fts.content MATCH ?1
+                    AND (?2 IS NULL OR fts.source_id = ?2)
+                  ORDER BY rank
+                  LIMIT ?3",
+            )?;
+            let ns_param = opts.namespace.map(|s| s.to_string());
+            let rows = stmt.query_map(
+                rusqlite::params![match_query, ns_param, limit as i64],
+                row_to_memory_entry,
+            )?;
+            for row in rows {
+                let entry = row?;
+                if out.iter().any(|e| e.id == entry.id) {
+                    continue; // already surfaced by the vector path
+                }
+                out.push(entry);
+            }
+        }
+
+        // 3) Optional category filter (applies to both paths) + cap to `limit`.
+        if let Some(filter) = &opts.category {
+            out.retain(|e| &e.category == filter);
+        }
+        out.truncate(limit);
         Ok(out)
     }
 
@@ -402,6 +474,27 @@ fn build_tags(category: &MemoryCategory, session_id: Option<&str>) -> Vec<String
         tags.push(format!("session:{s}"));
     }
     tags
+}
+
+/// Rank `(id, content, embedding)` candidates by cosine similarity to `query`,
+/// descending, dropping non-positive scores (zero-magnitude inert vectors +
+/// uncorrelated rows), and take the top `limit`.
+fn rank_by_cosine(
+    query: &[f32],
+    cands: Vec<(String, String, Vec<f32>)>,
+    limit: usize,
+) -> Vec<(String, String, f32)> {
+    let mut scored: Vec<(String, String, f32)> = cands
+        .into_iter()
+        .map(|(id, content, emb)| {
+            let s = cosine_similarity(query, &emb);
+            (id, content, s)
+        })
+        .filter(|(_, _, s)| *s > 0.0)
+        .collect();
+    scored.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+    scored.truncate(limit);
+    scored
 }
 
 /// Turn arbitrary user text into a safe FTS5 MATCH expression: split on
@@ -818,5 +911,40 @@ mod tests {
         // A normal token still matches.
         let hits = adapter.recall("phoenix", 10, opts.clone()).await.unwrap();
         assert!(!hits.is_empty(), "plain token should still match after sanitisation");
+    }
+
+    #[test]
+    fn rank_by_cosine_orders_desc_and_drops_nonpositive() {
+        // query ≈ A (same direction), orthogonal to B, opposite to C.
+        let q = vec![1.0_f32, 0.0, 0.0];
+        let cands = vec![
+            ("a".to_string(), "near".to_string(), vec![0.9_f32, 0.1, 0.0]),
+            ("b".to_string(), "ortho".to_string(), vec![0.0_f32, 1.0, 0.0]),
+            ("c".to_string(), "opposite".to_string(), vec![-1.0_f32, 0.0, 0.0]),
+        ];
+        let ranked = rank_by_cosine(&q, cands, 10);
+        // A first (positive cosine); B (cosine 0) and C (negative) dropped.
+        assert_eq!(ranked.len(), 1);
+        assert_eq!(ranked[0].0, "a");
+        assert!(ranked[0].2 > 0.0);
+    }
+
+    #[test]
+    fn rank_by_cosine_respects_limit() {
+        let q = vec![1.0_f32, 1.0];
+        let cands = vec![
+            ("a".to_string(), "x".to_string(), vec![1.0_f32, 1.0]),
+            ("b".to_string(), "y".to_string(), vec![0.9_f32, 1.0]),
+            ("c".to_string(), "z".to_string(), vec![0.8_f32, 1.0]),
+        ];
+        assert_eq!(rank_by_cosine(&q, cands, 2).len(), 2);
+    }
+
+    #[test]
+    fn rank_by_cosine_zero_query_is_empty() {
+        // Inert embedder → zero query vector → cosine 0 everywhere → empty.
+        let q = vec![0.0_f32, 0.0, 0.0];
+        let cands = vec![("a".to_string(), "x".to_string(), vec![1.0_f32, 2.0, 3.0])];
+        assert!(rank_by_cosine(&q, cands, 10).is_empty());
     }
 }
