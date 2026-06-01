@@ -43,9 +43,12 @@ pub(super) struct SystemPromptContext {
     /// Empty string when no rules.
     pub project_rules_block: String,
 
-    /// PR4 of Tier 1+2+3 batch — whether to apply ladder pad alignment
-    /// via `pad_to_ladder`. When `true`, the system prompt is padded to
-    /// the nearest cache-ladder tier for alignment. `false` skips padding.
+    /// PR4 of Tier 1+2+3 batch — whether to cache-align the assembled system
+    /// prompt via `align_to_1024_tokens` (pad up to the next 1024-token cache
+    /// block to isolate the stable prefix). `false` skips padding. (Was
+    /// `pad_to_ladder`, which jumped to a coarse [2048..32768] tier — far more
+    /// filler tokens/turn for no extra cache benefit. Field name kept for diff
+    /// stability.)
     pub apply_ladder_pad: bool,
 }
 
@@ -87,7 +90,7 @@ pub(super) fn assemble_system_prompt(ctx: SystemPromptContext) -> AssembledPromp
 
     // PR4: 4 post-append layers, now unified into the seam.
     // Order MUST match the original create_turn_snapshot order:
-    //   gene_block → plan_suggest_hint → project_rules_block → pad_to_ladder
+    //   gene_block → plan_suggest_hint → project_rules_block → cache-align
     if !ctx.gene_block.is_empty() {
         system.push_str(&ctx.gene_block);
     }
@@ -98,7 +101,12 @@ pub(super) fn assemble_system_prompt(ctx: SystemPromptContext) -> AssembledPromp
         system.push_str(&ctx.project_rules_block);
     }
     if ctx.apply_ladder_pad {
-        system = crate::agent::compact::cache_align::pad_to_ladder(&system);
+        // Align the stable system-prompt prefix to the next 1024-token cache
+        // block instead of padding up to a coarse [2048..32768] ladder tier.
+        // The tier jump inflated the prompt by thousands of filler tokens/turn
+        // for no real cache benefit (Anthropic caches at 1024 granularity;
+        // DeepSeek auto-prefix-caches). Matches the L1 fold-summary padding.
+        system = crate::agent::compact::cache_align::align_to_1024_tokens(&system);
     }
 
     // 2. Dynamic half — per-turn block prepended to last user message.
@@ -350,7 +358,7 @@ impl ChatDelegate {
             }
         };
 
-        // PR4 Layer D: ladder pad — always applied (matches prior behavior).
+        // PR4 Layer D: cache-align pad — always applied (matches prior behavior).
         let apply_ladder_pad = true;
 
         SystemPromptContext {
@@ -1711,7 +1719,7 @@ Strong success criteria let the execution phase run without further questions.
 
     // ── Test 6 ────────────────────────────────────────────────────────────
     // PR4: all 4 new layers populated. Verifies canonical append order:
-    //   gene_block → plan_suggest_hint → project_rules_block → pad_to_ladder
+    //   gene_block → plan_suggest_hint → project_rules_block → cache-align
     // and that their content appears AFTER the skills manifest block (which
     // comes from the prior seam).
     #[test]
@@ -1724,9 +1732,10 @@ Strong success criteria let the execution phase run without further questions.
             gene_block: "GEP_MARKER\n".to_string(),
             plan_suggest_hint: "PLAN_HINT\n".to_string(),
             project_rules_block: "RULES\n".to_string(),
-            // apply_ladder_pad=true: pad_to_ladder will be called. With only a small
-            // input the output will be padded with a <!-- pad: N bytes --> comment.
-            // We only assert ordering/containment, not the exact padded bytes.
+            // apply_ladder_pad=true: align_to_1024_tokens will be called. With a
+            // small input the output is padded to the next 1024-token boundary
+            // with a <!-- cache_align: ... --> comment. We only assert
+            // ordering/containment, not the exact padded bytes.
             apply_ladder_pad: true,
             ..base_ctx()
         };
@@ -1737,19 +1746,19 @@ Strong success criteria let the execution phase run without further questions.
         assert!(sys.contains("GEP_MARKER"), "gene_block must be present");
         assert!(sys.contains("PLAN_HINT"), "plan_suggest_hint must be present");
         assert!(sys.contains("RULES"), "project_rules_block must be present");
-        // Ladder pad produces a <!-- pad: ... --> comment when input is non-empty.
-        assert!(sys.contains("<!-- pad:"), "ladder pad comment must be present when apply_ladder_pad=true");
+        // Cache-align produces a <!-- cache_align: ... --> comment when input is non-empty.
+        assert!(sys.contains("<!-- cache_align:"), "cache-align comment must be present when apply_ladder_pad=true");
 
-        // Canonical order: manifest → gene_block → plan_suggest_hint → project_rules_block → pad comment.
+        // Canonical order: manifest → gene_block → plan_suggest_hint → project_rules_block → cache-align comment.
         let pos_manifest = sys.find("MANIFEST_BLOCK").expect("manifest block must be present");
         let pos_gene = sys.find("GEP_MARKER").expect("gene_block must be present");
         let pos_plan = sys.find("PLAN_HINT").expect("plan_suggest_hint must be present");
         let pos_rules = sys.find("RULES").expect("project_rules_block must be present");
-        let pos_pad = sys.find("<!-- pad:").expect("ladder pad comment must be present");
+        let pos_pad = sys.find("<!-- cache_align:").expect("cache-align comment must be present");
 
         assert!(pos_manifest < pos_gene, "gene_block must come after manifest: manifest={pos_manifest} gene={pos_gene}");
         assert!(pos_gene < pos_plan, "plan_suggest_hint must come after gene_block: gene={pos_gene} plan={pos_plan}");
         assert!(pos_plan < pos_rules, "project_rules_block must come after plan_suggest_hint: plan={pos_plan} rules={pos_rules}");
-        assert!(pos_rules < pos_pad, "ladder pad must come after project_rules_block: rules={pos_rules} pad={pos_pad}");
+        assert!(pos_rules < pos_pad, "cache-align must come after project_rules_block: rules={pos_rules} pad={pos_pad}");
     }
 }
