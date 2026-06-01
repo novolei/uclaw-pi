@@ -31,6 +31,7 @@ import { cn } from '@/lib/utils'
 import { ModuleHeader } from '../../shared/ModuleHeader'
 import { SkillsList } from './SkillsList'
 import { SkillDetail } from './SkillDetail'
+import { SkillsMarketplaceTab } from './SkillsMarketplaceTab'
 import { CreateSkillDialog } from './CreateSkillDialog'
 import { SkillConsolidationDialog } from '@/features/settings'
 import {
@@ -44,7 +45,7 @@ import {
   AlertDialogTitle,
 } from '@/components/ui/alert-dialog'
 
-export type FilterTab = 'all' | 'learned' | 'builtin' | 'user' | 'promoted' | 'draft' | 'deprecated'
+export type FilterTab = 'all' | 'learned' | 'builtin' | 'user' | 'promoted' | 'draft' | 'deprecated' | 'marketplace'
 
 export type UnifiedSkill =
   | { kind: 'learned'; id: string; name: string; enabled: boolean; raw: LearnedSkill }
@@ -203,8 +204,8 @@ export function SkillsModule(): React.ReactElement {
     (s) => s.kind === 'learned' && s.raw.lifecycle === 'deprecated',
   )
 
-  // Filter tabs with dynamic counts
-  const filterTabs: { value: FilterTab; label: string; count: number }[] = [
+  // Filter tabs with dynamic counts ('市场' has no count → count optional)
+  const filterTabs: { value: FilterTab; label: string; count?: number }[] = [
     { value: 'all', label: '全部', count: learnedFiltered.length + builtinFiltered.length },
     { value: 'learned', label: '自学技能', count: learnedFiltered.length },
     { value: 'builtin', label: '内建技能', count: bundledSkills.length },
@@ -212,6 +213,7 @@ export function SkillsModule(): React.ReactElement {
     { value: 'promoted', label: '已晋升', count: learnedPromoted.length },
     { value: 'draft', label: '草稿', count: learnedDraft.length },
     { value: 'deprecated', label: '已弃用', count: learnedDeprecated.length },
+    { value: 'marketplace', label: '市场', count: undefined },
   ]
 
   // Apply active filter
@@ -403,7 +405,9 @@ export function SkillsModule(): React.ReactElement {
                 )}
               >
                 {tab.label}
-                <span className="ml-1 opacity-70 tabular-nums">({tab.count})</span>
+                {tab.count !== undefined && (
+                  <span className="ml-1 opacity-70 tabular-nums">({tab.count})</span>
+                )}
               </button>
             ))}
           </div>
@@ -448,7 +452,9 @@ export function SkillsModule(): React.ReactElement {
                 )}
               >
                 {tab.label}
-                <span className="ml-0.5 opacity-70 tabular-nums">({tab.count})</span>
+                {tab.count !== undefined && (
+                  <span className="ml-0.5 opacity-70 tabular-nums">({tab.count})</span>
+                )}
               </button>
             ))}
           </div>
@@ -499,6 +505,10 @@ export function SkillsModule(): React.ReactElement {
       )}
 
       {/* ─── 主体区域 ─── */}
+      {activeFilter === 'marketplace' ? (
+        <SkillsMarketplaceTab query={query} onError={(m) => toast.error(m)} />
+      ) : (
+      <>
       {isEmpty ? (
         <div className="titlebar-no-drag flex-1 min-h-0 flex items-center justify-center">
           <div className="flex flex-col items-center gap-4 text-center px-8">
@@ -601,6 +611,8 @@ export function SkillsModule(): React.ReactElement {
             />
           </div>
         </div>
+      )}
+      </>
       )}
 
       {/* ─── Dialogs ─── */}
