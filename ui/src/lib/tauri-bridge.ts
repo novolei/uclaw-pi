@@ -88,6 +88,10 @@ import type {
   McpServerInput,
   // Built-in Skills
   SkillInfo,
+  // skills.sh marketplace
+  MarketplaceSkillSummary,
+  MarketplaceSkillDetail,
+  MarketplaceSkillAudit,
   SkillToggleInput,
   SkillMatchInput,
   SkillMatchResult,
@@ -851,6 +855,28 @@ export const installSkillFromMarketplace = (
   workspaceId?: string,
 ): Promise<string> =>
   invoke('install_skill_from_marketplace', { id, scope, workspaceId });
+
+/** Search skills.sh by free-text query. */
+export const searchSkillsMarketplace = (
+  query: string,
+  limit?: number,
+): Promise<MarketplaceSkillSummary[]> =>
+  invoke('search_skill_marketplace', { query, limit });
+/** List skills.sh (view = 'trending' | 'hot' | 'all-time'). */
+export const listSkillsMarketplace = (
+  view?: string,
+  page?: number,
+): Promise<MarketplaceSkillSummary[]> =>
+  invoke('list_skill_marketplace', { view, page });
+/** Fetch a skill's detail (inline files) by id. */
+export const getSkillMarketplaceDetail = (id: string): Promise<MarketplaceSkillDetail> =>
+  invoke('get_skill_marketplace_detail', { id });
+/** Fetch a skill's audit verdicts by id. */
+export const getSkillMarketplaceAudit = (id: string): Promise<MarketplaceSkillAudit> =>
+  invoke('get_skill_marketplace_audit', { id });
+/** Whether an installed marketplace skill has a newer version on skills.sh. */
+export const checkSkillMarketplaceUpdate = (id: string): Promise<boolean> =>
+  invoke('check_skill_marketplace_update', { id });
 
 // ─────────────────────────────────────────────────────────
 // GEP Gene Evolution
