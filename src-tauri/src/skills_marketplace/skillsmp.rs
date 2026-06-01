@@ -36,15 +36,39 @@ impl SkillsmpClient {
     }
 
     /// GET /api/v1/skills/search?q=&limit= — anonymous OK; a non-empty key raises
-    /// the rate limit. Normalizes skillsmp rows → the shared `SkillSummary`
+    /// the rate limit. **Resilient to a bad key:** since skillsmp search is keyless,
+    /// a rejected key (401/403) retries once anonymously rather than failing — so a
+    /// wrong/expired key never breaks search. Normalizes rows → `SkillSummary`
     /// (`install_url` = the row's `githubUrl`, the install/preview source).
     pub async fn search(&self, query: &str, limit: usize) -> Result<Vec<SkillSummary>, MarketplaceError> {
+        let has_key = self.api_key.as_deref().is_some_and(|k| !k.is_empty());
+        match self.search_inner(query, limit, has_key).await {
+            Err(MarketplaceError::Http(s))
+                if has_key && (s.contains("401") || s.contains("403")) =>
+            {
+                tracing::warn!("skillsmp: API key rejected ({s}); retrying anonymously");
+                self.search_inner(query, limit, false).await
+            }
+            other => other,
+        }
+    }
+
+    /// One search request; `with_key=false` forces the anonymous tier (the
+    /// rejected-key fallback path).
+    async fn search_inner(
+        &self,
+        query: &str,
+        limit: usize,
+        with_key: bool,
+    ) -> Result<Vec<SkillSummary>, MarketplaceError> {
         let q = urlencoding::encode(query);
         let limit = limit.clamp(1, 100);
         let url = format!("{}/api/v1/skills/search?q={q}&limit={limit}", self.base);
         let mut req = self.http.get(&url);
-        if let Some(key) = self.api_key.as_deref().filter(|k| !k.is_empty()) {
-            req = req.bearer_auth(key);
+        if with_key {
+            if let Some(key) = self.api_key.as_deref().filter(|k| !k.is_empty()) {
+                req = req.bearer_auth(key);
+            }
         }
         let resp = req
             .send()
@@ -133,6 +157,35 @@ mod tests {
         assert_eq!(out[0].description, "PDF stuff");
         assert_eq!(out[0].slug, "a-pdf-skill-md");
         m.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn rejected_key_falls_back_to_anonymous() {
+        let mut server = mockito::Server::new_async().await;
+        // First request WITH the bad key → 401 (skillsmp rejects it).
+        let m401 = server
+            .mock("GET", "/api/v1/skills/search?q=pdf&limit=5")
+            .match_header("authorization", "Bearer sk_bad")
+            .with_status(401)
+            .with_body(r#"{"success":false,"error":{"code":"INVALID_API_KEY"}}"#)
+            .create_async()
+            .await;
+        // Retry WITHOUT auth (anonymous) → 200.
+        let m200 = server
+            .mock("GET", "/api/v1/skills/search?q=pdf&limit=5")
+            .match_header("authorization", mockito::Matcher::Missing)
+            .with_status(200)
+            .with_body(
+                r#"{"data":{"skills":[{"id":"x-skill-md","name":"pdf","githubUrl":"https://github.com/o/r/tree/main/p"}]}}"#,
+            )
+            .create_async()
+            .await;
+        let c = SkillsmpClient::with_base(server.url(), Some("sk_bad".into()));
+        let out = c.search("pdf", 5).await.unwrap();
+        assert_eq!(out.len(), 1, "anonymous retry returns results despite the bad key");
+        assert_eq!(out[0].name, "pdf");
+        m401.assert_async().await;
+        m200.assert_async().await;
     }
 
     #[tokio::test]
