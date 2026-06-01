@@ -15,12 +15,14 @@
 
 mod legacy_kv;
 mod legacy_steward;
+mod memu_adapter;
 mod router;
 mod traits;
 mod types;
 
 pub use legacy_kv::LegacyKvAdapter;
 pub use legacy_steward::LegacyStewardAdapter;
+pub use memu_adapter::MemUAdapter;
 pub use router::{
     resolve_backend, resolve_backend_in, route_recall, route_recall_in, split_namespace_prefix,
     RecallOptsIpc, ResolvedBackend,
