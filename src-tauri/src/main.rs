@@ -970,6 +970,8 @@ fn main() {
             uclaw_core::commands::settings::set_pi_engine_enabled,
             uclaw_core::commands::settings::get_skills_sh_api_key_set,
             uclaw_core::commands::settings::set_skills_sh_api_key,
+            uclaw_core::commands::settings::get_skillsmp_api_key_set,
+            uclaw_core::commands::settings::set_skillsmp_api_key,
             uclaw_core::commands::bootstrap::patch_settings,
             uclaw_core::browser::runtime_pack_ipc::get_browser_runtime_status,
             uclaw_core::browser::runtime_pack_ipc::get_browser_runtime_control_center,
