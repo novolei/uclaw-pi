@@ -33,6 +33,18 @@ pub async fn get_skill_marketplace_audit(state: State<'_, AppState>, id: String)
     SkillsShClient::new(read_api_key(&state)).audit(&id).await.map_err(map_err)
 }
 
+/// Whether an installed marketplace skill has a newer version on skills.sh.
+/// `true` iff the slug is tracked-installed (V25) AND its stored hash differs from
+/// the latest detail hash. Not-installed ⇒ `false` (nothing to update).
+#[tauri::command]
+pub async fn check_skill_marketplace_update(state: State<'_, AppState>, id: String) -> Result<bool, Error> {
+    let detail = SkillsShClient::new(read_api_key(&state)).detail(&id).await.map_err(map_err)?;
+    let slug = install::flatten_slug(&id);
+    let conn = state.db.lock().map_err(|e| Error::Internal(format!("DB lock: {e}")))?;
+    let installed = install::read_install_version(&conn, &slug).ok().flatten();
+    Ok(installed.is_some_and(|h| h != detail.hash))
+}
+
 /// Install a skill from skills.sh. `scope` = Global → written untagged, so it's
 /// active in every workspace. `scope` = Workspace → the skill's SKILL.md and the
 /// space's `skill_tags` both get the (normalized) `workspace_id` as a tag, so the
