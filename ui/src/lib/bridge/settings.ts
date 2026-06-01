@@ -71,6 +71,11 @@ export const settingsBridge = {
   /** Enable/disable the optional local HTTP API server (persisted; restart to apply). */
   setHttpApiEnabled: (enabled: boolean): Promise<void> =>
     invoke<void>('set_http_api_enabled', { enabled }),
+  /** Whether the agent routes through the experimental PiEngine backend (live runtime value). */
+  getPiEngineEnabled: (): Promise<boolean> => invoke<boolean>('get_pi_engine_enabled'),
+  /** Switch the agent engine backend (pi vs legacy); persisted + applied on the next message. */
+  setPiEngineEnabled: (enabled: boolean): Promise<void> =>
+    invoke<void>('set_pi_engine_enabled', { enabled }),
   /** Snapshot the system-diagnostics report (health, bridges, services, processes). */
   getSystemDiagnostics: <T = unknown>(): Promise<T> => invoke<T>('get_system_diagnostics'),
   /** Run an eval suite by its command name (e.g. `run_agent_control_plane_eval`). */

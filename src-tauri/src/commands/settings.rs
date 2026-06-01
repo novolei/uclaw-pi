@@ -31,3 +31,29 @@ pub async fn set_http_api_enabled(state: State<'_, AppState>, enabled: bool) -> 
         .set_http_api_enabled(&conn, enabled)
         .map_err(Error::Database)
 }
+
+/// Whether the agent routes through the experimental PiEngine backend (vs the
+/// legacy loop). Reflects the live runtime value (Settings override > env var).
+#[tauri::command]
+pub async fn get_pi_engine_enabled(_state: State<'_, AppState>) -> Result<bool, Error> {
+    Ok(crate::engine_sink::pi_engine_enabled())
+}
+
+/// Switch the agent engine backend. Persisted AND applied at runtime — takes
+/// effect on the next message (a conversation boundary), not mid-stream. pi is
+/// experimental (R4: MCP/browser/skill tools not yet wired); legacy is the
+/// safe default.
+#[tauri::command]
+pub async fn set_pi_engine_enabled(state: State<'_, AppState>, enabled: bool) -> Result<(), Error> {
+    {
+        let conn = state
+            .db
+            .lock()
+            .map_err(|e| Error::Internal(format!("DB lock: {e}")))?;
+        DbSettings
+            .set_pi_engine_enabled(&conn, enabled)
+            .map_err(Error::Database)?;
+    }
+    crate::engine_sink::set_pi_engine_override(Some(enabled));
+    Ok(())
+}

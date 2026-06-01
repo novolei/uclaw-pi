@@ -14,6 +14,12 @@ pub trait SettingsService {
     fn http_api_enabled(&self, conn: &Connection) -> bool;
     /// Persist the HTTP-API enablement flag (takes effect on next restart).
     fn set_http_api_enabled(&self, conn: &Connection, enabled: bool) -> rusqlite::Result<()>;
+    /// Whether the agent routes through the experimental PiEngine backend
+    /// (default: off → legacy loop). Read at startup to seed the runtime override.
+    fn pi_engine_enabled(&self, conn: &Connection) -> bool;
+    /// Persist the engine-backend choice. The runtime override is updated
+    /// separately (by the command) so the change applies without a restart.
+    fn set_pi_engine_enabled(&self, conn: &Connection, enabled: bool) -> rusqlite::Result<()>;
 }
 
 /// The SQLite-backed implementation (the only one in production).
@@ -33,6 +39,24 @@ impl SettingsService for DbSettings {
     fn set_http_api_enabled(&self, conn: &Connection, enabled: bool) -> rusqlite::Result<()> {
         conn.execute(
             "INSERT OR REPLACE INTO settings (key, value) VALUES ('http_api_enabled', ?1)",
+            [if enabled { "true" } else { "false" }],
+        )?;
+        Ok(())
+    }
+
+    fn pi_engine_enabled(&self, conn: &Connection) -> bool {
+        conn.query_row(
+            "SELECT value FROM settings WHERE key = 'pi_engine_enabled'",
+            [],
+            |r| r.get::<_, String>(0),
+        )
+        .ok()
+        .is_some_and(|v| v == "true" || v == "1")
+    }
+
+    fn set_pi_engine_enabled(&self, conn: &Connection, enabled: bool) -> rusqlite::Result<()> {
+        conn.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES ('pi_engine_enabled', ?1)",
             [if enabled { "true" } else { "false" }],
         )?;
         Ok(())
@@ -58,5 +82,15 @@ mod tests {
         assert!(DbSettings.http_api_enabled(&c));
         DbSettings.set_http_api_enabled(&c, false).unwrap();
         assert!(!DbSettings.http_api_enabled(&c));
+    }
+
+    #[test]
+    fn pi_engine_flag_defaults_off_and_round_trips() {
+        let c = conn();
+        assert!(!DbSettings.pi_engine_enabled(&c), "default must be off (legacy loop)");
+        DbSettings.set_pi_engine_enabled(&c, true).unwrap();
+        assert!(DbSettings.pi_engine_enabled(&c));
+        DbSettings.set_pi_engine_enabled(&c, false).unwrap();
+        assert!(!DbSettings.pi_engine_enabled(&c));
     }
 }
