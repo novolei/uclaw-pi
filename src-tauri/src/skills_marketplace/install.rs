@@ -51,17 +51,20 @@ pub fn write_skill_files(skills_root: &Path, slug: &str, detail: &SkillDetail) -
 }
 
 /// Remove a marketplace skill's install dir (`<skills_root>/_marketplace/<slug>/`)
-/// and return that path (for registry `remove_scan_dir`). Slug-guarded; a missing
-/// dir is a no-op (idempotent uninstall).
-pub fn remove_skill_dir(skills_root: &Path, slug: &str) -> Result<PathBuf, MarketplaceError> {
+/// and return `(dir, existed)`. `existed=false` means there was no such install
+/// (slug isn't one of ours — e.g. an automation `_standalone/` skill that shares
+/// the V25 table); the caller must then skip V25/registry cleanup. Slug-guarded;
+/// a missing dir is a no-op (idempotent).
+pub fn remove_skill_dir(skills_root: &Path, slug: &str) -> Result<(PathBuf, bool), MarketplaceError> {
     if !is_safe_component(slug) {
         return Err(MarketplaceError::Invalid(format!("unsafe slug: {slug}")));
     }
     let dir = skills_root.join("_marketplace").join(slug);
-    if dir.exists() {
+    let existed = dir.exists();
+    if existed {
         std::fs::remove_dir_all(&dir).map_err(|e| MarketplaceError::Install(e.to_string()))?;
     }
-    Ok(dir)
+    Ok((dir, existed))
 }
 
 /// Create <workspace>/.uclaw/skills/<slug> -> <global_dir> (symlink, visibility only).
@@ -289,11 +292,13 @@ mod tests {
         let root = tmp.path().join("skills");
         let dir = write_skill_files(&root, "o__r__s", &detail("o/r/s")).unwrap();
         assert!(dir.exists());
-        let removed = remove_skill_dir(&root, "o__r__s").unwrap();
+        let (removed, existed) = remove_skill_dir(&root, "o__r__s").unwrap();
         assert_eq!(removed, dir);
+        assert!(existed, "dir was present");
         assert!(!dir.exists(), "dir removed");
-        // Idempotent: removing again (missing dir) is Ok.
-        assert!(remove_skill_dir(&root, "o__r__s").is_ok());
+        // Idempotent: removing again reports existed=false (slug isn't ours / gone).
+        let (_, existed2) = remove_skill_dir(&root, "o__r__s").unwrap();
+        assert!(!existed2);
         // Unsafe slug rejected (no traversal).
         assert!(remove_skill_dir(&root, "..").is_err());
         assert!(remove_skill_dir(&root, "a/b").is_err());

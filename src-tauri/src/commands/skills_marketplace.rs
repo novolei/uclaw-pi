@@ -189,7 +189,14 @@ pub async fn install_skill_from_marketplace(
 #[tauri::command]
 pub async fn uninstall_skill_from_marketplace(state: State<'_, AppState>, slug: String) -> Result<(), Error> {
     let skills_root = state.data_dir.join("skills");
-    let dir = install::remove_skill_dir(&skills_root, &slug).map_err(map_err)?;
+    let (dir, existed) = install::remove_skill_dir(&skills_root, &slug).map_err(map_err)?;
+    if !existed {
+        // No `_marketplace/<slug>` dir → this slug is not a skills-marketplace install
+        // (e.g. an automation `_standalone/` skill sharing the V25 table). Don't touch
+        // its V25 row / registry — leave it to the surface that installed it.
+        tracing::warn!(slug = %slug, "uninstall: no _marketplace/<slug> install dir; skipping V25/registry cleanup");
+        return Ok(());
+    }
     {
         let mut reg = state.skills_registry.write().await;
         reg.remove_scan_dir(&dir);
