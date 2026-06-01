@@ -861,6 +861,10 @@ export const installSkillFromMarketplace = (
 ): Promise<string> =>
   invoke('install_skill_from_marketplace', { id, scope, workspaceId, provider, source });
 
+/** Fully uninstall a marketplace skill (deletes files + V25 row + registry evict). */
+export const uninstallSkillFromMarketplace = (slug: string): Promise<void> =>
+  invoke('uninstall_skill_from_marketplace', { slug });
+
 /** Search a marketplace by free-text query (backend default skills_sh; the UI
  *  passes 'skillsmp' explicitly). */
 export const searchSkillsMarketplace = (
