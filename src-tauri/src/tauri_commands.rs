@@ -5502,11 +5502,20 @@ pub async fn send_agent_message(
         app_handle.clone(),
         input.session_id.clone(),
     ));
-    // skill_marketplace_search now queries skills.sh; read its API key from settings.
-    let skills_sh_key = state.db.lock().ok().and_then(|c| {
-        c.query_row("SELECT value FROM settings WHERE key='skills_sh_api_key'", [], |r| r.get::<_, String>(0)).ok()
-    });
-    tools.register(builtin::skill_marketplace::SkillMarketplaceSearchTool::new(skills_sh_key));
+    // skill_marketplace_search defaults to skillsmp.com (keyless); skills.sh needs a
+    // key. Read both keys from settings (skillsmp's is optional → anonymous tier).
+    let (skills_sh_key, skillsmp_key) = state
+        .db
+        .lock()
+        .ok()
+        .map(|c| {
+            let read = |k: &str| {
+                c.query_row("SELECT value FROM settings WHERE key=?1", [k], |r| r.get::<_, String>(0)).ok()
+            };
+            (read("skills_sh_api_key"), read("skillsmp_api_key"))
+        })
+        .unwrap_or((None, None));
+    tools.register(builtin::skill_marketplace::SkillMarketplaceSearchTool::new(skills_sh_key, skillsmp_key));
     // Bundle 21-D — `skill_install_from_marketplace`: install a
     // specific owner/repo/<skill-dir> into
     // ~/.uclaw/skills/_marketplace/. Approval-gated; persists.

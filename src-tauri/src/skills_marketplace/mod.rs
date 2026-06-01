@@ -70,15 +70,17 @@ pub enum InstallScope {
     Workspace,
 }
 
-/// Which marketplace backend a command targets. Default `Skillsmp` (keyless,
-/// works without an API key — the user's chosen default).
+/// Which marketplace backend a command targets. `Default` = `SkillsSh` for
+/// back-compat (legacy callers that omit a provider keep their skills.sh
+/// behavior, which needs no `source`); the FRONTEND provider selector defaults
+/// to skillsmp (keyless) and always passes an explicit provider.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum MarketplaceProvider {
     /// skills.sh /api/v1 — Bearer key required; inline-file detail + audit.
+    #[default]
     SkillsSh,
     /// skillsmp.com /api/v1 — search-only, keyless; install/preview via GitHub.
-    #[default]
     Skillsmp,
 }
 
