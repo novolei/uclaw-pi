@@ -15,18 +15,21 @@ Python runtime (`src-tauri/pyembed/`) drives the **memU** memory service via a
 JSON-RPC stdio bridge. A bundled Bun runtime + gbrain (`src-tauri/bunembed/`,
 `src-tauri/gbrain-source/`) provides the primary durable knowledge layer.
 
-The original migration target documented in `docs/uclaw-migration-plan.md`
-mentions Svelte 5, but the implementation is React 18 + TypeScript with
-Tailwind and Radix UI primitives — trust the code, not that doc.
+An early migration-plan target once mentioned Svelte 5, but the implementation
+is React 18 + TypeScript with Tailwind and Radix UI primitives — trust the
+code. (That migration-plan doc was removed in the `a11d57dc` cleanup.)
 
-**Strategic north star**: [`docs/adr/2026-05-20-uclaw-agent-platform-north-star.md`](docs/adr/2026-05-20-uclaw-agent-platform-north-star.md).
-New agent / runtime / browser / memory / automation / team / cluster designs
-should preserve the Agent OS v2 direction: local-first long-running work,
-small Rust runtime kernel, `IntentSpec` / `TaskSpec` / `TaskEvent` contracts,
-Context Fabric, Capability Mesh, World Projection, Hermes-aligned registries,
-gbrain as primary long-term knowledge, harness-gated self-evolution.
+**Strategic baseline**: the **Pi-lightweight product philosophy** — summarized
+in the *Product philosophy* section of `CLAUDE.md`. It supersedes the earlier
+"Agent OS v2" north-star positioning (whose ADR was removed in the `a11d57dc`
+cleanup). The still-relevant engineering direction it carried persists: new
+agent / runtime / browser / memory / automation / team / cluster designs should
+keep a small pure Rust runtime kernel, local-first long-running work,
+`IntentSpec` / `TaskSpec` / `TaskEvent` contracts, gbrain as primary long-term
+knowledge, and harness-gated self-evolution — but as optional layers above the
+kernel rather than loop branches (per the Pi-lightweight philosophy).
 
-**Pi Framework Convergence (ADR §20, 2026-05-26)**: UClaw's agent core is actively converging toward the Pi reference framework (`/Users/ryanliu/Documents/pi`). The four immediate adoption targets are: (1) `SteeringQueue + FollowUpQueue` dual interactive queues, (2) iterative compaction with `UPDATE_SUMMARIZATION_PROMPT` + Split-Turn recovery, (3) `SessionFileOps` persistent file-operations memory (9th StructuredFold axis), (4) `RollingTailBuffer` bash temp logging. Full design: `docs/superpowers/specs/2026-05-26-agent-framework-pi-upgrade-design.md`.
+**Pi Framework Convergence**: UClaw's agent core converged toward the Pi reference framework (`/Users/ryanliu/Documents/pi`). The four adoption targets were: (1) `SteeringQueue + FollowUpQueue` dual interactive queues, (2) iterative compaction with `UPDATE_SUMMARIZATION_PROMPT` + Split-Turn recovery, (3) `SessionFileOps` persistent file-operations memory (9th StructuredFold axis), (4) `RollingTailBuffer` bash temp logging. This work has largely landed (gap audit resolved, per `CLAUDE.md`). The detailed Pi-upgrade design spec was removed in the `a11d57dc` cleanup.
 
 ---
 
@@ -97,7 +100,7 @@ Key module roles:
   teams (`agent/teams/`), and built-in tools (`tools/builtin/`: file, edit,
   search, shell, web, plan, self_eval) plus MCP and memU tool adapters.
   **Loop v1**: `check_signals → compress_context → before_llm → call_llm → handle_response → after_iteration`.
-  **Loop v2 (Pi-aligned, in progress)**: dual-layer outer/inner loop, `TurnBoundaryDelegate`, `SteeringQueue` + `FollowUpQueue`, `TurnSnapshot` isolation — see `docs/superpowers/specs/2026-05-26-agent-framework-pi-upgrade-design.md`.
+  **Loop v2 (Pi-aligned)**: dual-layer outer/inner loop, `TurnBoundaryDelegate`, `SteeringQueue` + `FollowUpQueue`, `TurnSnapshot` isolation. (Design spec removed in the `a11d57dc` cleanup; this convergence work has largely landed.)
   **Cost capture** lives at `agent/dispatcher.rs::emit_turn_cost`.
   **Pi convergence modules** (landing across Sprint 1-3):
   `agent/steering.rs` (dual queues), `agent/compaction.rs` (iterative + split-turn),
@@ -165,7 +168,7 @@ Two PRs reusing the same V-number is the most common merge accident in this repo
 | V40 | mcp_audit — env-redacted MCP audit log | merged (MCP completeness PR-5) |
 | V41 | browser_task_runs + browser_task_steps + browser_task_memory | merged (Browser agent v2) |
 | V42 | browser_task_checkpoints | merged (Browser agent v2) |
-| V43 | Memory OS Cognitive Layer Phase 8.1 — 5 new tables | shipped empty + 7-row template seed; **PAUSED — see [ADR 2026-05-20](docs/adr/2026-05-20-gbrain-primary-freeze-l2-cognitive.md) (gbrain is primary)** |
+| V43 | Memory OS Cognitive Layer Phase 8.1 — 5 new tables | shipped empty + 7-row template seed; **PAUSED — gbrain is primary (ADR removed in `a11d57dc`)** |
 | V44 | Memory OS L3 Engines RETAINED schema (per ADR 2026-05-20 §8) — 4 new tables | in progress |
 | V45 | Memory OS L3 §4.12.3 RETAINED — `spaced_repetition_state` | in progress |
 | V46 | Memory OS L3 §4.12.4 RETAINED — `drift_events` | in progress |

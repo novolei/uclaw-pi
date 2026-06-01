@@ -7,17 +7,22 @@
 > (any IDE), Codex CLI, Cursor, Continue.dev, GitHub Copilot, Aider, or direct
 > shell.
 >
-> When an IDE-specific entry file (`CLAUDE.md`, `AGENTS.md`, `.cursorrules`,
+> When an IDE-specific entry file (`CLAUDE.md`, `AGENTS.md`,
 > `.github/copilot-instructions.md`) conflicts with this file, **this file wins**
 > for any rule that says "always", "must", or "never". IDE entry files may add
 > IDE-specific notes on top of this spec but cannot weaken its rules.
 >
 > See [§ How each IDE wires up](#how-each-ide-wires-up) at the bottom for the
-> per-IDE entry-file pattern. The strategic baseline this spec serves is
-> [`docs/adr/2026-05-28-uclaw-pi-lightweight-product-philosophy.md`](docs/adr/2026-05-28-uclaw-pi-lightweight-product-philosophy.md)
-> (Pi-lightweight product philosophy), which supersedes the heavyweight positioning of
-> [`docs/adr/2026-05-20-uclaw-agent-platform-north-star.md`](docs/adr/2026-05-20-uclaw-agent-platform-north-star.md)
-> (retained for history; its §18 spec-design rules and §20 Pi convergence remain in force).
+> per-IDE entry-file pattern. The strategic baseline this spec serves is the
+> **Pi-lightweight product philosophy** (uClaw as a Pi-style lightweight,
+> pluggable, domain-blind agent kernel) — summarized inline in the *Product
+> philosophy* section of `CLAUDE.md`. It supersedes the earlier "Agent OS v2"
+> heavyweight positioning. The source ADRs
+> (`2026-05-28-uclaw-pi-lightweight-product-philosophy.md` and the superseded
+> `2026-05-20-uclaw-agent-platform-north-star.md`) were removed in the `a11d57dc`
+> repo cleanup; their still-active guidance survives inline in `CLAUDE.md` and
+> `CONTEXT.md`. The spec-design and Pi-convergence rules they carried remain in
+> force (see the relevant sections below).
 
 ---
 
@@ -260,7 +265,7 @@ regardless of which agent or IDE is acting:
 
 - **License**: Apache-2.0. Every new derived file from `openai/codex` needs
   `SPDX-License-Identifier: Apache-2.0` + `Derived from codex-rs/<path>`
-  header + an entry in `NOTICE`. See `docs/THIRD_PARTY.md`.
+  header + an entry in `NOTICE`. See `LICENSE` and `NOTICE` for the policy.
 - **`memory_graph` is FROZEN** (ADR §11.2). Never write to it. New durable
   facts go to `gbrain`. The pre-commit hook blocks new
   `memory_graph::{write,insert,update,delete}*` calls; the runtime panic
@@ -269,12 +274,12 @@ regardless of which agent or IDE is acting:
   (and the directory helpers `uclaw_skills_dir()`, `uclaw_sessions_dir()`,
   `uclaw_plugins_dir()`, etc.). The pre-commit hook blocks the pattern; any
   remaining legacy call site must stay on an explicit allowlist until swept.
-- **ADR §18 11 questions**: strategic/runtime/platform specs must answer the
+- **The 11 spec-design questions**: strategic/runtime/platform specs must answer the
   11 questions (intent, autonomy, truth source, TaskEvent, context,
-  capability, hooks, projection, harness, rollback, what it does not own). See
-  `docs/adr/2026-05-20-uclaw-agent-platform-north-star.md` §18. Ordinary bug
-  fixes, local refactors, tests, and small docs updates only need the subset
-  that affects their scope.
+  capability, hooks, projection, harness, rollback, what it does not own). This
+  spec-design policy originated in the north-star ADR (removed in `a11d57dc`);
+  the rule itself stands. Ordinary bug fixes, local refactors, tests, and small
+  docs updates only need the subset that affects their scope.
 - **Active migration registry** lives in `CONTEXT.md`. Reserve your V-number
   there before writing any schema migration.
 - **GitNexus discipline** — see the auto-managed `<!-- gitnexus:start -->`
@@ -308,14 +313,15 @@ behavior contract:
 
 ### Cursor
 
-- Reads `.cursorrules` automatically. `.cursorrules` restates the critical
-  short-form rules and instructs Cursor to consult `BEHAVIOR.md` before
-  non-trivial or policy-sensitive edits.
+- Cursor's dedicated entry file (`.cursorrules`) was removed in the `a11d57dc`
+  repo cleanup, so there is no longer a maintained Cursor-specific surface. If
+  Cursor is used, it falls back to `AGENTS.md` / `CLAUDE.md` like the other
+  generic-instruction tools below; consult `BEHAVIOR.md` for the full spec.
 
 ### GitHub Copilot (in VS Code / JetBrains)
 
 - Reads `.github/copilot-instructions.md` for repo-wide custom instructions.
-  Same pattern as `.cursorrules`: critical rules inline, full text via file
+  Same pattern as `AGENTS.md`: critical rules inline, full text via file
   reference.
 
 ### Continue.dev, Aider, Windsurf, OpenCode, others
@@ -328,7 +334,7 @@ behavior contract:
 ### Direct shell / human
 
 - A human contributor reads `CLAUDE.md` (top-level) + `BEHAVIOR.md` (this file)
-  + the ADR before opening a non-trivial or policy-sensitive PR. The
+  + `CONTEXT.md` before opening a non-trivial or policy-sensitive PR. The
   pre-commit hook backs up the discipline if the human forgets.
 
 ---
@@ -346,7 +352,7 @@ behavior contract:
 
 ## Pi Framework Convergence — Agent Work Rules
 
-When implementing any feature in `src-tauri/src/agent/`, check whether it overlaps with the Pi convergence roadmap (ADR §20, `docs/superpowers/specs/2026-05-26-agent-framework-pi-upgrade-design.md`). If it does:
+When implementing any feature in `src-tauri/src/agent/`, check whether it overlaps with the Pi convergence roadmap. (The detailed Pi-upgrade design spec was removed in the `a11d57dc` cleanup, and the convergence work has largely landed — the gap audit is resolved per `CLAUDE.md`; the patterns below remain the standing rules.) If it does:
 
 1. **Reference the Pi source pattern** in the commit body: which Pi file, which design, why the Rust translation differs.
 2. **Do not duplicate the SoftInterruptQueue**. New message-injection paths must use `SteeringQueue` (mid-run, turn-boundary safe) or `FollowUpQueue` (post-agent serial). The existing `SoftInterruptQueue` is deprecated and will be removed after dual-queue migration.
