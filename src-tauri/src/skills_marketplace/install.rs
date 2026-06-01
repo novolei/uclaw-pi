@@ -75,6 +75,66 @@ pub fn unlink_from_workspace(workspace: &Path, slug: &str) {
     let _ = std::fs::remove_file(workspace.join(".uclaw").join("skills").join(slug));
 }
 
+/// Add `tag` to the `activation.tags` list in `<skill_dir>/SKILL.md`'s YAML
+/// frontmatter, idempotently, preserving the markdown body. This is how a
+/// workspace-scoped install activates: the SAME tag must appear on the skill
+/// (here) AND in the space's `skill_tags` for `skill_matches_workspace`
+/// (set-intersection) to match. Only the frontmatter is reserialized; the body
+/// is rejoined verbatim.
+pub fn add_activation_tag(skill_dir: &Path, tag: &str) -> Result<(), MarketplaceError> {
+    let path = skill_dir.join("SKILL.md");
+    let raw = std::fs::read_to_string(&path)
+        .map_err(|e| MarketplaceError::Install(format!("read SKILL.md: {e}")))?;
+
+    // Split `---\n<frontmatter>\n---\n<body>`. No frontmatter ⇒ can't inject.
+    let rest = raw
+        .strip_prefix("---\n")
+        .ok_or_else(|| MarketplaceError::Install("SKILL.md has no frontmatter".into()))?;
+    let end = rest
+        .find("\n---")
+        .ok_or_else(|| MarketplaceError::Install("unterminated frontmatter".into()))?;
+    let front = &rest[..end];
+    let after = &rest[end + 4..]; // skip "\n---"
+    let body = after.strip_prefix('\n').unwrap_or(after);
+
+    let mut doc: serde_yml::Value = serde_yml::from_str(front)
+        .map_err(|e| MarketplaceError::Install(format!("parse frontmatter: {e}")))?;
+    let map = doc
+        .as_mapping_mut()
+        .ok_or_else(|| MarketplaceError::Install("frontmatter is not a mapping".into()))?;
+
+    let act_key = serde_yml::Value::String("activation".to_string());
+    if !map.contains_key(&act_key) {
+        map.insert(
+            act_key.clone(),
+            serde_yml::Value::Mapping(serde_yml::Mapping::new()),
+        );
+    }
+    let act_map = map
+        .get_mut(&act_key)
+        .and_then(|v| v.as_mapping_mut())
+        .ok_or_else(|| MarketplaceError::Install("activation is not a mapping".into()))?;
+
+    let tags_key = serde_yml::Value::String("tags".to_string());
+    if !act_map.contains_key(&tags_key) {
+        act_map.insert(tags_key.clone(), serde_yml::Value::Sequence(Vec::new()));
+    }
+    let seq = act_map
+        .get_mut(&tags_key)
+        .and_then(|v| v.as_sequence_mut())
+        .ok_or_else(|| MarketplaceError::Install("activation.tags is not a list".into()))?;
+    if !seq.iter().any(|v| v.as_str() == Some(tag)) {
+        seq.push(serde_yml::Value::String(tag.to_string()));
+    }
+
+    let new_front = serde_yml::to_string(&doc)
+        .map_err(|e| MarketplaceError::Install(format!("serialize frontmatter: {e}")))?;
+    let new_raw = format!("---\n{new_front}---\n{body}");
+    std::fs::write(&path, new_raw)
+        .map_err(|e| MarketplaceError::Install(format!("write SKILL.md: {e}")))?;
+    Ok(())
+}
+
 use rusqlite::OptionalExtension as _;
 
 /// Record an install in V25 (item_type="skill"; `version` stores the skills.sh hash).
@@ -172,6 +232,41 @@ mod tests {
         let link = ws.join(".uclaw").join("skills").join("s1");
         assert!(link.exists());
         assert_eq!(std::fs::read_link(&link).unwrap(), global);
+    }
+
+    #[test]
+    fn add_activation_tag_adds_to_frontmatter_and_preserves_body() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        std::fs::write(
+            dir.join("SKILL.md"),
+            "---\nname: demo\ndescription: a demo skill\n---\n# Demo\n\nbody line\n",
+        )
+        .unwrap();
+
+        add_activation_tag(dir, "ws-alpha").unwrap();
+        let out = std::fs::read_to_string(dir.join("SKILL.md")).unwrap();
+        assert!(out.contains("ws-alpha"), "tag written: {out}");
+        assert!(
+            out.contains("# Demo") && out.contains("body line"),
+            "body preserved: {out}"
+        );
+
+        // Idempotent: a second call must not duplicate the tag.
+        add_activation_tag(dir, "ws-alpha").unwrap();
+        let out2 = std::fs::read_to_string(dir.join("SKILL.md")).unwrap();
+        assert_eq!(out2.matches("ws-alpha").count(), 1, "no duplicate tag: {out2}");
+
+        // Frontmatter is still valid YAML and the tag lives under activation.tags.
+        let front = out2.strip_prefix("---\n").unwrap();
+        let front = &front[..front.find("\n---").unwrap()];
+        let doc: serde_yml::Value = serde_yml::from_str(front).unwrap();
+        let tags = doc
+            .get("activation")
+            .and_then(|a| a.get("tags"))
+            .and_then(|t| t.as_sequence())
+            .expect("activation.tags is a sequence");
+        assert!(tags.iter().any(|v| v.as_str() == Some("ws-alpha")));
     }
 
     fn mem_conn() -> rusqlite::Connection {
