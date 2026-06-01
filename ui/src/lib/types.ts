@@ -900,6 +900,43 @@ export interface SkillInfo {
   provenance?: 'bundled' | 'user' | 'project' | 'marketplace';
 }
 
+// ── skills.sh marketplace types (mirror the Rust `skills_marketplace` serde
+// shapes; camelCase fields match the `#[serde(rename)]`s on the Rust side). ──
+/** skills.sh search/list row (mirrors Rust `SkillSummary`). */
+export interface MarketplaceSkillSummary {
+  id: string;
+  slug: string;
+  name: string;
+  source: string;
+  installs: number;
+  sourceType: string;
+  installUrl: string;
+  url: string;
+}
+/** One inline file from the detail endpoint (mirrors Rust `SkillFile`). */
+export interface MarketplaceSkillFile {
+  path: string;
+  contents: string;
+}
+/** skills.sh detail with inline files (mirrors Rust `SkillDetail`). */
+export interface MarketplaceSkillDetail {
+  id: string;
+  source: string;
+  slug: string;
+  hash: string;
+  files: MarketplaceSkillFile[];
+}
+/** One audit verdict (mirrors Rust `SkillAuditEntry`). */
+export interface MarketplaceSkillAuditEntry {
+  status: string;
+  riskLevel: string; // "LOW" | "MEDIUM" | "HIGH"
+  summary: string;
+}
+/** Audit response (mirrors Rust `SkillAudit`). */
+export interface MarketplaceSkillAudit {
+  audits: MarketplaceSkillAuditEntry[];
+}
+
 /** A row in the active-manifest debug panel — surfaces exactly what
  *  the agent loop's system prompt sees, in the order it sees it.
  *  "learned" provenance is for graph-stored skills (kind=Procedure);
