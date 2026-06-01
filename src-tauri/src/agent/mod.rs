@@ -53,6 +53,7 @@ pub mod heartbeat;
 pub mod recovery;
 pub mod history_window;
 pub mod llm_stream;
+pub mod memory_context;
 pub mod mode_prompts;
 pub mod mode_suggest;
 pub mod mode_suggest_store;
