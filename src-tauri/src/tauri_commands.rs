@@ -1615,11 +1615,42 @@ pub async fn send_message(
                 let mgr = state.mcp_manager.read().await;
                 crate::agent::gbrain_prompt::GbrainKnowledgeSection::render(&mgr)
             };
-            match (gbrain_block, recall_ctx) {
-                (Some(g), Some(r)) => Some(format!("{g}\n\n{r}")),
-                (Some(g), None) => Some(g),
-                (None, r) => r,
-            }
+            let facets_block =
+                crate::learning::prompt_section::UserProfileSection::render(&state.facet_cache);
+            let genes_block = {
+                let (active, repo) = {
+                    let g = state.proactive_service.read().await;
+                    match g.as_ref() {
+                        Some(svc) => {
+                            let repo = svc.gene_repository();
+                            let active = repo
+                                .lock()
+                                .ok()
+                                .and_then(|r| r.list_active_genes().ok())
+                                .unwrap_or_default();
+                            (active, Some(repo.clone()))
+                        }
+                        None => (Vec::new(), None),
+                    }
+                };
+                match build_gene_retriever(active, repo.as_ref()) {
+                    Some(retr) => {
+                        let matches = retr.match_genes(&input.content, &[], 5).await;
+                        let blk = crate::agent::gep::retrieval::format_gene_injection(&matches, 5);
+                        (!blk.trim().is_empty()).then_some(blk)
+                    }
+                    None => None,
+                }
+            };
+            crate::agent::memory_context::build_pi_prompt_context_blocks(
+                vec![
+                    ("facets", facets_block),
+                    ("genes", genes_block),
+                    ("recall", recall_ctx),
+                    ("gbrain", gbrain_block),
+                ],
+                12_000,
+            )
         };
         engine.send(uclaw_pi_engine::EngineCmd::Prompt {
             conv_id: conv_id.clone(),
@@ -5108,11 +5139,42 @@ pub async fn send_agent_message(
                 let mgr = state.mcp_manager.read().await;
                 crate::agent::gbrain_prompt::GbrainKnowledgeSection::render(&mgr)
             };
-            match (gbrain_block, recall_ctx) {
-                (Some(g), Some(r)) => Some(format!("{g}\n\n{r}")),
-                (Some(g), None) => Some(g),
-                (None, r) => r,
-            }
+            let facets_block =
+                crate::learning::prompt_section::UserProfileSection::render(&state.facet_cache);
+            let genes_block = {
+                let (active, repo) = {
+                    let g = state.proactive_service.read().await;
+                    match g.as_ref() {
+                        Some(svc) => {
+                            let repo = svc.gene_repository();
+                            let active = repo
+                                .lock()
+                                .ok()
+                                .and_then(|r| r.list_active_genes().ok())
+                                .unwrap_or_default();
+                            (active, Some(repo.clone()))
+                        }
+                        None => (Vec::new(), None),
+                    }
+                };
+                match build_gene_retriever(active, repo.as_ref()) {
+                    Some(retr) => {
+                        let matches = retr.match_genes(&input.user_message, &[], 5).await;
+                        let blk = crate::agent::gep::retrieval::format_gene_injection(&matches, 5);
+                        (!blk.trim().is_empty()).then_some(blk)
+                    }
+                    None => None,
+                }
+            };
+            crate::agent::memory_context::build_pi_prompt_context_blocks(
+                vec![
+                    ("facets", facets_block),
+                    ("genes", genes_block),
+                    ("recall", recall_ctx),
+                    ("gbrain", gbrain_block),
+                ],
+                12_000,
+            )
         };
         engine.send(uclaw_pi_engine::EngineCmd::Prompt {
             conv_id,
