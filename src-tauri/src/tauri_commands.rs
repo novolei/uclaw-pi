@@ -1604,11 +1604,25 @@ pub async fn send_message(
             }
             loaded.context
         };
+        // Prepend the gbrain-knowledge instruction (now that gbrain's MCP tools
+        // are bridged into pi) so the agent proactively uses gbrain for memory
+        // questions. None when gbrain isn't connected.
+        let prompt_context = {
+            let gbrain_block = {
+                let mgr = state.mcp_manager.read().await;
+                crate::agent::gbrain_prompt::GbrainKnowledgeSection::render(&mgr)
+            };
+            match (gbrain_block, recall_ctx) {
+                (Some(g), Some(r)) => Some(format!("{g}\n\n{r}")),
+                (Some(g), None) => Some(g),
+                (None, r) => r,
+            }
+        };
         engine.send(uclaw_pi_engine::EngineCmd::Prompt {
             conv_id: conv_id.clone(),
             input: input.content.clone(),
             cwd: run_cwd,
-            context: recall_ctx,
+            context: prompt_context,
         });
         return Ok(SendMessageResponse {
             message_id: user_msg_id,
@@ -5082,11 +5096,26 @@ pub async fn send_agent_message(
             }
         };
 
+        // Prepend the gbrain-knowledge instruction (now that gbrain's MCP tools
+        // are bridged into pi) so the agent proactively queries gbrain for memory
+        // questions — without it, a keyword-recall miss leaves the agent unable to
+        // find e.g. the user-profile page. None when gbrain isn't connected.
+        let prompt_context = {
+            let gbrain_block = {
+                let mgr = state.mcp_manager.read().await;
+                crate::agent::gbrain_prompt::GbrainKnowledgeSection::render(&mgr)
+            };
+            match (gbrain_block, recall_ctx) {
+                (Some(g), Some(r)) => Some(format!("{g}\n\n{r}")),
+                (Some(g), None) => Some(g),
+                (None, r) => r,
+            }
+        };
         engine.send(uclaw_pi_engine::EngineCmd::Prompt {
             conv_id,
             input: input.user_message.clone(),
             cwd: run_cwd,
-            context: recall_ctx,
+            context: prompt_context,
         });
         return Ok(());
     }
