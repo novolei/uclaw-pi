@@ -11,7 +11,6 @@ use serde::{Deserialize, Serialize};
 use crate::memory_graph::models::MemoryNode;
 use crate::memory_graph::recall::{MemoryRecallCandidate, MemoryRecallEngine, MemoryTimelineEntry, TimeRange};
 use crate::memory_graph::store::MemoryGraphStore;
-use crate::memu::client::MemUClient;
 
 /// 从 MemoryRecallCandidate 构建 MemoryNode
 fn candidate_to_node(c: &MemoryRecallCandidate) -> MemoryNode {
@@ -248,15 +247,11 @@ pub struct HybridSearchResult {
 /// 编排五个检索通道，通过加权融合或 RRF 合并各路结果。
 pub struct HybridSearchEngine {
     store: Arc<MemoryGraphStore>,
-    memu_client: Option<Arc<MemUClient>>,
 }
 
 impl HybridSearchEngine {
-    pub fn new(
-        store: Arc<MemoryGraphStore>,
-        memu_client: Option<Arc<MemUClient>>,
-    ) -> Self {
-        Self { store, memu_client }
+    pub fn new(store: Arc<MemoryGraphStore>) -> Self {
+        Self { store }
     }
 
     /// 执行五路混合检索
@@ -280,7 +275,6 @@ impl HybridSearchEngine {
 
         let recall_engine = MemoryRecallEngine::new(
             self.store.clone(),
-            self.memu_client.clone(),
             recall_config,
         );
 
@@ -639,7 +633,7 @@ mod tests {
         let store = make_test_store();
         insert_test_nodes(&store, "default");
 
-        let engine = HybridSearchEngine::new(store, None);
+        let engine = HybridSearchEngine::new(store);
 
         let request = HybridSearchRequest {
             query: "async programming".to_string(),
