@@ -1032,16 +1032,10 @@ impl AppState {
             bucket_seal_adapter.clone() as std::sync::Arc<dyn crate::memory_adapter::MemoryAdapter>,
         );
 
-        // 阶段 4: MemUAdapter exposes memU's semantic recall through the registry,
-        // registered only when memU initialised. Point
-        // MemoryRecallConfig.prompt_recall_backend = "memu" to use it as the
-        // agent prompt's semantic-recall source (via the piece-2 supplement).
-        if let Some(ref memu) = memu_client {
-            let memu_adapter =
-                std::sync::Arc::new(crate::memory_adapter::MemUAdapter::new(memu.clone()))
-                    as std::sync::Arc<dyn crate::memory_adapter::MemoryAdapter>;
-            memory_adapters_map.insert(memu_adapter.name().to_string(), memu_adapter);
-        }
+        // PR P2-①: memU is now embedder-only — its MemUEmbedder (above) feeds
+        // bucket_seal's vector recall, which is the default backend. The former
+        // MemUAdapter recall-backend registration was retired here; memU no
+        // longer participates in the unified recall registry.
 
         // 阶段 4: GbrainAdapter exposes gbrain's durable-knowledge search through
         // the registry. Registered unconditionally — it holds the always-present
