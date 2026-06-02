@@ -63,7 +63,10 @@ impl SkillsmpClient {
     ) -> Result<Vec<SkillSummary>, MarketplaceError> {
         let q = urlencoding::encode(query);
         let limit = limit.clamp(1, 100);
-        let url = format!("{}/api/v1/skills/search?q={q}&limit={limit}", self.base);
+        // `sortBy=stars` asks skillsmp to rank by popularity (the API's supported
+        // sort; see the skillsmp marketplace design spec). The backend tool also
+        // sorts defensively, so order is correct even if the API ignores this.
+        let url = format!("{}/api/v1/skills/search?q={q}&limit={limit}&sortBy=stars", self.base);
         let mut req = self.http.get(&url);
         if with_key {
             if let Some(key) = self.api_key.as_deref().filter(|k| !k.is_empty()) {
@@ -139,7 +142,7 @@ mod tests {
     async fn search_normalizes_skillsmp_rows() {
         let mut server = mockito::Server::new_async().await;
         let m = server
-            .mock("GET", "/api/v1/skills/search?q=pdf&limit=5")
+            .mock("GET", "/api/v1/skills/search?q=pdf&limit=5&sortBy=stars")
             .with_status(200)
             .with_body(
                 r#"{"success":true,"data":{"skills":[{"id":"a-pdf-skill-md","name":"pdf","author":"TuYv","description":"PDF stuff","githubUrl":"https://github.com/TuYv/ccpm/tree/main/x","skillUrl":"https://skillsmp.com/skills/a","stars":7}]}}"#,
@@ -164,7 +167,7 @@ mod tests {
         let mut server = mockito::Server::new_async().await;
         // First request WITH the bad key → 401 (skillsmp rejects it).
         let m401 = server
-            .mock("GET", "/api/v1/skills/search?q=pdf&limit=5")
+            .mock("GET", "/api/v1/skills/search?q=pdf&limit=5&sortBy=stars")
             .match_header("authorization", "Bearer sk_bad")
             .with_status(401)
             .with_body(r#"{"success":false,"error":{"code":"INVALID_API_KEY"}}"#)
@@ -172,7 +175,7 @@ mod tests {
             .await;
         // Retry WITHOUT auth (anonymous) → 200.
         let m200 = server
-            .mock("GET", "/api/v1/skills/search?q=pdf&limit=5")
+            .mock("GET", "/api/v1/skills/search?q=pdf&limit=5&sortBy=stars")
             .match_header("authorization", mockito::Matcher::Missing)
             .with_status(200)
             .with_body(
@@ -192,7 +195,7 @@ mod tests {
     async fn search_anonymous_sends_no_auth_header() {
         let mut server = mockito::Server::new_async().await;
         let m = server
-            .mock("GET", "/api/v1/skills/search?q=x&limit=1")
+            .mock("GET", "/api/v1/skills/search?q=x&limit=1&sortBy=stars")
             .match_header("authorization", mockito::Matcher::Missing)
             .with_status(200)
             .with_body(r#"{"data":{"skills":[]}}"#)

@@ -163,7 +163,7 @@ async fn query_provider(
     skills_sh_key: &Option<String>,
     skillsmp_key: &Option<String>,
 ) -> Result<Vec<serde_json::Value>, ToolError> {
-    let results = match provider {
+    let mut results = match provider {
         "skills_sh" => SkillsShClient::new(skills_sh_key.clone()).search(query, limit).await,
         _ => SkillsmpClient::new(skillsmp_key.clone()).search(query, limit).await,
     }
@@ -174,7 +174,19 @@ async fn query_provider(
         ),
         other => ToolError::kinded(ToolErrorKind::NetworkError, format!("marketplace search failed: {other}")),
     })?;
+    // Rank by popularity so the most-installed/most-starred skills surface first
+    // (skills.sh search has no sort param; skillsmp's `sortBy=stars` is only a
+    // hint). Defensive + provider-agnostic — the LLM and the install card both
+    // consume this order.
+    sort_by_popularity(&mut results);
     Ok(to_result_json(&results))
+}
+
+/// Order candidates by popularity (`installs`; for skillsmp this is GitHub
+/// stars) descending. Stable, so the API's relevance order is preserved among
+/// equal-popularity ties.
+fn sort_by_popularity(results: &mut [SkillSummary]) {
+    results.sort_by(|a, b| b.installs.cmp(&a.installs));
 }
 
 /// Map `SkillSummary`s to the JSON rows surfaced to the LLM / install card.
@@ -599,6 +611,23 @@ mod tests {
         let tool = SkillMarketplaceSearchTool::new(None, None);
         let err = tool.execute(json!({})).await.unwrap_err();
         assert!(format!("{err}").contains("query"));
+    }
+
+    #[test]
+    fn sort_by_popularity_orders_desc_and_is_stable() {
+        use crate::skills_marketplace::SkillSummary;
+        let mk = |name: &str, installs: u64| SkillSummary {
+            id: name.into(), slug: name.into(), name: name.into(), source: "o/r".into(),
+            installs, source_type: "github".into(), install_url: String::new(),
+            url: String::new(), description: String::new(),
+        };
+        // `b` and `c` tie at 100 → stable sort keeps b before c (input order).
+        let mut v = vec![mk("a", 0), mk("b", 100), mk("c", 100), mk("d", 5)];
+        super::sort_by_popularity(&mut v);
+        assert_eq!(
+            v.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            vec!["b", "c", "d", "a"],
+        );
     }
 
     #[test]
