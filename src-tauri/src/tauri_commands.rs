@@ -1522,6 +1522,8 @@ pub async fn send_message(
             conv_id: conv_id.clone(),
             input: input.content.clone(),
             cwd: run_cwd,
+            // Filled in by the chat memory-recall integration below (commit 2).
+            context: None,
         });
         return Ok(SendMessageResponse {
             message_id: user_msg_id,
@@ -4867,6 +4869,8 @@ pub async fn send_agent_message(
             conv_id,
             input: input.user_message.clone(),
             cwd: run_cwd,
+            // Filled in by the agent memory-recall integration below (commit 3).
+            context: None,
         });
         return Ok(());
     }

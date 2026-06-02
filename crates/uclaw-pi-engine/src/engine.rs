@@ -81,6 +81,14 @@ pub enum EngineCmd {
         conv_id: String,
         input: String,
         cwd: Option<PathBuf>,
+        /// Per-turn memory/recall block (uClaw `load_context`), prepended to
+        /// `input` before pi's agent loop sees it. `None` = no injection.
+        /// pi's session system prompt is fixed at creation, so per-turn
+        /// (query-dependent) recall can't ride it — it rides the user message
+        /// instead. Invisible to the UI: uClaw SQLite is the display
+        /// source-of-truth (the persisted user turn stays clean); only the
+        /// model's input carries the prefix.
+        context: Option<String>,
     },
     /// Continue `conv_id`'s loop without a new user message (steer/retry flows).
     FollowUp { conv_id: String },
@@ -113,8 +121,24 @@ pub enum EngineCmd {
 
 /// How a streaming run is driven (shared spawn path for `Prompt`/`FollowUp`).
 enum RunKind {
-    Prompt(String),
+    /// A new user prompt. `context`, when set, is the per-turn memory block
+    /// prepended to `input` just before pi's loop runs (see
+    /// [`compose_prompt_input`]).
+    Prompt { input: String, context: Option<String> },
     FollowUp,
+}
+
+/// Prepend the per-turn memory/recall `context` (uClaw `load_context`) to the
+/// user's `input`, so pi's agent loop sees the recalled block at the head of the
+/// turn. pi's session system prompt is built once at session creation, so
+/// per-turn (query-dependent) recall can't ride it — it rides the user message
+/// instead. Empty/blank/absent context returns `input` unchanged (no stray
+/// blank lines).
+fn compose_prompt_input(context: Option<String>, input: String) -> String {
+    match context {
+        Some(ctx) if !ctx.trim().is_empty() => format!("{ctx}\n\n{input}"),
+        _ => input,
+    }
 }
 
 /// Base session configuration. Per F2 (reversed), pi owns persistence, so
@@ -250,8 +274,8 @@ async fn actor_loop(
             EngineCmd::Configure { provider, model, api_key, base_url, api } => {
                 model_config = ModelConfig { provider, model, api_key, base_url, api };
             }
-            EngineCmd::Prompt { conv_id, input, cwd } => {
-                start_run(&mut sessions, &rt, &sink, &cx, &config, &model_config, &approval_handler, &tool_factory, cwd, conv_id, RunKind::Prompt(input)).await;
+            EngineCmd::Prompt { conv_id, input, cwd, context } => {
+                start_run(&mut sessions, &rt, &sink, &cx, &config, &model_config, &approval_handler, &tool_factory, cwd, conv_id, RunKind::Prompt { input, context }).await;
             }
             EngineCmd::FollowUp { conv_id } => {
                 start_run(&mut sessions, &rt, &sink, &cx, &config, &model_config, &approval_handler, &tool_factory, None, conv_id, RunKind::FollowUp).await;
@@ -451,8 +475,9 @@ async fn start_run(
         match handle.lock(&cx_task).await {
             Ok(mut guard) => {
                 let res = match kind {
-                    RunKind::Prompt(input) => {
-                        guard.prompt_with_abort(input, abort_sig, on_event).await
+                    RunKind::Prompt { input, context } => {
+                        let prompt = compose_prompt_input(context, input);
+                        guard.prompt_with_abort(prompt, abort_sig, on_event).await
                     }
                     RunKind::FollowUp => guard.continue_turn_with_abort(abort_sig, on_event).await,
                 };
@@ -516,6 +541,22 @@ mod tests {
         let dbg = format!("{cmd:?}");
         assert!(!dbg.contains("sk-leak-me"), "api key leaked: {dbg}");
         assert!(dbg.contains("<redacted>") && dbg.contains("anthropic"));
+    }
+
+    #[test]
+    fn compose_prompt_prepends_nonempty_context() {
+        let ctx = "<recalled_memories>\n- [core] k: v\n</recalled_memories>";
+        let out = compose_prompt_input(Some(ctx.into()), "what did I say?".into());
+        assert_eq!(out, format!("{ctx}\n\nwhat did I say?"));
+    }
+
+    #[test]
+    fn compose_prompt_passthrough_when_context_absent_or_blank() {
+        // None and blank/whitespace context both return the input verbatim —
+        // no leading block, no stray blank lines.
+        assert_eq!(compose_prompt_input(None, "hi".into()), "hi");
+        assert_eq!(compose_prompt_input(Some(String::new()), "hi".into()), "hi");
+        assert_eq!(compose_prompt_input(Some("   \n\t ".into()), "hi".into()), "hi");
     }
 
     /// Test EventSink that records every (name, payload) emitted.
