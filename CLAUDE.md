@@ -14,8 +14,9 @@ Kernel stays pure (stateless loop + one `AgentApi` handle + Pi `AgentHarness` la
 domains/heavy features (Teams, World Projection, Evolution Factory) live **above** the
 kernel as optional layers, never as loop branches. Plugins: one handle; third-party code
 plugins via subprocess/RPC (MCP generalized); domains as capability presets. Memory:
-modernize via openhuman ideas behind one `MemoryAdapter` (detailed gbrain↔openhuman
-architecture deferred to a dedicated effort). Borrow Pi (kernel/plugins), openhuman
+modernized via openhuman ideas behind one `MemoryAdapter` (**landed 2026-06-01** — five
+backends incl. the openhuman bucket-seal port; see *Agent framework direction* below).
+Borrow Pi (kernel/plugins), openhuman
 (memory), hermes (coding edits) — no language migration.
 
 **Agent framework direction**: The 2026-05-27 pi-convergence gap audit's 5-phase
@@ -23,12 +24,17 @@ remediation is **fully landed** — one `AgentApi` handle (`agent/api/mod.rs`), 
 chokepoint (`agent/tool_dispatch`), `CancellationToken` threaded to the flight points
 (`agent/llm_stream.rs`, `agent/tool_dispatch`), and the dead skeleton + eval `harness/`
 deleted (R5, `lib.rs`). **Treat that audit as resolved history, not a TODO.** The Pi
-patterns (dual queues, iterative compaction + split-turn, FileOps) are also in. The next
-strategic debt is the **memory layer** (8+ loosely-coordinated stores — kv / memory_graph /
-gbrain / memu / memorization / learning → one `MemoryAdapter` / openhuman bucket-seal), a
-deferred dedicated effort. (The 2026-05-2x gap-audit / agent-design specs + the strategy
-ADRs were removed in the `a11d57dc` repo cleanup; use `@CONTEXT.md` + `@BEHAVIOR.md` for
-surviving design context.)
+patterns (dual queues, iterative compaction + split-turn, FileOps) are also in. The
+**memory-layer convergence is now landed too** (2026-06-01, PRs #33–#40): the 8+
+loosely-coordinated stores are unified behind one `MemoryAdapter` trait (`memory_adapter/`)
++ a `load_context` seam (`agent/memory_context.rs`), with five registered backends —
+`legacy_kv`, `legacy_steward` (memory_graph), `bucket_seal` (the openhuman bucket-seal port
+at `memory_bucket_seal/`; FTS5 + vector recall over memU-FastEmbed embeddings; **now the
+default**), `memu` (semantic), `gbrain` (durable knowledge). The kernel holds one handle;
+the agent prompt routes via `MemoryRecallConfig.prompt_recall_backend`. **Treat the memory
+layer as resolved history, not a TODO** (design specs in `docs/superpowers/specs/2026-06-01-*`).
+(The 2026-05-2x gap-audit / agent-design specs + the strategy ADRs were removed in the
+`a11d57dc` repo cleanup; use `@CONTEXT.md` + `@BEHAVIOR.md` for surviving design context.)
 
 Other agents (Codex, Copilot, …) get equivalent entry files
 (`AGENTS.md`, `.github/copilot-instructions.md`) that point
