@@ -1518,12 +1518,71 @@ pub async fn send_message(
                 api,
             });
         }
+        // ── Memory Recall Integration (pi engine, chat) ──────────────────
+        // The legacy chat recall block (below the early-return) never runs on
+        // this branch, so without this the pi path bypasses load_context and the
+        // agent gets no memory recall. Mirror that block here and hand the
+        // composed context to pi as the prompt's per-turn `context`. Synchronous
+        // like the legacy chat path (no background deadline — chat accepts the
+        // latency; the agent path below uses a deadline instead).
+        let recall_ctx: Option<String> = {
+            let recall_config = {
+                let s = state.settings.read().await;
+                s.memory_recall_config
+                    .clone()
+                    .map(crate::memory_graph::recall::MemoryRecallConfig::from)
+                    .unwrap_or_default()
+            };
+            let recall_engine = crate::memory_graph::recall::MemoryRecallEngine::new(
+                state.memory_graph_store.clone(),
+                state.memu_client.clone(),
+                recall_config,
+            );
+            let space_id = {
+                let session_mgr = state.session_manager.read().await;
+                session_mgr
+                    .get_space_id(&input.conversation_id)
+                    .unwrap_or_else(|| "default".to_string())
+            };
+            let prompt_backend = recall_engine.config().prompt_recall_backend.clone();
+            let prompt_limit = recall_engine.config().prompt_recall_limit;
+            let default_backend_str = state
+                .default_memory_backend
+                .read()
+                .ok()
+                .map(|g| g.clone())
+                .unwrap_or_else(|| "legacy_kv".to_string());
+            let adapter_recall = prompt_backend
+                .as_deref()
+                .filter(|b| !b.is_empty())
+                .map(|backend| crate::agent::memory_context::AdapterRecall {
+                    adapters: &state.memory_adapters,
+                    default_backend: &default_backend_str,
+                    backend,
+                    limit: prompt_limit,
+                });
+            let loaded = crate::agent::memory_context::load_context(
+                crate::agent::memory_context::MemoryContextInputs {
+                    recall_engine: &recall_engine,
+                    memory_store: &state.memory_store,
+                    space_id: &space_id,
+                    conversation_id: &input.conversation_id,
+                    query: &input.content,
+                    browser_ctx: build_browser_task_memory_context(&state, &input.content),
+                    adapter_recall,
+                },
+            )
+            .await;
+            if let Some(ev) = loaded.recall_event {
+                let _ = app_handle.emit("agent:memory-recall", ev);
+            }
+            loaded.context
+        };
         engine.send(uclaw_pi_engine::EngineCmd::Prompt {
             conv_id: conv_id.clone(),
             input: input.content.clone(),
             cwd: run_cwd,
-            // Filled in by the chat memory-recall integration below (commit 2).
-            context: None,
+            context: recall_ctx,
         });
         return Ok(SendMessageResponse {
             message_id: user_msg_id,
