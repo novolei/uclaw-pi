@@ -31,6 +31,12 @@ const REFLECTION_EVENT_WINDOW: usize = 50;
 const REFLECTION_MAX_TOKENS: u32 = 512;
 /// Cost tag prefix written into `cost_records.model` for reflection LLM calls.
 const REFLECTION_COST_TAG: &str = "memory_reflection";
+/// Max tokens for the promotion completion (one short persona summary).
+const PROMOTION_MAX_TOKENS: u32 = 400;
+/// Cost tag prefix written into `cost_records.model` for promotion LLM calls.
+const PROMOTION_COST_TAG: &str = "memory_promotion";
+/// Fixed singleton id for the `user_model` row (one row per install).
+const USER_MODEL_ID: &str = "default";
 
 /// Parse the LLM's reflection completion into `(insight, confidence)`.
 ///
@@ -132,6 +138,52 @@ pub fn recent_reflections(conn: &Connection, limit: usize) -> rusqlite::Result<V
     Ok(rows)
 }
 
+// ─── user_model store (P3-②: Pattern→Model layer) ──────────────────────────
+
+/// Apply the V57 `user_model` DDL to a bare connection. Mirrors the migration
+/// block exactly; used by unit tests against `:memory:` so they don't drag in
+/// the whole migration stack. (The real table is created by the V57 migration.)
+pub fn apply_user_model_schema(conn: &Connection) {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS user_model (
+            id          TEXT PRIMARY KEY,
+            summary     TEXT NOT NULL,
+            updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
+        );",
+    )
+    .expect("apply_user_model_schema");
+}
+
+/// Upsert the singleton `user_model` row (fixed id [`USER_MODEL_ID`]). Each
+/// promotion pass overwrites the previous summary so there is always exactly one
+/// row. Best-effort callers map the `Result` to a log line.
+pub fn upsert_user_model(conn: &Connection, summary: &str) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO user_model (id, summary, updated_at)
+         VALUES (?1, ?2, datetime('now'))
+         ON CONFLICT(id) DO UPDATE SET
+             summary = excluded.summary,
+             updated_at = excluded.updated_at",
+        params![USER_MODEL_ID, summary],
+    )?;
+    Ok(())
+}
+
+/// Read the singleton `user_model` summary, if one has been distilled. Returns
+/// `Ok(None)` when the table is empty (no promotion has run yet).
+pub fn get_user_model(conn: &Connection) -> rusqlite::Result<Option<String>> {
+    conn.query_row(
+        "SELECT summary FROM user_model WHERE id = ?1",
+        params![USER_MODEL_ID],
+        |r| r.get::<_, String>(0),
+    )
+    .map(Some)
+    .or_else(|e| match e {
+        rusqlite::Error::QueryReturnedNoRows => Ok(None),
+        other => Err(other),
+    })
+}
+
 /// System prompt for the reflection pass. Pins the JSON output contract so
 /// `parse_reflection_output` has a stable shape to parse.
 const REFLECTION_SYSTEM_PROMPT: &str = "\
@@ -141,6 +193,19 @@ goals, working style, or the project — something worth remembering across futu
 sessions. Ignore one-off chit-chat. Respond with ONLY a JSON object, no prose, \
 no markdown fences:\n\
 {\"insight\": \"<one concise sentence>\", \"confidence\": <float 0.0-1.0>}";
+
+/// System prompt for the promotion pass. Distills the user's learned facets +
+/// profile facts into one compact persona/preferences summary (the Pattern→Model
+/// layer). Plain prose out — this is stored verbatim as the `user_model` and
+/// injected into the pi prompt, so no JSON contract here.
+const PROMOTION_SYSTEM_PROMPT: &str = "\
+You are a user-modeling agent. You are given a list of learned facts, rules, and \
+preferences about a single user (their identity, tooling, working style, vetoes, \
+and goals). Synthesize them into ONE compact, durable user model: a few sentences \
+capturing who this user is and how they prefer to work, so a future assistant can \
+serve them well without re-learning. Write plain prose (no JSON, no markdown \
+fences, no preamble). Prefer concrete, high-signal traits over hedging. Keep it \
+under ~120 words.";
 
 /// Read up to [`REFLECTION_EVENT_WINDOW`] recent `agent_messages` (role+content,
 /// newest first), then re-order oldest→newest into a transcript string for the
@@ -174,6 +239,49 @@ fn build_recent_transcript(conn: &Connection) -> Option<String> {
         transcript.push('\n');
     }
     Some(transcript)
+}
+
+/// Read the user's learned facets (`user_profile_facets.class/name/value`) +
+/// learned profile facts (`memory_nodes WHERE kind='user_profile'`.title) into a
+/// single newline-delimited digest for the promotion LLM. Returns `None` when
+/// BOTH sources are empty (nothing to model yet). Each line is bounded so a huge
+/// stored value can't blow the prompt.
+fn build_profile_digest(conn: &Connection) -> Option<String> {
+    let mut lines: Vec<String> = Vec::new();
+
+    if let Ok(mut stmt) =
+        conn.prepare("SELECT class, name, value FROM user_profile_facets ORDER BY class, name")
+    {
+        if let Ok(rows) = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        }) {
+            for (class, name, value) in rows.flatten() {
+                let value: String = value.chars().take(400).collect();
+                lines.push(format!("- [{class}] {name}: {value}"));
+            }
+        }
+    }
+
+    if let Ok(mut stmt) = conn.prepare(
+        "SELECT title FROM memory_nodes WHERE kind = 'user_profile' ORDER BY created_at DESC",
+    ) {
+        if let Ok(rows) = stmt.query_map([], |r| r.get::<_, String>(0)) {
+            for title in rows.flatten() {
+                let title: String = title.chars().take(400).collect();
+                lines.push(format!("- {title}"));
+            }
+        }
+    }
+
+    if lines.is_empty() {
+        None
+    } else {
+        Some(lines.join("\n"))
+    }
 }
 
 /// Run one reflection pass: read recent turns → ask the LLM for a JSON insight →
@@ -272,8 +380,99 @@ pub async fn run_once(app: tauri::AppHandle) {
         "reflection: distilled and stored a new reflection"
     );
 
-    // P3-②: run_promotion(state).await — distill facts → user_model here, after
-    // the reflection pass, so both distillations share one `run_once` trigger.
+    // P3-②: distill facts + profile nodes → user_model here, after the
+    // reflection pass, so both distillations share one `run_once` trigger. The
+    // run_once budget/LLM gates above already passed; `run_promotion` is itself
+    // best-effort and re-reads the budget defensively.
+    run_promotion(&state).await;
+}
+
+/// Run one promotion pass: read the user's learned facets + profile facts → ask
+/// the LLM for a compact persona/preferences summary → upsert the singleton
+/// `user_model` row. Best-effort end to end; every failure path logs and
+/// returns. Called at the tail of [`run_once`] (the Pattern→Model layer of
+/// mem.md's Event→Fact→Pattern→Model chain).
+pub async fn run_promotion(state: &crate::app::AppState) {
+    // LLM presence gate — no configured learning LLM ⇒ nothing to do.
+    let Some(llm) = state.learning_llm.clone() else {
+        tracing::debug!("promotion: no learning_llm configured; skipping");
+        return;
+    };
+
+    // Daily-budget gate — same shared "daily learning budget burned" signal as
+    // the reflection pass (the extractor's budget knob + `today_learning_tokens`
+    // rollup). Defensive re-check: `run_once` already gated, but `run_promotion`
+    // is `pub` and best-effort, so it owns its own gate.
+    let daily_budget = {
+        let cfg = state.memubot_config.read().await;
+        cfg.memory_os.learning_llm_daily_token_budget
+    };
+    if daily_budget == 0 {
+        tracing::debug!("promotion: learning LLM daily budget is 0; skipping");
+        return;
+    }
+    let spent = crate::cost_store::today_learning_tokens(&state.db);
+    if spent >= daily_budget {
+        tracing::debug!(
+            spent,
+            daily_budget,
+            "promotion: daily learning budget exhausted; skipping"
+        );
+        return;
+    }
+
+    // Read the profile digest. Hold the std::sync::Mutex only for the read, then
+    // drop it before the `.await` (the guard is not `Send`).
+    let digest = {
+        let Ok(conn) = state.db.lock() else {
+            return;
+        };
+        let Some(d) = build_profile_digest(&conn) else {
+            tracing::debug!("promotion: no facets or profile nodes; skipping");
+            return;
+        };
+        d
+    };
+
+    let user_prompt = format!(
+        "Learned facts, rules, and preferences about the user:\n\n{digest}\n\n\
+         Synthesize the user model now."
+    );
+    let output = match llm
+        .complete_text(
+            PROMOTION_COST_TAG,
+            PROMOTION_SYSTEM_PROMPT,
+            &user_prompt,
+            PROMOTION_MAX_TOKENS,
+        )
+        .await
+    {
+        Ok(o) => o,
+        Err(e) => {
+            tracing::warn!(error = %e, "promotion: LLM call failed; skipping");
+            return;
+        }
+    };
+
+    let summary = output.text.trim();
+    if summary.is_empty() {
+        tracing::debug!("promotion: empty summary from LLM; skipping");
+        return;
+    }
+
+    {
+        let Ok(conn) = state.db.lock() else {
+            return;
+        };
+        if let Err(e) = upsert_user_model(&conn, summary) {
+            tracing::warn!(error = %e, "promotion: upsert_user_model failed");
+            return;
+        }
+    }
+    tracing::info!(
+        chars = summary.len(),
+        "promotion: distilled facts + profile nodes into user_model"
+    );
 }
 
 #[cfg(test)]
@@ -311,5 +510,17 @@ mod tests {
         assert!(should_run_reflection(40, 20));
         assert!(!should_run_reflection(19, 20));
         assert!(!should_run_reflection(0, 20)); // 0 never fires
+    }
+
+    #[test]
+    fn user_model_upserts_single_row() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        apply_user_model_schema(&conn);
+        upsert_user_model(&conn, "Ryan, engineer, Rust").unwrap();
+        upsert_user_model(&conn, "Ryan Liu, Apple PKG PD, Rust+SwiftUI").unwrap();
+        assert_eq!(
+            get_user_model(&conn).unwrap().as_deref(),
+            Some("Ryan Liu, Apple PKG PD, Rust+SwiftUI")
+        );
     }
 }
