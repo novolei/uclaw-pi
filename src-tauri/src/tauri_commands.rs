@@ -1503,6 +1503,14 @@ pub async fn send_message(
                 crate::services::workspace_service::DbWorkspace.conversation_cwd(&conn, &conv_id)
             };
         }
+        // bucket_seal ingest 通水 — feed the user turn into the openhuman
+        // bucket-seal tree (best-effort, fire-and-forget; never blocks the turn).
+        crate::engine_persist::spawn_bucket_seal_ingest(
+            state.bucket_seal_adapter.clone(),
+            conv_id.clone(),
+            "user".to_string(),
+            input.content.clone(),
+        );
         // [R4/F7] Source pi's provider/model/api_key from provider_service — the
         // SAME resolution the legacy path uses (per-msg override → role → active →
         // fallback), i.e. whatever the user configured in Settings → 服务商. pi
@@ -4926,6 +4934,14 @@ pub async fn send_agent_message(
                 crate::services::workspace_service::DbWorkspace.agent_session_cwd(&conn, &conv_id)
             };
         }
+        // bucket_seal ingest 通水 — feed the user turn into the openhuman
+        // bucket-seal tree (best-effort, fire-and-forget; never blocks the turn).
+        crate::engine_persist::spawn_bucket_seal_ingest(
+            state.bucket_seal_adapter.clone(),
+            conv_id.clone(),
+            "user".to_string(),
+            input.user_message.clone(),
+        );
         // Active provider/model/key/base_url/api from provider_service (服务商 tab).
         if let Some((provider, model, api_key, base_url, api_type)) =
             state.provider_service.get_chat_llm_config().await

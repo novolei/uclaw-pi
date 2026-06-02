@@ -88,6 +88,16 @@ impl TauriEventSink {
         if let Err(e) = result {
             tracing::warn!("PiEngine assistant persist failed: {e}");
         }
+        // bucket_seal ingest 通水 — feed the assistant turn into the openhuman
+        // bucket-seal tree. Best-effort, fire-and-forget; the async task writes
+        // chunks.db (not this `conn`), so spawning while the state.db guard is
+        // still held is safe.
+        crate::engine_persist::spawn_bucket_seal_ingest(
+            state.bucket_seal_adapter.clone(),
+            conv.to_string(),
+            "assistant".to_string(),
+            text.to_string(),
+        );
     }
 }
 
