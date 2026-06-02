@@ -22,7 +22,11 @@ use tokio::sync::Mutex;
 use crate::memory_adapter::{
     MemoryAdapter, MemoryCategory, MemoryEntry, NamespaceSummary, RecallOpts,
 };
+use crate::memory_bucket_seal::canonicalize::chat::{
+    canonicalise as chat_canonicalise, ChatBatch, ChatMessage,
+};
 use crate::memory_bucket_seal::canonicalize::document::{canonicalise, DocumentInput};
+use crate::memory_bucket_seal::canonicalize::CanonicalisedSource;
 use crate::memory_bucket_seal::chunker::{chunk_markdown, ChunkerInput, ChunkerOptions};
 use crate::memory_bucket_seal::score::embed::{cosine_similarity, unpack_embedding, Embedder};
 use crate::memory_bucket_seal::score::store::{upsert_score, ScoreRow};
@@ -31,7 +35,7 @@ use crate::memory_bucket_seal::store::BucketSealStore;
 use crate::memory_bucket_seal::tree_source::{
     append_leaf, get_or_create_source_tree, LabelStrategy, LeafRef, Summariser,
 };
-use crate::memory_bucket_seal::{stage_chunks, types::SourceKind};
+use crate::memory_bucket_seal::stage_chunks;
 
 const ADAPTER_NAME: &str = "bucket_seal";
 
@@ -72,6 +76,137 @@ impl BucketSealAdapter {
         map.entry(namespace.to_string())
             .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone()
+    }
+
+    /// Shared ingest tail used by both [`MemoryAdapter::store`] (Document source)
+    /// and [`Self::ingest_chat_turn`] (Chat source): resolve the tree, serialise
+    /// on its per-tree mutex, then chunk → score → stage → append_leaf (firing the
+    /// seal cascade). The chunker's `source_kind` comes from the canonical
+    /// metadata, so chat transcripts chunk per-message and documents per-section.
+    /// (Canonicalisation is pure and happens in the callers, before the mutex.)
+    async fn ingest_canonical(
+        &self,
+        namespace: &str,
+        canonical: CanonicalisedSource,
+    ) -> Result<()> {
+        // 1. Resolve tree (idempotent get_or_create).
+        let tree = get_or_create_source_tree(&self.store, namespace)
+            .context("get_or_create_source_tree")?;
+
+        // 2. Acquire the per-tree mutex — PR8's append_leaf contract requires
+        //    callers to serialise appends per tree.id (bucket_seal.rs:111-118).
+        let tree_mutex = self.tree_mutex(namespace).await;
+        let _guard = tree_mutex.lock().await;
+
+        // 3. Chunk (source_kind from the canonical metadata).
+        let chunker_input = ChunkerInput {
+            source_kind: canonical.metadata.source_kind,
+            source_id: namespace.to_string(),
+            markdown: canonical.markdown.clone(),
+            metadata: canonical.metadata.clone(),
+        };
+        let chunks = chunk_markdown(&chunker_input, &ChunkerOptions::default());
+        if chunks.is_empty() {
+            tracing::debug!(namespace = %namespace, "chunker produced no chunks");
+            return Ok(());
+        }
+
+        // 4. Score each chunk; collect admitted chunks + their score rows.
+        let scoring_config = ScoringConfig::default();
+        let mut admitted: Vec<crate::memory_bucket_seal::types::Chunk> = Vec::new();
+        let mut score_rows: Vec<ScoreRow> = Vec::new();
+        for chunk in &chunks {
+            let result = score_chunk(chunk, &scoring_config);
+            score_rows.push(ScoreRow {
+                chunk_id: result.chunk_id.clone(),
+                total: result.total,
+                signals: result.signals.clone(),
+                dropped: !result.kept,
+                reason: result.drop_reason.clone(),
+                computed_at_ms: Utc::now().timestamp_millis(),
+            });
+            if result.kept {
+                admitted.push(chunk.clone());
+            }
+        }
+
+        // 5. Stage admitted chunks to disk and upsert to mem_tree_chunks.
+        if !admitted.is_empty() {
+            let staged = stage_chunks(&self.content_root, &admitted).context("stage_chunks")?;
+            self.store
+                .upsert_staged_chunks(&staged)
+                .context("upsert_staged_chunks")?;
+        }
+
+        // 6. Persist score rows — only for staged chunks (FK to mem_tree_chunks).
+        for row in &score_rows {
+            if admitted.iter().any(|c| c.id == row.chunk_id) {
+                upsert_score(&self.store, row).context("upsert_score")?;
+            }
+        }
+
+        // 7. append_leaf each admitted chunk so the seal cascade can fire.
+        for chunk in &admitted {
+            let leaf = LeafRef {
+                chunk_id: chunk.id.clone(),
+                token_count: chunk.token_count,
+                timestamp: chunk.metadata.timestamp,
+                content: chunk.content.clone(),
+                entities: chunk.metadata.tags.clone(), // placeholder until entity extract lands
+                topics: vec![],
+                score: score_rows
+                    .iter()
+                    .find(|r| r.chunk_id == chunk.id)
+                    .map(|r| r.total)
+                    .unwrap_or(0.0),
+            };
+            append_leaf(
+                &self.store,
+                &tree,
+                &leaf,
+                &self.summariser,
+                &self.embedder,
+                &LabelStrategy::Empty,
+            )
+            .await
+            .context("append_leaf")?;
+        }
+
+        Ok(())
+    }
+
+    /// Ingest one conversation turn (Chat source) into `namespace`'s tree:
+    /// `canonicalize::chat` (a one-message batch preserving author + timestamp)
+    /// → [`Self::ingest_canonical`]. Used by the agent/chat turn-persist tap so
+    /// the live conversation flows into bucket_seal's hierarchical memory tree.
+    /// Best-effort: empty text or an empty canonicalisation is a no-op.
+    pub async fn ingest_chat_turn(
+        &self,
+        namespace: &str,
+        author: &str,
+        text: &str,
+        session_id: Option<&str>,
+    ) -> Result<()> {
+        if text.trim().is_empty() {
+            return Ok(());
+        }
+        let tags = build_tags(&MemoryCategory::Conversation, session_id);
+        let batch = ChatBatch {
+            platform: "uclaw".to_string(),
+            channel_label: namespace.to_string(),
+            messages: vec![ChatMessage {
+                author: author.to_string(),
+                timestamp: Utc::now(),
+                text: text.to_string(),
+                source_ref: None,
+            }],
+        };
+        let canonical = chat_canonicalise(namespace, session_id.unwrap_or("global"), &tags, batch)
+            .map_err(|e| anyhow::anyhow!("chat canonicalise: {}", e))?;
+        let Some(canonical) = canonical else {
+            return Ok(());
+        };
+        self.ingest_canonical(namespace, canonical).await
     }
 
     /// Semantic recall over the sealed summaries of `namespace`'s tree: embed the
@@ -157,19 +292,11 @@ impl MemoryAdapter for BucketSealAdapter {
             return Ok(());
         }
 
-        // 1. Resolve tree (idempotent get_or_create).
-        let tree = get_or_create_source_tree(&self.store, namespace)
-            .context("get_or_create_source_tree")?;
-
-        // 2. Acquire the per-tree mutex — PR8's append_leaf contract requires
-        //    callers to serialise appends per tree.id (bucket_seal.rs:111-118).
-        let tree_mutex = self.tree_mutex(namespace).await;
-        let _guard = tree_mutex.lock().await;
-
-        // 3. Build tags (category + session encoded into the chunk's tags_json).
+        // Canonicalise as a Document (one content piece per trait call), then
+        // hand off to the shared ingest tail (chunk → score → stage → append_leaf).
+        // Canonicalisation is pure, so it runs before `ingest_canonical` takes the
+        // per-tree mutex.
         let tags = build_tags(&category, session_id);
-
-        // 4. Canonicalise as a Document (one content piece per trait call).
         let canonical = canonicalise(
             namespace,
             "system",
@@ -189,84 +316,7 @@ impl MemoryAdapter for BucketSealAdapter {
             return Ok(());
         };
 
-        // 5. Chunk.
-        let chunker_input = ChunkerInput {
-            source_kind: SourceKind::Document,
-            source_id: namespace.to_string(),
-            markdown: canonical.markdown.clone(),
-            metadata: canonical.metadata.clone(),
-        };
-        let chunks = chunk_markdown(&chunker_input, &ChunkerOptions::default());
-        if chunks.is_empty() {
-            tracing::debug!(namespace = %namespace, key = %key, "chunker produced no chunks");
-            return Ok(());
-        }
-
-        // 6. Score each chunk; collect admitted chunks + their score rows.
-        let scoring_config = ScoringConfig::default();
-        let mut admitted: Vec<crate::memory_bucket_seal::types::Chunk> = Vec::new();
-        let mut score_rows: Vec<ScoreRow> = Vec::new();
-        for chunk in &chunks {
-            let result = score_chunk(chunk, &scoring_config);
-            // Build a score row for every chunk; only admitted (staged) ones are
-            // persisted below — the mem_tree_score FK requires the chunk row.
-            score_rows.push(ScoreRow {
-                chunk_id: result.chunk_id.clone(),
-                total: result.total,
-                signals: result.signals.clone(),
-                dropped: !result.kept,
-                reason: result.drop_reason.clone(),
-                computed_at_ms: Utc::now().timestamp_millis(),
-            });
-            if result.kept {
-                admitted.push(chunk.clone());
-            }
-        }
-
-        // 7. Stage admitted chunks to disk and upsert to mem_tree_chunks.
-        if !admitted.is_empty() {
-            let staged = stage_chunks(&self.content_root, &admitted).context("stage_chunks")?;
-            self.store
-                .upsert_staged_chunks(&staged)
-                .context("upsert_staged_chunks")?;
-        }
-
-        // 8. Persist score rows — only for chunks we actually staged, since
-        //    mem_tree_score.chunk_id has an FK to mem_tree_chunks(id).
-        for row in &score_rows {
-            if admitted.iter().any(|c| c.id == row.chunk_id) {
-                upsert_score(&self.store, row).context("upsert_score")?;
-            }
-        }
-
-        // 9. append_leaf each admitted chunk so the seal cascade can fire.
-        for chunk in &admitted {
-            let leaf = LeafRef {
-                chunk_id: chunk.id.clone(),
-                token_count: chunk.token_count,
-                timestamp: chunk.metadata.timestamp,
-                content: chunk.content.clone(),
-                entities: chunk.metadata.tags.clone(), // placeholder until entity extract lands
-                topics: vec![],
-                score: score_rows
-                    .iter()
-                    .find(|r| r.chunk_id == chunk.id)
-                    .map(|r| r.total)
-                    .unwrap_or(0.0),
-            };
-            append_leaf(
-                &self.store,
-                &tree,
-                &leaf,
-                &self.summariser,
-                &self.embedder,
-                &LabelStrategy::Empty,
-            )
-            .await
-            .context("append_leaf")?;
-        }
-
-        Ok(())
+        self.ingest_canonical(namespace, canonical).await
     }
 
     /// Hybrid recall: semantic (cosine over sealed-summary embeddings, when a
@@ -651,6 +701,38 @@ mod tests {
         let count = adapter.store.count_chunks().unwrap();
         assert!(count >= 1, "store should have inserted at least one chunk");
         let _ = tree;
+    }
+
+    #[tokio::test]
+    async fn ingest_chat_turn_admits_a_chunk() {
+        // The turn-persist tap path: a conversation turn → canonicalize::chat →
+        // ingest_canonical → chunks. Proves bucket_seal is actually fed.
+        let (adapter, _dir) = fresh_adapter();
+        adapter
+            .ingest_chat_turn(
+                "global",
+                "user",
+                "My name is Ryan Liu and I am an engineer working on uClaw.",
+                Some("sess_1"),
+            )
+            .await
+            .unwrap();
+        let count = adapter.store.count_chunks().unwrap();
+        assert!(count >= 1, "chat ingest should have inserted at least one chunk");
+    }
+
+    #[tokio::test]
+    async fn ingest_chat_turn_empty_text_is_noop() {
+        let (adapter, _dir) = fresh_adapter();
+        adapter
+            .ingest_chat_turn("global", "user", "   \n\t ", Some("s"))
+            .await
+            .unwrap();
+        assert_eq!(
+            adapter.store.count_chunks().unwrap(),
+            0,
+            "blank turn must not create chunks"
+        );
     }
 
     #[tokio::test]

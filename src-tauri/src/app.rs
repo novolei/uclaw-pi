@@ -222,6 +222,12 @@ pub struct AppState {
     /// registers `BucketSealAdapter`, the default is immediately live.
     pub default_memory_backend: std::sync::Arc<std::sync::RwLock<String>>,
 
+    /// CONCRETE handle to the bucket_seal adapter (the same instance also lives
+    /// trait-erased in `memory_adapters["bucket_seal"]`). Held concretely so the
+    /// agent/chat turn-persist ingest tap can call `ingest_chat_turn` — an
+    /// inherent method not on the `MemoryAdapter` trait.
+    pub bucket_seal_adapter: std::sync::Arc<crate::memory_bucket_seal::BucketSealAdapter>,
+
     /// AI Wiki synthesizer — drives `wiki_artifacts(kind="overview")`
     /// regeneration. Memory OS Foundation Phase 3 ships
     /// `wiki_synth::StubSynthesizer` as the default; future PRs swap in
@@ -1011,15 +1017,20 @@ impl AppState {
         let bucket_seal_summariser: std::sync::Arc<dyn crate::memory_bucket_seal::Summariser> =
             std::sync::Arc::new(crate::memory_bucket_seal::InertSummariser::new());
 
+        // Keep a CONCRETE handle (for `ingest_chat_turn` — an inherent method not
+        // on the MemoryAdapter trait, used by the turn-persist ingest tap) AND
+        // register a trait-erased clone in the adapter map for the unified
+        // store/recall path.
         let bucket_seal_adapter = std::sync::Arc::new(crate::memory_bucket_seal::BucketSealAdapter::new(
             bucket_seal_store,
             bucket_seal_content_root,
             bucket_seal_embedder,
             bucket_seal_summariser,
-        ))
-            as std::sync::Arc<dyn crate::memory_adapter::MemoryAdapter>;
-
-        memory_adapters_map.insert(bucket_seal_adapter.name().to_string(), bucket_seal_adapter);
+        ));
+        memory_adapters_map.insert(
+            crate::memory_adapter::MemoryAdapter::name(bucket_seal_adapter.as_ref()).to_string(),
+            bucket_seal_adapter.clone() as std::sync::Arc<dyn crate::memory_adapter::MemoryAdapter>,
+        );
 
         // 阶段 4: MemUAdapter exposes memU's semantic recall through the registry,
         // registered only when memU initialised. Point
@@ -1085,6 +1096,11 @@ impl AppState {
             default_memory_backend: std::sync::Arc::new(std::sync::RwLock::new(
                 "bucket_seal".to_string(),
             )),
+            // Concrete bucket_seal handle for the turn-persist ingest tap
+            // (engine_persist → ingest_chat_turn). This is what actually feeds
+            // bucket_seal at runtime, independent of the `default_memory_backend`
+            // routing above.
+            bucket_seal_adapter,
             // Picked above based on `memory_os.wiki_real_synthesizer_enabled`
             // (Phase 6b). Defaults to StubSynthesizer; flipping the flag
             // routes overview regen through the active LLM provider.

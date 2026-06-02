@@ -152,6 +152,36 @@ pub fn persist_agent_text_message(
 // `_for_conversation`) moved to `services::workspace_service` — workspace
 // resolution is a distinct concern from message persistence (ADR 2026-05-31).
 
+/// Fire-and-forget: feed one just-persisted conversation turn into bucket_seal's
+/// hierarchical memory tree (`canonicalize::chat` → seal cascade) so the live
+/// agent/chat stream actually populates the openhuman bucket-seal store — closing
+/// the "registered as default but zero ingest" gap.
+///
+/// `namespace` is hard-wired to `"global"` so ingested turns share the tree the
+/// prompt-recall supplement queries (`route_recall_in(..., "global", ...)`);
+/// otherwise the data would be unreachable by recall. Spawned on Tauri's runtime
+/// (safe even from the engine thread's synchronous EventSink callback, where
+/// `tokio::spawn` would panic). Best-effort: empty text is skipped and any error
+/// is logged and dropped — it never blocks or fails the turn.
+pub fn spawn_bucket_seal_ingest(
+    adapter: std::sync::Arc<crate::memory_bucket_seal::BucketSealAdapter>,
+    session_id: String,
+    author: String,
+    text: String,
+) {
+    if text.trim().is_empty() {
+        return;
+    }
+    tauri::async_runtime::spawn(async move {
+        if let Err(e) = adapter
+            .ingest_chat_turn("global", &author, &text, Some(&session_id))
+            .await
+        {
+            tracing::debug!(error = %e, session_id = %session_id, role = %author, "bucket_seal chat ingest failed");
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
