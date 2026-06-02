@@ -1514,6 +1514,21 @@ pub async fn send_message(
             "user".to_string(),
             input.content.clone(),
         );
+        // 写 seam: fire-and-forget learning extraction (user msg → LearningCandidate
+        // → Buffer → existing LearningScheduler folds into facets). Regex-only MVP
+        // (llm_enabled=false): zero LLM cost, no budget gate.
+        {
+            let buffer = std::sync::Arc::clone(&state.learning_buffer);
+            let text = input.content.to_string();
+            let session = conv_id.clone();
+            let turn_id = user_msg_id.clone();
+            tauri::async_runtime::spawn(async move {
+                let _ = crate::learning::extractor::extract_from_chat_turn(
+                    &text, &session, &turn_id, &buffer, false, None,
+                )
+                .await;
+            });
+        }
         // [R4/F7] Source pi's provider/model/api_key from provider_service — the
         // SAME resolution the legacy path uses (per-msg override → role → active →
         // fallback), i.e. whatever the user configured in Settings → 服务商. pi
@@ -4990,6 +5005,21 @@ pub async fn send_agent_message(
             "user".to_string(),
             input.user_message.clone(),
         );
+        // 写 seam: fire-and-forget learning extraction (user msg → LearningCandidate
+        // → Buffer → existing LearningScheduler folds into facets). Regex-only MVP
+        // (llm_enabled=false): zero LLM cost, no budget gate.
+        {
+            let buffer = std::sync::Arc::clone(&state.learning_buffer);
+            let text = input.user_message.to_string();
+            let session = conv_id.clone();
+            let turn_id = user_msg_id.clone();
+            tauri::async_runtime::spawn(async move {
+                let _ = crate::learning::extractor::extract_from_chat_turn(
+                    &text, &session, &turn_id, &buffer, false, None,
+                )
+                .await;
+            });
+        }
         // Active provider/model/key/base_url/api from provider_service (服务商 tab).
         if let Some((provider, model, api_key, base_url, api_type)) =
             state.provider_service.get_chat_llm_config().await
