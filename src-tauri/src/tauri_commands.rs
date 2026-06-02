@@ -1639,15 +1639,13 @@ pub async fn send_message(
                     None => None,
                 }
             };
-            crate::agent::memory_context::build_pi_prompt_context_blocks(
-                vec![
-                    ("facets", facets_block),
-                    ("genes", genes_block),
-                    ("recall", recall_ctx),
-                    ("gbrain", gbrain_block),
-                ],
-                12_000,
-            )
+            crate::agent::memory_context::PiPromptContext {
+                facts: facets_block,
+                genes: genes_block,
+                recall: recall_ctx,
+                gbrain: gbrain_block,
+            }
+            .compose(12_000)
         };
         engine.send(uclaw_pi_engine::EngineCmd::Prompt {
             conv_id: conv_id.clone(),
@@ -5166,15 +5164,13 @@ pub async fn send_agent_message(
                     None => None,
                 }
             };
-            crate::agent::memory_context::build_pi_prompt_context_blocks(
-                vec![
-                    ("facets", facets_block),
-                    ("genes", genes_block),
-                    ("recall", recall_ctx),
-                    ("gbrain", gbrain_block),
-                ],
-                12_000,
-            )
+            crate::agent::memory_context::PiPromptContext {
+                facts: facets_block,
+                genes: genes_block,
+                recall: recall_ctx,
+                gbrain: gbrain_block,
+            }
+            .compose(12_000)
         };
         engine.send(uclaw_pi_engine::EngineCmd::Prompt {
             conv_id,
