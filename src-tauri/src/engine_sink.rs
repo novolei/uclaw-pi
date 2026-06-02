@@ -274,16 +274,49 @@ async fn run_skill_tool(app: &AppHandle, tool_name: &str, input: serde_json::Val
     }
 }
 
+/// Build + execute a bridged MCP tool (`mcp__server__tool`), returning
+/// `(text, is_error)`. Mirrors [`run_skill_tool`]: the manager read-guard is
+/// dropped before the `.await` (not `Send`), and execution goes through
+/// `McpToolProxy::execute` — the same lock-free network call legacy uses, with
+/// the same `tool_result_text` shape as skill tools so results render uniformly.
+async fn run_mcp_tool(app: &AppHandle, tool_name: &str, input: serde_json::Value) -> (String, bool) {
+    let proxy = {
+        let Some(state) = app.try_state::<AppState>() else {
+            return ("agent state unavailable".to_string(), true);
+        };
+        let mgr = state.mcp_manager.read().await;
+        crate::mcp::McpManager::create_tool_proxies(&state.mcp_manager, &mgr)
+            .into_iter()
+            .find(|p| p.name() == tool_name)
+    };
+    match proxy {
+        Some(proxy) => tool_result_text(proxy.execute(input).await),
+        None => (format!("unknown or disconnected MCP tool: {tool_name}"), true),
+    }
+}
+
 impl uclaw_pi_engine::ToolRequestSink for RealToolRequestSink {
     fn io_tool_specs(&self) -> Vec<uclaw_pi_engine::IoToolSpec> {
         let Some(state) = self.app.try_state::<AppState>() else {
             return Vec::new();
         };
-        PI_SKILL_TOOLS
+        let mut specs: Vec<uclaw_pi_engine::IoToolSpec> = PI_SKILL_TOOLS
             .iter()
             .filter_map(|name| build_skill_tool(name, &state, &self.app))
             .map(|t| spec_from_tool(t.as_ref()))
-            .collect()
+            .collect();
+        // Bridge connected MCP server tools (gbrain, playwright, …) so the pi
+        // agent can call them like legacy — without this it only ever sees the 3
+        // skill tools. Best-effort sync snapshot via `try_read`: if a write is in
+        // progress (rare: connect/reconnect), this session starts without MCP
+        // tools and the next session picks them up. `create_tool_proxies` honours
+        // each server's `tool_allowlist` (same filtering as the legacy registry).
+        if let Ok(mgr) = state.mcp_manager.try_read() {
+            for proxy in crate::mcp::McpManager::create_tool_proxies(&state.mcp_manager, &mgr) {
+                specs.push(spec_from_tool(&proxy));
+            }
+        }
+        specs
     }
 
     fn request(&self, request_id: &str, tool_name: &str, input: &serde_json::Value) {
@@ -295,7 +328,13 @@ impl uclaw_pi_engine::ToolRequestSink for RealToolRequestSink {
         // The engine thread is asupersync — spawn onto Tauri's tokio runtime, NOT
         // tokio::spawn (no tokio reactor on this thread).
         tauri::async_runtime::spawn(async move {
-            let (text, is_error) = run_skill_tool(&app, &tool_name, input).await;
+            // Route MCP tools (`mcp__server__tool`) to the bridged MCP executor;
+            // everything else is a uClaw skill tool.
+            let (text, is_error) = if crate::mcp::parse_mcp_tool_name(&tool_name).is_some() {
+                run_mcp_tool(&app, &tool_name, input).await
+            } else {
+                run_skill_tool(&app, &tool_name, input).await
+            };
             match engine.and_then(|w| w.upgrade()) {
                 Some(engine) => {
                     let sent = engine.send(uclaw_pi_engine::EngineCmd::ToolResult {
@@ -382,6 +421,18 @@ mod tests {
         let err = tool_result_text(Err(ToolError::kinded(ToolErrorKind::Other, "boom")));
         assert!(err.1, "err flagged");
         assert!(err.0.contains("boom"), "err text: {}", err.0);
+    }
+
+    #[test]
+    fn request_routing_classifies_mcp_vs_skill_tools() {
+        // request() dispatches on parse_mcp_tool_name: `mcp__server__tool` names
+        // go to run_mcp_tool (the bridged MCP executor), everything else to
+        // run_skill_tool. Pin that contract so a rename can't silently re-route.
+        assert!(crate::mcp::parse_mcp_tool_name("mcp__gbrain__get_page").is_some());
+        assert!(crate::mcp::parse_mcp_tool_name("mcp__playwright__browser_click").is_some());
+        assert!(crate::mcp::parse_mcp_tool_name("skill_search").is_none());
+        assert!(crate::mcp::parse_mcp_tool_name("load_skill").is_none());
+        assert!(crate::mcp::parse_mcp_tool_name("skill_marketplace_search").is_none());
     }
 
     #[test]
