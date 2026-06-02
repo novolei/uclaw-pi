@@ -295,6 +295,14 @@ pub struct AppState {
     /// the same `AgentQueues` pair via `agent_queues_for(session_id)`.
     pub agent_queues: Arc<std::sync::Mutex<std::collections::HashMap<String, AgentQueues>>>,
 
+    /// Phase 3 growth — monotonic agent-turn counter for the turn-count
+    /// reflection trigger. `engine_sink::persist_assistant` bumps this on every
+    /// agent turn; when `count % N == 0` it fire-and-forget spawns
+    /// `reflection_service::run_once`. Global (not per-session) by design: the
+    /// reflection pass reads the most-recent `agent_messages` regardless of
+    /// which session produced them.
+    pub reflection_turn_counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
+
     /// Bundle 20 — per-session cached composed `memory_context` from
     /// the most recent **completed** background recall. The agent
     /// recall pipeline (Bundle 6) puts recall in `tokio::spawn` with
@@ -1118,6 +1126,7 @@ impl AppState {
             memubot_config: Arc::new(tokio::sync::RwLock::new(memubot_config)),
             running_sessions: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             agent_queues: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            reflection_turn_counter: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             // Bundle 20 — see `recall_ctx_cache` field doc.
             recall_ctx_cache: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
             browser_context_manager,

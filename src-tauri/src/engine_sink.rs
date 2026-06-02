@@ -98,6 +98,27 @@ impl TauriEventSink {
             "assistant".to_string(),
             text.to_string(),
         );
+
+        // P3: turn-count trigger — every N agent turns, distill recent turns
+        // into a reflection. Fire-and-forget on Tauri's runtime; run_once is
+        // best-effort and can never break this turn. Agent sessions only (chat
+        // turns don't populate agent_messages, which the pass reads).
+        const REFLECTION_EVERY_N_TURNS: u64 = 20;
+        if is_agent_session {
+            let n = state
+                .reflection_turn_counter
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                + 1;
+            if crate::memory_graph::reflection_service::should_run_reflection(
+                n,
+                REFLECTION_EVERY_N_TURNS,
+            ) {
+                let app = self.app.clone();
+                tauri::async_runtime::spawn(async move {
+                    crate::memory_graph::reflection_service::run_once(app).await;
+                });
+            }
+        }
     }
 }
 
