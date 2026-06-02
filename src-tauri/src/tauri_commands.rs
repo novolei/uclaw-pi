@@ -4924,12 +4924,123 @@ pub async fn send_agent_message(
                 api,
             });
         }
+        // ── Memory Recall Integration (pi engine, agent) ─────────────────
+        // The legacy agent recall (the deadline-bounded background block far
+        // below the early-return) never runs on this branch, so the pi agent
+        // path previously sent EngineCmd::Prompt with no memory context. Mirror
+        // its semantics here so behavior matches the (user-verified) legacy
+        // agent path:
+        //   * Run recall in a BACKGROUND task so it completes — and primes the
+        //     per-session recall_ctx_cache — even when this turn's deadline
+        //     fires. memU's L3 retrieve goes through a Python subprocess and can
+        //     stall many seconds; a plain timeout(load_context) would cancel it
+        //     and the cache would never warm, so memory would never inject.
+        //   * Await a oneshot under a 400ms deadline (keep memU's tail off TTFT);
+        //     on a miss, fall back to the prior turn's cached ctx. So memory
+        //     primes turn N+1 even when every turn's own recall is too slow.
+        const PI_RECALL_DEADLINE_MS: u64 = 400;
+        let (recall_tx, recall_rx) = tokio::sync::oneshot::channel::<Option<String>>();
+        {
+            let recall_store = state.memory_graph_store.clone();
+            let recall_memu = state.memu_client.clone();
+            let recall_config = {
+                let s = state.settings.read().await;
+                s.memory_recall_config
+                    .clone()
+                    .map(crate::memory_graph::recall::MemoryRecallConfig::from)
+                    .unwrap_or_default()
+            };
+            // Pre-resolve everything the 'static spawn needs (no &state borrow).
+            let user_msg_for_recall = input.user_message.clone();
+            let session_id_for_recall = input.session_id.clone();
+            let memory_store_for_recall = Arc::clone(&state.memory_store);
+            let app_handle_for_recall = app_handle.clone();
+            let memory_adapters_for_recall = Arc::clone(&state.memory_adapters);
+            let default_backend_for_recall = state
+                .default_memory_backend
+                .read()
+                .ok()
+                .map(|g| g.clone())
+                .unwrap_or_else(|| "legacy_kv".to_string());
+            let recall_ctx_cache_for_bg = Arc::clone(&state.recall_ctx_cache);
+
+            tokio::spawn(async move {
+                let recall_engine = crate::memory_graph::recall::MemoryRecallEngine::new(
+                    recall_store,
+                    recall_memu,
+                    recall_config,
+                );
+                // Background task has no AppState → AppState-free browser fn.
+                let browser_task_memory_ctx =
+                    browser_task_memory_for_query(&memory_store_for_recall, &user_msg_for_recall);
+                let prompt_backend = recall_engine.config().prompt_recall_backend.clone();
+                let prompt_limit = recall_engine.config().prompt_recall_limit;
+                let adapter_recall = prompt_backend
+                    .as_deref()
+                    .filter(|b| !b.is_empty())
+                    .map(|backend| crate::agent::memory_context::AdapterRecall {
+                        adapters: &memory_adapters_for_recall,
+                        default_backend: &default_backend_for_recall,
+                        backend,
+                        limit: prompt_limit,
+                    });
+                let loaded = crate::agent::memory_context::load_context(
+                    crate::agent::memory_context::MemoryContextInputs {
+                        recall_engine: &recall_engine,
+                        memory_store: &memory_store_for_recall,
+                        space_id: "default",
+                        conversation_id: &session_id_for_recall,
+                        query: &user_msg_for_recall,
+                        browser_ctx: browser_task_memory_ctx,
+                        adapter_recall,
+                    },
+                )
+                .await;
+                if let Some(ev) = loaded.recall_event {
+                    let _ = app_handle_for_recall.emit("agent:memory-recall", ev);
+                }
+                let composed = loaded.context;
+                // Prime the cache BEFORE sending the oneshot, so even if this
+                // turn's deadline already fired the next turn reads this value.
+                if let Some(ref ctx) = composed {
+                    recall_ctx_cache_for_bg
+                        .write()
+                        .await
+                        .insert(session_id_for_recall.clone(), ctx.clone());
+                }
+                let _ = recall_tx.send(composed);
+            });
+        }
+
+        let recall_ctx: Option<String> = match tokio::time::timeout(
+            std::time::Duration::from_millis(PI_RECALL_DEADLINE_MS),
+            recall_rx,
+        )
+        .await
+        {
+            Ok(Ok(Some(ctx))) => Some(ctx),
+            Ok(Ok(None)) => {
+                recall_cache_fallback(&state.recall_ctx_cache, &input.session_id, "empty-compose")
+                    .await
+            }
+            Ok(Err(_)) => {
+                recall_cache_fallback(&state.recall_ctx_cache, &input.session_id, "channel-closed")
+                    .await
+            }
+            Err(_) => {
+                tracing::info!(
+                    deadline_ms = PI_RECALL_DEADLINE_MS,
+                    "Memory recall deadline exceeded; checking cross-turn cache (pi agent)"
+                );
+                recall_cache_fallback(&state.recall_ctx_cache, &input.session_id, "deadline").await
+            }
+        };
+
         engine.send(uclaw_pi_engine::EngineCmd::Prompt {
             conv_id,
             input: input.user_message.clone(),
             cwd: run_cwd,
-            // Filled in by the agent memory-recall integration below (commit 3).
-            context: None,
+            context: recall_ctx,
         });
         return Ok(());
     }
