@@ -101,6 +101,13 @@ async fn recall_adapter_block(ar: &AdapterRecall<'_>, query: &str) -> Option<Str
     if hits.is_empty() {
         return None;
     }
+    // Observability: the supplement is otherwise silent on success, so this is
+    // how you confirm prompt_recall_backend is actually injecting into the prompt.
+    tracing::info!(
+        backend = %ar.backend,
+        hits = hits.len(),
+        "adapter recall supplement added to prompt"
+    );
     let mut block = String::from("<recalled_memories>\n");
     for h in &hits {
         let snippet: String = h.content.chars().take(200).collect();
