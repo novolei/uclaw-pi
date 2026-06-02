@@ -3,6 +3,8 @@ pub mod store;
 pub mod search;
 pub mod recall;
 pub mod reflection;
+// Phase 3 growth — turn-count-triggered ReflectionService (mem.md Reflection Agent).
+pub mod reflection_service;
 pub mod environment;
 pub mod auto_classify;
 // Memory OS Foundation Phase 1 — per-entity compiled-truth + timeline schema.

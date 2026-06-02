@@ -1639,9 +1639,29 @@ pub async fn send_message(
                     None => None,
                 }
             };
+            // Phase 3 — inject the most-recent distilled reflections. Best-effort:
+            // a poisoned lock or read error yields no block (never fails the turn).
+            let reflections_block = {
+                let recent = state.db.lock().ok()
+                    .and_then(|c| crate::memory_graph::reflection_service::recent_reflections(&c, 3).ok())
+                    .unwrap_or_default();
+                if recent.is_empty() { None } else {
+                    let mut s = String::from("## Recent Reflections\n");
+                    for r in &recent { s.push_str(&format!("- ({:.2}) {}\n", r.confidence, r.insight)); }
+                    Some(s)
+                }
+            };
+            // Phase 3 (P3-②) — inject the distilled user_model (Pattern→Model
+            // layer). Best-effort: a poisoned lock or read error yields no block.
+            let user_model_block = state.db.lock().ok()
+                .and_then(|c| crate::memory_graph::reflection_service::get_user_model(&c).ok())
+                .flatten()
+                .map(|m| format!("## User Model\n{m}"));
             crate::agent::memory_context::PiPromptContext {
                 facts: facets_block,
+                user_model: user_model_block,
                 genes: genes_block,
+                reflections: reflections_block,
                 recall: recall_ctx,
                 gbrain: gbrain_block,
             }
@@ -5164,9 +5184,29 @@ pub async fn send_agent_message(
                     None => None,
                 }
             };
+            // Phase 3 — inject the most-recent distilled reflections. Best-effort:
+            // a poisoned lock or read error yields no block (never fails the turn).
+            let reflections_block = {
+                let recent = state.db.lock().ok()
+                    .and_then(|c| crate::memory_graph::reflection_service::recent_reflections(&c, 3).ok())
+                    .unwrap_or_default();
+                if recent.is_empty() { None } else {
+                    let mut s = String::from("## Recent Reflections\n");
+                    for r in &recent { s.push_str(&format!("- ({:.2}) {}\n", r.confidence, r.insight)); }
+                    Some(s)
+                }
+            };
+            // Phase 3 (P3-②) — inject the distilled user_model (Pattern→Model
+            // layer). Best-effort: a poisoned lock or read error yields no block.
+            let user_model_block = state.db.lock().ok()
+                .and_then(|c| crate::memory_graph::reflection_service::get_user_model(&c).ok())
+                .flatten()
+                .map(|m| format!("## User Model\n{m}"));
             crate::agent::memory_context::PiPromptContext {
                 facts: facets_block,
+                user_model: user_model_block,
                 genes: genes_block,
+                reflections: reflections_block,
                 recall: recall_ctx,
                 gbrain: gbrain_block,
             }

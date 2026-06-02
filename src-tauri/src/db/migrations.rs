@@ -2342,6 +2342,27 @@ const SQL_V56: &str = r#"
             REFERENCES automation_approval_requests(id);
 "#;
 
+// ─── V57 — Phase 3 growth: reflections + user_model (mem.md Reflection Agent) ──
+// `reflections`: periodic insights distilled from recent agent turns.
+// `user_model`: singleton distilled persona/preference model (Pattern→Model
+// layer, populated by P3-②'s promotion pass). Additive + IF NOT EXISTS so the
+// block is idempotent and safe to replay on every boot.
+const SQL_V57: &str = r#"
+    CREATE TABLE IF NOT EXISTS reflections (
+        id                 TEXT PRIMARY KEY,
+        insight            TEXT NOT NULL,
+        confidence         REAL NOT NULL DEFAULT 0.5,
+        source_event_count INTEGER NOT NULL DEFAULT 0,
+        created_at         TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_reflections_created ON reflections(created_at DESC);
+    CREATE TABLE IF NOT EXISTS user_model (
+        id          TEXT PRIMARY KEY,
+        summary     TEXT NOT NULL,
+        updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+"#;
+
 /// Test/dev helper: run the full migration stack on a fresh connection.
 ///
 /// The `_target` parameter is currently ignored. All migrations are
@@ -2789,6 +2810,14 @@ pub fn run(conn: &rusqlite::Connection) -> Result<(), rusqlite::Error> {
     for stmt in SQL_V56.split(';').map(|s| s.trim()).filter(|s| !s.is_empty()) {
         if let Err(e) = conn.execute(stmt, []) {
             tracing::debug!("V56 stmt skipped (likely already applied): {} :: {}", e, stmt);
+        }
+    }
+    // V57: Phase 3 growth — reflections + user_model tables (mem.md Reflection
+    // Agent). Additive + IF NOT EXISTS, so replaying on every boot is a no-op.
+    tracing::debug!("Running migration V57: reflections + user_model");
+    for stmt in SQL_V57.split(';').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        if let Err(e) = conn.execute(stmt, []) {
+            tracing::debug!("V57 stmt skipped (likely already applied): {} :: {}", e, stmt);
         }
     }
     tracing::info!("Database migrations complete");
