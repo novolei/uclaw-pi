@@ -339,9 +339,13 @@ fn build_profile_digest(conn: &Connection) -> Option<String> {
 }
 
 /// Run one reflection pass: read recent turns → ask the LLM for a JSON insight →
-/// persist a `reflections` row. Best-effort end to end; every failure path logs
-/// and returns. Spawned fire-and-forget from the turn-count trigger.
-pub async fn run_once(app: tauri::AppHandle) {
+/// persist a `reflections` row, then [`run_promotion`] (facts → `user_model`)
+/// and — every 1/5 of the reflection cadence — [`run_daydream`] (divergent
+/// free-association over random memory). `turn_count` is the agent-turn count the
+/// trigger computed; it gates the daydream sub-cadence. Best-effort end to end;
+/// every failure path logs and returns. Spawned fire-and-forget from the
+/// turn-count trigger.
+pub async fn run_once(app: tauri::AppHandle, turn_count: u64) {
     use tauri::Manager;
 
     let Some(state) = app.try_state::<crate::app::AppState>() else {
@@ -439,6 +443,16 @@ pub async fn run_once(app: tauri::AppHandle) {
     // run_once budget/LLM gates above already passed; `run_promotion` is itself
     // best-effort and re-reads the budget defensively.
     run_promotion(&state).await;
+
+    // P4: every ~100 agent turns (1/5 of the reflection cadence — this `run_once`
+    // already only fires every REFLECTION_EVERY_N_TURNS turns, so the sub-gate is
+    // on the same turn-count axis), free-associate over random memory into one
+    // novel daydream. UI-surface only (`agent:daydream`), not injected into the
+    // prompt. `run_daydream` is itself best-effort and re-reads the budget.
+    const DAYDREAM_EVERY_N_TURNS: u64 = 100;
+    if should_run_reflection(turn_count, DAYDREAM_EVERY_N_TURNS) {
+        run_daydream(app.clone()).await;
+    }
 }
 
 /// Run one promotion pass: read the user's learned facets + profile facts → ask
@@ -526,6 +540,151 @@ pub async fn run_promotion(state: &crate::app::AppState) {
     tracing::info!(
         chars = summary.len(),
         "promotion: distilled facts + profile nodes into user_model"
+    );
+}
+
+/// Max tokens for the daydream completion (one short hypothesis/connection).
+const DAYDREAM_MAX_TOKENS: u32 = 300;
+/// Cost tag prefix written into `cost_records.model` for daydream LLM calls.
+const DAYDREAM_COST_TAG: &str = "memory_daydream";
+/// How many random memory titles seed one daydream pass.
+const DAYDREAM_SEED_TITLES: i64 = 6;
+
+/// System prompt for the daydream pass. Deliberately divergent (the opposite of
+/// the reflection/promotion convergent prompts): free-associate over unrelated
+/// memories to surface ONE novel idea. Plain prose out — stored verbatim and
+/// only surfaced in the UI (`agent:daydream`), never injected into the prompt.
+const DAYDREAM_SYSTEM_PROMPT: &str = "\
+You are free-associating. Be creative and speculative. From these unrelated \
+memories, generate ONE novel hypothesis, connection, or idea — something \
+non-obvious that links them or leaps off from them. Write a single short \
+paragraph of plain prose (no JSON, no markdown fences, no preamble, no list). \
+Favour the surprising over the safe.";
+
+/// Run one daydream pass: sample random memory titles → ask the LLM to
+/// free-associate ONE novel hypothesis/connection → persist a `daydreams` row
+/// AND emit `agent:daydream` for the UI. Mirrors [`run_promotion`]'s structure
+/// (budget gate, learning-LLM presence gate, std-Mutex-dropped-before-await),
+/// but the data source is *random* memory (divergent), not the convergent
+/// profile digest. Best-effort end to end; every failure path logs and returns,
+/// never panics. **Not injected into the prompt** — UI surface only.
+pub async fn run_daydream(app: tauri::AppHandle) {
+    use tauri::Emitter;
+    use tauri::Manager;
+
+    let Some(state) = app.try_state::<crate::app::AppState>() else {
+        return;
+    };
+
+    // LLM presence gate — no configured learning LLM ⇒ nothing to do.
+    let Some(llm) = state.learning_llm.clone() else {
+        tracing::debug!("daydream: no learning_llm configured; skipping");
+        return;
+    };
+
+    // Daily-budget gate — same shared "daily learning budget burned" signal as
+    // the reflection/promotion passes (the extractor's budget knob +
+    // `today_learning_tokens` rollup). Daydream's spend lands under the
+    // `memory_daydream:` cost prefix.
+    let daily_budget = {
+        let cfg = state.memubot_config.read().await;
+        cfg.memory_os.learning_llm_daily_token_budget
+    };
+    if daily_budget == 0 {
+        tracing::debug!("daydream: learning LLM daily budget is 0; skipping");
+        return;
+    }
+    let spent = crate::cost_store::today_learning_tokens(&state.db);
+    if spent >= daily_budget {
+        tracing::debug!(
+            spent,
+            daily_budget,
+            "daydream: daily learning budget exhausted; skipping"
+        );
+        return;
+    }
+
+    // Sample random memory titles. Hold the std::sync::Mutex only for the read,
+    // then drop it before the `.await` (the guard is not `Send`).
+    let seed = {
+        let Ok(conn) = state.db.lock() else {
+            return;
+        };
+        let titles: Vec<String> = match conn.prepare(
+            "SELECT title FROM memory_nodes
+             WHERE title IS NOT NULL AND title != ''
+             ORDER BY RANDOM() LIMIT ?1",
+        ) {
+            Ok(mut stmt) => match stmt.query_map(params![DAYDREAM_SEED_TITLES], |r| {
+                r.get::<_, String>(0)
+            }) {
+                Ok(rows) => rows
+                    .flatten()
+                    .map(|t| t.chars().take(400).collect::<String>())
+                    .collect(),
+                Err(e) => {
+                    tracing::warn!(error = %e, "daydream: title query_map failed; skipping");
+                    return;
+                }
+            },
+            Err(e) => {
+                tracing::warn!(error = %e, "daydream: title prepare failed; skipping");
+                return;
+            }
+        };
+        if titles.is_empty() {
+            tracing::debug!("daydream: no memory_nodes titles to dream on; skipping");
+            return;
+        }
+        titles.join("\n")
+    };
+
+    let user_prompt = format!(
+        "Unrelated memories:\n\n{seed}\n\nFree-associate ONE novel hypothesis, connection, or idea."
+    );
+    let output = match llm
+        .complete_text(
+            DAYDREAM_COST_TAG,
+            DAYDREAM_SYSTEM_PROMPT,
+            &user_prompt,
+            DAYDREAM_MAX_TOKENS,
+        )
+        .await
+    {
+        Ok(o) => o,
+        Err(e) => {
+            tracing::warn!(error = %e, "daydream: LLM call failed; skipping");
+            return;
+        }
+    };
+
+    let text = output.text.trim();
+    if text.is_empty() {
+        tracing::debug!("daydream: empty text from LLM; skipping");
+        return;
+    }
+
+    let id = uuid::Uuid::new_v4().to_string();
+    {
+        let Ok(conn) = state.db.lock() else {
+            return;
+        };
+        if let Err(e) = insert_daydream(&conn, &id, text) {
+            tracing::warn!(error = %e, "daydream: insert_daydream failed");
+            return;
+        }
+    }
+    tracing::info!(%id, chars = text.len(), "daydream: free-associated a new daydream");
+
+    // UI surface — emit `agent:daydream` so the frontend can render it live.
+    // Best-effort: a failed emit (no webview yet, serialization) is logged by
+    // the `let _ =` drop, never panics. NOT injected into the prompt.
+    let _ = app.emit(
+        "agent:daydream",
+        serde_json::json!({
+            "content": text,
+            "created_at": chrono::Utc::now().to_rfc3339(),
+        }),
     );
 }
 
