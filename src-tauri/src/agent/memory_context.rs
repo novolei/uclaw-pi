@@ -84,6 +84,10 @@ fn compose_memory_context(
 pub struct PiPromptContext {
     pub facts: Option<String>,
     pub genes: Option<String>,
+    /// Phase 3 — recent distilled reflections (mem.md Reflection Agent). Ranked
+    /// above raw `recall`: a reflection is a high-value, already-distilled
+    /// insight, so it earns budget before verbose recall snippets.
+    pub reflections: Option<String>,
     pub recall: Option<String>,
     pub gbrain: Option<String>,
 }
@@ -92,11 +96,13 @@ impl PiPromptContext {
     pub fn compose(self, total_budget: usize) -> Option<String> {
         const CAP_FACTS: usize = 1_500;
         const CAP_GENES: usize = 2_500;
+        const CAP_REFLECTIONS: usize = 2_000;
         const CAP_RECALL: usize = 8_000;
         const CAP_GBRAIN: usize = 2_000;
         let dims = [
             (self.facts, CAP_FACTS),
             (self.genes, CAP_GENES),
+            (self.reflections, CAP_REFLECTIONS),
             (self.recall, CAP_RECALL),
             (self.gbrain, CAP_GBRAIN),
         ];
@@ -364,11 +370,13 @@ mod tests {
 
     #[test]
     fn pi_context_orders_by_priority_and_skips_empty() {
+        // Priority order: facts → genes → reflections → recall → gbrain.
         let out = PiPromptContext {
             facts: Some("F".into()), genes: Some("G".into()),
+            reflections: Some("X".into()),
             recall: Some("R".into()), gbrain: Some("B".into()),
         }.compose(10_000);
-        assert_eq!(out.as_deref(), Some("F\n\nG\n\nR\n\nB"));
+        assert_eq!(out.as_deref(), Some("F\n\nG\n\nX\n\nR\n\nB"));
         assert!(PiPromptContext::default().compose(10_000).is_none());
         assert!(PiPromptContext { gbrain: Some("   ".into()), ..Default::default() }
             .compose(10_000).is_none());
