@@ -328,6 +328,12 @@ impl uclaw_pi_engine::ToolRequestSink for RealToolRequestSink {
         // The engine thread is asupersync — spawn onto Tauri's tokio runtime, NOT
         // tokio::spawn (no tokio reactor on this thread).
         tauri::async_runtime::spawn(async move {
+            // Capture the tool-input summary before `input` is moved into the
+            // executor below; mirrors the legacy ToolDispatcher InfraService publish.
+            let input_summary = crate::agent::dispatcher::truncate_utf8(
+                &serde_json::to_string(&input).unwrap_or_default(),
+                500,
+            );
             // Route MCP tools (`mcp__server__tool`) to the bridged MCP executor;
             // everything else is a uClaw skill tool.
             let (text, is_error) = if crate::mcp::parse_mcp_tool_name(&tool_name).is_some() {
@@ -335,6 +341,32 @@ impl uclaw_pi_engine::ToolRequestSink for RealToolRequestSink {
             } else {
                 run_skill_tool(&app, &tool_name, input).await
             };
+            // 写 seam: feed the pi tool execution to InfraService — the GeneCandidate
+            // pool subscribes to InfraEventType::ToolExecuted, so this re-feeds gene
+            // distillation + capsule fitness on the pi path. Fire-and-forget; the
+            // metadata shape mirrors the legacy ToolDispatcher publish (duration_ms
+            // is unavailable on the pi executor → 0).
+            if let Some(state) = app.try_state::<crate::app::AppState>() {
+                let infra = std::sync::Arc::clone(&state.infra_service);
+                let tn = tool_name.clone();
+                let success = !is_error;
+                let output_summary = crate::agent::dispatcher::truncate_utf8(&text, 500);
+                tauri::async_runtime::spawn(async move {
+                    infra
+                        .publish_tool_executed(
+                            "local",
+                            &tn,
+                            &output_summary,
+                            serde_json::json!({
+                                "tool_name": tn,
+                                "success": success,
+                                "duration_ms": 0,
+                                "tool_input": input_summary,
+                            }),
+                        )
+                        .await;
+                });
+            }
             match engine.and_then(|w| w.upgrade()) {
                 Some(engine) => {
                     let sent = engine.send(uclaw_pi_engine::EngineCmd::ToolResult {
