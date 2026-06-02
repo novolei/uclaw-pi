@@ -1651,8 +1651,15 @@ pub async fn send_message(
                     Some(s)
                 }
             };
+            // Phase 3 (P3-②) — inject the distilled user_model (Pattern→Model
+            // layer). Best-effort: a poisoned lock or read error yields no block.
+            let user_model_block = state.db.lock().ok()
+                .and_then(|c| crate::memory_graph::reflection_service::get_user_model(&c).ok())
+                .flatten()
+                .map(|m| format!("## User Model\n{m}"));
             crate::agent::memory_context::PiPromptContext {
                 facts: facets_block,
+                user_model: user_model_block,
                 genes: genes_block,
                 reflections: reflections_block,
                 recall: recall_ctx,
@@ -5189,8 +5196,15 @@ pub async fn send_agent_message(
                     Some(s)
                 }
             };
+            // Phase 3 (P3-②) — inject the distilled user_model (Pattern→Model
+            // layer). Best-effort: a poisoned lock or read error yields no block.
+            let user_model_block = state.db.lock().ok()
+                .and_then(|c| crate::memory_graph::reflection_service::get_user_model(&c).ok())
+                .flatten()
+                .map(|m| format!("## User Model\n{m}"));
             crate::agent::memory_context::PiPromptContext {
                 facts: facets_block,
+                user_model: user_model_block,
                 genes: genes_block,
                 reflections: reflections_block,
                 recall: recall_ctx,

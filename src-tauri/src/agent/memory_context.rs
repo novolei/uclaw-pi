@@ -83,6 +83,10 @@ fn compose_memory_context(
 #[derive(Default)]
 pub struct PiPromptContext {
     pub facts: Option<String>,
+    /// Phase 3 (P3-②) — the distilled `user_model` (Pattern→Model layer). The
+    /// core "who you are" persona/preferences summary: small + high-value, so it
+    /// ranks just below `facts` and above everything else.
+    pub user_model: Option<String>,
     pub genes: Option<String>,
     /// Phase 3 — recent distilled reflections (mem.md Reflection Agent). Ranked
     /// above raw `recall`: a reflection is a high-value, already-distilled
@@ -95,12 +99,14 @@ pub struct PiPromptContext {
 impl PiPromptContext {
     pub fn compose(self, total_budget: usize) -> Option<String> {
         const CAP_FACTS: usize = 1_500;
+        const CAP_USER_MODEL: usize = 1_200;
         const CAP_GENES: usize = 2_500;
         const CAP_REFLECTIONS: usize = 2_000;
         const CAP_RECALL: usize = 8_000;
         const CAP_GBRAIN: usize = 2_000;
         let dims = [
             (self.facts, CAP_FACTS),
+            (self.user_model, CAP_USER_MODEL),
             (self.genes, CAP_GENES),
             (self.reflections, CAP_REFLECTIONS),
             (self.recall, CAP_RECALL),
@@ -370,13 +376,14 @@ mod tests {
 
     #[test]
     fn pi_context_orders_by_priority_and_skips_empty() {
-        // Priority order: facts → genes → reflections → recall → gbrain.
+        // Priority order: facts → user_model → genes → reflections → recall → gbrain.
         let out = PiPromptContext {
-            facts: Some("F".into()), genes: Some("G".into()),
+            facts: Some("F".into()), user_model: Some("U".into()),
+            genes: Some("G".into()),
             reflections: Some("X".into()),
             recall: Some("R".into()), gbrain: Some("B".into()),
         }.compose(10_000);
-        assert_eq!(out.as_deref(), Some("F\n\nG\n\nX\n\nR\n\nB"));
+        assert_eq!(out.as_deref(), Some("F\n\nU\n\nG\n\nX\n\nR\n\nB"));
         assert!(PiPromptContext::default().compose(10_000).is_none());
         assert!(PiPromptContext { gbrain: Some("   ".into()), ..Default::default() }
             .compose(10_000).is_none());
