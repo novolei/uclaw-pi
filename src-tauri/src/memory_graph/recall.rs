@@ -139,6 +139,12 @@ pub struct MemoryRecallConfig {
     pub prompt_recall_backend: Option<String>,
     /// Max entries pulled for the adapter-recall supplement. Default 5.
     pub prompt_recall_limit: usize,
+    /// When set, bound each L3 `memu.retrieve` (vector search) to this many
+    /// milliseconds; on timeout, fall back to FTS-only (identical to the path
+    /// taken when memU errors). `None` = unbounded (default — legacy behavior).
+    /// The pi-engine recall sites set this so a slow/empty memU L3 (a Python
+    /// subprocess that can stall seconds) can't block same-turn recall.
+    pub memu_retrieve_timeout_ms: Option<u64>,
 }
 
 // Standalone default functions retained: used both by
@@ -180,6 +186,7 @@ impl Default for MemoryRecallConfig {
             backlink_boost_weight: default_backlink_boost_weight(),
             prompt_recall_backend: None,
             prompt_recall_limit: 5,
+            memu_retrieve_timeout_ms: None,
         }
     }
 }
@@ -233,6 +240,8 @@ pub struct MemoryRecallConfigDto {
     pub prompt_recall_backend: Option<String>,
     #[serde(default)]
     pub prompt_recall_limit: Option<usize>,
+    #[serde(default)]
+    pub memu_retrieve_timeout_ms: Option<u64>,
 }
 
 impl From<MemoryRecallConfigDto> for MemoryRecallConfig {
@@ -259,6 +268,9 @@ impl From<MemoryRecallConfigDto> for MemoryRecallConfig {
             backlink_boost_weight: dto.backlink_boost_weight.unwrap_or(default.backlink_boost_weight),
             prompt_recall_backend: dto.prompt_recall_backend.or(default.prompt_recall_backend),
             prompt_recall_limit: dto.prompt_recall_limit.unwrap_or(default.prompt_recall_limit),
+            memu_retrieve_timeout_ms: dto
+                .memu_retrieve_timeout_ms
+                .or(default.memu_retrieve_timeout_ms),
         }
     }
 }
@@ -286,6 +298,7 @@ impl From<MemoryRecallConfig> for MemoryRecallConfigDto {
             backlink_boost_weight: Some(cfg.backlink_boost_weight),
             prompt_recall_backend: cfg.prompt_recall_backend,
             prompt_recall_limit: Some(cfg.prompt_recall_limit),
+            memu_retrieve_timeout_ms: cfg.memu_retrieve_timeout_ms,
         }
     }
 }
@@ -1137,18 +1150,39 @@ impl MemoryRecallEngine {
             .fts_search(space_id, user_input, fts_limit)
             .unwrap_or_default();
 
-        // Vector search via memU (if available)
+        // Vector search via memU (if available). memU's retrieve goes through a
+        // Python subprocess and can stall for seconds; when the caller sets
+        // `memu_retrieve_timeout_ms` (the pi-engine recall sites do), bound it
+        // and fall back to FTS-only on timeout — identical to the memU-error
+        // path — so a slow/empty L3 can't block same-turn recall.
         let vector_results = if let Some(ref memu) = self.memu_client {
             let queries = vec![serde_json::json!({
                 "role": "user",
                 "content": user_input,
             })];
-            match memu.retrieve(queries, None, None).await {
-                Ok(result) => result.items,
-                Err(e) => {
-                    info!(error = %e, "recall: memU retrieve failed, falling back to FTS only");
-                    Vec::new()
+            let fetch = async {
+                match memu.retrieve(queries, None, None).await {
+                    Ok(result) => result.items,
+                    Err(e) => {
+                        info!(error = %e, "recall: memU retrieve failed, falling back to FTS only");
+                        Vec::new()
+                    }
                 }
+            };
+            match self.config.memu_retrieve_timeout_ms {
+                Some(ms) => {
+                    match tokio::time::timeout(std::time::Duration::from_millis(ms), fetch).await {
+                        Ok(items) => items,
+                        Err(_) => {
+                            info!(
+                                timeout_ms = ms,
+                                "recall: memU retrieve timed out, falling back to FTS only"
+                            );
+                            Vec::new()
+                        }
+                    }
+                }
+                None => fetch.await,
             }
         } else {
             Vec::new()
@@ -1994,6 +2028,29 @@ mod phase5_boost_tests {
         let restored: MemoryRecallConfig = dto.into();
         assert_eq!(restored.entity_page_boost, 1.5);
         assert_eq!(restored.backlink_boost_weight, 0.3);
+    }
+
+    #[test]
+    fn dto_round_trip_preserves_memu_retrieve_timeout() {
+        let mut cfg = MemoryRecallConfig::default();
+        // Default is unbounded (legacy behavior — no per-retrieve timeout).
+        assert_eq!(cfg.memu_retrieve_timeout_ms, None);
+        cfg.memu_retrieve_timeout_ms = Some(300);
+        let dto: MemoryRecallConfigDto = cfg.clone().into();
+        assert_eq!(dto.memu_retrieve_timeout_ms, Some(300));
+        let restored: MemoryRecallConfig = dto.into();
+        assert_eq!(restored.memu_retrieve_timeout_ms, Some(300));
+    }
+
+    #[test]
+    fn dto_without_memu_timeout_defaults_to_none() {
+        // Forward-compat: a settings blob that predates the field stays
+        // unbounded (legacy callers are untouched).
+        let json = r#"{"bootLimit": 8}"#;
+        let dto: MemoryRecallConfigDto = serde_json::from_str(json).unwrap();
+        assert!(dto.memu_retrieve_timeout_ms.is_none());
+        let cfg: MemoryRecallConfig = dto.into();
+        assert_eq!(cfg.memu_retrieve_timeout_ms, None);
     }
 
     #[test]
