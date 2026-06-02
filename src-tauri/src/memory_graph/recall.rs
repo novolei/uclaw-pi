@@ -145,6 +145,15 @@ pub struct MemoryRecallConfig {
     /// The pi-engine recall sites set this so a slow/empty memU L3 (a Python
     /// subprocess that can stall seconds) can't block same-turn recall.
     pub memu_retrieve_timeout_ms: Option<u64>,
+
+    /// When `true` (default), `build_recall_plan_with_time` ranks recall
+    /// candidates by the pre-computed `memory_importance_scores.importance`
+    /// (DESC; candidates with no score row sort last as 0.0) and drops any
+    /// candidate whose `archive_pending_since IS NOT NULL`. This activates
+    /// the importance subsystem (recall.rs computes/stores importance but
+    /// historically never read it back during recall). Set `false` to keep
+    /// the legacy ordering/visibility (no importance read, no archive drop).
+    pub importance_recall_enabled: bool,
 }
 
 // Standalone default functions retained: used both by
@@ -187,6 +196,8 @@ impl Default for MemoryRecallConfig {
             prompt_recall_backend: None,
             prompt_recall_limit: 5,
             memu_retrieve_timeout_ms: None,
+            // Default on: activate the importance-ranked recall + archive drop.
+            importance_recall_enabled: true,
         }
     }
 }
@@ -242,6 +253,10 @@ pub struct MemoryRecallConfigDto {
     pub prompt_recall_limit: Option<usize>,
     #[serde(default)]
     pub memu_retrieve_timeout_ms: Option<u64>,
+    /// Rank recall by `memory_importance_scores` + drop archive_pending
+    /// candidates. Defaults to `true` via the `From<Dto>` fallback.
+    #[serde(default)]
+    pub importance_recall_enabled: Option<bool>,
 }
 
 impl From<MemoryRecallConfigDto> for MemoryRecallConfig {
@@ -271,6 +286,9 @@ impl From<MemoryRecallConfigDto> for MemoryRecallConfig {
             memu_retrieve_timeout_ms: dto
                 .memu_retrieve_timeout_ms
                 .or(default.memu_retrieve_timeout_ms),
+            importance_recall_enabled: dto
+                .importance_recall_enabled
+                .unwrap_or(default.importance_recall_enabled),
         }
     }
 }
@@ -299,6 +317,7 @@ impl From<MemoryRecallConfig> for MemoryRecallConfigDto {
             prompt_recall_backend: cfg.prompt_recall_backend,
             prompt_recall_limit: Some(cfg.prompt_recall_limit),
             memu_retrieve_timeout_ms: cfg.memu_retrieve_timeout_ms,
+            importance_recall_enabled: Some(cfg.importance_recall_enabled),
         }
     }
 }
@@ -2064,5 +2083,16 @@ mod phase5_boost_tests {
         let cfg: MemoryRecallConfig = dto.into();
         assert_eq!(cfg.entity_page_boost, 1.0);
         assert_eq!(cfg.backlink_boost_weight, 0.0);
+    }
+
+    #[test]
+    fn dto_round_trip_preserves_importance_recall_enabled() {
+        let mut cfg = MemoryRecallConfig::default();
+        assert_eq!(cfg.importance_recall_enabled, true);
+        cfg.importance_recall_enabled = false;
+        let dto: MemoryRecallConfigDto = cfg.clone().into();
+        assert_eq!(dto.importance_recall_enabled, Some(false));
+        let restored: MemoryRecallConfig = dto.into();
+        assert_eq!(restored.importance_recall_enabled, false);
     }
 }

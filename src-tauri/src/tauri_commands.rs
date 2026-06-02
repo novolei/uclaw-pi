@@ -224,6 +224,9 @@ pub async fn patch_memory_recall_config(
             .memu_retrieve_timeout_ms
             .or(existing.memu_retrieve_timeout_ms)
             .map(|v| v.clamp(50, 30_000)),
+        importance_recall_enabled: input
+            .importance_recall_enabled
+            .or(existing.importance_recall_enabled),
     };
 
     settings.memory_recall_config = Some(merged.clone());
