@@ -184,6 +184,60 @@ pub fn get_user_model(conn: &Connection) -> rusqlite::Result<Option<String>> {
     })
 }
 
+// ─── daydreams store (P4: divergent free-association pass) ──────────────────
+
+/// One daydream row, as read back for the UI surface (`agent:daydream` event /
+/// a recent-daydreams view). Mirrors the V58 `daydreams` columns we read.
+#[derive(Debug, Clone)]
+pub struct DaydreamRow {
+    pub content: String,
+    pub created_at: String,
+}
+
+/// Apply the V58 `daydreams` DDL to a bare connection. Mirrors the migration
+/// block exactly; used by unit tests against `:memory:` so they don't drag in
+/// the whole migration stack. (The real table is created by the V58 migration.)
+pub fn apply_daydreams_schema(conn: &Connection) {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS daydreams (
+            id          TEXT PRIMARY KEY,
+            content     TEXT NOT NULL,
+            created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_daydreams_created ON daydreams(created_at DESC);",
+    )
+    .expect("apply_daydreams_schema");
+}
+
+/// Insert one daydream. `created_at` is left to the column default
+/// (`datetime('now')`). Best-effort callers map the `Result` to a log line.
+pub fn insert_daydream(conn: &Connection, id: &str, content: &str) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO daydreams (id, content) VALUES (?1, ?2)",
+        params![id, content],
+    )?;
+    Ok(())
+}
+
+/// Most-recent daydreams, newest first, capped at `limit`.
+pub fn recent_daydreams(conn: &Connection, limit: usize) -> rusqlite::Result<Vec<DaydreamRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT content, created_at
+         FROM daydreams
+         ORDER BY created_at DESC
+         LIMIT ?1",
+    )?;
+    let rows = stmt
+        .query_map(params![limit as i64], |r| {
+            Ok(DaydreamRow {
+                content: r.get(0)?,
+                created_at: r.get(1)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
 /// System prompt for the reflection pass. Pins the JSON output contract so
 /// `parse_reflection_output` has a stable shape to parse.
 const REFLECTION_SYSTEM_PROMPT: &str = "\
@@ -522,5 +576,16 @@ mod tests {
             get_user_model(&conn).unwrap().as_deref(),
             Some("Ryan Liu, Apple PKG PD, Rust+SwiftUI")
         );
+    }
+
+    #[test]
+    fn daydreams_store_inserts_and_reads_recent() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        apply_daydreams_schema(&conn);
+        insert_daydream(&conn, "id1", "what if agents dream in graphs?").unwrap();
+        insert_daydream(&conn, "id2", "rust borrow-checker as a memory model").unwrap();
+        let recent = recent_daydreams(&conn, 5).unwrap();
+        assert_eq!(recent.len(), 2);
+        assert!(recent.iter().any(|d| d.content.contains("borrow-checker")));
     }
 }
