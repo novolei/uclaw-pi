@@ -2363,6 +2363,20 @@ const SQL_V57: &str = r#"
     );
 "#;
 
+// ─── V58 — Phase 4 growth: daydreams (divergent free-association pass) ────────
+// `daydreams`: novel hypotheses/connections the ReflectionService free-associates
+// over random memory (~every 100 agent turns, 1/5 of the reflection cadence).
+// UI-surface only (emitted as `agent:daydream`); NOT injected into the prompt.
+// Additive + IF NOT EXISTS so the block is idempotent and safe to replay on boot.
+const SQL_V58: &str = r#"
+    CREATE TABLE IF NOT EXISTS daydreams (
+        id          TEXT PRIMARY KEY,
+        content     TEXT NOT NULL,
+        created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_daydreams_created ON daydreams(created_at DESC);
+"#;
+
 /// Test/dev helper: run the full migration stack on a fresh connection.
 ///
 /// The `_target` parameter is currently ignored. All migrations are
@@ -2818,6 +2832,14 @@ pub fn run(conn: &rusqlite::Connection) -> Result<(), rusqlite::Error> {
     for stmt in SQL_V57.split(';').map(|s| s.trim()).filter(|s| !s.is_empty()) {
         if let Err(e) = conn.execute(stmt, []) {
             tracing::debug!("V57 stmt skipped (likely already applied): {} :: {}", e, stmt);
+        }
+    }
+    // V58: Phase 4 growth — daydreams table (divergent free-association pass).
+    // Additive + IF NOT EXISTS, so replaying on every boot is a no-op.
+    tracing::debug!("Running migration V58: daydreams");
+    for stmt in SQL_V58.split(';').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        if let Err(e) = conn.execute(stmt, []) {
+            tracing::debug!("V58 stmt skipped (likely already applied): {} :: {}", e, stmt);
         }
     }
     tracing::info!("Database migrations complete");

@@ -115,7 +115,7 @@ impl TauriEventSink {
             ) {
                 let app = self.app.clone();
                 tauri::async_runtime::spawn(async move {
-                    crate::memory_graph::reflection_service::run_once(app).await;
+                    crate::memory_graph::reflection_service::run_once(app, n).await;
                 });
             }
         }
