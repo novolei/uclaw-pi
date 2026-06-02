@@ -145,6 +145,15 @@ pub struct MemoryRecallConfig {
     /// The pi-engine recall sites set this so a slow/empty memU L3 (a Python
     /// subprocess that can stall seconds) can't block same-turn recall.
     pub memu_retrieve_timeout_ms: Option<u64>,
+
+    /// When `true` (default), `build_recall_plan_with_time` ranks recall
+    /// candidates by the pre-computed `memory_importance_scores.importance`
+    /// (DESC; candidates with no score row sort last as 0.0) and drops any
+    /// candidate whose `archive_pending_since IS NOT NULL`. This activates
+    /// the importance subsystem (recall.rs computes/stores importance but
+    /// historically never read it back during recall). Set `false` to keep
+    /// the legacy ordering/visibility (no importance read, no archive drop).
+    pub importance_recall_enabled: bool,
 }
 
 // Standalone default functions retained: used both by
@@ -187,6 +196,8 @@ impl Default for MemoryRecallConfig {
             prompt_recall_backend: None,
             prompt_recall_limit: 5,
             memu_retrieve_timeout_ms: None,
+            // Default on: activate the importance-ranked recall + archive drop.
+            importance_recall_enabled: true,
         }
     }
 }
@@ -242,6 +253,10 @@ pub struct MemoryRecallConfigDto {
     pub prompt_recall_limit: Option<usize>,
     #[serde(default)]
     pub memu_retrieve_timeout_ms: Option<u64>,
+    /// Rank recall by `memory_importance_scores` + drop archive_pending
+    /// candidates. Defaults to `true` via the `From<Dto>` fallback.
+    #[serde(default)]
+    pub importance_recall_enabled: Option<bool>,
 }
 
 impl From<MemoryRecallConfigDto> for MemoryRecallConfig {
@@ -271,6 +286,9 @@ impl From<MemoryRecallConfigDto> for MemoryRecallConfig {
             memu_retrieve_timeout_ms: dto
                 .memu_retrieve_timeout_ms
                 .or(default.memu_retrieve_timeout_ms),
+            importance_recall_enabled: dto
+                .importance_recall_enabled
+                .unwrap_or(default.importance_recall_enabled),
         }
     }
 }
@@ -299,6 +317,7 @@ impl From<MemoryRecallConfig> for MemoryRecallConfigDto {
             prompt_recall_backend: cfg.prompt_recall_backend,
             prompt_recall_limit: Some(cfg.prompt_recall_limit),
             memu_retrieve_timeout_ms: cfg.memu_retrieve_timeout_ms,
+            importance_recall_enabled: Some(cfg.importance_recall_enabled),
         }
     }
 }
@@ -456,6 +475,16 @@ impl MemoryRecallEngine {
         // L5 — Recent (with native time range filtering)
         let recent = self.layer_recent_enhanced(space_id, time_range)?;
         info!(count = recent.len(), "recall: L5 recent entries");
+
+        // P1-① — When importance_recall_enabled (default), re-rank each
+        // candidate layer by memory_importance_scores.importance DESC and
+        // drop archive_pending candidates. Each call is a pure pass-through
+        // when the flag is off, so legacy behavior is byte-for-byte preserved.
+        // L5 `recent` holds MemoryTimelineEntry (not candidates) → untouched.
+        let boot = self.rank_and_filter_by_importance(boot)?;
+        let triggered = self.rank_and_filter_by_importance(triggered)?;
+        let relevant = self.rank_and_filter_by_importance(relevant)?;
+        let expanded = self.rank_and_filter_by_importance(expanded)?;
 
         Ok(MemoryRecallPlan {
             boot,
@@ -1124,6 +1153,87 @@ impl MemoryRecallEngine {
             out.insert(id, (MemoryNodeKind::from_str(&kind_str), backlinks));
         }
         Ok(out)
+    }
+
+    /// P1-① — activate the importance subsystem during recall.
+    ///
+    /// When `config.importance_recall_enabled` is set (default), batch-load
+    /// `(importance, archive_pending_since)` from `memory_importance_scores`
+    /// for the candidates' `node_id`s in a single sync connection block
+    /// (mirrors `fetch_boost_signals`; no `.await` held under the lock),
+    /// then:
+    ///   1. drop any candidate whose `archive_pending_since IS NOT NULL`,
+    ///   2. stable-sort the survivors by `importance DESC` (a candidate with
+    ///      no score row is treated as `0.0` and therefore sorts last).
+    ///
+    /// When the flag is off this is a pure pass-through: no DB read, input
+    /// order and visibility are preserved exactly (legacy behavior).
+    fn rank_and_filter_by_importance(
+        &self,
+        candidates: Vec<MemoryRecallCandidate>,
+    ) -> anyhow::Result<Vec<MemoryRecallCandidate>> {
+        if !self.config.importance_recall_enabled || candidates.is_empty() {
+            return Ok(candidates);
+        }
+
+        let ids: Vec<String> = candidates.iter().map(|c| c.node_id.clone()).collect();
+
+        // (importance, archive_pending) keyed by node_id. Missing rows are
+        // simply absent → importance 0.0, not archive-pending.
+        let scores: HashMap<String, (f64, bool)> = {
+            let conn = self
+                .store
+                .conn
+                .lock()
+                .map_err(|e| anyhow::anyhow!("DB lock: {}", e))?;
+            let placeholders = (1..=ids.len())
+                .map(|i| format!("?{}", i))
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT node_id, importance, archive_pending_since \
+                 FROM memory_importance_scores \
+                 WHERE node_id IN ({placeholders})"
+            );
+            // E0597 lifetime pattern: stmt + rows in their own scope so the
+            // MappedRows iterator drops before stmt does.
+            let mut stmt = conn.prepare(&sql)?;
+            let params_refs: Vec<&dyn rusqlite::types::ToSql> =
+                ids.iter().map(|s| s as &dyn rusqlite::types::ToSql).collect();
+            let rows = stmt.query_map(params_refs.as_slice(), |row| {
+                let id: String = row.get(0)?;
+                let importance: f64 = row.get(1)?;
+                let archive_pending: Option<i64> = row.get(2)?;
+                Ok((id, importance, archive_pending.is_some()))
+            })?;
+            let mut map = HashMap::with_capacity(ids.len());
+            for r in rows.flatten() {
+                let (id, importance, archive_pending) = r;
+                map.insert(id, (importance, archive_pending));
+            }
+            map
+            // conn lock released here, before any further work.
+        };
+
+        // 1. Drop archive_pending candidates.
+        let mut kept: Vec<MemoryRecallCandidate> = candidates
+            .into_iter()
+            .filter(|c| {
+                scores
+                    .get(&c.node_id)
+                    .map(|(_, archive_pending)| !archive_pending)
+                    .unwrap_or(true) // no score row → not archive-pending → keep
+            })
+            .collect();
+
+        // 2. Stable-sort by importance DESC (missing → 0.0, sorts last).
+        kept.sort_by(|a, b| {
+            let ia = scores.get(&a.node_id).map(|(imp, _)| *imp).unwrap_or(0.0);
+            let ib = scores.get(&b.node_id).map(|(imp, _)| *imp).unwrap_or(0.0);
+            ib.partial_cmp(&ia).unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        Ok(kept)
     }
 
     // ── L3 Relevant (seed) ───────────────────────────────────────────────
@@ -2064,5 +2174,117 @@ mod phase5_boost_tests {
         let cfg: MemoryRecallConfig = dto.into();
         assert_eq!(cfg.entity_page_boost, 1.0);
         assert_eq!(cfg.backlink_boost_weight, 0.0);
+    }
+
+    #[test]
+    fn dto_round_trip_preserves_importance_recall_enabled() {
+        let mut cfg = MemoryRecallConfig::default();
+        assert_eq!(cfg.importance_recall_enabled, true);
+        cfg.importance_recall_enabled = false;
+        let dto: MemoryRecallConfigDto = cfg.clone().into();
+        assert_eq!(dto.importance_recall_enabled, Some(false));
+        let restored: MemoryRecallConfig = dto.into();
+        assert_eq!(restored.importance_recall_enabled, false);
+    }
+
+    // ─── Importance-ranked recall (P1-①) ────────────────────────────────
+
+    /// Like `fresh_store` but also installs the V44 L3-retained schema that
+    /// owns `memory_importance_scores` (the table the importance recall
+    /// reads). Kept separate so the other phase-5 tests stay untouched.
+    fn fresh_store_with_importance() -> Arc<MemoryGraphStore> {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(crate::db::migrations::V4_MEMORY_GRAPH).unwrap();
+        conn.execute_batch(crate::db::migrations::V35_MEMORY_OS_PHASE_1).unwrap();
+        conn.execute_batch(crate::db::migrations::V44_L3_RETAINED_SCHEMA).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").ok();
+        Arc::new(MemoryGraphStore::new(Arc::new(Mutex::new(conn))))
+    }
+
+    fn set_importance(store: &MemoryGraphStore, node_id: &str, importance: f64, archive_pending: bool) {
+        let conn = store.conn.lock().unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let archive_since: Option<i64> = if archive_pending { Some(now) } else { None };
+        conn.execute(
+            "INSERT INTO memory_importance_scores \
+             (node_id, base_value, citation_factor, edge_factor, recency_factor, \
+              status_bonus, penalty, importance, decay_half_life_days, last_computed_at, \
+              archive_pending_since) \
+             VALUES (?1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, ?2, 7.0, ?3, ?4)",
+            params![node_id, importance, now, archive_since],
+        )
+        .unwrap();
+    }
+
+    fn make_candidate(id: &str) -> MemoryRecallCandidate {
+        MemoryRecallCandidate {
+            node_id: id.to_string(),
+            title: id.to_string(),
+            content: String::new(),
+            kind: MemoryNodeKind::Episode,
+            source: "test".to_string(),
+            reason: "test".to_string(),
+            score: None,
+            fts_rank: None,
+            vector_rank: None,
+            matched_keywords: Vec::new(),
+            metadata: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn recall_orders_by_importance_and_drops_archive_pending() {
+        let store = fresh_store_with_importance();
+        insert_node(&store, "high", "episode", "High");
+        insert_node(&store, "low", "episode", "Low");
+        insert_node(&store, "archived", "episode", "Archived");
+        // high.importance=0.9, low=0.1, archived flagged archive_pending.
+        set_importance(&store, "high", 0.9, false);
+        set_importance(&store, "low", 0.1, false);
+        set_importance(&store, "archived", 0.5, true);
+
+        let cfg = MemoryRecallConfig::default();
+        assert!(cfg.importance_recall_enabled); // default-on path under test
+        let engine = MemoryRecallEngine::new(store, None, cfg);
+
+        // Deliberately pass low BEFORE high to prove the sort actually reorders.
+        let input = vec![
+            make_candidate("low"),
+            make_candidate("archived"),
+            make_candidate("high"),
+        ];
+        let filtered = engine.rank_and_filter_by_importance(input).unwrap();
+
+        let ids: Vec<&str> = filtered.iter().map(|c| c.node_id.as_str()).collect();
+        // archive_pending node dropped …
+        assert!(!ids.contains(&"archived"), "archive_pending node must be dropped: {ids:?}");
+        // … and high (0.9) ranks before low (0.1).
+        assert_eq!(ids, vec!["high", "low"], "expected importance DESC order");
+    }
+
+    #[tokio::test]
+    async fn recall_missing_importance_sorts_last_and_flag_off_is_noop() {
+        let store = fresh_store_with_importance();
+        insert_node(&store, "scored", "episode", "Scored");
+        insert_node(&store, "unscored", "episode", "Unscored"); // no importance row → 0.0
+        set_importance(&store, "scored", 0.7, false);
+
+        // Flag ON: unscored (treated as 0.0) sorts after scored.
+        let engine = MemoryRecallEngine::new(store.clone(), None, MemoryRecallConfig::default());
+        let on = engine
+            .rank_and_filter_by_importance(vec![make_candidate("unscored"), make_candidate("scored")])
+            .unwrap();
+        let on_ids: Vec<&str> = on.iter().map(|c| c.node_id.as_str()).collect();
+        assert_eq!(on_ids, vec!["scored", "unscored"]);
+
+        // Flag OFF: input order preserved verbatim (legacy behavior, no DB read).
+        let mut off_cfg = MemoryRecallConfig::default();
+        off_cfg.importance_recall_enabled = false;
+        let engine_off = MemoryRecallEngine::new(store, None, off_cfg);
+        let off = engine_off
+            .rank_and_filter_by_importance(vec![make_candidate("unscored"), make_candidate("scored")])
+            .unwrap();
+        let off_ids: Vec<&str> = off.iter().map(|c| c.node_id.as_str()).collect();
+        assert_eq!(off_ids, vec!["unscored", "scored"]);
     }
 }

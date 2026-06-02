@@ -76,6 +76,28 @@ fn compose_memory_context(
     }
 }
 
+/// Compose the pi prompt-context from priority-ordered blocks (highest first)
+/// under a char budget. When the running total would exceed `budget_chars`,
+/// remaining lower-priority blocks are dropped. Empty/blank/None blocks are
+/// skipped. Returns None when nothing fits.
+pub fn build_pi_prompt_context_blocks(
+    blocks: Vec<(&'static str, Option<String>)>,
+    budget_chars: usize,
+) -> Option<String> {
+    let mut kept: Vec<String> = Vec::new();
+    let mut used = 0usize;
+    for (_label, block) in blocks {
+        let Some(b) = block else { continue };
+        if b.trim().is_empty() { continue; }
+        // Budget bounds total content length; the inter-block "\n\n"
+        // separators are joining glue and don't count against it.
+        if used + b.len() > budget_chars { break; }
+        used += b.len();
+        kept.push(b);
+    }
+    if kept.is_empty() { None } else { Some(kept.join("\n\n")) }
+}
+
 /// Recall from the configured adapter backend and format a bounded
 /// `<recalled_memories>` block. Best-effort: any router/adapter error logs a
 /// warning and yields `None` (never fails the turn).
@@ -318,5 +340,23 @@ mod tests {
             limit: 5,
         };
         assert!(recall_adapter_block(&ar, "q").await.is_none());
+    }
+
+    #[test]
+    fn compose_pi_orders_by_priority_and_skips_empty() {
+        let out = build_pi_prompt_context_blocks(
+            vec![("facets", Some("F".into())), ("genes", Some("G".into())),
+                 ("recall", Some("R".into())), ("gbrain", Some("B".into()))],
+            10_000);
+        assert_eq!(out.as_deref(), Some("F\n\nG\n\nR\n\nB"));
+        assert!(build_pi_prompt_context_blocks(vec![("x", None), ("y", Some("  ".into()))], 10_000).is_none());
+    }
+    #[test]
+    fn compose_pi_drops_low_priority_over_budget() {
+        let out = build_pi_prompt_context_blocks(
+            vec![("facets", Some("AAAA".into())), ("genes", Some("BBBB".into())),
+                 ("recall", Some("CCCC".into()))], 8);
+        let s = out.unwrap();
+        assert!(s.contains("AAAA") && s.contains("BBBB") && !s.contains("CCCC"));
     }
 }
