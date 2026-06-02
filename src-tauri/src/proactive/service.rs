@@ -621,7 +621,6 @@ impl ProactiveService {
         let tool_memory_manager = Arc::new(ToolUsageMemoryManager::new(memory_graph_store.clone()));
         let hybrid_search_engine = Arc::new(HybridSearchEngine::new(
             memory_graph_store.clone(),
-            memu_client.clone(),
         ));
         let conversation_bridge = Arc::new(ConversationBridge::new(memory_graph_store.clone()));
         let failure_memory_manager = Arc::new(FailureMemoryManager::new(memory_graph_store.clone()));
@@ -629,7 +628,6 @@ impl ProactiveService {
         let personality_model = Arc::new(PersonalityModel::new(memory_graph_store.clone()));
         let proactive_recall_service = Arc::new(ProactiveRecallService::new(
             memory_graph_store.clone(),
-            memu_client.clone(),
             task_memory_manager.clone(),
             tool_memory_manager.clone(),
             failure_memory_manager.clone(),

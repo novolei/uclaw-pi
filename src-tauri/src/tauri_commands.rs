@@ -218,12 +218,6 @@ pub async fn patch_memory_recall_config(
             0,
             50,
         ),
-        // Per-retrieve memU bound (ms). None = unbounded (legacy). Clamped to a
-        // sane [50ms, 30s] when a user supplies it.
-        memu_retrieve_timeout_ms: input
-            .memu_retrieve_timeout_ms
-            .or(existing.memu_retrieve_timeout_ms)
-            .map(|v| v.clamp(50, 30_000)),
         importance_recall_enabled: input
             .importance_recall_enabled
             .or(existing.importance_recall_enabled),
@@ -1347,13 +1341,6 @@ fn browser_task_memory_for_query(
 ///
 /// Returning a clone here is fine — composed contexts are 1-3 KB
 /// typical; cheap relative to the LLM call that follows.
-/// pi-engine memU bound (ms): how long an L3 `memu.retrieve` may run on the pi
-/// recall path before falling back to FTS-only, so a slow/empty memU can't push
-/// recall past the per-turn deadline. Applied to the pi sites only (via
-/// `get_or_insert`); legacy callers leave `memu_retrieve_timeout_ms` = None
-/// (unbounded). User-overridable via `memoryRecallConfig.memuRetrieveTimeoutMs`.
-const PI_PROMPT_RECALL_MEMU_TIMEOUT_MS: u64 = 300;
-
 async fn recall_cache_fallback(
     cache: &Arc<tokio::sync::RwLock<std::collections::HashMap<String, String>>>,
     session_id: &str,
@@ -1565,21 +1552,16 @@ pub async fn send_message(
         // like the legacy chat path (no background deadline — chat accepts the
         // latency; the agent path below uses a deadline instead).
         let recall_ctx: Option<String> = {
-            let mut recall_config = {
+            let recall_config = {
                 let s = state.settings.read().await;
                 s.memory_recall_config
                     .clone()
                     .map(crate::memory_graph::recall::MemoryRecallConfig::from)
                     .unwrap_or_default()
             };
-            // pi path: bound memU's slow L3 retrieve so it can't block same-turn
-            // recall. `get_or_insert` = default only — an explicit user setting wins.
-            recall_config
-                .memu_retrieve_timeout_ms
-                .get_or_insert(PI_PROMPT_RECALL_MEMU_TIMEOUT_MS);
+            // PR P2-①: recall is FTS-only — no L3 memU retrieve to bound.
             let recall_engine = crate::memory_graph::recall::MemoryRecallEngine::new(
                 state.memory_graph_store.clone(),
-                state.memu_client.clone(),
                 recall_config,
             );
             let space_id = {
@@ -1657,15 +1639,13 @@ pub async fn send_message(
                     None => None,
                 }
             };
-            crate::agent::memory_context::build_pi_prompt_context_blocks(
-                vec![
-                    ("facets", facets_block),
-                    ("genes", genes_block),
-                    ("recall", recall_ctx),
-                    ("gbrain", gbrain_block),
-                ],
-                12_000,
-            )
+            crate::agent::memory_context::PiPromptContext {
+                facts: facets_block,
+                genes: genes_block,
+                recall: recall_ctx,
+                gbrain: gbrain_block,
+            }
+            .compose(12_000)
         };
         engine.send(uclaw_pi_engine::EngineCmd::Prompt {
             conv_id: conv_id.clone(),
@@ -2073,7 +2053,6 @@ pub async fn send_message(
     // Build a recall plan and inject memory context into the system prompt.
     {
         let recall_store = state.memory_graph_store.clone();
-        let recall_memu = state.memu_client.clone();
         // Hot-reload: read the latest config from persisted settings so
         // users can tune recall behaviour without restarting the app.
         let recall_config = {
@@ -2085,7 +2064,6 @@ pub async fn send_message(
         };
         let recall_engine = crate::memory_graph::recall::MemoryRecallEngine::new(
             recall_store,
-            recall_memu,
             recall_config,
         );
         // Consolidated memory assembly — see agent::memory_context::load_context.
@@ -2870,12 +2848,10 @@ pub async fn memory_graph_search(
     input: MemoryGraphSearchInput,
 ) -> Result<serde_json::Value, String> {
     let store = &state.memory_graph_store;
-    let memu_client = state.memu_client.clone();
     let space_id = input.space_id.unwrap_or_else(|| "default".into());
 
     let engine = crate::memory_graph::recall::MemoryRecallEngine::new(
         store.clone(),
-        memu_client,
         crate::memory_graph::recall::MemoryRecallConfig::default(),
     );
 
@@ -2997,12 +2973,10 @@ pub async fn memory_graph_explain_recall(
     input: MemoryGraphExplainRecallInput,
 ) -> Result<serde_json::Value, String> {
     let store = &state.memory_graph_store;
-    let memu_client = state.memu_client.clone();
     let space_id = input.space_id.unwrap_or_else(|| "default".into());
 
     let engine = crate::memory_graph::recall::MemoryRecallEngine::new(
         store.clone(),
-        memu_client,
         crate::memory_graph::recall::MemoryRecallConfig::default(),
     );
 
@@ -5044,36 +5018,31 @@ pub async fn send_agent_message(
         // agent path:
         //   * Run recall in a BACKGROUND task so it completes — and primes the
         //     per-session recall_ctx_cache — even when this turn's deadline
-        //     fires. memU's L3 retrieve goes through a Python subprocess and can
-        //     stall many seconds; a plain timeout(load_context) would cancel it
-        //     and the cache would never warm, so memory would never inject.
+        //     fires. Adapter backends (e.g. the gbrain MCP) can still stall, so
+        //     a plain timeout(load_context) would cancel them and the cache would
+        //     never warm, leaving memory uninjected.
         //   * Await a oneshot under a deadline; on a miss, fall back to the prior
         //     turn's cached ctx (so memory still primes turn N+1).
         //
-        // Same-turn tuning: with memU's L3 bounded above
-        // (PI_PROMPT_RECALL_MEMU_TIMEOUT_MS), the full recall now lands in ~1.2s
-        // (fast layers + bounded memU + the gbrain adapter) instead of ~2.8s, so
-        // the deadline is raised 400 → 1500ms — enough to inject memory on the
-        // SAME turn (incl. turn 1) rather than one turn behind, at the cost of up
-        // to ~1.5s recall latency before the turn starts. The cache fallback
-        // still covers the occasional recall that overruns.
+        // Same-turn tuning: recall is FTS-only now (PR P2-① retired memU's L3
+        // vector path; bucket_seal owns vector recall), so the graph layers land
+        // fast and the full recall (fast layers + the gbrain adapter) fits well
+        // under the deadline, which is raised 400 → 1500ms — enough to inject
+        // memory on the SAME turn (incl. turn 1) rather than one turn behind, at
+        // the cost of up to ~1.5s recall latency before the turn starts. The
+        // cache fallback still covers the occasional recall that overruns.
         const PI_RECALL_DEADLINE_MS: u64 = 1500;
         let (recall_tx, recall_rx) = tokio::sync::oneshot::channel::<Option<String>>();
         {
             let recall_store = state.memory_graph_store.clone();
-            let recall_memu = state.memu_client.clone();
-            let mut recall_config = {
+            let recall_config = {
                 let s = state.settings.read().await;
                 s.memory_recall_config
                     .clone()
                     .map(crate::memory_graph::recall::MemoryRecallConfig::from)
                     .unwrap_or_default()
             };
-            // pi path: bound memU's slow L3 retrieve so it can't block same-turn
-            // recall. `get_or_insert` = default only — an explicit user setting wins.
-            recall_config
-                .memu_retrieve_timeout_ms
-                .get_or_insert(PI_PROMPT_RECALL_MEMU_TIMEOUT_MS);
+            // PR P2-①: recall is FTS-only — no L3 memU retrieve to bound.
             // Pre-resolve everything the 'static spawn needs (no &state borrow).
             let user_msg_for_recall = input.user_message.clone();
             let session_id_for_recall = input.session_id.clone();
@@ -5091,7 +5060,6 @@ pub async fn send_agent_message(
             tokio::spawn(async move {
                 let recall_engine = crate::memory_graph::recall::MemoryRecallEngine::new(
                     recall_store,
-                    recall_memu,
                     recall_config,
                 );
                 // Background task has no AppState → AppState-free browser fn.
@@ -5196,15 +5164,13 @@ pub async fn send_agent_message(
                     None => None,
                 }
             };
-            crate::agent::memory_context::build_pi_prompt_context_blocks(
-                vec![
-                    ("facets", facets_block),
-                    ("genes", genes_block),
-                    ("recall", recall_ctx),
-                    ("gbrain", gbrain_block),
-                ],
-                12_000,
-            )
+            crate::agent::memory_context::PiPromptContext {
+                facts: facets_block,
+                genes: genes_block,
+                recall: recall_ctx,
+                gbrain: gbrain_block,
+            }
+            .compose(12_000)
         };
         engine.send(uclaw_pi_engine::EngineCmd::Prompt {
             conv_id,
@@ -6084,7 +6050,6 @@ pub async fn send_agent_message(
     let (recall_tx, recall_rx) = tokio::sync::oneshot::channel::<Option<String>>();
     {
         let recall_store = state.memory_graph_store.clone();
-        let recall_memu = state.memu_client.clone();
         let recall_config = {
             let s = state.settings.read().await;
             s.memory_recall_config
@@ -6119,7 +6084,6 @@ pub async fn send_agent_message(
         tokio::spawn(async move {
             let recall_engine = crate::memory_graph::recall::MemoryRecallEngine::new(
                 recall_store,
-                recall_memu,
                 recall_config,
             );
             let recall_space_id = "default";

@@ -76,26 +76,46 @@ fn compose_memory_context(
     }
 }
 
-/// Compose the pi prompt-context from priority-ordered blocks (highest first)
-/// under a char budget. When the running total would exceed `budget_chars`,
-/// remaining lower-priority blocks are dropped. Empty/blank/None blocks are
-/// skipped. Returns None when nothing fits.
-pub fn build_pi_prompt_context_blocks(
-    blocks: Vec<(&'static str, Option<String>)>,
-    budget_chars: usize,
-) -> Option<String> {
-    let mut kept: Vec<String> = Vec::new();
-    let mut used = 0usize;
-    for (_label, block) in blocks {
-        let Some(b) = block else { continue };
-        if b.trim().is_empty() { continue; }
-        // Budget bounds total content length; the inter-block "\n\n"
-        // separators are joining glue and don't count against it.
-        if used + b.len() > budget_chars { break; }
-        used += b.len();
-        kept.push(b);
+/// Typed pi prompt-context. Dimensions in priority order (facts highest,
+/// gbrain lowest). `compose` truncates each dimension to its per-dim cap, then
+/// concatenates by priority under `total_budget` chars (lower-priority dropped
+/// when the budget would overflow). Phase 3 adds `reflections` / `user_model`.
+#[derive(Default)]
+pub struct PiPromptContext {
+    pub facts: Option<String>,
+    pub genes: Option<String>,
+    pub recall: Option<String>,
+    pub gbrain: Option<String>,
+}
+
+impl PiPromptContext {
+    pub fn compose(self, total_budget: usize) -> Option<String> {
+        const CAP_FACTS: usize = 1_500;
+        const CAP_GENES: usize = 2_500;
+        const CAP_RECALL: usize = 8_000;
+        const CAP_GBRAIN: usize = 2_000;
+        let dims = [
+            (self.facts, CAP_FACTS),
+            (self.genes, CAP_GENES),
+            (self.recall, CAP_RECALL),
+            (self.gbrain, CAP_GBRAIN),
+        ];
+        let mut kept: Vec<String> = Vec::new();
+        let mut used = 0usize;
+        for (block, cap) in dims {
+            let Some(mut b) = block else { continue };
+            if b.trim().is_empty() { continue; }
+            if b.len() > cap {
+                let mut n = cap;
+                while n > 0 && !b.is_char_boundary(n) { n -= 1; }
+                b.truncate(n);
+            }
+            if used + b.len() > total_budget { break; }
+            used += b.len();
+            kept.push(b);
+        }
+        if kept.is_empty() { None } else { Some(kept.join("\n\n")) }
     }
-    if kept.is_empty() { None } else { Some(kept.join("\n\n")) }
 }
 
 /// Recall from the configured adapter backend and format a bounded
@@ -343,20 +363,34 @@ mod tests {
     }
 
     #[test]
-    fn compose_pi_orders_by_priority_and_skips_empty() {
-        let out = build_pi_prompt_context_blocks(
-            vec![("facets", Some("F".into())), ("genes", Some("G".into())),
-                 ("recall", Some("R".into())), ("gbrain", Some("B".into()))],
-            10_000);
+    fn pi_context_orders_by_priority_and_skips_empty() {
+        let out = PiPromptContext {
+            facts: Some("F".into()), genes: Some("G".into()),
+            recall: Some("R".into()), gbrain: Some("B".into()),
+        }.compose(10_000);
         assert_eq!(out.as_deref(), Some("F\n\nG\n\nR\n\nB"));
-        assert!(build_pi_prompt_context_blocks(vec![("x", None), ("y", Some("  ".into()))], 10_000).is_none());
+        assert!(PiPromptContext::default().compose(10_000).is_none());
+        assert!(PiPromptContext { gbrain: Some("   ".into()), ..Default::default() }
+            .compose(10_000).is_none());
     }
     #[test]
-    fn compose_pi_drops_low_priority_over_budget() {
-        let out = build_pi_prompt_context_blocks(
-            vec![("facets", Some("AAAA".into())), ("genes", Some("BBBB".into())),
-                 ("recall", Some("CCCC".into()))], 8);
+    fn pi_context_total_budget_drops_low_priority() {
+        let out = PiPromptContext {
+            facts: Some("AAAA".into()), genes: Some("BBBB".into()),
+            recall: Some("CCCC".into()), ..Default::default()
+        }.compose(8);
         let s = out.unwrap();
         assert!(s.contains("AAAA") && s.contains("BBBB") && !s.contains("CCCC"));
+    }
+    #[test]
+    fn pi_context_per_dim_cap_truncates_recall_on_char_boundary() {
+        // recall block far over CAP_RECALL must be truncated to <= cap, never
+        // splitting a UTF-8 codepoint.
+        let huge = "电".repeat(5000); // 3 bytes each = 15000 bytes > CAP_RECALL
+        let out = PiPromptContext { recall: Some(huge), ..Default::default() }
+            .compose(1_000_000);
+        let s = out.unwrap();
+        assert!(s.len() <= 8_000, "recall capped to CAP_RECALL=8000, got {}", s.len());
+        assert!(std::str::from_utf8(s.as_bytes()).is_ok(), "no broken codepoint");
     }
 }

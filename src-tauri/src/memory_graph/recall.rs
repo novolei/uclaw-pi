@@ -7,7 +7,6 @@ use tracing::info;
 use super::models::*;
 use super::search::MemorySearchResult;
 use super::store::MemoryGraphStore;
-use crate::memu::client::MemUClient;
 
 // ─── Time Range ───────────────────────────────────────────────────────────
 
@@ -139,12 +138,6 @@ pub struct MemoryRecallConfig {
     pub prompt_recall_backend: Option<String>,
     /// Max entries pulled for the adapter-recall supplement. Default 5.
     pub prompt_recall_limit: usize,
-    /// When set, bound each L3 `memu.retrieve` (vector search) to this many
-    /// milliseconds; on timeout, fall back to FTS-only (identical to the path
-    /// taken when memU errors). `None` = unbounded (default — legacy behavior).
-    /// The pi-engine recall sites set this so a slow/empty memU L3 (a Python
-    /// subprocess that can stall seconds) can't block same-turn recall.
-    pub memu_retrieve_timeout_ms: Option<u64>,
 
     /// When `true` (default), `build_recall_plan_with_time` ranks recall
     /// candidates by the pre-computed `memory_importance_scores.importance`
@@ -195,7 +188,6 @@ impl Default for MemoryRecallConfig {
             backlink_boost_weight: default_backlink_boost_weight(),
             prompt_recall_backend: None,
             prompt_recall_limit: 5,
-            memu_retrieve_timeout_ms: None,
             // Default on: activate the importance-ranked recall + archive drop.
             importance_recall_enabled: true,
         }
@@ -251,8 +243,6 @@ pub struct MemoryRecallConfigDto {
     pub prompt_recall_backend: Option<String>,
     #[serde(default)]
     pub prompt_recall_limit: Option<usize>,
-    #[serde(default)]
-    pub memu_retrieve_timeout_ms: Option<u64>,
     /// Rank recall by `memory_importance_scores` + drop archive_pending
     /// candidates. Defaults to `true` via the `From<Dto>` fallback.
     #[serde(default)]
@@ -283,9 +273,6 @@ impl From<MemoryRecallConfigDto> for MemoryRecallConfig {
             backlink_boost_weight: dto.backlink_boost_weight.unwrap_or(default.backlink_boost_weight),
             prompt_recall_backend: dto.prompt_recall_backend.or(default.prompt_recall_backend),
             prompt_recall_limit: dto.prompt_recall_limit.unwrap_or(default.prompt_recall_limit),
-            memu_retrieve_timeout_ms: dto
-                .memu_retrieve_timeout_ms
-                .or(default.memu_retrieve_timeout_ms),
             importance_recall_enabled: dto
                 .importance_recall_enabled
                 .unwrap_or(default.importance_recall_enabled),
@@ -316,7 +303,6 @@ impl From<MemoryRecallConfig> for MemoryRecallConfigDto {
             backlink_boost_weight: Some(cfg.backlink_boost_weight),
             prompt_recall_backend: cfg.prompt_recall_backend,
             prompt_recall_limit: Some(cfg.prompt_recall_limit),
-            memu_retrieve_timeout_ms: cfg.memu_retrieve_timeout_ms,
             importance_recall_enabled: Some(cfg.importance_recall_enabled),
         }
     }
@@ -384,21 +370,12 @@ pub struct MemoryRecallExplanation {
 
 pub struct MemoryRecallEngine {
     store: Arc<MemoryGraphStore>,
-    memu_client: Option<Arc<MemUClient>>,
     config: MemoryRecallConfig,
 }
 
 impl MemoryRecallEngine {
-    pub fn new(
-        store: Arc<MemoryGraphStore>,
-        memu_client: Option<Arc<MemUClient>>,
-        config: MemoryRecallConfig,
-    ) -> Self {
-        Self {
-            store,
-            memu_client,
-            config,
-        }
+    pub fn new(store: Arc<MemoryGraphStore>, config: MemoryRecallConfig) -> Self {
+        Self { store, config }
     }
 
     /// Return a reference to the engine's configuration.
@@ -1244,13 +1221,12 @@ impl MemoryRecallEngine {
         user_input: &str,
         seen: &mut HashSet<String>,
     ) -> anyhow::Result<Vec<MemoryRecallCandidate>> {
-        // 根据 memU 可用性调整 FTS 搜索范围
-        let fts_limit = if self.memu_client.is_some() {
-            self.config.seed_limit * 2
-        } else {
-            // memU 不可用时，扩大 FTS 搜索范围以补偿
-            (self.config.seed_limit as f32 * self.config.fts_fallback_limit_multiplier) as usize
-        };
+        // PR P2-①: recall is FTS-only now. memU was retired as a recall backend
+        // (it's embedder-only — MemUEmbedder feeds bucket_seal's vector recall),
+        // so the FTS pass always uses the (formerly memU-unavailable) widened
+        // fallback range to compensate for the absent L3 vector signal.
+        let fts_limit =
+            (self.config.seed_limit as f32 * self.config.fts_fallback_limit_multiplier) as usize;
 
         // FTS5 search — trigram tokenizer handles CJK natively (since V31 migration).
         // No need for enhanced n-gram query workaround; raw user input works well
@@ -1260,43 +1236,11 @@ impl MemoryRecallEngine {
             .fts_search(space_id, user_input, fts_limit)
             .unwrap_or_default();
 
-        // Vector search via memU (if available). memU's retrieve goes through a
-        // Python subprocess and can stall for seconds; when the caller sets
-        // `memu_retrieve_timeout_ms` (the pi-engine recall sites do), bound it
-        // and fall back to FTS-only on timeout — identical to the memU-error
-        // path — so a slow/empty L3 can't block same-turn recall.
-        let vector_results = if let Some(ref memu) = self.memu_client {
-            let queries = vec![serde_json::json!({
-                "role": "user",
-                "content": user_input,
-            })];
-            let fetch = async {
-                match memu.retrieve(queries, None, None).await {
-                    Ok(result) => result.items,
-                    Err(e) => {
-                        info!(error = %e, "recall: memU retrieve failed, falling back to FTS only");
-                        Vec::new()
-                    }
-                }
-            };
-            match self.config.memu_retrieve_timeout_ms {
-                Some(ms) => {
-                    match tokio::time::timeout(std::time::Duration::from_millis(ms), fetch).await {
-                        Ok(items) => items,
-                        Err(_) => {
-                            info!(
-                                timeout_ms = ms,
-                                "recall: memU retrieve timed out, falling back to FTS only"
-                            );
-                            Vec::new()
-                        }
-                    }
-                }
-                None => fetch.await,
-            }
-        } else {
-            Vec::new()
-        };
+        // PR P2-①: the L3 `memu.retrieve` vector path was removed. The FTS+vector
+        // fusion below degrades to pure FTS (#44's 300ms timeout already fell back
+        // to this whenever memU's Python subprocess stalled). bucket_seal now owns
+        // vector recall.
+        let vector_results: Vec<serde_json::Value> = Vec::new();
 
         // Build rank maps
         let mut fts_rank_map: HashMap<String, (u32, &MemorySearchResult)> = HashMap::new();
@@ -2048,7 +1992,7 @@ mod phase5_boost_tests {
         let mut cfg = MemoryRecallConfig::default();
         cfg.entity_page_boost = entity_page_boost;
         cfg.backlink_boost_weight = backlink_boost_weight;
-        MemoryRecallEngine::new(store, None, cfg)
+        MemoryRecallEngine::new(store, cfg)
     }
 
     fn insert_node(store: &MemoryGraphStore, id: &str, kind: &str, title: &str) {
@@ -2141,29 +2085,6 @@ mod phase5_boost_tests {
     }
 
     #[test]
-    fn dto_round_trip_preserves_memu_retrieve_timeout() {
-        let mut cfg = MemoryRecallConfig::default();
-        // Default is unbounded (legacy behavior — no per-retrieve timeout).
-        assert_eq!(cfg.memu_retrieve_timeout_ms, None);
-        cfg.memu_retrieve_timeout_ms = Some(300);
-        let dto: MemoryRecallConfigDto = cfg.clone().into();
-        assert_eq!(dto.memu_retrieve_timeout_ms, Some(300));
-        let restored: MemoryRecallConfig = dto.into();
-        assert_eq!(restored.memu_retrieve_timeout_ms, Some(300));
-    }
-
-    #[test]
-    fn dto_without_memu_timeout_defaults_to_none() {
-        // Forward-compat: a settings blob that predates the field stays
-        // unbounded (legacy callers are untouched).
-        let json = r#"{"bootLimit": 8}"#;
-        let dto: MemoryRecallConfigDto = serde_json::from_str(json).unwrap();
-        assert!(dto.memu_retrieve_timeout_ms.is_none());
-        let cfg: MemoryRecallConfig = dto.into();
-        assert_eq!(cfg.memu_retrieve_timeout_ms, None);
-    }
-
-    #[test]
     fn dto_partial_update_keeps_defaults_for_unspecified_knobs() {
         // Forward-compat: a config DTO that doesn't mention the Phase 5
         // knobs must keep the neutral defaults (not flip them to None or
@@ -2245,7 +2166,7 @@ mod phase5_boost_tests {
 
         let cfg = MemoryRecallConfig::default();
         assert!(cfg.importance_recall_enabled); // default-on path under test
-        let engine = MemoryRecallEngine::new(store, None, cfg);
+        let engine = MemoryRecallEngine::new(store, cfg);
 
         // Deliberately pass low BEFORE high to prove the sort actually reorders.
         let input = vec![
@@ -2270,7 +2191,7 @@ mod phase5_boost_tests {
         set_importance(&store, "scored", 0.7, false);
 
         // Flag ON: unscored (treated as 0.0) sorts after scored.
-        let engine = MemoryRecallEngine::new(store.clone(), None, MemoryRecallConfig::default());
+        let engine = MemoryRecallEngine::new(store.clone(), MemoryRecallConfig::default());
         let on = engine
             .rank_and_filter_by_importance(vec![make_candidate("unscored"), make_candidate("scored")])
             .unwrap();
@@ -2280,7 +2201,7 @@ mod phase5_boost_tests {
         // Flag OFF: input order preserved verbatim (legacy behavior, no DB read).
         let mut off_cfg = MemoryRecallConfig::default();
         off_cfg.importance_recall_enabled = false;
-        let engine_off = MemoryRecallEngine::new(store, None, off_cfg);
+        let engine_off = MemoryRecallEngine::new(store, off_cfg);
         let off = engine_off
             .rank_and_filter_by_importance(vec![make_candidate("unscored"), make_candidate("scored")])
             .unwrap();
