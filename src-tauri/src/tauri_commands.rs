@@ -218,6 +218,12 @@ pub async fn patch_memory_recall_config(
             0,
             50,
         ),
+        // Per-retrieve memU bound (ms). None = unbounded (legacy). Clamped to a
+        // sane [50ms, 30s] when a user supplies it.
+        memu_retrieve_timeout_ms: input
+            .memu_retrieve_timeout_ms
+            .or(existing.memu_retrieve_timeout_ms)
+            .map(|v| v.clamp(50, 30_000)),
     };
 
     settings.memory_recall_config = Some(merged.clone());
@@ -1338,6 +1344,13 @@ fn browser_task_memory_for_query(
 ///
 /// Returning a clone here is fine — composed contexts are 1-3 KB
 /// typical; cheap relative to the LLM call that follows.
+/// pi-engine memU bound (ms): how long an L3 `memu.retrieve` may run on the pi
+/// recall path before falling back to FTS-only, so a slow/empty memU can't push
+/// recall past the per-turn deadline. Applied to the pi sites only (via
+/// `get_or_insert`); legacy callers leave `memu_retrieve_timeout_ms` = None
+/// (unbounded). User-overridable via `memoryRecallConfig.memuRetrieveTimeoutMs`.
+const PI_PROMPT_RECALL_MEMU_TIMEOUT_MS: u64 = 300;
+
 async fn recall_cache_fallback(
     cache: &Arc<tokio::sync::RwLock<std::collections::HashMap<String, String>>>,
     session_id: &str,
@@ -1526,13 +1539,18 @@ pub async fn send_message(
         // like the legacy chat path (no background deadline — chat accepts the
         // latency; the agent path below uses a deadline instead).
         let recall_ctx: Option<String> = {
-            let recall_config = {
+            let mut recall_config = {
                 let s = state.settings.read().await;
                 s.memory_recall_config
                     .clone()
                     .map(crate::memory_graph::recall::MemoryRecallConfig::from)
                     .unwrap_or_default()
             };
+            // pi path: bound memU's slow L3 retrieve so it can't block same-turn
+            // recall. `get_or_insert` = default only — an explicit user setting wins.
+            recall_config
+                .memu_retrieve_timeout_ms
+                .get_or_insert(PI_PROMPT_RECALL_MEMU_TIMEOUT_MS);
             let recall_engine = crate::memory_graph::recall::MemoryRecallEngine::new(
                 state.memory_graph_store.clone(),
                 state.memu_client.clone(),
@@ -4935,21 +4953,33 @@ pub async fn send_agent_message(
         //     fires. memU's L3 retrieve goes through a Python subprocess and can
         //     stall many seconds; a plain timeout(load_context) would cancel it
         //     and the cache would never warm, so memory would never inject.
-        //   * Await a oneshot under a 400ms deadline (keep memU's tail off TTFT);
-        //     on a miss, fall back to the prior turn's cached ctx. So memory
-        //     primes turn N+1 even when every turn's own recall is too slow.
-        const PI_RECALL_DEADLINE_MS: u64 = 400;
+        //   * Await a oneshot under a deadline; on a miss, fall back to the prior
+        //     turn's cached ctx (so memory still primes turn N+1).
+        //
+        // Same-turn tuning: with memU's L3 bounded above
+        // (PI_PROMPT_RECALL_MEMU_TIMEOUT_MS), the full recall now lands in ~1.2s
+        // (fast layers + bounded memU + the gbrain adapter) instead of ~2.8s, so
+        // the deadline is raised 400 → 1500ms — enough to inject memory on the
+        // SAME turn (incl. turn 1) rather than one turn behind, at the cost of up
+        // to ~1.5s recall latency before the turn starts. The cache fallback
+        // still covers the occasional recall that overruns.
+        const PI_RECALL_DEADLINE_MS: u64 = 1500;
         let (recall_tx, recall_rx) = tokio::sync::oneshot::channel::<Option<String>>();
         {
             let recall_store = state.memory_graph_store.clone();
             let recall_memu = state.memu_client.clone();
-            let recall_config = {
+            let mut recall_config = {
                 let s = state.settings.read().await;
                 s.memory_recall_config
                     .clone()
                     .map(crate::memory_graph::recall::MemoryRecallConfig::from)
                     .unwrap_or_default()
             };
+            // pi path: bound memU's slow L3 retrieve so it can't block same-turn
+            // recall. `get_or_insert` = default only — an explicit user setting wins.
+            recall_config
+                .memu_retrieve_timeout_ms
+                .get_or_insert(PI_PROMPT_RECALL_MEMU_TIMEOUT_MS);
             // Pre-resolve everything the 'static spawn needs (no &state borrow).
             let user_msg_for_recall = input.user_message.clone();
             let session_id_for_recall = input.session_id.clone();
