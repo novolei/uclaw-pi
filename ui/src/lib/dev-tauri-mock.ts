@@ -1,5 +1,6 @@
 import { clearMocks, mockConvertFileSrc, mockIPC, mockWindows } from '@tauri-apps/api/mocks'
 import type { InvokeArgs } from '@tauri-apps/api/core'
+import { emit } from '@tauri-apps/api/event'
 
 declare global {
   interface Window {
@@ -226,6 +227,130 @@ const browserIdentityStatusFixture = {
   activeTasks: [],
 }
 
+// ── S1–S5 local-model / pet / onboarding fixtures ─────────────────────────────
+//
+// These mirror the exact serde wire shapes the bridges decode:
+//   - `EnvReport` (camelCase) — see `lib/bridge/settings.ts`
+//   - `ProbeSourcesResult` — { fastest, latencies }
+//   - `PetPersona` (camelCase) — see `atoms/pet-atoms.ts` / `local_llm/persona.rs`
+// so the LocalModelSettings / PetSettings / onboarding panels render with real
+// data and interactions don't throw.
+
+/** First-launch env preflight: everything green so the download CTA is enabled. */
+const localModelEnvReportFixture = {
+  diskFreeBytes: 120 * 1_073_741_824, // 120 GB free
+  diskOk: true,
+  diskRequiredBytes: 1 * 1_073_741_824, // ~1 GB needed
+  ramTotalBytes: 16 * 1_073_741_824,
+  ramAvailableBytes: 8 * 1_073_741_824,
+  ramOk: true,
+  metalAvailable: true,
+  network: {
+    modelscopeReachable: true,
+    huggingfaceReachable: true,
+    fastest: 'modelscope',
+    anyReachable: true,
+  },
+}
+
+/** Source-probe result: ModelScope wins; both reachable. */
+const probeDownloadSourcesFixture = {
+  fastest: 'modelscope',
+  latencies: { modelscope: 120, huggingface: 300 },
+}
+
+/** The five built-in desk-pet personas (camelCase wire shape, astro is default). */
+const petPersonasFixture = [
+  {
+    id: 'astro',
+    displayName: 'Astro',
+    character: 'astro',
+    systemPrompt: 'You are Astro, an upbeat, encouraging desktop companion.',
+  },
+  {
+    id: 'clawby',
+    displayName: 'Clawby',
+    character: 'clawby',
+    systemPrompt: 'You are Clawby, a playful, slightly cheeky desktop pet.',
+  },
+  {
+    id: 'clawd',
+    displayName: 'Clawd',
+    character: 'clawd',
+    systemPrompt: 'You are Clawd, the friendly crab-like coding desk companion.',
+  },
+  {
+    id: 'sprout',
+    displayName: 'Sprout',
+    character: 'astro',
+    systemPrompt: 'You are Sprout, a gentle, calm desk companion.',
+  },
+  {
+    id: 'pixel',
+    displayName: 'Pixel',
+    character: 'clawby',
+    systemPrompt: 'You are Pixel, a curious, geeky little desk buddy.',
+  },
+]
+
+/**
+ * Event-streaming simulation.
+ *
+ * `mockIPC(..., { shouldMockEvents: true })` intercepts `plugin:event|emit` and
+ * dispatches the payload to every handler the app registered via `listen()`
+ * (the mock keeps an internal `listeners` Map keyed by event name). So a mock
+ * command handler can drive the app's real event subscribers simply by calling
+ * `@tauri-apps/api/event`'s `emit(name, payload)` — the same path the existing
+ * `dev-tauri-mock.test.ts` "listen + emit" test exercises.
+ *
+ * We schedule the emits on timers and resolve the command AFTER the stream so
+ * the in-flight UI (download progress bar / streamed pet reply) is observable
+ * before the terminal resolve flips it to the final state.
+ */
+const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms))
+
+/** Stream a `local-model:download-progress` sequence: probing → 0..100% → verifying. */
+async function simulateLocalModelDownload(): Promise<string> {
+  const total = 688 * 1_048_576 // ~688 MB (Q4_K_M)
+  await emit('local-model:download-progress', {
+    downloaded: 0,
+    total: 0,
+    source: 'modelscope',
+    phase: 'probing',
+  })
+  for (const pct of [0, 25, 50, 75, 100]) {
+    await sleep(120)
+    await emit('local-model:download-progress', {
+      downloaded: Math.round((total * pct) / 100),
+      total,
+      source: 'modelscope',
+      phase: 'downloading',
+    })
+  }
+  await sleep(120)
+  await emit('local-model:download-progress', {
+    downloaded: total,
+    total,
+    source: 'modelscope',
+    phase: 'verifying',
+  })
+  await sleep(120)
+  // Resolve to the (mock) GGUF path — `useLocalModel` then flips status → ready.
+  return '/mock/uclaw/models/minicpm-q4_k_m.gguf'
+}
+
+/** Stream a pet reply: a few `pet:reply-delta` then `pet:reply-done`. */
+async function simulatePetChat(): Promise<null> {
+  const chunks = ['你好', '！我是', '你的桌面', '伙伴 🦀']
+  for (const text of chunks) {
+    await sleep(100)
+    await emit('pet:reply-delta', { text })
+  }
+  await sleep(100)
+  await emit('pet:reply-done', {})
+  return null
+}
+
 export function shouldInstallDevTauriMock(): boolean {
   return import.meta.env.VITE_UCLAW_MOCK_TAURI === '1'
     && typeof window !== 'undefined'
@@ -360,6 +485,38 @@ export function createUclawMockIpcHandler(): MockHandler {
         const id = `mock-conv-${now}`
         return { id, title: 'New Conversation', archived: false, updatedAt: now, createdAt: now }
       }
+
+      // ── S1–S5 local-model (smart download + onboarding) ──────────────────────
+      case 'is_local_model_present':
+        // false so the download CTA / onboarding "下载并启用" path shows.
+        return false
+      case 'check_local_model_environment':
+        return localModelEnvReportFixture
+      case 'probe_download_sources':
+        return probeDownloadSourcesFixture
+      case 'download_local_model':
+        // Streams `local-model:download-progress` events, then resolves to the
+        // GGUF path. (If event mocking is unavailable the UI still won't throw —
+        // the promise just resolves after the timers.)
+        return simulateLocalModelDownload()
+      case 'set_local_model_quant':
+      case 'warmup_local_model':
+      case 'assign_local_model_to_roles':
+      case 'cancel_download':
+        return null
+
+      // ── S4 desk-pet ──────────────────────────────────────────────────────────
+      case 'list_pet_personas':
+        return petPersonasFixture
+      case 'pet_chat':
+        // Streams `pet:reply-delta` events then `pet:reply-done`, then resolves.
+        return simulatePetChat()
+      case 'set_pet_persona':
+      case 'show_desk_pet':
+      case 'hide_desk_pet':
+      case 'set_desk_pet_click_through':
+        return null
+
       default:
         console.warn(`[uClaw mock Tauri IPC] unhandled command: ${cmd}`)
         return null
