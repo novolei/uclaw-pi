@@ -42,11 +42,12 @@ impl OnnxInference {
             .map_err(|e| anyhow::anyhow!(e.to_string()))?;
 
         info!("✓ ONNX 模型加载成功");
-        // 适配 ort 2.0.0-rc.10：`inputs` / `outputs` 是字段，不是方法
+        // 适配 ort 2.0.0-rc.12：`inputs` / `outputs` 改为方法（S1 mistralrs 接入
+        // 迫使 ort rc.10→rc.12 升级，详见 local_llm spike）。
         info!(
             "  输入数: {} 输出数: {}",
-            session.inputs.len(),
-            session.outputs.len()
+            session.inputs().len(),
+            session.outputs().len()
         );
 
         Ok(Self { session })
@@ -59,7 +60,11 @@ impl OnnxInference {
         language_id: i32,
         textnorm_id: i32,
     ) -> anyhow::Result<(Array2<f32>, Vec<i32>)> {
-        let speech = TensorRef::from_array_view(features.view().insert_axis(Axis(0)))
+        // ort rc.12: from_array_view's TensorArrayData bound no longer matches a
+        // borrowed ArrayView produced by insert_axis on a view; pass an owned
+        // Array by reference (`&Array` impls TensorArrayData).
+        let speech_arr = features.view().insert_axis(Axis(0)).to_owned();
+        let speech = TensorRef::from_array_view(&speech_arr)
             .map_err(|e| anyhow::anyhow!(e.to_string()))?;
         let speech_lengths = Tensor::from_array(([1usize], vec![features.nrows() as i32]))
             .map_err(|e| anyhow::anyhow!(e.to_string()))?;

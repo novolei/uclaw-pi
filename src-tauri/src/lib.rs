@@ -43,6 +43,7 @@ pub mod plugins;
 pub mod policy_eval;
 
 // B2: Infrastructure modules
+pub mod local_llm;
 pub mod memory;
 pub mod memory_adapter;
 pub mod memory_bucket_seal;
