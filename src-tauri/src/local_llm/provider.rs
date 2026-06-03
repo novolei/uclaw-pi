@@ -123,14 +123,51 @@ impl LlmProvider for LocalMistralRsProvider {
 
     async fn stream(
         &self,
-        _messages: Vec<ChatMessage>,
+        messages: Vec<ChatMessage>,
         _tools: Vec<ToolDefinition>,
-        _config: &CompletionConfig,
+        config: &CompletionConfig,
     ) -> Result<Box<dyn futures::Stream<Item = Result<StreamDelta, Error>> + Send + Unpin>, Error>
     {
-        Err(Error::Internal(
-            "LocalMistralRsProvider: streaming is not supported in S1 (planned for S4)".into(),
-        ))
+        use crate::local_llm::engine::{EngineGenerateOpts, LocalStreamChunk};
+        use futures::StreamExt;
+        use tokio_stream::wrappers::UnboundedReceiverStream;
+
+        let (system, user) = Self::split_messages(&messages);
+
+        // Provider path mirrors complete(): single-shot, thinking:false. (The
+        // pet command drives its own thinking flag via the engine directly.)
+        let opts = EngineGenerateOpts {
+            thinking: false,
+            max_tokens: config.max_tokens,
+            temperature: config.temperature,
+        };
+
+        let (_model_id, rx) = self
+            .engine
+            .clone()
+            .stream(system, user, opts)
+            .await
+            .map_err(|e| Error::Llm(LlmError::ApiRequestFailed(e.to_string())))?;
+
+        let mapped = UnboundedReceiverStream::new(rx).map(|chunk| match chunk {
+            LocalStreamChunk::Text(text) => Ok(StreamDelta::TextDelta { text }),
+            LocalStreamChunk::Done {
+                finish_reason,
+                input_tokens,
+                output_tokens,
+            } => Ok(StreamDelta::Done {
+                finish_reason,
+                usage: Some(TokenUsage {
+                    input_tokens,
+                    output_tokens,
+                    cache_read_tokens: 0,
+                    cache_creation_tokens: 0,
+                    reasoning_output_tokens: 0,
+                }),
+            }),
+        });
+
+        Ok(Box::new(mapped))
     }
 }
 
@@ -144,22 +181,22 @@ mod tests {
     use std::path::PathBuf;
 
     #[tokio::test]
-    async fn stream_is_unsupported_in_s1() {
-        let engine = Arc::new(LocalLlmEngine::new(PathBuf::from("/tmp/x")));
+    async fn stream_errs_when_model_missing() {
+        // S4: stream() is implemented; with no model on disk the up-front guard
+        // surfaces a synchronous Err (mapped from ModelMissing) so the caller
+        // can show "本地模型未就绪" instead of an empty stream.
+        let engine = Arc::new(LocalLlmEngine::new(PathBuf::from(
+            "/tmp/uclaw-stream-missing-zzz",
+        )));
         let provider = LocalMistralRsProvider::new(engine, "minicpm5-1b".into());
         let result = provider
-            .stream(vec![], vec![], &CompletionConfig::default())
+            .stream(
+                vec![ChatMessage::user("hi")],
+                vec![],
+                &CompletionConfig::default(),
+            )
             .await;
-        match result {
-            Err(e) => {
-                let msg = e.to_string();
-                assert!(
-                    msg.contains("streaming is not supported"),
-                    "unexpected error message: {msg}"
-                );
-            }
-            Ok(_) => panic!("stream() must return Err in S1"),
-        }
+        assert!(result.is_err(), "stream() must Err when model is missing");
     }
 
     #[test]
