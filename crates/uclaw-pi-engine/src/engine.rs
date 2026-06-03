@@ -389,6 +389,12 @@ async fn start_run(
         // own source tree. pi reads this via SessionOptions.working_directory
         // (sdk.rs `cwd = options.working_directory…`).
         if let Some(cwd) = run_cwd {
+            // [uclaw-pi rename] Bring a legacy `<cwd>/.pi` project dir up to the
+            // current `.uclaw-pi` layout before pi resolves project paths
+            // (skills/settings/packages). Idempotent + cheap; runs once per new
+            // session. Failures are logged by the migration via tracing::warn.
+            // The CLI path covers this via run_startup_migrations.
+            let _ = pi::migrations::migrate_project_dir(&cwd);
             opts.working_directory = Some(cwd);
         }
         // [R4/F7] Apply the user's configured provider/model/key (provider_service

@@ -69,7 +69,7 @@ impl Tool for SkillMarketplaceSearchTool {
     }
 
     fn description(&self) -> &str {
-        "Search a skill marketplace for installable skills matching a query. Default provider \"skillsmp\" (skillsmp.com — NO API key needed); pass provider=\"skills_sh\" for skills.sh (needs a key). Use when the user asks \"is there a skill for X\" or local skill_search finds nothing. Returns candidates {id, name, source, installs}. Do NOT install silently — surface the candidates so the USER can choose to Install (global or this workspace)."
+        "Search a skill marketplace for installable skills matching a query. Default provider \"skills_sh\" (skills.sh — NO API key needed for search; a key only raises the rate limit). Pass provider=\"skillsmp\" for the skillsmp.com alternate (also keyless). Use when the user asks \"is there a skill for X\" or local skill_search finds nothing. Returns candidates {id, name, source, installs}. Do NOT install silently — surface the candidates so the USER can choose to Install (global or this workspace)."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -89,9 +89,9 @@ impl Tool for SkillMarketplaceSearchTool {
                 },
                 "provider": {
                     "type": "string",
-                    "enum": ["skillsmp", "skills_sh"],
-                    "description": "Marketplace to search. Default \"skillsmp\" (no API key needed). \"skills_sh\" needs a skills.sh API key.",
-                    "default": "skillsmp"
+                    "enum": ["skills_sh", "skillsmp"],
+                    "description": "Marketplace to search. Default \"skills_sh\" (skills.sh — no API key needed for search). \"skillsmp\" is the alternate (skillsmp.com, also keyless).",
+                    "default": "skills_sh"
                 }
             },
             "required": ["query"]
@@ -125,10 +125,11 @@ impl Tool for SkillMarketplaceSearchTool {
             .and_then(|v| v.as_u64())
             .map(|n| n.clamp(1, 20) as usize)
             .unwrap_or(8);
-        // Default skillsmp (keyless); only skills_sh needs a key. Unknown → skillsmp.
+        // Default skills.sh (keyless search; a key only raises its rate limit).
+        // Unknown/missing → skills_sh.
         let provider = match params.get("provider").and_then(|v| v.as_str()) {
-            Some("skills_sh") => "skills_sh",
-            _ => "skillsmp",
+            Some("skillsmp") => "skillsmp",
+            _ => "skills_sh",
         };
 
         let results = query_provider(&query, limit, provider, &self.skills_sh_key, &self.skillsmp_key).await?;

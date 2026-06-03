@@ -2071,10 +2071,11 @@ html[data-chat-serif="true"] .chat-content pre {
 }
 .chat-content ol > li {
   counter-increment: chat-ordered;
-  display: flex;
-  gap: 12px;
-  align-items: flex-start;
-  padding: 14px;
+  /* Badge lives in a left gutter (absolute); the item's own content flows as
+     normal block flow so a bold title and any nested bullet list STACK
+     vertically instead of becoming side-by-side flex columns. */
+  position: relative;
+  padding: 14px 14px 14px 46px;
   margin: 8px 0;
   background: hsl(var(--muted) / 0.45);
   border-radius: 10px;
@@ -2082,7 +2083,9 @@ html[data-chat-serif="true"] .chat-content pre {
 }
 .chat-content ol > li::before {
   content: counter(chat-ordered);
-  flex-shrink: 0;
+  position: absolute;
+  left: 12px;
+  top: 12px;
   width: 24px;
   height: 24px;
   background: hsl(var(--foreground));
@@ -2094,7 +2097,6 @@ html[data-chat-serif="true"] .chat-content pre {
   font-size: 12.5px;
   font-weight: 600;
   font-variant-numeric: tabular-nums;
-  margin-top: 1px;
 }
 .chat-content ol > li > :first-child { margin-top: 0; }
 .chat-content ol > li > :last-child  { margin-bottom: 0; }

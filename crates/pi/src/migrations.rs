@@ -19,6 +19,8 @@ const MANAGED_TOOL_BINARIES: &[&str] = &["fd", "rg", "fd.exe", "rg.exe"];
 /// Summary of startup migration actions.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MigrationReport {
+    /// Legacy `<cwd>/.pi` project dir renamed to `<cwd>/.uclaw-pi`, if it ran.
+    pub migrated_project_dir: Option<PathBuf>,
     /// Providers migrated into `auth.json`.
     pub migrated_auth_providers: Vec<String>,
     /// Number of session files moved from `~/.pi/agent/*.jsonl` to `sessions/<encoded-cwd>/`.
@@ -38,6 +40,12 @@ impl MigrationReport {
     pub fn messages(&self) -> Vec<String> {
         let mut messages = Vec::new();
 
+        if let Some(dir) = &self.migrated_project_dir {
+            messages.push(format!(
+                "Migrated legacy project dir .pi -> {}",
+                dir.display()
+            ));
+        }
         if !self.migrated_auth_providers.is_empty() {
             messages.push(format!(
                 "Migrated legacy credentials into auth.json for providers: {}",
@@ -91,6 +99,11 @@ pub fn run_startup_migrations(cwd: &Path) -> MigrationReport {
 fn run_startup_migrations_with_agent_dir(agent_dir: &Path, cwd: &Path) -> MigrationReport {
     let mut report = MigrationReport::default();
 
+    // Run the project-dir rename FIRST so the subsequent project-scoped
+    // migrations below resolve `Config::project_dir()` (now `.uclaw-pi`) against
+    // the already-renamed directory.
+    report.migrated_project_dir = migrate_project_dir_inner(cwd, &mut report.warnings);
+
     report.migrated_auth_providers = migrate_auth_to_auth_json(agent_dir, &mut report.warnings);
     report.migrated_session_files =
         migrate_sessions_from_agent_root(agent_dir, &mut report.warnings);
@@ -116,6 +129,59 @@ fn run_startup_migrations_with_agent_dir(agent_dir: &Path, cwd: &Path) -> Migrat
         .extend(check_deprecated_extension_dirs(&project_dir, "Project"));
 
     report
+}
+
+/// Rename a legacy `<cwd>/.pi` project dir to the current
+/// [`Config::project_dir`] (`.uclaw-pi`) so installed packages, settings, and
+/// skills carry over on first use after the rename. Idempotent and cheap — a
+/// single `stat` when there is nothing to do.
+///
+/// Safe to call on every session start. Skips when:
+/// - `Config::project_dir()` is still `.pi` (rename not in effect),
+/// - the legacy `.pi` dir is absent,
+/// - `cwd` is the home dir (never touch the global `~/.pi`), or
+/// - the new dir already exists (don't clobber a fresh layout).
+///
+/// Returns the new path when a rename happened, logging any failure as a warning.
+#[must_use]
+pub fn migrate_project_dir(cwd: &Path) -> Option<PathBuf> {
+    let mut warnings = Vec::new();
+    let moved = migrate_project_dir_inner(cwd, &mut warnings);
+    for warning in &warnings {
+        tracing::warn!("{warning}");
+    }
+    moved
+}
+
+fn migrate_project_dir_inner(cwd: &Path, warnings: &mut Vec<String>) -> Option<PathBuf> {
+    let new = cwd.join(Config::project_dir());
+    let legacy = cwd.join(".pi");
+    if new == legacy {
+        // `project_dir()` is still `.pi`; nothing to rename.
+        return None;
+    }
+    if !legacy.is_dir() {
+        return None;
+    }
+    // Never touch the global `~/.pi` (only possible when cwd == home).
+    if dirs::home_dir().is_some_and(|home| home == cwd) {
+        return None;
+    }
+    if new.exists() {
+        // A `.uclaw-pi` layout already exists; leave the legacy dir untouched.
+        return None;
+    }
+    match fs::rename(&legacy, &new) {
+        Ok(()) => Some(new),
+        Err(e) => {
+            warnings.push(format!(
+                "Failed to migrate project dir {} -> {}: {e}",
+                legacy.display(),
+                new.display()
+            ));
+            None
+        }
+    }
 }
 
 #[allow(clippy::too_many_lines)]
@@ -666,7 +732,7 @@ mod tests {
         let temp = TempDir::new().expect("tempdir");
         let agent_dir = temp.path().join("agent");
         let cwd = temp.path().join("workspace");
-        let project_dir = cwd.join(".pi");
+        let project_dir = cwd.join(".uclaw-pi");
         fs::create_dir_all(&agent_dir).expect("create agent dir");
         fs::create_dir_all(&project_dir).expect("create project dir");
 
@@ -712,7 +778,7 @@ mod tests {
         let temp = TempDir::new().expect("tempdir");
         let agent_dir = temp.path().join("agent");
         let cwd = temp.path().join("workspace");
-        let project_dir = cwd.join(".pi");
+        let project_dir = cwd.join(".uclaw-pi");
         fs::create_dir_all(agent_dir.join("hooks")).expect("create global hooks");
         fs::create_dir_all(project_dir.join("hooks")).expect("create project hooks");
         write(&agent_dir.join("tools/custom.sh"), "#!/bin/sh\necho hi\n");
@@ -724,6 +790,40 @@ mod tests {
                 .messages()
                 .iter()
                 .any(|line| line.contains("Migration guide: "))
+        );
+    }
+
+    #[test]
+    fn migrate_project_dir_renames_legacy_pi_and_preserves_contents() {
+        let temp = TempDir::new().expect("tempdir");
+        let cwd = temp.path().join("workspace");
+        let legacy = cwd.join(".pi");
+        write(&legacy.join("skills/pptx-generator/SKILL.md"), "---\nname: x\n---\n");
+        write(&legacy.join("settings.json"), "{}");
+
+        let moved = super::migrate_project_dir(&cwd).expect("rename happened");
+        assert_eq!(moved, cwd.join(".uclaw-pi"));
+        assert!(!legacy.exists(), "legacy .pi removed");
+        assert!(cwd.join(".uclaw-pi/skills/pptx-generator/SKILL.md").exists());
+        assert!(cwd.join(".uclaw-pi/settings.json").exists());
+
+        // Idempotent: a second call is a no-op (no legacy dir left).
+        assert!(super::migrate_project_dir(&cwd).is_none());
+    }
+
+    #[test]
+    fn migrate_project_dir_skips_when_new_layout_exists() {
+        let temp = TempDir::new().expect("tempdir");
+        let cwd = temp.path().join("workspace");
+        write(&cwd.join(".pi/settings.json"), "{\"legacy\":true}");
+        write(&cwd.join(".uclaw-pi/settings.json"), "{\"current\":true}");
+
+        // Don't clobber a present `.uclaw-pi`; leave the legacy `.pi` untouched.
+        assert!(super::migrate_project_dir(&cwd).is_none());
+        assert!(cwd.join(".pi/settings.json").exists());
+        assert_eq!(
+            fs::read_to_string(cwd.join(".uclaw-pi/settings.json")).unwrap(),
+            "{\"current\":true}"
         );
     }
 
@@ -895,6 +995,7 @@ mod tests {
                 n_deprecations in 0..3usize
             ) {
                 let report = MigrationReport {
+                    migrated_project_dir: None,
                     migrated_auth_providers: (0..n_providers).map(|i| format!("p{i}")).collect(),
                     migrated_session_files: sessions,
                     migrated_commands_dirs: Vec::new(),
