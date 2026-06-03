@@ -160,6 +160,16 @@ fn role_for_cost_tag(tag: &str) -> &'static str {
     }
 }
 
+/// Whether a completion's token spend should be booked to `cost_records`.
+/// Local in-process inference (`ApiType::LocalMistralRs`) is free, so it is
+/// never costed; every hosted provider (api `None` / OpenAI / Anthropic / …)
+/// records as before. (Guarding here rather than in the global
+/// `calculate_cost`, which intentionally keeps a non-zero default for unknown
+/// hosted model ids.)
+fn should_record_cost(api: &Option<crate::providers::types::ApiType>) -> bool {
+    !matches!(api, Some(crate::providers::types::ApiType::LocalMistralRs))
+}
+
 #[async_trait]
 impl MemoryOsLlm for MemoryOsLlmClient {
     async fn complete_text(
@@ -170,7 +180,7 @@ impl MemoryOsLlm for MemoryOsLlmClient {
         max_tokens: u32,
     ) -> Result<MemoryOsLlmOutput, MemoryOsLlmError> {
         let role = role_for_cost_tag(cost_tag);
-        let (provider_id, model, api_key, base_url, _) = self
+        let (provider_id, model, api_key, base_url, api) = self
             .provider_service
             .get_role_llm_config(role)
             .await
@@ -192,7 +202,8 @@ impl MemoryOsLlm for MemoryOsLlmClient {
             &base_url,
             max_tokens,
             0.3, // memory-os synthesis prefers determinism over flair
-            None, // TODO(Task 2): effective api
+            api.clone(), // effective api — carries ApiType::LocalMistralRs so a role
+                         // assigned to local-minicpm reaches the local provider (S1)
         );
         let provider =
             create_provider(&cfg).map_err(|e| MemoryOsLlmError::Llm(e.to_string()))?;
@@ -226,7 +237,9 @@ impl MemoryOsLlm for MemoryOsLlmClient {
             return Err(MemoryOsLlmError::EmptyText);
         }
 
-        self.record_cost(cost_tag, &model, usage.input_tokens, usage.output_tokens);
+        if should_record_cost(&api) {
+            self.record_cost(cost_tag, &model, usage.input_tokens, usage.output_tokens);
+        }
 
         Ok(MemoryOsLlmOutput {
             text,
@@ -351,5 +364,29 @@ mod tests {
         assert_eq!(role_for_cost_tag("memory_lint"), "utility");
         // Unknown tags default to the safe "chat" role.
         assert_eq!(role_for_cost_tag("something_new"), "chat");
+    }
+
+    #[test]
+    fn effective_api_is_carried_into_llm_config() {
+        // The config built for a resolved local-minicpm role must keep the
+        // LocalMistralRs api so create_provider routes to the local provider
+        // (rather than falling back to the OpenAI wire protocol).
+        let cfg = crate::llm::llm_config_from_provider(
+            "local-minicpm", "minicpm5-1b", "", "", 256, 0.3,
+            Some(crate::providers::types::ApiType::LocalMistralRs),
+        );
+        assert_eq!(cfg.api, Some(crate::providers::types::ApiType::LocalMistralRs));
+        assert_eq!(cfg.provider, "local-minicpm");
+    }
+
+    #[test]
+    fn local_inference_skips_cost_recording() {
+        use crate::providers::types::ApiType;
+        // Local in-process inference is free → never recorded.
+        assert!(!should_record_cost(&Some(ApiType::LocalMistralRs)));
+        // Hosted providers (and the unset/default case) always record.
+        assert!(should_record_cost(&None));
+        assert!(should_record_cost(&Some(ApiType::OpenAiCompletions)));
+        assert!(should_record_cost(&Some(ApiType::AnthropicMessages)));
     }
 }
