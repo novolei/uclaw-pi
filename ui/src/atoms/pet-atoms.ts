@@ -14,7 +14,7 @@
 import { atom } from 'jotai'
 import { atomWithStorage } from 'jotai/utils'
 
-export type PetCharacter = 'astro' | 'clawby'
+export type PetCharacter = 'astro' | 'clawby' | 'clawd'
 
 export type PetPrimaryState = 'idle' | 'thinking' | 'typing' | 'success' | 'error'
 export type PetState = PetPrimaryState | 'hover'

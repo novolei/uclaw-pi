@@ -47,6 +47,7 @@
 
 .pet-widget[data-char="astro"] .pet-layer { --feet-offset: 6.4%; }
 .pet-widget[data-char="clawby"] .pet-layer { --feet-offset: 17.8%; }
+.pet-widget[data-char="clawd"] .pet-layer { --feet-offset: 0%; }
 
 /* Tablet / mobile: scale down */
 @media (max-width: 640px) {
