@@ -289,10 +289,11 @@ Expected: PASS.
 - [ ] **Step 5: Route `complete_text` through the role and add a concise routing log**
 
 > NOTE (drift): the temporary `[VERIFY]` `tracing::warn!` block referenced in
-> the spec was already removed upstream (the `pi/memory-llm-tz-fixes` commits).
-> So instead of *augmenting* it, add a lightweight permanent `tracing::debug!`
+> the spec was already removed upstream (squashed into `main` via #57). So
+> instead of *augmenting* it, add a lightweight permanent `tracing::info!`
 > right after role resolution — this keeps the spec's observability promise
-> (`role` + `resolved_model`) without resurrecting temporary diagnostics.
+> (`role` + `resolved_model` + `cost_tag`) without resurrecting temporary
+> diagnostics.
 
 In `complete_text`, replace the resolver call (lines 159-163):
 
@@ -316,7 +317,7 @@ with:
 
         // Per-scenario routing observability (S0): proves which role a given
         // Memory-OS pass resolved to, and which model it landed on.
-        tracing::debug!(
+        tracing::info!(
             cost_tag,
             role,
             resolved_model = %model,
@@ -358,7 +359,7 @@ Run: `gitnexus_detect_changes()` and confirm only `get_role_llm_config`, `get_ch
 
 - [ ] **Manual smoke (optional, requires running app)**
 
-In Settings → 智能 → 模型分配, assign a *different* model to `摘要模型 (summarizer)` than to `主对话模型 (chat)`. Trigger a consolidation pass (cadence is already lowered on this branch lineage). Confirm the `memory_os_llm: routed completion to role` debug log shows `role=summarizer` and `resolved_model=<the summarizer assignment>` (run with `RUST_LOG=...=debug`).
+In Settings → 智能 → 模型分配, assign a *different* model to `摘要模型 (summarizer)` than to `主对话模型 (chat)`. Trigger a consolidation pass (cadence is already lowered on this branch lineage). Confirm the `memory_os_llm: routed completion to role` info log shows `role=summarizer` and `resolved_model=<the summarizer assignment>`.
 
 ---
 
