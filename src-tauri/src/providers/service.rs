@@ -335,6 +335,7 @@ impl ProviderService {
         api_key: Option<&str>,
     ) -> Result<Vec<Model>, String> {
         match provider_id {
+            "local-minicpm" => Ok(list_local_minicpm_models()),
             "ollama" => list_ollama_models(base_url).await,
             "anthropic" => Ok(list_anthropic_models()),
             _ => list_openai_compat_models(base_url, api_key).await,
@@ -410,6 +411,20 @@ async fn list_ollama_models(base_url: &str) -> Result<Vec<Model>, String> {
             })
         })
         .collect())
+}
+
+/// Return the static MiniCPM model list (no network call).
+fn list_local_minicpm_models() -> Vec<Model> {
+    vec![Model {
+        id: "minicpm5-1b".to_string(),
+        name: "MiniCPM5 1B (本地)".to_string(),
+        context_window: Some(32_768),
+        max_tokens: Some(4_096),
+        modality: ModelModality::Text,
+        reasoning: false,
+        reasoning_required_in_tool_calls: false,
+        supports_reasoning_effort: false,
+    }]
 }
 
 /// Return known Anthropic/Claude models from built-in registry.

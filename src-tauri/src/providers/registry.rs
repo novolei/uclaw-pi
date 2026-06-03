@@ -311,6 +311,16 @@ pub fn builtin_providers() -> Vec<KnownProvider> {
         geo_category: ProviderCategory::Local,
         supports_models: true,
     },
+    KnownProvider {
+        id: "local-minicpm".into(),
+        display_name: "MiniCPM (本地)".into(),
+        auth_type: AuthType::None,
+        default_base_url: "".into(),
+        default_api: ApiType::LocalMistralRs,
+        service_category: ServiceCategory::Api,
+        geo_category: ProviderCategory::Local,
+        supports_models: false,
+    },
     ]
 }
 

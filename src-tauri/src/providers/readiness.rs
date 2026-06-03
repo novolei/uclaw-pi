@@ -18,6 +18,8 @@ pub fn api_family_from_api_type(api_type: &ApiType) -> ProviderApiFamily {
         ApiType::AnthropicMessages => ProviderApiFamily::AnthropicMessages,
         ApiType::OpenAiResponses => ProviderApiFamily::OpenAiResponses,
         ApiType::OpenAiCodexResponses => ProviderApiFamily::OpenAiCodexResponses,
+        // In-process local inference — no remote wire protocol.
+        ApiType::LocalMistralRs => ProviderApiFamily::Unknown,
     }
 }
 
