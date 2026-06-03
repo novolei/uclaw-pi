@@ -1229,9 +1229,13 @@ fn main() {
             uclaw_core::commands::learned_skills::cancel_skill_consolidation,
             uclaw_core::commands::learned_skills::apply_skill_consolidation,
             uclaw_core::commands::agent_memory::list_reflections,
+            uclaw_core::commands::agent_memory::list_profile_facts,
             uclaw_core::commands::agent_memory::get_agent_user_model,
             uclaw_core::commands::agent_memory::list_daydreams,
             uclaw_core::commands::agent_memory::list_user_model_history,
+            uclaw_core::commands::agent_memory::archive_reflection,
+            uclaw_core::commands::agent_memory::restore_reflection,
+            uclaw_core::commands::agent_memory::trigger_memory_refresh,
             // System Diagnostics
             uclaw_core::tauri_commands::get_system_diagnostics,
             // [R5] eval 命令注册已删。

@@ -161,6 +161,44 @@ pub async fn list_profile_facts(
     Ok(rows)
 }
 
+#[tauri::command]
+pub async fn archive_reflection(
+    state: tauri::State<'_, crate::app::AppState>, id: String,
+) -> Result<(), String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    conn.execute(
+        "UPDATE reflections SET archived_at = datetime('now') WHERE id = ?1 AND archived_at IS NULL",
+        rusqlite::params![id],
+    ).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn restore_reflection(
+    state: tauri::State<'_, crate::app::AppState>, id: String,
+) -> Result<(), String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    conn.execute("UPDATE reflections SET archived_at = NULL WHERE id = ?1", rusqlite::params![id])
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Fire-and-forget re-ground (run_promotion: facts → user_model — fixes drift after a bad
+/// fact is deleted) + consolidation (dedup, self-gated). Returns immediately; the frontend
+/// refetches after a short delay. Takes `AppHandle` (not `State`) so the spawned task can
+/// `try_state` without holding a non-Send guard across the await.
+#[tauri::command]
+pub async fn trigger_memory_refresh(app: tauri::AppHandle) -> Result<(), String> {
+    tauri::async_runtime::spawn(async move {
+        use tauri::Manager;
+        if let Some(state) = app.try_state::<crate::app::AppState>() {
+            crate::memory_graph::reflection_service::run_promotion(&state).await;
+            crate::memory_graph::reflection_service::run_consolidation(&state).await;
+        }
+    });
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
