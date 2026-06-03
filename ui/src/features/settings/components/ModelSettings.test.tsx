@@ -1,4 +1,5 @@
 import { describe, it, expect, vi } from 'vitest'
+import { fireEvent } from '@testing-library/react'
 import { renderWithProviders, screen, waitFor } from '@/test-utils/render'
 import { ModelSettings } from './ModelSettings'
 
@@ -24,6 +25,20 @@ describe('ModelSettings', () => {
       expect(screen.getByText('轻工具模型')).toBeTruthy()
       expect(screen.getByText('gpt-4o')).toBeTruthy()
       expect(screen.getByText('1/5 已配置')).toBeTruthy()
+    })
+  })
+
+  it('always offers the built-in local model as an assignable option (even when not in configured models)', async () => {
+    // The mocked bridge returns ONLY openai configured models — no local-minicpm.
+    // The local model must still appear in a role dropdown so it can be assigned
+    // to summarizer/utility without manual provider setup.
+    renderWithProviders(<ModelSettings />)
+    await waitFor(() => expect(screen.getByText('gpt-4o')).toBeTruthy())
+    // Open the chat role's dropdown (its trigger shows the assigned "gpt-4o").
+    fireEvent.click(screen.getByText('gpt-4o'))
+    await waitFor(() => {
+      expect(screen.getByText('minicpm5-1b')).toBeTruthy()
+      expect(screen.getByText('local-minicpm')).toBeTruthy()
     })
   })
 })

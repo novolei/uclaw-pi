@@ -17,6 +17,16 @@ interface ModelGroup {
 
 const ALL_ROLES = ['chat', 'utility', 'utility_large', 'summarizer', 'compiler']
 
+// The built-in local MiniCPM provider is a zero-config, always-available option:
+// it has no API key and is never added to `selected_models`, so it does NOT come
+// back from `getAllConfiguredModels()`. Surface it here so users can route roles
+// (esp. summarizer / utility) to it from 模型分配 without any manual provider setup —
+// matching the "无需手动配置" goal. Scoped to role assignment ONLY (the chat
+// quick-picker and IM channels deliberately don't offer the local model).
+// The `ref` stays `local-minicpm/minicpm5-1b` so backend routing resolves correctly.
+const LOCAL_PROVIDER_ID = 'local-minicpm'
+const LOCAL_MODEL_ID = 'minicpm5-1b'
+
 export function useModelSettings() {
   const [groups, setGroups] = React.useState<ModelGroup[]>([])
   const [roleConfigs, setRoleConfigs] = React.useState<ModelRoleConfig[]>([])
@@ -31,6 +41,14 @@ export function useModelSettings() {
     const g: ModelGroup[] = allModels
       .filter(([, mids]) => mids.length > 0)
       .map(([pid, mids]) => ({ providerId: pid, models: mids }))
+
+    // Always offer the built-in local model (it isn't a "configured" model — see note above).
+    const localGroup = g.find((grp) => grp.providerId === LOCAL_PROVIDER_ID)
+    if (localGroup) {
+      if (!localGroup.models.includes(LOCAL_MODEL_ID)) localGroup.models.push(LOCAL_MODEL_ID)
+    } else {
+      g.push({ providerId: LOCAL_PROVIDER_ID, models: [LOCAL_MODEL_ID] })
+    }
     setGroups(g)
 
     // Merge roles with defaults
