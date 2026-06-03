@@ -981,6 +981,10 @@ export interface ProactiveLearningEvent {
 /** 最近的记忆捕捉事件（最多保留 10 条，新的在前） */
 export const proactiveLearningEventsAtom = atom<ProactiveLearningEvent[]>([])
 
+/** 最近的 daydream 事件（最多保留 10 条，新的在前） */
+export interface DaydreamEvent { content: string; createdAt: string }
+export const daydreamEventsAtom = atom<DaydreamEvent[]>([])
+
 // ===== 记忆召回事件 =====
 
 export interface MemoryRecallItem {

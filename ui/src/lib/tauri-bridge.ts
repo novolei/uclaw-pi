@@ -401,6 +401,20 @@ export const getMemoryRecallConfig = (): Promise<MemoryRecallConfigDto> =>
 export const patchMemoryRecallConfig = (input: MemoryRecallConfigDto): Promise<MemoryRecallConfigDto> =>
   invoke('patch_memory_recall_config', { input });
 
+export interface ReflectionDto { insight: string; confidence: number; createdAt: string }
+export interface UserModelDto { summary: string; updatedAt: string }
+export interface DaydreamDto { content: string; createdAt: string }
+export interface UserModelHistoryDto { summary: string; replacedAt: string }
+
+export const listReflections = (limit = 20): Promise<ReflectionDto[]> =>
+  invoke('list_reflections', { limit });
+export const getAgentUserModel = (): Promise<UserModelDto | null> =>
+  invoke('get_agent_user_model');
+export const listDaydreams = (limit = 20): Promise<DaydreamDto[]> =>
+  invoke('list_daydreams', { limit });
+export const listUserModelHistory = (limit = 20): Promise<UserModelHistoryDto[]> =>
+  invoke('list_user_model_history', { limit });
+
 // ─────────────────────────────────────────────────────────
 // Conversations
 // ─────────────────────────────────────────────────────────
