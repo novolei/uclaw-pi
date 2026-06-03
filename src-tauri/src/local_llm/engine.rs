@@ -169,11 +169,17 @@ impl LoadedModel {
             .send_chat_request(req)
             .await
             .map_err(|e| LocalLlmError::Inference(e.to_string()))?;
-        let text = resp
+        let raw = resp
             .choices
             .first()
             .and_then(|c| c.message.content.clone())
             .unwrap_or_default();
+        // MiniCPM5 is a reasoning model: even with thinking disabled it can wrap
+        // output in a leading <think>…</think> block. Strip it so callers (the
+        // session-title JSON parser, memory synthesis) get the clean answer
+        // instead of think-prefixed/garbled text. (If the model spent its whole
+        // budget inside <think>, this yields "" → the caller's graceful fallback.)
+        let text = strip_think(&raw).to_string();
         let usage = resp.usage;
         Ok((text, usage.prompt_tokens as u32, usage.completion_tokens as u32))
     }
