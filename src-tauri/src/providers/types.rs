@@ -88,6 +88,9 @@ pub enum ApiType {
     /// ChatGPT Codex Responses API (Plus/Pro)
     #[serde(rename = "openai-codex-responses")]
     OpenAiCodexResponses,
+    /// In-process local inference via mistralrs (S1: MiniCPM5-1B-GGUF).
+    #[serde(rename = "local-mistralrs")]
+    LocalMistralRs,
 }
 
 // ── Auth Type ───────────────────────────────────────────────────────────────

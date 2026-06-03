@@ -23,6 +23,7 @@ pub mod humane_automation;
 pub mod knowledge_ingestion;
 pub mod learned_skills;
 pub mod llm_config;
+pub mod local_llm;
 pub mod mcp;
 pub mod memory;
 pub mod memubot;

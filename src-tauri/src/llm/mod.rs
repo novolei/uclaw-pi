@@ -32,6 +32,9 @@ pub fn create_provider(config: &LlmConfig) -> Result<Arc<dyn LlmProvider>, crate
             config.api_key.clone(),
             config.base_url.clone(),
         ))),
+        ApiType::LocalMistralRs => Ok(Arc::new(
+            crate::local_llm::provider::LocalMistralRsProvider::from_global(config.model.clone())?,
+        )),
         _ => Ok(Arc::new(OpenAIProvider::new(
             config.api_key.clone(),
             config.base_url.clone(),

@@ -848,6 +848,20 @@ fn main() {
                         }
                     }
 
+                    // [Stage 3] Local LLM idle-unload reaper: drop the MiniCPM
+                    // model after 10 min idle (checked once a minute).
+                    tokio::spawn(async {
+                        let mut tick =
+                            tokio::time::interval(std::time::Duration::from_secs(60));
+                        loop {
+                            tick.tick().await;
+                            if let Some(engine) = uclaw_core::local_llm::local_engine() {
+                                engine.unload_if_idle().await;
+                            }
+                        }
+                    });
+                    tracing::info!("[Stage 3] Local LLM idle-unload reaper spawned");
+
                     // Stage 4: 启动所有已注册服务
                     tracing::info!("[Stage 4] Starting all registered services...");
                     let results = service_manager.start_all().await;
@@ -1117,6 +1131,9 @@ fn main() {
             uclaw_core::commands::provider::set_active_model,
             uclaw_core::commands::provider::get_role_models,
             uclaw_core::commands::provider::set_role_model,
+            // Local LLM (S1 — local MiniCPM runtime)
+            uclaw_core::commands::local_llm::is_local_model_present,
+            uclaw_core::commands::local_llm::download_local_model,
             // Persona
             uclaw_core::commands::persona::create_persona_journal_entry,
             uclaw_core::commands::persona::delete_persona_journal_entry,

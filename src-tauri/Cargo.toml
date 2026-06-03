@@ -61,9 +61,11 @@ lettre = { version = "0.11", default-features = false, features = ["smtp-transpo
 # onnxruntime tarball 并静态链接进 binary。运行时零 dlopen / 零 ORT_DYLIB_PATH /
 # 零版本号维护。首次 build 多 ~30s + 最终 binary 多 ~30MB，换永远不再为
 # onnxruntime 版本对应关系 panic（详见 PR #156 的事故说明）。
-ort = { version = "=2.0.0-rc.10", features = ["ndarray", "half"] }
+ort = { version = "=2.0.0-rc.12", features = ["ndarray", "half"] }
 realfft = "3"
-ndarray = "0.16"
+# Bumped 0.16 → 0.17 to match ort 2.0.0-rc.12's ndarray integration (S1
+# mistralrs added → ort bumped rc.10→rc.12 → ndarray 0.17). STT-only usage.
+ndarray = "0.17"
 half = "2"
 once_cell = "1"
 
@@ -178,10 +180,20 @@ sysinfo = { version = "0.31", default-features = false, features = ["system"] }
 # URL encoding for DingTalk signature
 urlencoding = "2"
 
+# Local in-process LLM inference (S1). Pure-Rust mistralrs (candle backend).
+# Pinned to 0.8.1 (latest stable on crates.io 2026-06-03). Metal feature is
+# enabled per-target in the macOS block below; CPU fallback elsewhere.
+# Deps confirmed compatible: tokio ^1.49 (workspace resolves 1.52), reqwest
+# ^0.13 (coexists with our 0.12 as a separate semver-major copy — no conflict).
+mistralrs = { version = "0.8.1", default-features = false }
+
 # macOS keychain
 [target.'cfg(target_os = "macos")'.dependencies]
 security-framework = "3"
 objc2-app-kit = { version = "0.3.2", features = ["NSColor", "NSView", "NSWindow"] }
+
+# Local LLM on Apple Silicon: GPU via Metal. Merges with the base mistralrs dep.
+mistralrs = { version = "0.8.1", features = ["metal"] }
 
 # Knowledge ingestion pipeline (sub-project B)
 pdf-extract = "0.7"
