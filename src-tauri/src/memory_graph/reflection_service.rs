@@ -70,6 +70,59 @@ pub fn parse_reflection_output(s: &str) -> (String, f64) {
     }
 }
 
+/// Parsed consolidation output: the deduplicated reflection set + the re-grounded
+/// user_model (absent when the LLM omitted/blanked it).
+#[derive(Debug, Clone)]
+pub struct ConsolidationResult {
+    pub reflections: Vec<(String, f64)>,
+    pub user_model: Option<String>,
+}
+
+/// Extract the first `{...}` JSON object substring — tolerates ```json fences and
+/// preamble/trailing prose. `None` when no balanced-looking braces are present.
+fn extract_json_object(s: &str) -> Option<&str> {
+    let start = s.find('{')?;
+    let end = s.rfind('}')?;
+    (end > start).then(|| &s[start..=end])
+}
+
+/// Parse the consolidation LLM output. Returns `None` (→ caller no-ops, never
+/// corrupts memory) on any parse failure or an empty reflection set. Confidence is
+/// clamped to `[0,1]`; blank insights are dropped; a blank/missing `user_model`
+/// becomes `None`.
+pub fn parse_consolidation_output(s: &str) -> Option<ConsolidationResult> {
+    let obj = extract_json_object(s.trim())?;
+    let v: serde_json::Value = serde_json::from_str(obj).ok()?;
+    let arr = v.get("reflections")?.as_array()?;
+    let mut reflections = Vec::new();
+    for item in arr {
+        let insight = item.get("insight").and_then(serde_json::Value::as_str).map(str::trim);
+        let Some(insight) = insight.filter(|i| !i.is_empty()) else { continue };
+        let conf = item
+            .get("confidence")
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or(0.5)
+            .clamp(0.0, 1.0);
+        reflections.push((insight.to_string(), conf));
+    }
+    if reflections.is_empty() {
+        return None;
+    }
+    let user_model = v
+        .get("user_model")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|u| !u.is_empty())
+        .map(String::from);
+    Some(ConsolidationResult { reflections, user_model })
+}
+
+/// Apply-guard: only apply when the result is non-empty AND did not GROW the set
+/// (a dedup shrinks or holds). Prevents an LLM hallucination from inflating memory.
+pub fn consolidation_should_apply(input_live_count: usize, result: &ConsolidationResult) -> bool {
+    !result.reflections.is_empty() && result.reflections.len() <= input_live_count
+}
+
 /// Turn-count trigger predicate: fire on every `n`-th turn. `n == 0` (disabled)
 /// and `count == 0` (no turns yet) never fire.
 pub fn should_run_reflection(count: u64, n: u64) -> bool {
@@ -94,7 +147,8 @@ pub fn apply_reflections_schema(conn: &Connection) {
             insight            TEXT NOT NULL,
             confidence         REAL NOT NULL DEFAULT 0.5,
             source_event_count INTEGER NOT NULL DEFAULT 0,
-            created_at         TEXT NOT NULL DEFAULT (datetime('now'))
+            created_at         TEXT NOT NULL DEFAULT (datetime('now')),
+            archived_at        TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_reflections_created ON reflections(created_at DESC);",
     )
@@ -123,6 +177,7 @@ pub fn recent_reflections(conn: &Connection, limit: usize) -> rusqlite::Result<V
     let mut stmt = conn.prepare(
         "SELECT insight, confidence, created_at
          FROM reflections
+         WHERE archived_at IS NULL
          ORDER BY created_at DESC
          LIMIT ?1",
     )?;
@@ -238,6 +293,54 @@ pub fn recent_daydreams(conn: &Connection, limit: usize) -> rusqlite::Result<Vec
     Ok(rows)
 }
 
+// ─── user_model_history store (P5: memory refinement audit trail) ────────────
+
+/// One `user_model_history` row, as read back for audit/restore.
+#[derive(Debug, Clone)]
+pub struct UserModelHistoryRow {
+    pub summary: String,
+    pub replaced_at: String,
+}
+
+/// Apply the V59 `user_model_history` DDL to a bare connection (tests only; the
+/// real table is created by the V59 migration).
+pub fn apply_user_model_history_schema(conn: &Connection) {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS user_model_history (
+            id          TEXT PRIMARY KEY,
+            summary     TEXT NOT NULL,
+            replaced_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );",
+    )
+    .expect("apply_user_model_history_schema");
+}
+
+/// Append one superseded user_model summary before a re-ground overwrites it.
+pub fn insert_user_model_history(conn: &Connection, id: &str, summary: &str) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO user_model_history (id, summary) VALUES (?1, ?2)",
+        params![id, summary],
+    )?;
+    Ok(())
+}
+
+/// Most-recent superseded summaries, newest first, capped at `limit`.
+pub fn recent_user_model_history(
+    conn: &Connection,
+    limit: usize,
+) -> rusqlite::Result<Vec<UserModelHistoryRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT summary, replaced_at FROM user_model_history
+         ORDER BY replaced_at DESC LIMIT ?1",
+    )?;
+    let rows = stmt
+        .query_map(params![limit as i64], |r| {
+            Ok(UserModelHistoryRow { summary: r.get(0)?, replaced_at: r.get(1)? })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
 /// System prompt for the reflection pass. Pins the JSON output contract so
 /// `parse_reflection_output` has a stable shape to parse.
 const REFLECTION_SYSTEM_PROMPT: &str = "\
@@ -258,8 +361,10 @@ preferences about a single user (their identity, tooling, working style, vetoes,
 and goals). Synthesize them into ONE compact, durable user model: a few sentences \
 capturing who this user is and how they prefer to work, so a future assistant can \
 serve them well without re-learning. Write plain prose (no JSON, no markdown \
-fences, no preamble). Prefer concrete, high-signal traits over hedging. Keep it \
-under ~120 words.";
+fences, no preamble). Prefer concrete, high-signal traits over hedging. CRITICAL: \
+state ONLY what the provided facts support — do NOT infer or invent occupation, \
+age, identity, or preferences that are not explicitly present in the input. Keep \
+it under ~120 words.";
 
 /// Read up to [`REFLECTION_EVENT_WINDOW`] recent `agent_messages` (role+content,
 /// newest first), then re-order oldest→newest into a transcript string for the
@@ -453,6 +558,14 @@ pub async fn run_once(app: tauri::AppHandle, turn_count: u64) {
     if should_run_reflection(turn_count, DAYDREAM_EVERY_N_TURNS) {
         run_daydream(app.clone()).await;
     }
+
+    // P5: every 100 agent turns, run the convergent consolidation pass (dedup
+    // reflections + re-ground user_model). Gated again inside on a min-count
+    // pre-check, so an early sparse `reflections` table just no-ops.
+    const CONSOLIDATION_EVERY_N_TURNS: u64 = 100;
+    if should_run_reflection(turn_count, CONSOLIDATION_EVERY_N_TURNS) {
+        run_consolidation(&state).await;
+    }
 }
 
 /// Run one promotion pass: read the user's learned facets + profile facts → ask
@@ -542,6 +655,148 @@ pub async fn run_promotion(state: &crate::app::AppState) {
         "promotion: distilled facts + profile nodes into user_model"
     );
 }
+
+/// Run one consolidation pass: dedup live reflections + re-ground the user_model in
+/// one LLM call, then apply IN-PLACE with an audit trail (archive the superseded
+/// reflections, append the prior user_model to `user_model_history`) inside a single
+/// transaction. Mirrors [`run_promotion`]'s gates + borrow-safety. Best-effort end
+/// to end; every failure path logs and returns. The apply-guards
+/// ([`consolidation_should_apply`]) ensure a misbehaving LLM can never grow or blank
+/// the memory.
+pub async fn run_consolidation(state: &crate::app::AppState) {
+    let Some(llm) = state.learning_llm.clone() else {
+        tracing::debug!("consolidation: no learning_llm configured; skipping");
+        return;
+    };
+    let daily_budget = {
+        let cfg = state.memubot_config.read().await;
+        cfg.memory_os.learning_llm_daily_token_budget
+    };
+    if daily_budget == 0 {
+        tracing::debug!("consolidation: learning LLM daily budget is 0; skipping");
+        return;
+    }
+    let spent = crate::cost_store::today_learning_tokens(&state.db);
+    if spent >= daily_budget {
+        tracing::debug!(spent, daily_budget, "consolidation: daily budget exhausted; skipping");
+        return;
+    }
+
+    // Read inputs (hold the std Mutex only for the read; drop before await).
+    let (live, current_user_model, digest) = {
+        let Ok(conn) = state.db.lock() else { return };
+        let live_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM reflections WHERE archived_at IS NULL", [], |r| r.get(0))
+            .unwrap_or(0);
+        if live_count < MIN_REFLECTIONS_TO_CONSOLIDATE {
+            tracing::debug!(live_count, "consolidation: too few live reflections; skipping");
+            return;
+        }
+        let live: Vec<(String, String, f64)> = match conn.prepare(
+            "SELECT id, insight, confidence FROM reflections
+             WHERE archived_at IS NULL ORDER BY created_at DESC LIMIT ?1",
+        ) {
+            Ok(mut stmt) => match stmt.query_map(params![CONSOLIDATION_READ_CAP as i64], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, f64>(2)?))
+            }) {
+                Ok(rows) => rows.flatten().collect(),
+                Err(e) => { tracing::warn!(error = %e, "consolidation: query_map failed; skipping"); return; }
+            },
+            Err(e) => { tracing::warn!(error = %e, "consolidation: prepare failed; skipping"); return; }
+        };
+        let current_user_model = get_user_model(&conn).ok().flatten();
+        let digest = build_profile_digest(&conn);
+        (live, current_user_model, digest)
+    };
+    if live.is_empty() {
+        return;
+    }
+
+    let reflections_block = live
+        .iter()
+        .map(|(_, insight, conf)| format!("- ({conf:.2}) {insight}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let user_prompt = format!(
+        "Reflections (one per line, with confidence):\n{reflections_block}\n\n\
+         Current user_model:\n{}\n\nGrounded facts:\n{}\n\nCurate now.",
+        current_user_model.as_deref().unwrap_or("(none yet)"),
+        digest.as_deref().unwrap_or("(no facts yet)"),
+    );
+
+    let output = match llm
+        .complete_text(CONSOLIDATION_COST_TAG, CONSOLIDATION_SYSTEM_PROMPT, &user_prompt, CONSOLIDATION_MAX_TOKENS)
+        .await
+    {
+        Ok(o) => o,
+        Err(e) => { tracing::warn!(error = %e, "consolidation: LLM call failed; skipping"); return; }
+    };
+
+    let Some(result) = parse_consolidation_output(&output.text) else {
+        tracing::warn!("consolidation: unparseable LLM output; skipping (memory untouched)");
+        return;
+    };
+    if !consolidation_should_apply(live.len(), &result) {
+        tracing::warn!(
+            input = live.len(), output = result.reflections.len(),
+            "consolidation: apply-guard rejected output; skipping (memory untouched)"
+        );
+        return;
+    }
+
+    // Apply in ONE transaction (no await inside — guard held safely).
+    let before = live.len();
+    let after = result.reflections.len();
+    {
+        let mut guard = match state.db.lock() { Ok(g) => g, Err(_) => return };
+        let tx = match guard.transaction() {
+            Ok(t) => t,
+            Err(e) => { tracing::warn!(error = %e, "consolidation: begin tx failed; skipping"); return; }
+        };
+        let apply = (|| -> rusqlite::Result<()> {
+            tx.execute("UPDATE reflections SET archived_at = datetime('now') WHERE archived_at IS NULL", [])?;
+            for (insight, conf) in &result.reflections {
+                let id = uuid::Uuid::new_v4().to_string();
+                insert_reflection(&tx, &id, insight, *conf, 0)?;
+            }
+            if let Some(new_um) = &result.user_model {
+                if let Some(prior) = &current_user_model {
+                    insert_user_model_history(&tx, &uuid::Uuid::new_v4().to_string(), prior)?;
+                }
+                upsert_user_model(&tx, new_um)?;
+            }
+            Ok(())
+        })();
+        match apply.and_then(|()| tx.commit()) {
+            Ok(()) => {}
+            Err(e) => { tracing::warn!(error = %e, "consolidation: apply tx failed; rolled back"); return; }
+        }
+    }
+    tracing::info!(before, after, "consolidation: deduped reflections + re-grounded user_model");
+}
+
+/// Max tokens for the consolidation completion (a deduped set + a short user_model).
+const CONSOLIDATION_MAX_TOKENS: u32 = 1024;
+/// Cost tag prefix written into `cost_records.model` for consolidation LLM calls.
+const CONSOLIDATION_COST_TAG: &str = "memory_consolidation";
+/// Don't consolidate until at least this many live reflections have accumulated.
+const MIN_REFLECTIONS_TO_CONSOLIDATE: i64 = 8;
+/// Cap how many live reflections feed one consolidation prompt.
+const CONSOLIDATION_READ_CAP: usize = 40;
+
+/// System prompt for the convergent consolidation pass — the opposite of daydream.
+const CONSOLIDATION_SYSTEM_PROMPT: &str = "\
+You are curating an AI agent's long-term memory. You are given (1) a list of \
+distilled reflections about one user, (2) the current user_model summary, and (3) \
+the grounded facts the user_model must rest on. Do two things. (a) MERGE only \
+near-identical or strongly-overlapping reflections into a single deduplicated \
+reflection, keeping the highest confidence of each merged group; leave genuinely \
+distinct insights untouched and NEVER invent new ones — the output set must be the \
+same size or smaller. (b) Rewrite the user_model so every claim is STRICTLY \
+supported by the provided facts: remove any occupation, age, identity, or \
+preference not present in the facts; do not extrapolate. Respond with ONLY a JSON \
+object, no prose, no markdown fences:\n\
+{\"reflections\":[{\"insight\":\"<sentence>\",\"confidence\":<float 0.0-1.0>}],\"user_model\":\"<prose>\"}";
 
 /// Max tokens for the daydream completion (one short hypothesis/connection).
 const DAYDREAM_MAX_TOKENS: u32 = 300;
@@ -746,5 +1001,60 @@ mod tests {
         let recent = recent_daydreams(&conn, 5).unwrap();
         assert_eq!(recent.len(), 2);
         assert!(recent.iter().any(|d| d.content.contains("borrow-checker")));
+    }
+
+    #[test]
+    fn recent_reflections_excludes_archived() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        apply_reflections_schema(&conn);
+        insert_reflection(&conn, "r1", "live insight", 0.9, 10).unwrap();
+        insert_reflection(&conn, "r2", "stale insight", 0.8, 10).unwrap();
+        conn.execute(
+            "UPDATE reflections SET archived_at = datetime('now') WHERE id = 'r2'",
+            [],
+        )
+        .unwrap();
+        let recent = recent_reflections(&conn, 10).unwrap();
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].insight, "live insight");
+    }
+
+    #[test]
+    fn user_model_history_inserts_and_reads_recent() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        apply_user_model_history_schema(&conn);
+        insert_user_model_history(&conn, "h1", "old summary one").unwrap();
+        insert_user_model_history(&conn, "h2", "old summary two").unwrap();
+        let recent = recent_user_model_history(&conn, 5).unwrap();
+        assert_eq!(recent.len(), 2);
+        assert!(recent.iter().any(|h| h.summary.contains("old summary two")));
+    }
+
+    #[test]
+    fn parse_consolidation_output_reads_reflections_and_user_model() {
+        let s = r#"```json
+        {"reflections":[{"insight":"a","confidence":0.9},{"insight":"b","confidence":0.7}],
+         "user_model":"compact model"}
+        ```"#;
+        let r = parse_consolidation_output(s).expect("should parse");
+        assert_eq!(r.reflections.len(), 2);
+        assert_eq!(r.reflections[0].0, "a");
+        assert!((r.reflections[0].1 - 0.9).abs() < 1e-9);
+        assert_eq!(r.user_model.as_deref(), Some("compact model"));
+    }
+
+    #[test]
+    fn parse_consolidation_output_none_on_prose_or_empty() {
+        assert!(parse_consolidation_output("not json at all").is_none());
+        assert!(parse_consolidation_output(r#"{"reflections":[]}"#).is_none());
+    }
+
+    #[test]
+    fn consolidation_should_apply_guards_grow_and_empty() {
+        let ok = ConsolidationResult { reflections: vec![("x".into(), 0.5)], user_model: None };
+        assert!(consolidation_should_apply(3, &ok)); // 1 <= 3
+        assert!(!consolidation_should_apply(0, &ok)); // 1 > 0 → grew
+        let empty = ConsolidationResult { reflections: vec![], user_model: None };
+        assert!(!consolidation_should_apply(5, &empty));
     }
 }
