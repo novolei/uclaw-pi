@@ -1,17 +1,19 @@
 /**
  * AgentGrowthTab — "成长" tab for the Memory module.
  *
- * Three read-only sections:
- *   1. 用户模型 — current model card + collapsible 演化历史 timeline
- *   2. 反思     — reflection cards with confidence badges
- *   3. 遐想     — live ring-buffer events prepended to persisted daydreams,
- *                 de-duplicated by content
+ * Four sections:
+ *   0. 认知/事实  — profile facts with delete action
+ *   1. 用户模型   — current model card + collapsible 演化历史 timeline
+ *   2. 反思       — reflection cards with archive/restore + confidence badges
+ *   3. 遐想       — live ring-buffer events prepended to persisted daydreams,
+ *                   de-duplicated by content
  *
+ * Header adds a 立即整合 button (triggers memory distillation) next to 刷新.
  * Mirrors LearnedProfileTab's shell: header + refresh button + count badges,
  * Loader2 spinner, error banner, empty states.
  */
 import * as React from 'react'
-import { Loader2, RefreshCw, Brain } from 'lucide-react'
+import { Loader2, RefreshCw, Brain, Trash2, RotateCcw } from 'lucide-react'
 import { useAtomValue } from 'jotai'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
@@ -50,8 +52,25 @@ function InfoCard({ children, className }: { children: React.ReactNode; classNam
 // ─── Component ────────────────────────────────────────────────────────────
 
 export function AgentGrowthTab(): React.ReactElement {
-  const { loading, error, reflections, userModel, daydreams, history, refresh } = useAgentMemory()
+  const {
+    loading,
+    error,
+    reflections,
+    userModel,
+    daydreams,
+    history,
+    facts,
+    showArchived,
+    refresh,
+    deleteFact,
+    archiveRefl,
+    restoreRefl,
+    refreshMemory,
+    toggleArchived,
+  } = useAgentMemory()
   const liveEvents = useAtomValue(daydreamEventsAtom)
+
+  const [refreshing, setRefreshing] = React.useState<boolean>(false)
 
   // Merge live ring-buffer events + persisted daydreams, de-dup by content
   const mergedDaydreams = React.useMemo(() => {
@@ -72,6 +91,21 @@ export function AgentGrowthTab(): React.ReactElement {
     return result
   }, [liveEvents, daydreams])
 
+  const handleRefreshMemory = async (): Promise<void> => {
+    setRefreshing(true)
+    try {
+      await refreshMemory()
+    } finally {
+      // refreshMemory schedules a refresh after 3s; we reset spinner after that
+      setTimeout(() => setRefreshing(false), 3200)
+    }
+  }
+
+  const handleDeleteFact = async (id: string): Promise<void> => {
+    if (!window.confirm('删除这条事实?')) return
+    await deleteFact(id)
+  }
+
   return (
     <div className="space-y-6 overflow-y-auto h-full" data-testid="agent-growth-tab">
       {/* ── Header ─────────────────────────────────────────────────────── */}
@@ -91,6 +125,18 @@ export function AgentGrowthTab(): React.ReactElement {
               size="sm"
               variant="ghost"
               className="text-xs h-7 gap-1"
+              onClick={() => void handleRefreshMemory()}
+              disabled={refreshing || loading}
+              title="重新蒸馏 user_model + 整合反思"
+            >
+              <Loader2 className={cn('size-3', refreshing ? 'animate-spin' : 'hidden')} />
+              <RefreshCw className={cn('size-3', refreshing && 'hidden')} />
+              立即整合
+            </Button>
+            <Button
+              size="sm"
+              variant="ghost"
+              className="text-xs h-7 gap-1"
               onClick={() => void refresh()}
               disabled={loading}
               title="刷新数据"
@@ -103,6 +149,9 @@ export function AgentGrowthTab(): React.ReactElement {
 
         {/* Count badges */}
         <div className="flex items-center gap-2 text-xs text-muted-foreground">
+          <Badge variant="outline" className="text-[10px] px-1.5 py-0">
+            {facts.length} 事实
+          </Badge>
           <Badge variant="outline" className="text-[10px] px-1.5 py-0">
             {reflections.length} 反思
           </Badge>
@@ -128,6 +177,41 @@ export function AgentGrowthTab(): React.ReactElement {
 
       {!loading && (
         <div className="space-y-8">
+          {/* ── Section 0: 认知/事实 ─────────────────────────────────────── */}
+          <section>
+            <h3 className="text-xs font-semibold text-muted-foreground uppercase tracking-wide mb-1">
+              认知/事实
+            </h3>
+            <p className="text-[11px] text-muted-foreground mb-3">
+              Agent 学到的关于你的事实 — 删掉不准确的
+            </p>
+            {facts.length > 0 ? (
+              <div className="space-y-2">
+                {facts.map((f) => (
+                  <InfoCard key={f.id}>
+                    <div className="flex items-start justify-between gap-2">
+                      <p className="text-sm leading-relaxed flex-1">{f.title}</p>
+                      <Button
+                        size="icon"
+                        variant="ghost"
+                        className="size-6 shrink-0 text-muted-foreground hover:text-destructive"
+                        onClick={() => void handleDeleteFact(f.id)}
+                        title="删除这条事实"
+                      >
+                        <Trash2 className="size-3" />
+                      </Button>
+                    </div>
+                    <p className="text-[11px] text-muted-foreground mt-2">
+                      {relativeTime(f.createdAt)}
+                    </p>
+                  </InfoCard>
+                ))}
+              </div>
+            ) : (
+              <p className="text-xs text-muted-foreground italic">暂无事实</p>
+            )}
+          </section>
+
           {/* ── Section 1: 用户模型 ───────────────────────────────────────── */}
           <section>
             <h3 className="text-xs font-semibold text-muted-foreground uppercase tracking-wide mb-3">
@@ -174,21 +258,54 @@ export function AgentGrowthTab(): React.ReactElement {
 
           {/* ── Section 2: 反思 ──────────────────────────────────────────── */}
           <section>
-            <h3 className="text-xs font-semibold text-muted-foreground uppercase tracking-wide mb-3">
-              反思
-            </h3>
+            <div className="flex items-center justify-between mb-3">
+              <h3 className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">
+                反思
+              </h3>
+              <Button
+                size="sm"
+                variant="ghost"
+                className="text-[11px] h-6 px-2 text-muted-foreground"
+                onClick={toggleArchived}
+              >
+                {showArchived ? '隐藏已归档' : '显示已归档'}
+              </Button>
+            </div>
             {reflections.length > 0 ? (
               <div className="space-y-2">
-                {reflections.map((r, i) => (
-                  <InfoCard key={i}>
+                {reflections.map((r) => (
+                  <InfoCard key={r.id} className={cn(r.archivedAt != null && 'opacity-50')}>
                     <div className="flex items-start justify-between gap-2">
                       <p className="text-sm leading-relaxed flex-1">{r.insight}</p>
-                      <Badge
-                        variant="outline"
-                        className="text-[10px] px-1.5 py-0 shrink-0 tabular-nums"
-                      >
-                        {Math.round(r.confidence * 100)}%
-                      </Badge>
+                      <div className="flex items-center gap-1 shrink-0">
+                        <Badge
+                          variant="outline"
+                          className="text-[10px] px-1.5 py-0 tabular-nums"
+                        >
+                          {Math.round(r.confidence * 100)}%
+                        </Badge>
+                        {r.archivedAt != null ? (
+                          <Button
+                            size="icon"
+                            variant="ghost"
+                            className="size-6 text-muted-foreground hover:text-foreground"
+                            onClick={() => void restoreRefl(r.id)}
+                            title="恢复"
+                          >
+                            <RotateCcw className="size-3" />
+                          </Button>
+                        ) : (
+                          <Button
+                            size="icon"
+                            variant="ghost"
+                            className="size-6 text-muted-foreground hover:text-destructive"
+                            onClick={() => void archiveRefl(r.id)}
+                            title="归档"
+                          >
+                            <Trash2 className="size-3" />
+                          </Button>
+                        )}
+                      </div>
                     </div>
                     <p className="text-[11px] text-muted-foreground mt-2">
                       {relativeTime(r.createdAt)}
