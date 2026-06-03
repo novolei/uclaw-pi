@@ -77,6 +77,20 @@ fn main() {
         .setup(move |app| {
             let app_state = AppState::new(app.handle())?;
 
+            // Seed the local-LLM active-quant static from the persisted
+            // provider config so the engine loads the user-selected quant
+            // (falls back to Quant::default() when unset). Spawned on the
+            // tauri async runtime — get_active_local_quant() reads an async
+            // RwLock and AppState::new is sync. Runs before any model load.
+            {
+                let provider_service = app_state.provider_service.clone();
+                tauri::async_runtime::spawn(async move {
+                    if let Some(q) = provider_service.get_active_local_quant().await {
+                        uclaw_core::local_llm::set_active_quant(q);
+                    }
+                });
+            }
+
             // Bundle 27-A — if Bundle 27-C reported an unclean shutdown,
             // check whether the prior run left a `last_active_run.json`
             // flight record with buffered assistant text. If so, emit
@@ -1146,6 +1160,7 @@ fn main() {
             uclaw_core::commands::local_llm::check_local_model_environment,
             uclaw_core::commands::local_llm::warmup_local_model,
             uclaw_core::commands::local_llm::assign_local_model_to_roles,
+            uclaw_core::commands::local_llm::set_local_model_quant,
             // Desk pet (S4)
             uclaw_core::commands::pet::pet_chat,
             uclaw_core::commands::pet::list_pet_personas,

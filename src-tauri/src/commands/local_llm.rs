@@ -233,6 +233,26 @@ pub async fn assign_local_model_to_roles(state: State<'_, AppState>) -> Result<(
     Ok(())
 }
 
+/// Persist + activate the user-selected local-model GGUF quant. Writes the
+/// choice to `providers.json` (so the engine + UI agree across restarts),
+/// updates the in-process active-quant static, and force-unloads any loaded
+/// model so the next `complete`/`stream` reloads the newly-selected quant.
+#[tauri::command]
+pub async fn set_local_model_quant(
+    state: State<'_, AppState>,
+    quant: String,
+) -> Result<(), Error> {
+    let parsed = parse_quant(Some(quant))?;
+    state.provider_service.set_active_local_quant(parsed).await?;
+    crate::local_llm::set_active_quant(parsed);
+    // Force the next inference to reload the new quant (best-effort; no-op if
+    // the engine is uninitialized or already unloaded).
+    if let Some(engine) = crate::local_llm::local_engine() {
+        engine.unload().await;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -94,7 +94,13 @@ export function useLocalModel() {
 
   const handleQuantChange = React.useCallback(
     (next: LocalModelQuant) => {
+      // Instant UI: the atom drives the selector + presence probe locally.
       setQuant(next)
+      // Persist backend-side so the in-process engine loads the same quant
+      // (best-effort; silently no-op outside Tauri).
+      settingsBridge
+        .setLocalModelQuant(next)
+        .catch((e) => console.warn('[useLocalModel] set_local_model_quant failed:', e))
     },
     [setQuant],
   )
