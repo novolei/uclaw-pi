@@ -414,18 +414,27 @@ impl LoadedModel {
         -> Result<(String, u32, u32), LocalLlmError>
     {
         use mistralrs::{TextMessageRole, RequestBuilder};
-        // Build a request with sampling params. Adapt to the exact spike-confirmed API.
+        // API confirmed by the Task 1 spike (mistralrs 0.8.1).
+        // CRITICAL: MiniCPM5 is a REASONING model — its chat template emits
+        // `<think>…</think>` before the answer. With a short max_tokens budget
+        // the whole budget is spent inside `<think>` and `content` comes back
+        // EMPTY (this is the same empty-completion failure mode seen on hosted
+        // reasoning models). For the short single-shot memory-OS completions we
+        // MUST disable thinking. (S4's pet may re-enable it with headroom +
+        // a `<think>` stripper.)
         let req = RequestBuilder::new()
             .add_message(TextMessageRole::System, system)
             .add_message(TextMessageRole::User, user)
             .set_sampler_max_len(max_tokens as usize)
-            .set_sampler_temperature(temperature as f64);
+            .set_sampler_temperature(temperature as f64)
+            .enable_thinking(false);
         let resp = self.inner.send_chat_request(req).await
             .map_err(|e| LocalLlmError::Inference(e.to_string()))?;
         let text = resp.choices.first()
             .and_then(|c| c.message.content.clone())
             .unwrap_or_default();
-        let usage = resp.usage; // field names per spike
+        // usage fields are `usize` in mistralrs 0.8.1 (spike-confirmed).
+        let usage = resp.usage;
         Ok((text, usage.prompt_tokens as u32, usage.completion_tokens as u32))
     }
 }
@@ -879,3 +888,10 @@ Run: `cd src-tauri && cargo test --lib local_llm providers::service memory_os_ll
 - **Streaming, tools, LoRA persona swap → S4.** HF fallback / smart source / progress UI → S2. Onboarding wizard → S3.
 - The `mistralrs` raw API in Tasks 3-4 follows the version pinned by the Task 1 spike — adapt the builder/request/response calls to that confirmed signature; the surrounding structure (build-once handle, `complete` mapping to `RespondOutput::Text`, `stream` unsupported) is fixed.
 - Do not stage `Cargo.lock` opportunistically; it changes legitimately here because `Cargo.toml` gained `mistralrs` — in THIS feature `Cargo.lock` SHOULD be committed (in Task 1's commit) so the dependency is reproducible. Stage it explicitly in Task 1 only.
+
+### Spike outcomes (Task 1, done — mistralrs 0.8.1, gate GREEN)
+
+- **Confirmed API** is recorded verbatim in `src-tauri/src/local_llm/spike_test.rs`; Tasks 3-4 copy it. `GgufModelBuilder::new(dir, vec![file]).build().await`; `RequestBuilder::new().add_message(role,txt).set_sampler_max_len(usize).set_sampler_temperature(f64).enable_thinking(bool)`; `model.send_chat_request(req)`; text at `resp.choices[0].message.content: Option<String>`; usage `resp.usage.prompt_tokens/.completion_tokens: usize`.
+- **MiniCPM5 is a reasoning model** (`<think>…</think>`). Short budgets → empty `content`. Tasks 3-4 call `.enable_thinking(false)` (already baked into Task 3's `generate`).
+- **Adjacent dep change (out-of-S1-scope but mandatory):** mistralrs's `smallvec ^2.0.0-alpha.12` requirement conflicted with STT's exact-pinned `ort 2.0.0-rc.10` (`smallvec =2.0.0-alpha.10`). Resolution: bump `ort` rc.10 → **rc.12** and `ndarray` 0.16 → **0.17**, migrating `src-tauri/src/stt/openflow/onnx_inference.rs` to the new `ort` API (`Session::inputs/outputs` now methods; tighter `TensorRef` bounds). All 26 STT tests pass. **Review focus:** this touches the STT subsystem's runtime deps — the final review + manual STT smoke must confirm no STT regression. Ideally this would be its own commit/PR; it was bundled into the spike commit because it's a hard prerequisite for mistralrs to compile at all.
+- **Build-env prereqs (not committed, needed on CI/other machines):** Xcode Metal Toolchain component (`xcodebuild -downloadComponent MetalToolchain`) for mistralrs's `.metal` kernel precompile; and the `pyembed`/`bunembed`/`gbrain-source` resource symlinks for the Tauri build.
