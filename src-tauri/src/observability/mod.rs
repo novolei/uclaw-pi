@@ -47,15 +47,27 @@ fn env_filter() -> EnvFilter {
 ///
 /// Returns a `WorkerGuard` whose Drop flushes any pending non-blocking
 /// file writes. Hold it in `main` for the lifetime of the process.
+/// Log timestamps in Beijing time (UTC+8) instead of the default UTC. Uses a fixed
+/// offset (not OS-local detection) so it's panic-free and deterministic.
+struct BeijingTime;
+impl tracing_subscriber::fmt::time::FormatTime for BeijingTime {
+    fn format_time(&self, w: &mut tracing_subscriber::fmt::format::Writer<'_>) -> std::fmt::Result {
+        let bj = chrono::Utc::now()
+            .with_timezone(&chrono::FixedOffset::east_opt(8 * 3600).expect("valid +08:00 offset"));
+        write!(w, "{}", bj.format("%Y-%m-%d %H:%M:%S%.3f"))
+    }
+}
+
 pub fn init() -> WorkerGuard {
     let dir = log_dir();
     let file_appender = tracing_appender::rolling::daily(&dir, "uclaw.log");
     let (file_writer, guard) = tracing_appender::non_blocking(file_appender);
 
-    let stdout_layer = fmt::layer().with_writer(std::io::stdout);
+    let stdout_layer = fmt::layer().with_writer(std::io::stdout).with_timer(BeijingTime);
     let file_layer = fmt::layer()
         .with_writer(file_writer)
-        .with_ansi(false); // no escape codes in the on-disk log
+        .with_ansi(false) // no escape codes in the on-disk log
+        .with_timer(BeijingTime);
 
     Registry::default()
         .with(env_filter())

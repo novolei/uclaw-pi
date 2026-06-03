@@ -27,12 +27,17 @@ use rusqlite::{params, Connection};
 
 /// How many recent `agent_messages` rows feed one reflection pass.
 const REFLECTION_EVENT_WINDOW: usize = 50;
-/// Max tokens for the reflection completion (one short JSON object).
-const REFLECTION_MAX_TOKENS: u32 = 512;
+/// Max tokens for the reflection completion (one short JSON object). Headroom for
+/// the model's reasoning budget before the JSON `content` (it's a cap, not a target —
+/// the model stops early when done; the extra only protects against a reasoning spike
+/// consuming the whole budget and yielding an empty completion).
+const REFLECTION_MAX_TOKENS: u32 = 2048;
 /// Cost tag prefix written into `cost_records.model` for reflection LLM calls.
 const REFLECTION_COST_TAG: &str = "memory_reflection";
-/// Max tokens for the promotion completion (one short persona summary).
-const PROMOTION_MAX_TOKENS: u32 = 400;
+/// Max tokens for the promotion completion (one short persona summary). Headroom for
+/// the model's reasoning budget (observed: a 400 cap was occasionally consumed entirely
+/// by reasoning, yielding an empty completion). Cap, not target — stops early when done.
+const PROMOTION_MAX_TOKENS: u32 = 2048;
 /// Cost tag prefix written into `cost_records.model` for promotion LLM calls.
 const PROMOTION_COST_TAG: &str = "memory_promotion";
 /// Fixed singleton id for the `user_model` row (one row per install).
@@ -776,7 +781,10 @@ pub async fn run_consolidation(state: &crate::app::AppState) {
 }
 
 /// Max tokens for the consolidation completion (a deduped set + a short user_model).
-const CONSOLIDATION_MAX_TOKENS: u32 = 1024;
+/// Generous: the configured model (e.g. deepseek-v4-flash) spends a large reasoning
+/// budget on this multi-step curation before emitting the JSON `content`; too small a
+/// cap and reasoning consumes the whole budget, leaving an empty completion.
+const CONSOLIDATION_MAX_TOKENS: u32 = 4096;
 /// Cost tag prefix written into `cost_records.model` for consolidation LLM calls.
 const CONSOLIDATION_COST_TAG: &str = "memory_consolidation";
 /// Don't consolidate until at least this many live reflections have accumulated.
@@ -799,7 +807,8 @@ object, no prose, no markdown fences:\n\
 {\"reflections\":[{\"insight\":\"<sentence>\",\"confidence\":<float 0.0-1.0>}],\"user_model\":\"<prose>\"}";
 
 /// Max tokens for the daydream completion (one short hypothesis/connection).
-const DAYDREAM_MAX_TOKENS: u32 = 300;
+/// Headroom for the model's reasoning before the JSON `content` (300 truncated it).
+const DAYDREAM_MAX_TOKENS: u32 = 2048;
 /// Cost tag prefix written into `cost_records.model` for daydream LLM calls.
 const DAYDREAM_COST_TAG: &str = "memory_daydream";
 /// How many random memory titles seed one daydream pass.
