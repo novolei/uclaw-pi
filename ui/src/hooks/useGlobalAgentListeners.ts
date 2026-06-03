@@ -15,12 +15,14 @@ import {
   currentAgentSessionIdAtom,
   agentSessionsAtom,
   proactiveLearningEventsAtom,
+  daydreamEventsAtom,
   memoryRecallEventAtom,
   sessionBrowserPreviewMapAtom,
   liveMessagesMapAtom,
   skillRecallsMapAtom,
   type AgentStreamState,
   type ProactiveLearningEvent,
+  type DaydreamEvent,
   type MemoryRecallEvent,
   type AgentStreamErrorPayload,
   type BrowserPreviewState,
@@ -844,6 +846,17 @@ function startAgentListeners(store: Store): void {
         [payload, ...prev].slice(0, 10)
       )
     })
+  )
+
+  // agent:daydream → live-prepend to the daydream ring buffer (cap 10)
+  reg(
+    listen<{ content: string; created_at?: string }>('agent:daydream', ({ payload }) => {
+      const ev: DaydreamEvent = {
+        content: payload.content,
+        createdAt: payload.created_at ?? new Date().toISOString(),
+      }
+      store.set(daydreamEventsAtom, (prev) => [ev, ...prev].slice(0, 10))
+    }),
   )
 
   // agent:memory-recall → update latest recall event

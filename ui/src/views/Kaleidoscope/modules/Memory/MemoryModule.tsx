@@ -5,7 +5,7 @@
  * 星云图 / Boot / 时间线 / 搜索。数据一次性加载后传递给子组件。
  */
 import * as React from 'react'
-import { Network, Star, Clock, Search, Sparkles, BookOpen, FileText, ShieldCheck, Orbit } from 'lucide-react'
+import { Network, Star, Clock, Search, Sparkles, BookOpen, FileText, ShieldCheck, Orbit, Brain } from 'lucide-react'
 import {
   Dialog,
   DialogContent,
@@ -27,10 +27,11 @@ import { WikiView } from '@/components/memory/WikiView'
 import { MemoryHealthPanel } from '@/components/memory/MemoryHealthPanel'
 import { DualNebulaView } from '@/components/memory/DualNebulaView'
 import { gbrainFullGraph, type KnowledgeGraph } from '@/lib/gbrain-browse'
+import { AgentGrowthTab } from './AgentGrowthTab'
 
 // ─── Tab 定义 ───────────────────────────────────────────────────────────
 
-type MemoryTab = 'nebula' | 'boot' | 'timeline' | 'search' | 'fragments' | 'daily' | 'wiki' | 'health' | 'dual'
+type MemoryTab = 'nebula' | 'boot' | 'timeline' | 'search' | 'fragments' | 'daily' | 'wiki' | 'health' | 'dual' | 'self'
 
 const TABS: { value: MemoryTab; label: string; icon: React.ElementType }[] = [
   { value: 'nebula', label: '星云图', icon: Network },
@@ -45,6 +46,8 @@ const TABS: { value: MemoryTab; label: string; icon: React.ElementType }[] = [
   { value: 'dual', label: '双星云', icon: Orbit },
   // Memory OS Foundation Phase 4 — Health findings panel.
   { value: 'health', label: 'Health', icon: ShieldCheck },
+  // Memory inspector — agent's learned self (reflections / user_model / daydreams + live).
+  { value: 'self', label: '成长', icon: Brain },
 ]
 
 export function MemoryModule(): React.ReactElement {
@@ -197,6 +200,7 @@ export function MemoryModule(): React.ReactElement {
             className="h-full w-full rounded-xl overflow-hidden border border-border/40"
           />
         )}
+        {activeTab === 'self' && <AgentGrowthTab />}
       </div>
 
       {/* 节点详情弹窗 */}

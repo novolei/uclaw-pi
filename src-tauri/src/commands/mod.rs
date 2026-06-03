@@ -8,6 +8,7 @@
 //! god file (~13k lines), which is being decomposed into this module one domain
 //! at a time. `settings` is the first slice (the HTTP-API toggle).
 
+pub mod agent_memory;
 pub mod artifact;
 pub mod automation;
 pub mod background_task;
