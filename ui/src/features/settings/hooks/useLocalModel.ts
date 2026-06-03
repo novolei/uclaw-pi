@@ -17,6 +17,13 @@ import { localModelQuantAtom, localModelStatusAtom } from '@/atoms/local-model-a
 export function useLocalModel() {
   const [quant, setQuant] = useAtom(localModelQuantAtom)
   const [status, setStatus] = useAtom(localModelStatusAtom)
+  // True only while a download command is in flight. The backend emits the
+  // "verifying" phase as its LAST progress event right before the command
+  // resolves; that event is delivered asynchronously and can land AFTER the
+  // command's await resolves + we set `ready`, clobbering it back to "校验中"
+  // forever. The progress listener checks this ref and ignores any event that
+  // arrives once the download has settled — the command result is authoritative.
+  const downloadActiveRef = React.useRef(false)
 
   // Presence probe on mount + whenever the chosen quant changes. A download
   // in flight wins (don't clobber its progress).
@@ -44,6 +51,8 @@ export function useLocalModel() {
   React.useEffect(() => {
     let unlisten: UnlistenFn | undefined
     void onLocalModelDownloadProgress((p) => {
+      // Ignore stragglers delivered after the command settled (see ref note).
+      if (!downloadActiveRef.current) return
       const percent = p.total > 0 ? Math.round((p.downloaded / p.total) * 100) : 0
       setStatus({
         kind: 'downloading',
@@ -62,6 +71,7 @@ export function useLocalModel() {
   }, [setStatus])
 
   const handleDownload = React.useCallback(async () => {
+    downloadActiveRef.current = true
     setStatus({
       kind: 'downloading',
       phase: 'probing',
@@ -73,8 +83,10 @@ export function useLocalModel() {
     try {
       // No explicit source -> backend probes the fastest mirror.
       await settingsBridge.downloadLocalModel(quant, undefined)
+      downloadActiveRef.current = false
       setStatus({ kind: 'ready' })
     } catch (e) {
+      downloadActiveRef.current = false
       const message = String((e as Error)?.message ?? e)
       // A user-requested cancel surfaces as a backend error; re-probe presence.
       const present = await settingsBridge.isLocalModelPresent(quant).catch(() => false)

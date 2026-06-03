@@ -7474,11 +7474,18 @@ async fn try_generate_title(
     system: &str,
     user_content: &str,
 ) -> Result<(String, String), Error> {
-    // Build LLM config from the active provider, falling back to legacy config
-    let llm_cfg = if let Some((provider_id, model, api_key, base_url, _api)) =
-        provider_service.get_active_llm_config().await
+    // Session title generation is a light one-shot — route it through the
+    // `utility` role (so it can use the local MiniCPM model when assigned),
+    // falling back utility → chat → active, then to the legacy config.
+    let llm_cfg = if let Some((provider_id, model, api_key, base_url, api_override)) =
+        provider_service.get_role_llm_config("utility").await
     {
-        crate::llm::llm_config_from_provider(&provider_id, &model, &api_key, &base_url, 256, 0.3, None) // secondary call site — out of scope (Task 2)
+        // Carry the effective wire API so a local-minicpm (LocalMistralRs)
+        // utility assignment routes to the in-process provider, not OpenAI.
+        let effective_api = api_override.or_else(|| {
+            crate::providers::registry::find(&provider_id).map(|k| k.default_api)
+        });
+        crate::llm::llm_config_from_provider(&provider_id, &model, &api_key, &base_url, 256, 0.3, effective_api)
     } else {
         if llm_config_legacy.api_key.is_empty() && llm_config_legacy.provider != "ollama" {
             return Err(Error::InvalidInput("No LLM provider configured".into()));
@@ -7608,11 +7615,16 @@ fn spawn_agent_session_title_summary(
             compact.chars().take(320).collect::<String>()
         };
 
-        // Build LLM config once (shared across retries)
-        let llm_cfg = if let Some((provider_id, model, api_key, base_url, _api)) =
-            provider_service.get_active_llm_config().await
+        // Build LLM config once (shared across retries). Agent-session title
+        // generation routes through the `utility` role (local MiniCPM when
+        // assigned), falling back utility → chat → active, then legacy.
+        let llm_cfg = if let Some((provider_id, model, api_key, base_url, api_override)) =
+            provider_service.get_role_llm_config("utility").await
         {
-            crate::llm::llm_config_from_provider(&provider_id, &model, &api_key, &base_url, 512, 0.1, None) // secondary call site — out of scope (Task 2)
+            let effective_api = api_override.or_else(|| {
+                crate::providers::registry::find(&provider_id).map(|k| k.default_api)
+            });
+            crate::llm::llm_config_from_provider(&provider_id, &model, &api_key, &base_url, 512, 0.1, effective_api)
         } else {
             if llm_config_legacy.api_key.is_empty() && llm_config_legacy.provider != "ollama" {
                 tracing::warn!(session_id = %session_id, "No LLM provider configured, skipping title generation");
