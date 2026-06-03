@@ -3,10 +3,13 @@
 pub mod engine;
 pub mod paths;
 pub mod download;
+pub mod persona;
 pub mod preflight;
 pub mod provider;
 #[cfg(test)]
 mod spike_test;
+#[cfg(test)]
+mod s4_spike_test;
 
 use std::sync::{Arc, OnceLock};
 use engine::LocalLlmEngine;

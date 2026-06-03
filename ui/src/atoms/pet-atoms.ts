@@ -25,6 +25,25 @@ export const petCharacterAtom = atomWithStorage<PetCharacter>('pet.character', '
 export const petPrimaryStateAtom = atom<PetPrimaryState>('idle')
 export const petHoverActiveAtom = atom<boolean>(false)
 
+/**
+ * Desk-pet persona (S4). A persona is system-prompt-only (no LoRA/adapter) —
+ * it pairs a sprite `character` with a voice (`systemPrompt`). Wire shape mirrors
+ * the backend `PetPersona` (serde camelCase): id / displayName / character /
+ * systemPrompt. See `src-tauri/src/local_llm/persona.rs`.
+ */
+export interface PetPersona {
+  id: string
+  displayName: string
+  character: string
+  systemPrompt: string
+}
+
+/** Selected persona id, persisted. Defaults to the backend's first built-in. */
+export const petPersonaIdAtom = atomWithStorage<string>('pet.personaId', 'astro')
+
+/** The persona roster loaded from `list_pet_personas` (runtime, not persisted). */
+export const petPersonasAtom = atom<PetPersona[]>([])
+
 export const petDisplayStateAtom = atom<PetState>((get) => {
   const primary = get(petPrimaryStateAtom)
   const hovering = get(petHoverActiveAtom)

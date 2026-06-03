@@ -147,6 +147,12 @@ fn main() {
                 .build(app)?;
             let _ = tray; // keep alive — owned by the app
 
+            // Desk-pet window (S4) is created on demand via the
+            // `show_desk_pet` command (commands/pet.rs), not at startup. The
+            // env-gated UCLAW_DESKPET_SPIKE prototype was removed once the real
+            // commands landed; the streaming/window findings live in the
+            // local_llm::s4_spike_test test module.
+
             // Spawn HTTP server for remote access
             let session_mgr = app_state.session_manager.clone();
             let data_dir = app_state.data_dir.clone();
@@ -1140,6 +1146,13 @@ fn main() {
             uclaw_core::commands::local_llm::check_local_model_environment,
             uclaw_core::commands::local_llm::warmup_local_model,
             uclaw_core::commands::local_llm::assign_local_model_to_roles,
+            // Desk pet (S4)
+            uclaw_core::commands::pet::pet_chat,
+            uclaw_core::commands::pet::list_pet_personas,
+            uclaw_core::commands::pet::set_pet_persona,
+            uclaw_core::commands::pet::show_desk_pet,
+            uclaw_core::commands::pet::hide_desk_pet,
+            uclaw_core::commands::pet::set_desk_pet_click_through,
             // Persona
             uclaw_core::commands::persona::create_persona_journal_entry,
             uclaw_core::commands::persona::delete_persona_journal_entry,
