@@ -52,6 +52,26 @@ export interface SttDownloadModelRequest {
   force: boolean
 }
 
+/** Quantization of the local MiniCPM GGUF (mirrors the Rust `Quant` serde repr). */
+export type LocalModelQuant = 'q4_k_m' | 'q8_0' | 'f16'
+
+/** Download mirror label (mirrors the Rust `Source::label`). */
+export type LocalModelSource = 'modelscope' | 'huggingface'
+
+/** Result of `probe_download_sources`: fastest reachable mirror + per-source ms. */
+export interface ProbeSourcesResult {
+  fastest: LocalModelSource | null
+  latencies: Record<string, number | null>
+}
+
+/** Payload of the `local-model:download-progress` event. */
+export interface LocalModelProgress {
+  downloaded: number
+  total: number
+  source: string | null
+  phase: 'probing' | 'downloading' | 'verifying'
+}
+
 /** A freshly-issued WeChat iLink login QR code (polling token + image payload). */
 export interface WechatIlinkQrcode {
   qrcode: string
@@ -297,6 +317,22 @@ export const settingsBridge = {
   /** Download (or force-redownload) the STT model; resolves to the model dir. */
   sttDownloadModel: (request: SttDownloadModelRequest): Promise<string> =>
     invoke<string>('stt_download_model', { request }),
+
+  // ── Local MiniCPM model IPC (S2 smart download). Powers the Intelligence-tab
+  // 本地模型 section. Thin wrappers — the caller owns its try/catch. ──
+  /** Whether the local MiniCPM GGUF for `quant` (default Q4_K_M) is downloaded. */
+  isLocalModelPresent: (quant?: LocalModelQuant): Promise<boolean> =>
+    invoke<boolean>('is_local_model_present', { quant }),
+  /** Concurrently probe ModelScope/HF latency for `quant`; for the progress bar. */
+  probeDownloadSources: (quant?: LocalModelQuant): Promise<ProbeSourcesResult> =>
+    invoke<ProbeSourcesResult>('probe_download_sources', { quant }),
+  /** Download the local model for `quant` (default Q4_K_M) from `source`
+   * (default: probe fastest); resolves to the GGUF path. Progress streams on
+   * `local-model:download-progress` — subscribe via `onLocalModelDownloadProgress`. */
+  downloadLocalModel: (quant?: LocalModelQuant, source?: LocalModelSource): Promise<string> =>
+    invoke<string>('download_local_model', { quant, source }),
+  /** Request cancellation of the in-flight local-model download (best-effort). */
+  cancelLocalModelDownload: (): Promise<void> => invoke<void>('cancel_download'),
 }
 
 // ── Developer-options setup-script event stream (was `@tauri-apps/api/event`
@@ -325,3 +361,11 @@ export const onImChannelStatusChanged = (
   handler: (status: ImChannelStatus) => void,
 ): Promise<UnlistenFn> =>
   listen<ImChannelStatus>('im_channel_status_changed', (e) => handler(e.payload))
+
+// ── Local MiniCPM download progress stream (S2). The hook subscribes through
+// this wrapper so no settings component imports `@tauri-apps/api`. ──
+/** Subscribe to local-model download progress (probing/downloading/verifying). */
+export const onLocalModelDownloadProgress = (
+  handler: (p: LocalModelProgress) => void,
+): Promise<UnlistenFn> =>
+  listen<LocalModelProgress>('local-model:download-progress', (e) => handler(e.payload))

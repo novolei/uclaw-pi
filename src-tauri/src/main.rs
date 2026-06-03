@@ -1131,9 +1131,11 @@ fn main() {
             uclaw_core::commands::provider::set_active_model,
             uclaw_core::commands::provider::get_role_models,
             uclaw_core::commands::provider::set_role_model,
-            // Local LLM (S1 — local MiniCPM runtime)
+            // Local LLM (S1 — local MiniCPM runtime; S2 — smart download)
             uclaw_core::commands::local_llm::is_local_model_present,
             uclaw_core::commands::local_llm::download_local_model,
+            uclaw_core::commands::local_llm::probe_download_sources,
+            uclaw_core::commands::local_llm::cancel_download,
             // Persona
             uclaw_core::commands::persona::create_persona_journal_entry,
             uclaw_core::commands::persona::delete_persona_journal_entry,

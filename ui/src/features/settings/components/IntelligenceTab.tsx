@@ -4,7 +4,7 @@
  */
 import * as React from 'react'
 import { Play, Square, Loader2 } from 'lucide-react'
-import { ModelSettings, AgentSettings, PromptsSettings } from '@/features/settings'
+import { ModelSettings, AgentSettings, PromptsSettings, LocalModelSettings } from '@/features/settings'
 import { SettingsSection } from './primitives/SettingsSection'
 import { SettingsCard } from './primitives/SettingsCard'
 import { Button } from '@/components/ui/button'
@@ -94,6 +94,9 @@ export function IntelligenceTab(): React.ReactElement {
     <div className="space-y-8">
       <section data-settings-section="模型分配">
         <ModelSettings />
+      </section>
+      <section data-settings-section="本地模型">
+        <LocalModelSettings />
       </section>
       <section data-settings-section="Agent 行为">
         <AgentSettings />

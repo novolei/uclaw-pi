@@ -133,7 +133,7 @@ impl LocalLlmEngine {
         max_tokens: u32,
         temperature: f32,
     ) -> Result<LocalCompletion, LocalLlmError> {
-        if !is_model_present(&self.data_dir) {
+        if !is_model_present(&self.data_dir, crate::local_llm::download::Quant::default()) {
             return Err(LocalLlmError::ModelMissing);
         }
 
