@@ -28,6 +28,7 @@ import {
 import { Toaster } from './components/ui/sonner'
 import { GlobalShortcuts } from './components/shortcuts/GlobalShortcuts'
 import { AutomationLoginBrowserWindow } from './components/automation/AutomationLoginBrowserWindow'
+import { DeskPetApp } from './components/deskpet/DeskPetApp'
 import './styles/globals.css'
 
 // App-wide right-click bridge — ensures the contextmenu event fires for
@@ -135,14 +136,27 @@ class RootErrorBoundary extends React.Component<
   }
 }
 
+const searchParams = new URLSearchParams(window.location.search)
 const isAutomationLoginBrowserWindow =
-  new URLSearchParams(window.location.search).get('uclawWindow') === 'automation-login-browser'
+  searchParams.get('uclawWindow') === 'automation-login-browser'
+// S4: the frameless transparent desk-pet window loads `index.html?view=deskpet`
+// and renders a LIGHT root (no AppShell / agent loop), so OS transparency shows.
+const isDeskPetWindow = searchParams.get('view') === 'deskpet'
+
+if (isDeskPetWindow) {
+  // Make the document chrome transparent so the OS window transparency is visible
+  // (the deskpet root paints `background: transparent`).
+  document.documentElement.style.background = 'transparent'
+  document.body.style.background = 'transparent'
+}
 
 ReactDOM.createRoot(document.getElementById('root')!).render(
   <React.StrictMode>
     <RootErrorBoundary>
       <ThemeInitializer />
-      {isAutomationLoginBrowserWindow ? (
+      {isDeskPetWindow ? (
+        <DeskPetApp />
+      ) : isAutomationLoginBrowserWindow ? (
         <>
           <AutomationLoginBrowserWindow />
           <Toaster />
