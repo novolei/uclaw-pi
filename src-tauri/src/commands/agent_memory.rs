@@ -6,6 +6,18 @@ use crate::memory_graph::reflection_service::{
     DaydreamRow, ReflectionRow, UserModelHistoryRow,
 };
 
+/// SQLite `datetime('now')` returns `"YYYY-MM-DD HH:MM:SS"` in UTC but with NO zone
+/// marker, so the frontend's `new Date(...)` parses it as LOCAL time (off by the local
+/// offset — e.g. "8 小时前" for a row created seconds ago in UTC+8). Normalize to
+/// RFC3339 UTC (`...T...Z`) so the frontend parses it as UTC and relative times are right.
+fn to_iso_utc(s: String) -> String {
+    if s.len() == 19 && s.as_bytes().get(10) == Some(&b' ') {
+        format!("{}Z", s.replace(' ', "T"))
+    } else {
+        s
+    }
+}
+
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReflectionDto {
@@ -15,7 +27,7 @@ pub struct ReflectionDto {
 }
 impl From<ReflectionRow> for ReflectionDto {
     fn from(r: ReflectionRow) -> Self {
-        Self { insight: r.insight, confidence: r.confidence, created_at: r.created_at }
+        Self { insight: r.insight, confidence: r.confidence, created_at: to_iso_utc(r.created_at) }
     }
 }
 
@@ -34,7 +46,7 @@ pub struct DaydreamDto {
 }
 impl From<DaydreamRow> for DaydreamDto {
     fn from(r: DaydreamRow) -> Self {
-        Self { content: r.content, created_at: r.created_at }
+        Self { content: r.content, created_at: to_iso_utc(r.created_at) }
     }
 }
 
@@ -46,7 +58,7 @@ pub struct UserModelHistoryDto {
 }
 impl From<UserModelHistoryRow> for UserModelHistoryDto {
     fn from(r: UserModelHistoryRow) -> Self {
-        Self { summary: r.summary, replaced_at: r.replaced_at }
+        Self { summary: r.summary, replaced_at: to_iso_utc(r.replaced_at) }
     }
 }
 
@@ -71,7 +83,7 @@ pub async fn get_agent_user_model(
     match conn.query_row(
         "SELECT summary, updated_at FROM user_model WHERE id = 'default'",
         [],
-        |r| Ok(UserModelDto { summary: r.get(0)?, updated_at: r.get(1)? }),
+        |r| Ok(UserModelDto { summary: r.get(0)?, updated_at: to_iso_utc(r.get(1)?) }),
     ) {
         Ok(dto) => Ok(Some(dto)),
         Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
