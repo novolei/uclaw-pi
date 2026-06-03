@@ -1,2 +1,9 @@
 coverage/
 .vitest/
+
+# Playwright E2E (S6 smoke) artifacts
+test-results/
+playwright-report/
+blob-report/
+.playwright/
+playwright/.cache/

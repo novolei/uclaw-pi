@@ -104,6 +104,73 @@ describe('dev tauri mock', () => {
     await expect(await handler('list_automations')).toEqual([])
   })
 
+  it('stubs S1–S5 local-model + pet commands for browser-only validation', async () => {
+    const handler = createUclawMockIpcHandler()
+
+    // Local model: not present (so the download CTA shows) + a green env report.
+    await expect(await handler('is_local_model_present')).toBe(false)
+    await expect(await handler('check_local_model_environment')).toMatchObject({
+      diskOk: true,
+      ramOk: true,
+      metalAvailable: true,
+      network: { anyReachable: true, fastest: 'modelscope' },
+    })
+    await expect(await handler('probe_download_sources')).toMatchObject({
+      fastest: 'modelscope',
+      latencies: { modelscope: 120, huggingface: 300 },
+    })
+    // Side-effecting no-op commands resolve ok (null).
+    await expect(await handler('set_local_model_quant', { quant: 'q8_0' })).toBeNull()
+    await expect(await handler('warmup_local_model')).toBeNull()
+    await expect(await handler('assign_local_model_to_roles')).toBeNull()
+    await expect(await handler('cancel_download')).toBeNull()
+
+    // Pet: the five built-in personas, including Clawd, in the camelCase shape.
+    const personas = (await handler('list_pet_personas')) as Array<{
+      id: string
+      displayName: string
+      character: string
+      systemPrompt: string
+    }>
+    expect(personas).toHaveLength(5)
+    expect(personas.map((p) => p.id)).toEqual(['astro', 'clawby', 'clawd', 'sprout', 'pixel'])
+    expect(personas.find((p) => p.id === 'clawd')?.displayName).toBe('Clawd')
+    await expect(await handler('set_pet_persona', { id: 'clawd' })).toBeNull()
+    await expect(await handler('show_desk_pet')).toBeNull()
+    await expect(await handler('hide_desk_pet')).toBeNull()
+    await expect(await handler('set_desk_pet_click_through', { ignore: true })).toBeNull()
+  })
+
+  it('streams local-model download progress + pet reply events through the mock', async () => {
+    vi.stubEnv('VITE_UCLAW_MOCK_TAURI', '1')
+    installDevTauriMock()
+
+    const progress = vi.fn()
+    const delta = vi.fn()
+    const done = vi.fn()
+    const unlistenProgress = await listen('local-model:download-progress', (e) =>
+      progress(e.payload),
+    )
+    const unlistenDelta = await listen('pet:reply-delta', (e) => delta(e.payload))
+    const unlistenDone = await listen('pet:reply-done', () => done())
+
+    // The commands resolve only after the full event stream has been emitted.
+    await invoke('download_local_model', {})
+    await invoke('pet_chat', { message: 'hi' })
+
+    await unlistenProgress()
+    await unlistenDelta()
+    await unlistenDone()
+
+    // probing → 5 downloading ticks → verifying = 7 progress emits.
+    expect(progress).toHaveBeenCalledTimes(7)
+    expect(progress).toHaveBeenCalledWith(expect.objectContaining({ phase: 'probing' }))
+    expect(progress).toHaveBeenLastCalledWith(expect.objectContaining({ phase: 'verifying' }))
+    // pet_chat emits a few deltas then exactly one done.
+    expect(delta.mock.calls.length).toBeGreaterThanOrEqual(2)
+    expect(done).toHaveBeenCalledTimes(1)
+  })
+
   it('mocks confirmed Browser Runtime execute IPC for browser-only validation', async () => {
     const handler = createUclawMockIpcHandler()
 
