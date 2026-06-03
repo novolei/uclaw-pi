@@ -72,6 +72,26 @@ export interface LocalModelProgress {
   phase: 'probing' | 'downloading' | 'verifying'
 }
 
+/** Per-source reachability + fastest source (mirrors the Rust `NetworkReport`). */
+export interface NetworkReport {
+  modelscopeReachable: boolean
+  huggingfaceReachable: boolean
+  fastest: string | null
+  anyReachable: boolean
+}
+
+/** First-launch environment report (mirrors the Rust `EnvReport`, camelCase). */
+export interface EnvReport {
+  diskFreeBytes: number
+  diskOk: boolean
+  diskRequiredBytes: number
+  ramTotalBytes: number
+  ramAvailableBytes: number
+  ramOk: boolean
+  metalAvailable: boolean
+  network: NetworkReport
+}
+
 /** A freshly-issued WeChat iLink login QR code (polling token + image payload). */
 export interface WechatIlinkQrcode {
   qrcode: string
@@ -333,6 +353,17 @@ export const settingsBridge = {
     invoke<string>('download_local_model', { quant, source }),
   /** Request cancellation of the in-flight local-model download (best-effort). */
   cancelLocalModelDownload: (): Promise<void> => invoke<void>('cancel_download'),
+
+  // ── Local MiniCPM first-launch onboarding IPC (S3). Powers the onboarding
+  // LocalModelStep + the Settings re-entry. Thin wrappers — the caller owns
+  // its try/catch. ──
+  /** Run the first-launch environment preflight (disk/RAM/Metal/network) for `quant`. */
+  checkLocalModelEnvironment: (quant?: LocalModelQuant): Promise<EnvReport> =>
+    invoke<EnvReport>('check_local_model_environment', { quant }),
+  /** Load + JIT the local runtime via a throwaway 1-token completion. */
+  warmupLocalModel: (): Promise<void> => invoke<void>('warmup_local_model'),
+  /** Auto-assign the local MiniCPM to the cheap roles (summarizer + utility). */
+  assignLocalModelToRoles: (): Promise<void> => invoke<void>('assign_local_model_to_roles'),
 }
 
 // ── Developer-options setup-script event stream (was `@tauri-apps/api/event`
