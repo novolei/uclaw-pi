@@ -50,6 +50,61 @@ impl From<UserModelHistoryRow> for UserModelHistoryDto {
     }
 }
 
+#[tauri::command]
+pub async fn list_reflections(
+    state: tauri::State<'_, crate::app::AppState>,
+    limit: usize,
+) -> Result<Vec<ReflectionDto>, String> {
+    let rows = {
+        let conn = state.db.lock().map_err(|e| e.to_string())?;
+        crate::memory_graph::reflection_service::recent_reflections(&conn, limit)
+            .map_err(|e| e.to_string())?
+    };
+    Ok(rows.into_iter().map(Into::into).collect())
+}
+
+#[tauri::command]
+pub async fn get_agent_user_model(
+    state: tauri::State<'_, crate::app::AppState>,
+) -> Result<Option<UserModelDto>, String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    match conn.query_row(
+        "SELECT summary, updated_at FROM user_model WHERE id = 'default'",
+        [],
+        |r| Ok(UserModelDto { summary: r.get(0)?, updated_at: r.get(1)? }),
+    ) {
+        Ok(dto) => Ok(Some(dto)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+#[tauri::command]
+pub async fn list_daydreams(
+    state: tauri::State<'_, crate::app::AppState>,
+    limit: usize,
+) -> Result<Vec<DaydreamDto>, String> {
+    let rows = {
+        let conn = state.db.lock().map_err(|e| e.to_string())?;
+        crate::memory_graph::reflection_service::recent_daydreams(&conn, limit)
+            .map_err(|e| e.to_string())?
+    };
+    Ok(rows.into_iter().map(Into::into).collect())
+}
+
+#[tauri::command]
+pub async fn list_user_model_history(
+    state: tauri::State<'_, crate::app::AppState>,
+    limit: usize,
+) -> Result<Vec<UserModelHistoryDto>, String> {
+    let rows = {
+        let conn = state.db.lock().map_err(|e| e.to_string())?;
+        crate::memory_graph::reflection_service::recent_user_model_history(&conn, limit)
+            .map_err(|e| e.to_string())?
+    };
+    Ok(rows.into_iter().map(Into::into).collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
