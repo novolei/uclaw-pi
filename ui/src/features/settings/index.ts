@@ -45,6 +45,12 @@ export { ToolSettings } from './components/ToolSettings'
 // dropdown open/outside-click UI state stays in the component).
 export { ModelSettings } from './components/ModelSettings'
 
+// S2 — LocalModelSettings (local MiniCPM smart download): advanced quant
+// selector + source-aware progress bar; download lifecycle in useLocalModel,
+// IPC behind settingsBridge.* + onLocalModelDownloadProgress. Consumed by
+// IntelligenceTab (relative sibling import).
+export { LocalModelSettings } from './components/LocalModelSettings'
+
 // P3a — PermissionsSettings migrated + split (328 → thin shell composing
 // permissions/ cards; all IPC + draft state in usePermissionsSettings; the
 // sandbox sub-panel is the migrated WorkspaceSandboxSettings sibling).
