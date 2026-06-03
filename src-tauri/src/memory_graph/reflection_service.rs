@@ -816,6 +816,42 @@ non-obvious that links them or leaps off from them. Write a single short \
 paragraph of plain prose (no JSON, no markdown fences, no preamble, no list). \
 Favour the surprising over the safe.";
 
+/// Build the daydream seed from grounded sources + some randomness. Up to 2 recent
+/// reflections + the user_model + up to 3 random titles. Keeping random titles
+/// preserves divergence; the reflections/user_model make associations more coherent.
+fn build_daydream_seed(reflections: &[String], user_model: Option<&str>, titles: &[String]) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for r in reflections.iter().take(2) {
+        parts.push(format!("Reflection: {}", r.chars().take(400).collect::<String>()));
+    }
+    if let Some(um) = user_model.map(str::trim).filter(|u| !u.is_empty()) {
+        parts.push(format!("User model: {}", um.chars().take(400).collect::<String>()));
+    }
+    for t in titles.iter().take(3) {
+        parts.push(t.chars().take(400).collect::<String>());
+    }
+    parts.join("\n")
+}
+
+/// Parse the daydream output `{content, worth_remembering}`. Prose (no JSON) falls
+/// back to `(prose, false)` — a free-form daydream that doesn't reflow.
+pub fn parse_daydream_output(s: &str) -> (String, bool) {
+    if let Some(obj) = extract_json_object(s.trim()) {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(obj) {
+            if let Some(content) = v
+                .get("content")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|c| !c.is_empty())
+            {
+                let worth = v.get("worth_remembering").and_then(serde_json::Value::as_bool).unwrap_or(false);
+                return (content.to_string(), worth);
+            }
+        }
+    }
+    (s.trim().to_string(), false)
+}
+
 /// Run one daydream pass: sample random memory titles → ask the LLM to
 /// free-associate ONE novel hypothesis/connection → persist a `daydreams` row
 /// AND emit `agent:daydream` for the UI. Mirrors [`run_promotion`]'s structure
@@ -1056,5 +1092,34 @@ mod tests {
         assert!(!consolidation_should_apply(0, &ok)); // 1 > 0 → grew
         let empty = ConsolidationResult { reflections: vec![], user_model: None };
         assert!(!consolidation_should_apply(5, &empty));
+    }
+
+    #[test]
+    fn build_daydream_seed_mixes_all_sources_and_caps() {
+        let refl = vec!["insight one".to_string(), "insight two".to_string(), "insight three".to_string()];
+        let titles = vec!["t1".to_string(), "t2".to_string(), "t3".to_string(), "t4".to_string()];
+        let seed = build_daydream_seed(&refl, Some("the user model"), &titles);
+        assert!(seed.contains("insight one") && seed.contains("insight two"));
+        assert!(!seed.contains("insight three")); // capped at 2 reflections
+        assert!(seed.contains("the user model"));
+        assert!(seed.contains("t1") && seed.contains("t3"));
+        assert!(!seed.contains("t4")); // capped at 3 titles
+    }
+
+    #[test]
+    fn build_daydream_seed_handles_missing_user_model_and_empty_reflections() {
+        let seed = build_daydream_seed(&[], None, &["only-title".to_string()]);
+        assert!(seed.contains("only-title"));
+        assert!(!seed.to_lowercase().contains("user model"));
+    }
+
+    #[test]
+    fn parse_daydream_output_reads_json_and_falls_back_to_prose() {
+        let (c, w) = parse_daydream_output(r#"{"content":"a leap","worth_remembering":true}"#);
+        assert_eq!(c, "a leap");
+        assert!(w);
+        let (c2, w2) = parse_daydream_output("just a plain prose daydream");
+        assert_eq!(c2, "just a plain prose daydream");
+        assert!(!w2);
     }
 }
