@@ -3,7 +3,7 @@
 //! in the ReflectionService; these only READ, for the MemoryModule "成长" tab.
 
 use crate::memory_graph::reflection_service::{
-    DaydreamRow, ReflectionRow, UserModelHistoryRow,
+    DaydreamRow, UserModelHistoryRow,
 };
 
 /// SQLite `datetime('now')` returns `"YYYY-MM-DD HH:MM:SS"` in UTC but with NO zone
@@ -21,14 +21,11 @@ fn to_iso_utc(s: String) -> String {
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReflectionDto {
+    pub id: String,
     pub insight: String,
     pub confidence: f64,
     pub created_at: String,
-}
-impl From<ReflectionRow> for ReflectionDto {
-    fn from(r: ReflectionRow) -> Self {
-        Self { insight: r.insight, confidence: r.confidence, created_at: to_iso_utc(r.created_at) }
-    }
+    pub archived_at: Option<String>,
 }
 
 #[derive(serde::Serialize)]
@@ -66,13 +63,32 @@ impl From<UserModelHistoryRow> for UserModelHistoryDto {
 pub async fn list_reflections(
     state: tauri::State<'_, crate::app::AppState>,
     limit: usize,
+    include_archived: Option<bool>,
 ) -> Result<Vec<ReflectionDto>, String> {
-    let rows = {
-        let conn = state.db.lock().map_err(|e| e.to_string())?;
-        crate::memory_graph::reflection_service::recent_reflections(&conn, limit)
-            .map_err(|e| e.to_string())?
+    let include = include_archived.unwrap_or(false);
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    let sql = if include {
+        "SELECT id, insight, confidence, created_at, archived_at FROM reflections \
+         ORDER BY created_at DESC LIMIT ?1"
+    } else {
+        "SELECT id, insight, confidence, created_at, archived_at FROM reflections \
+         WHERE archived_at IS NULL ORDER BY created_at DESC LIMIT ?1"
     };
-    Ok(rows.into_iter().map(Into::into).collect())
+    let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(rusqlite::params![limit as i64], |r| {
+            Ok(ReflectionDto {
+                id: r.get(0)?,
+                insight: r.get(1)?,
+                confidence: r.get(2)?,
+                created_at: to_iso_utc(r.get::<_, String>(3)?),
+                archived_at: r.get::<_, Option<String>>(4)?.map(to_iso_utc),
+            })
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|e| e.to_string())?;
+    Ok(rows)
 }
 
 #[tauri::command]
@@ -117,17 +133,92 @@ pub async fn list_user_model_history(
     Ok(rows.into_iter().map(Into::into).collect())
 }
 
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProfileFactDto {
+    pub id: String,
+    pub title: String,
+    pub created_at: String,
+}
+
+#[tauri::command]
+pub async fn list_profile_facts(
+    state: tauri::State<'_, crate::app::AppState>,
+) -> Result<Vec<ProfileFactDto>, String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    let mut stmt = conn.prepare(
+        "SELECT id, title, created_at FROM memory_nodes \
+         WHERE kind = 'user_profile' AND title IS NOT NULL AND title != '' \
+         ORDER BY created_at DESC LIMIT 100",
+    ).map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([], |r| Ok(ProfileFactDto {
+            id: r.get(0)?, title: r.get(1)?, created_at: to_iso_utc(r.get::<_, String>(2)?),
+        }))
+        .map_err(|e| e.to_string())?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|e| e.to_string())?;
+    Ok(rows)
+}
+
+#[tauri::command]
+pub async fn archive_reflection(
+    state: tauri::State<'_, crate::app::AppState>, id: String,
+) -> Result<(), String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    conn.execute(
+        "UPDATE reflections SET archived_at = datetime('now') WHERE id = ?1 AND archived_at IS NULL",
+        rusqlite::params![id],
+    ).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn restore_reflection(
+    state: tauri::State<'_, crate::app::AppState>, id: String,
+) -> Result<(), String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    conn.execute("UPDATE reflections SET archived_at = NULL WHERE id = ?1", rusqlite::params![id])
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Fire-and-forget re-ground (run_promotion: facts → user_model — fixes drift after a bad
+/// fact is deleted) + consolidation (dedup, self-gated). Returns immediately; the frontend
+/// refetches after a short delay. Takes `AppHandle` (not `State`) so the spawned task can
+/// `try_state` without holding a non-Send guard across the await.
+#[tauri::command]
+pub async fn trigger_memory_refresh(app: tauri::AppHandle) -> Result<(), String> {
+    tauri::async_runtime::spawn(async move {
+        use tauri::Manager;
+        if let Some(state) = app.try_state::<crate::app::AppState>() {
+            crate::memory_graph::reflection_service::run_promotion(&state).await;
+            crate::memory_graph::reflection_service::run_consolidation(&state).await;
+        }
+    });
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn reflection_dto_maps_from_row() {
-        let row = ReflectionRow { insight: "x".into(), confidence: 0.9, created_at: "t".into() };
-        let dto: ReflectionDto = row.into();
-        assert_eq!(dto.insight, "x");
-        assert!((dto.confidence - 0.9).abs() < 1e-9);
-        assert_eq!(dto.created_at, "t");
+    fn reflections_query_round_trips_id_and_archived() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::memory_graph::reflection_service::apply_reflections_schema(&conn);
+        use crate::memory_graph::reflection_service::insert_reflection;
+        insert_reflection(&conn, "r1", "live one", 0.9, 0).unwrap();
+        insert_reflection(&conn, "r2", "archived one", 0.8, 0).unwrap();
+        conn.execute("UPDATE reflections SET archived_at = datetime('now') WHERE id='r2'", []).unwrap();
+        let live: Vec<(String, Option<String>)> = conn
+            .prepare("SELECT id, archived_at FROM reflections WHERE archived_at IS NULL").unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap().flatten().collect();
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].0, "r1");
+        assert!(live[0].1.is_none());
+        let all: i64 = conn.query_row("SELECT COUNT(*) FROM reflections", [], |r| r.get(0)).unwrap();
+        assert_eq!(all, 2);
     }
 
     #[test]

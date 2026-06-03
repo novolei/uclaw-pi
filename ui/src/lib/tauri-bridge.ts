@@ -401,19 +401,28 @@ export const getMemoryRecallConfig = (): Promise<MemoryRecallConfigDto> =>
 export const patchMemoryRecallConfig = (input: MemoryRecallConfigDto): Promise<MemoryRecallConfigDto> =>
   invoke('patch_memory_recall_config', { input });
 
-export interface ReflectionDto { insight: string; confidence: number; createdAt: string }
+export interface ReflectionDto { id: string; insight: string; confidence: number; createdAt: string; archivedAt: string | null }
 export interface UserModelDto { summary: string; updatedAt: string }
 export interface DaydreamDto { content: string; createdAt: string }
 export interface UserModelHistoryDto { summary: string; replacedAt: string }
+export interface ProfileFactDto { id: string; title: string; createdAt: string }
 
-export const listReflections = (limit = 20): Promise<ReflectionDto[]> =>
-  invoke('list_reflections', { limit });
+export const listReflections = (limit = 20, includeArchived = false): Promise<ReflectionDto[]> =>
+  invoke('list_reflections', { limit, includeArchived });
 export const getAgentUserModel = (): Promise<UserModelDto | null> =>
   invoke('get_agent_user_model');
 export const listDaydreams = (limit = 20): Promise<DaydreamDto[]> =>
   invoke('list_daydreams', { limit });
 export const listUserModelHistory = (limit = 20): Promise<UserModelHistoryDto[]> =>
   invoke('list_user_model_history', { limit });
+export const listProfileFacts = (): Promise<ProfileFactDto[]> =>
+  invoke('list_profile_facts');
+export const archiveReflection = (id: string): Promise<void> =>
+  invoke('archive_reflection', { id });
+export const restoreReflection = (id: string): Promise<void> =>
+  invoke('restore_reflection', { id });
+export const triggerMemoryRefresh = (): Promise<void> =>
+  invoke('trigger_memory_refresh');
 
 // ─────────────────────────────────────────────────────────
 // Conversations
