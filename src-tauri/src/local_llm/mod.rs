@@ -3,6 +3,7 @@
 pub mod engine;
 pub mod paths;
 pub mod download;
+pub mod preflight;
 pub mod provider;
 #[cfg(test)]
 mod spike_test;
