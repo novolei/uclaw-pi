@@ -663,4 +663,29 @@ mod tests {
         let s = svc(ProviderConfigs::default());
         assert!(s.get_role_llm_config("summarizer").await.is_none());
     }
+
+    #[tokio::test]
+    async fn role_config_falls_through_unresolvable_assignment_to_chat() {
+        // The role is assigned, but neither candidate resolves cleanly:
+        // a dead provider reference AND a malformed (slash-less) ref must
+        // both fall THROUGH to the valid chat assignment — not return None.
+        let configs = ProviderConfigs {
+            providers: vec![provider("deepseek")],
+            active_model: None,
+            selected_models: vec![],
+            role_models: vec![
+                // points at a provider that isn't configured → find_provider miss
+                ModelRoleConfig { role: "summarizer".into(), model_ref: Some("ghost/missing".into()) },
+                // malformed: no '/' separator → split miss
+                ModelRoleConfig { role: "utility".into(), model_ref: Some("no-slash".into()) },
+                ModelRoleConfig { role: "chat".into(), model_ref: Some("deepseek/deepseek-v4".into()) },
+            ],
+        };
+        let s = svc(configs);
+        let (pid, mid, _, _, _) = s.get_role_llm_config("summarizer").await.unwrap();
+        assert_eq!(pid, "deepseek", "dead-provider role must fall through to chat");
+        assert_eq!(mid, "deepseek-v4");
+        let (pid2, _, _, _, _) = s.get_role_llm_config("utility").await.unwrap();
+        assert_eq!(pid2, "deepseek", "malformed model_ref must fall through to chat");
+    }
 }
