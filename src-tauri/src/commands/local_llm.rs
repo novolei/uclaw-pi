@@ -132,10 +132,14 @@ pub async fn download_local_model(
         );
     };
     emit(&app, 0, 0, source_label.lock().unwrap().clone(), "probing");
-    if prefer.is_none() {
+    // If no explicit source was requested, probe once here to label the bar AND
+    // reuse that result as `prefer` so `download_model` doesn't probe a 2nd time.
+    let mut effective_prefer = prefer;
+    if effective_prefer.is_none() {
         if let Ok(s) =
             crate::local_llm::download::source::probe_fastest(quant, UI_PROBE_TIMEOUT).await
         {
+            effective_prefer = Some(s);
             *source_label.lock().unwrap() = Some(s.label().to_string());
             emit(&app, 0, 0, source_label.lock().unwrap().clone(), "probing");
         }
@@ -146,7 +150,7 @@ pub async fn download_local_model(
     let path = crate::local_llm::download::download_model_cancellable(
         &data_dir,
         quant,
-        prefer,
+        effective_prefer,
         move |downloaded, total| {
             let src = label_progress.lock().unwrap().clone();
             let _ = app_progress.emit(
