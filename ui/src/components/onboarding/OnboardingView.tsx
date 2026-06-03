@@ -2,22 +2,52 @@
  * OnboardingView — 首次使用引导
  *
  * 首次打开应用时的引导流程：
- * 1. 欢迎页 → 2. API Key 配置 → 3. 主题选择 → 4. 完成
+ * 1. 欢迎页 → 2. API Key 配置 → 3. 本地模型(可选) → 4. 主题选择 → 5. 完成
  * 从 Proma 迁移，适配 Tauri。
+ *
+ * S3: 在 API Key 步骤后插入可选的「本地模型」步骤（LocalModelStep），完成 /
+ * 跳过的结果持久化到 localStorage（`ONBOARDING_LOCAL_MODEL_KEY`），与 S2 本地模型
+ * atoms 的 localStorage 键约定一致，使再次进入引导时不会重复提示。
  */
 
 import * as React from 'react'
 import { ChevronRight, ChevronLeft, Sparkles, Key, Palette, Check } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { cn } from '@/lib/utils'
+import { LocalModelStep } from './steps/LocalModelStep'
 
 interface OnboardingViewProps {
   onComplete: () => void
 }
 
-type OnboardingStep = 'welcome' | 'api-key' | 'theme' | 'done'
+type OnboardingStep = 'welcome' | 'api-key' | 'local-model' | 'theme' | 'done'
 
-const STEPS: OnboardingStep[] = ['welcome', 'api-key', 'theme', 'done']
+const STEPS: OnboardingStep[] = ['welcome', 'api-key', 'local-model', 'theme', 'done']
+
+/**
+ * Persisted outcome of the optional local-model onboarding step. Mirrors the S2
+ * `uclaw.localModel.*` localStorage key convention so re-entering onboarding (or
+ * the Settings re-entry) can tell whether the user already chose. `null` = not
+ * yet prompted.
+ */
+export const ONBOARDING_LOCAL_MODEL_KEY = 'uclaw.onboarding.localModel'
+
+export function readLocalModelOnboardingFlag(): 'done' | 'skipped' | null {
+  try {
+    const v = localStorage.getItem(ONBOARDING_LOCAL_MODEL_KEY)
+    return v === 'done' || v === 'skipped' ? v : null
+  } catch {
+    return null
+  }
+}
+
+function persistLocalModelOnboardingFlag(outcome: 'done' | 'skipped'): void {
+  try {
+    localStorage.setItem(ONBOARDING_LOCAL_MODEL_KEY, outcome)
+  } catch {
+    // localStorage unavailable — best-effort only.
+  }
+}
 
 /** 步骤指示器 */
 function StepIndicator({ current, total }: { current: number; total: number }): React.ReactElement {
@@ -139,12 +169,20 @@ export function OnboardingView({ onComplete }: OnboardingViewProps): React.React
     setStepIndex((i) => Math.max(i - 1, 0))
   }, [])
 
+  // Persist the local-model outcome (done/skipped) when the step settles, then
+  // auto-advance to the next step so the user isn't stuck on a terminal step.
+  const handleLocalModelSettled = React.useCallback((outcome: 'done' | 'skipped') => {
+    persistLocalModelOnboardingFlag(outcome)
+    setStepIndex((i) => Math.min(i + 1, STEPS.length - 1))
+  }, [])
+
   return (
     <div className="flex-1 flex flex-col items-center justify-center p-8 bg-background">
       <div className="w-full max-w-lg">
         {/* Step Content */}
         {currentStep === 'welcome' && <WelcomeStep />}
         {currentStep === 'api-key' && <ApiKeyStep />}
+        {currentStep === 'local-model' && <LocalModelStep onSettled={handleLocalModelSettled} />}
         {currentStep === 'theme' && <ThemeStep />}
         {currentStep === 'done' && <DoneStep />}
 
