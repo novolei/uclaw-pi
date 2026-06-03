@@ -47,6 +47,8 @@ pub enum DownloadError {
     NoSource,
     #[error("checksum mismatch: expected {expected}, got {got}")]
     Checksum { expected: String, got: String },
+    #[error("download cancelled")]
+    Cancelled,
 }
 
 impl From<resume::ResumeError> for DownloadError {
@@ -54,6 +56,7 @@ impl From<resume::ResumeError> for DownloadError {
         match e {
             resume::ResumeError::Http(s) => DownloadError::Http(s),
             resume::ResumeError::Io(s) => DownloadError::Io(s),
+            resume::ResumeError::Cancelled => DownloadError::Cancelled,
         }
     }
 }
@@ -154,6 +157,20 @@ pub async fn download_model(
     prefer: Option<Source>,
     on_progress: impl Fn(u64, u64) + Send + Sync,
 ) -> Result<PathBuf, DownloadError> {
+    download_model_cancellable(data_dir, quant, prefer, on_progress, || false).await
+}
+
+/// Like [`download_model`] but polls `should_cancel` before each downloaded
+/// chunk. On cancellation returns [`DownloadError::Cancelled`] with the `.part`
+/// left in place (so a later call resumes). See `stream_with_resume` for the
+/// best-effort semantics (aborts before the *next* chunk).
+pub async fn download_model_cancellable(
+    data_dir: &Path,
+    quant: Quant,
+    prefer: Option<Source>,
+    on_progress: impl Fn(u64, u64) + Send + Sync,
+    should_cancel: impl Fn() -> bool + Send + Sync,
+) -> Result<PathBuf, DownloadError> {
     let dir = model_dir(data_dir);
     tokio::fs::create_dir_all(&dir)
         .await
@@ -162,6 +179,7 @@ pub async fn download_model(
     let part_path = dir.join(format!("{}.part", quant.filename()));
 
     let on_progress = &on_progress;
+    let should_cancel = &should_cancel;
     let part_for_stream = part_path.clone();
     let part_for_verify = part_path.clone();
 
@@ -180,7 +198,7 @@ pub async fn download_model(
             let url = src.file_url(quant);
             let part = part_for_stream.clone();
             Box::pin(async move {
-                resume::stream_with_resume(&url, &part, |d, t| on_progress(d, t))
+                resume::stream_with_resume(&url, &part, |d, t| on_progress(d, t), || should_cancel())
                     .await
                     .map_err(DownloadError::from)
             })

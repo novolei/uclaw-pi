@@ -28,15 +28,23 @@ pub enum ResumeError {
     Http(String),
     #[error("io error: {0}")]
     Io(String),
+    #[error("download cancelled")]
+    Cancelled,
 }
 
 /// Stream `url` into `part_path`, resuming from its current length. Returns the
 /// total bytes written to `.part` on success (the full file size when the
 /// server reports it).
+///
+/// `should_cancel` is polled before each chunk write; when it returns `true` the
+/// stream aborts with [`ResumeError::Cancelled`] and the `.part` is preserved on
+/// disk so a later call resumes from where it stopped. This is best-effort: it
+/// aborts before the *next* chunk, so an in-flight chunk read still completes.
 pub async fn stream_with_resume(
     url: &str,
     part_path: &Path,
     on_progress: impl Fn(u64, u64) + Send,
+    should_cancel: impl Fn() -> bool + Send,
 ) -> Result<u64, ResumeError> {
     use futures::StreamExt;
     use tokio::io::AsyncWriteExt;
@@ -86,6 +94,12 @@ pub async fn stream_with_resume(
     on_progress(downloaded, total);
     let mut stream = resp.bytes_stream();
     while let Some(chunk) = stream.next().await {
+        // Best-effort cancellation: abort before writing the next chunk. The
+        // `.part` is left in place so the next download resumes from here.
+        if should_cancel() {
+            let _ = file.flush().await;
+            return Err(ResumeError::Cancelled);
+        }
         let chunk = chunk.map_err(|e| ResumeError::Http(e.to_string()))?;
         file.write_all(&chunk)
             .await
