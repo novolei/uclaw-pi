@@ -94,7 +94,8 @@ pub fn apply_reflections_schema(conn: &Connection) {
             insight            TEXT NOT NULL,
             confidence         REAL NOT NULL DEFAULT 0.5,
             source_event_count INTEGER NOT NULL DEFAULT 0,
-            created_at         TEXT NOT NULL DEFAULT (datetime('now'))
+            created_at         TEXT NOT NULL DEFAULT (datetime('now')),
+            archived_at        TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_reflections_created ON reflections(created_at DESC);",
     )
@@ -123,6 +124,7 @@ pub fn recent_reflections(conn: &Connection, limit: usize) -> rusqlite::Result<V
     let mut stmt = conn.prepare(
         "SELECT insight, confidence, created_at
          FROM reflections
+         WHERE archived_at IS NULL
          ORDER BY created_at DESC
          LIMIT ?1",
     )?;
@@ -794,6 +796,22 @@ mod tests {
         let recent = recent_daydreams(&conn, 5).unwrap();
         assert_eq!(recent.len(), 2);
         assert!(recent.iter().any(|d| d.content.contains("borrow-checker")));
+    }
+
+    #[test]
+    fn recent_reflections_excludes_archived() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        apply_reflections_schema(&conn);
+        insert_reflection(&conn, "r1", "live insight", 0.9, 10).unwrap();
+        insert_reflection(&conn, "r2", "stale insight", 0.8, 10).unwrap();
+        conn.execute(
+            "UPDATE reflections SET archived_at = datetime('now') WHERE id = 'r2'",
+            [],
+        )
+        .unwrap();
+        let recent = recent_reflections(&conn, 10).unwrap();
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].insight, "live insight");
     }
 
     #[test]
