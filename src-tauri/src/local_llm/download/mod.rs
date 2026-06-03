@@ -4,7 +4,9 @@ use std::path::{Path, PathBuf};
 use crate::local_llm::paths::{model_dir, model_file_path, MODEL_FILE};
 
 pub mod quant;
+pub mod source;
 pub use quant::Quant;
+pub use source::Source;
 
 /// ModelScope raw-file URL for the Q4_K_M GGUF.
 pub fn modelscope_url() -> String {
