@@ -34,7 +34,17 @@ async fn provider_detail(
 ) -> Result<SkillDetail, Error> {
     match provider {
         MarketplaceProvider::SkillsSh => {
-            SkillsShClient::new(read_api_key(state, provider)).detail(id).await.map_err(map_err)
+            // Keyed → the skills.sh detail endpoint (inline files). Keyless →
+            // the detail endpoint is 401, but anonymous search returns `id` =
+            // `owner/repo/path` (carried in `source`/install_url), so fetch the
+            // files straight from GitHub — same path skillsmp uses.
+            let key = read_api_key(state, provider);
+            if key.as_deref().is_some_and(|k| !k.is_empty()) {
+                SkillsShClient::new(key).detail(id).await.map_err(map_err)
+            } else {
+                let gh = source.filter(|s| !s.is_empty()).unwrap_or(id);
+                github::fetch_github_skill(gh).await.map_err(map_err)
+            }
         }
         MarketplaceProvider::Skillsmp => {
             let gh = source.ok_or_else(|| {

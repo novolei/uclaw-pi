@@ -82,9 +82,9 @@ export function SkillMarketplaceSearchResultCard({
       </div>
     )
   }
-  // The tool result now carries a top-level provider; default to 'skillsmp'
-  // (the keyless search-only provider) for older results that predate the field.
-  const provider: MarketplaceProvider = parsed.provider ?? 'skillsmp'
+  // The tool result now carries a top-level provider; default to 'skills_sh'
+  // (the default keyless provider) for older results that predate the field.
+  const provider: MarketplaceProvider = parsed.provider ?? 'skills_sh'
   // Defensive client-side popularity sort: the backend already ranks by
   // installs desc, but older/cached results may predate that — so re-sort here
   // too. Stable (toSorted preserves order among equal-install ties).
