@@ -70,6 +70,59 @@ pub fn parse_reflection_output(s: &str) -> (String, f64) {
     }
 }
 
+/// Parsed consolidation output: the deduplicated reflection set + the re-grounded
+/// user_model (absent when the LLM omitted/blanked it).
+#[derive(Debug, Clone)]
+pub struct ConsolidationResult {
+    pub reflections: Vec<(String, f64)>,
+    pub user_model: Option<String>,
+}
+
+/// Extract the first `{...}` JSON object substring — tolerates ```json fences and
+/// preamble/trailing prose. `None` when no balanced-looking braces are present.
+fn extract_json_object(s: &str) -> Option<&str> {
+    let start = s.find('{')?;
+    let end = s.rfind('}')?;
+    (end > start).then(|| &s[start..=end])
+}
+
+/// Parse the consolidation LLM output. Returns `None` (→ caller no-ops, never
+/// corrupts memory) on any parse failure or an empty reflection set. Confidence is
+/// clamped to `[0,1]`; blank insights are dropped; a blank/missing `user_model`
+/// becomes `None`.
+pub fn parse_consolidation_output(s: &str) -> Option<ConsolidationResult> {
+    let obj = extract_json_object(s.trim())?;
+    let v: serde_json::Value = serde_json::from_str(obj).ok()?;
+    let arr = v.get("reflections")?.as_array()?;
+    let mut reflections = Vec::new();
+    for item in arr {
+        let insight = item.get("insight").and_then(serde_json::Value::as_str).map(str::trim);
+        let Some(insight) = insight.filter(|i| !i.is_empty()) else { continue };
+        let conf = item
+            .get("confidence")
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or(0.5)
+            .clamp(0.0, 1.0);
+        reflections.push((insight.to_string(), conf));
+    }
+    if reflections.is_empty() {
+        return None;
+    }
+    let user_model = v
+        .get("user_model")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|u| !u.is_empty())
+        .map(String::from);
+    Some(ConsolidationResult { reflections, user_model })
+}
+
+/// Apply-guard: only apply when the result is non-empty AND did not GROW the set
+/// (a dedup shrinks or holds). Prevents an LLM hallucination from inflating memory.
+pub fn consolidation_should_apply(input_live_count: usize, result: &ConsolidationResult) -> bool {
+    !result.reflections.is_empty() && result.reflections.len() <= input_live_count
+}
+
 /// Turn-count trigger predicate: fire on every `n`-th turn. `n == 0` (disabled)
 /// and `count == 0` (no turns yet) never fire.
 pub fn should_run_reflection(count: u64, n: u64) -> bool {
@@ -823,5 +876,33 @@ mod tests {
         let recent = recent_user_model_history(&conn, 5).unwrap();
         assert_eq!(recent.len(), 2);
         assert!(recent.iter().any(|h| h.summary.contains("old summary two")));
+    }
+
+    #[test]
+    fn parse_consolidation_output_reads_reflections_and_user_model() {
+        let s = r#"```json
+        {"reflections":[{"insight":"a","confidence":0.9},{"insight":"b","confidence":0.7}],
+         "user_model":"compact model"}
+        ```"#;
+        let r = parse_consolidation_output(s).expect("should parse");
+        assert_eq!(r.reflections.len(), 2);
+        assert_eq!(r.reflections[0].0, "a");
+        assert!((r.reflections[0].1 - 0.9).abs() < 1e-9);
+        assert_eq!(r.user_model.as_deref(), Some("compact model"));
+    }
+
+    #[test]
+    fn parse_consolidation_output_none_on_prose_or_empty() {
+        assert!(parse_consolidation_output("not json at all").is_none());
+        assert!(parse_consolidation_output(r#"{"reflections":[]}"#).is_none());
+    }
+
+    #[test]
+    fn consolidation_should_apply_guards_grow_and_empty() {
+        let ok = ConsolidationResult { reflections: vec![("x".into(), 0.5)], user_model: None };
+        assert!(consolidation_should_apply(3, &ok)); // 1 <= 3
+        assert!(!consolidation_should_apply(0, &ok)); // 1 > 0 → grew
+        let empty = ConsolidationResult { reflections: vec![], user_model: None };
+        assert!(!consolidation_should_apply(5, &empty));
     }
 }
