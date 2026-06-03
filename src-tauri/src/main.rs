@@ -147,45 +147,11 @@ fn main() {
                 .build(app)?;
             let _ = tray; // keep alive — owned by the app
 
-            // ── S4 spike: desk-pet window prototype (DISABLED by default) ──────
-            // Verifies Tauri 2.11 supports a frameless + transparent +
-            // always-on-top + click-through window for the S4 desktop pet.
-            // Gated behind UCLAW_DESKPET_SPIKE=1 so normal startup is unchanged.
-            // The HTML body must paint a transparent background for the
-            // transparency to show; click-through is toggled at runtime from
-            // JS via `appWindow.setIgnoreCursorEvents(bool)` based on pointer
-            // hit-testing over the pet sprite (the whole window ignores cursor
-            // events except when hovering the opaque pet). See spike report.
-            if std::env::var("UCLAW_DESKPET_SPIKE").as_deref() == Ok("1") {
-                match tauri::WebviewWindowBuilder::new(
-                    app,
-                    "deskpet",
-                    tauri::WebviewUrl::App("index.html?view=deskpet".into()),
-                )
-                .title("uClaw Desk Pet")
-                .inner_size(220.0, 260.0)
-                .decorations(false) // frameless
-                .transparent(true) // requires macos-private-api feature + macOSPrivateApi:true (both set)
-                .always_on_top(true)
-                .resizable(false)
-                .skip_taskbar(true)
-                .shadow(false)
-                .build()
-                {
-                    Ok(win) => {
-                        // Start fully click-through; JS flips this off while the
-                        // cursor is over the pet sprite (pointer hit-testing).
-                        if let Err(e) = win.set_ignore_cursor_events(true) {
-                            tracing::warn!(error = %e, "[S4 spike] set_ignore_cursor_events failed");
-                        }
-                        tracing::info!("[S4 spike] desk-pet transparent always-on-top window created");
-                    }
-                    Err(e) => {
-                        // Degrade path: fall back to the in-app PetWidget overlay.
-                        tracing::warn!(error = %e, "[S4 spike] desk-pet window creation failed — degrade to in-app PetWidget overlay");
-                    }
-                }
-            }
+            // Desk-pet window (S4) is created on demand via the
+            // `show_desk_pet` command (commands/pet.rs), not at startup. The
+            // env-gated UCLAW_DESKPET_SPIKE prototype was removed once the real
+            // commands landed; the streaming/window findings live in the
+            // local_llm::s4_spike_test test module.
 
             // Spawn HTTP server for remote access
             let session_mgr = app_state.session_manager.clone();
@@ -1180,6 +1146,13 @@ fn main() {
             uclaw_core::commands::local_llm::check_local_model_environment,
             uclaw_core::commands::local_llm::warmup_local_model,
             uclaw_core::commands::local_llm::assign_local_model_to_roles,
+            // Desk pet (S4)
+            uclaw_core::commands::pet::pet_chat,
+            uclaw_core::commands::pet::list_pet_personas,
+            uclaw_core::commands::pet::set_pet_persona,
+            uclaw_core::commands::pet::show_desk_pet,
+            uclaw_core::commands::pet::hide_desk_pet,
+            uclaw_core::commands::pet::set_desk_pet_click_through,
             // Persona
             uclaw_core::commands::persona::create_persona_journal_entry,
             uclaw_core::commands::persona::delete_persona_journal_entry,

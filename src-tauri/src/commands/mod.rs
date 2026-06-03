@@ -29,6 +29,7 @@ pub mod memory;
 pub mod memubot;
 pub mod notification;
 pub mod persona;
+pub mod pet;
 pub mod provider;
 pub mod safety;
 pub mod search;
