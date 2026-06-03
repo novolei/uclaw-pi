@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
-use crate::local_llm::paths::{is_model_present, model_file_path};
+use crate::local_llm::paths::is_model_present;
 
 #[derive(Debug, thiserror::Error)]
 pub enum LocalLlmError {
@@ -134,8 +134,6 @@ impl LocalLlmEngine {
         temperature: f32,
     ) -> Result<LocalCompletion, LocalLlmError> {
         if !is_model_present(&self.data_dir) {
-            // Reference the path so the compiler doesn't strip the import.
-            let _ = model_file_path(&self.data_dir);
             return Err(LocalLlmError::ModelMissing);
         }
 

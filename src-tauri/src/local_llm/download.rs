@@ -35,27 +35,45 @@ pub async fn download_from_modelscope(
     let final_path = model_file_path(data_dir);
     let part_path = dir.join(format!("{MODEL_FILE}.part"));
 
-    let resp = reqwest::get(modelscope_url()).await.map_err(|e| DownloadError::Http(e.to_string()))?;
-    let resp = resp.error_for_status().map_err(|e| DownloadError::Http(e.to_string()))?;
-    let total = resp.content_length().unwrap_or(0);
+    // Stream into the `.part` file. Any failure here leaves a partial file we
+    // clean up below (S2 owns true resumability; here we just avoid stray MBs).
+    let result: Result<(), DownloadError> = async {
+        let resp = reqwest::get(modelscope_url()).await.map_err(|e| DownloadError::Http(e.to_string()))?;
+        let resp = resp.error_for_status().map_err(|e| DownloadError::Http(e.to_string()))?;
+        let total = resp.content_length().unwrap_or(0);
 
-    let mut file = tokio::fs::File::create(&part_path).await.map_err(|e| DownloadError::Io(e.to_string()))?;
-    let mut downloaded: u64 = 0;
-    let mut stream = resp.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| DownloadError::Http(e.to_string()))?;
-        file.write_all(&chunk).await.map_err(|e| DownloadError::Io(e.to_string()))?;
-        downloaded += chunk.len() as u64;
-        on_progress(downloaded, total);
-    }
-    file.flush().await.map_err(|e| DownloadError::Io(e.to_string()))?;
-    drop(file);
+        let mut file = tokio::fs::File::create(&part_path).await.map_err(|e| DownloadError::Io(e.to_string()))?;
+        let mut downloaded: u64 = 0;
+        let mut stream = resp.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| DownloadError::Http(e.to_string()))?;
+            file.write_all(&chunk).await.map_err(|e| DownloadError::Io(e.to_string()))?;
+            downloaded += chunk.len() as u64;
+            on_progress(downloaded, total);
+        }
+        file.flush().await.map_err(|e| DownloadError::Io(e.to_string()))?;
+        drop(file);
 
-    if total > 0 && downloaded < total {
-        return Err(DownloadError::Incomplete { got: downloaded });
+        if total > 0 && downloaded < total {
+            return Err(DownloadError::Incomplete { got: downloaded });
+        }
+        Ok(())
     }
-    tokio::fs::rename(&part_path, &final_path).await.map_err(|e| DownloadError::Io(e.to_string()))?;
-    Ok(final_path)
+    .await;
+
+    match result {
+        Ok(()) => {
+            tokio::fs::rename(&part_path, &final_path)
+                .await
+                .map_err(|e| DownloadError::Io(e.to_string()))?;
+            Ok(final_path)
+        }
+        Err(e) => {
+            // Best-effort cleanup of the partial download.
+            let _ = tokio::fs::remove_file(&part_path).await;
+            Err(e)
+        }
+    }
 }
 
 #[cfg(test)]
