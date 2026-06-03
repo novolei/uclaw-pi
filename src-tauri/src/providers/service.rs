@@ -320,6 +320,24 @@ impl ProviderService {
             .map_err(|e| Error::Internal(format!("Failed to save model selection: {e}")))
     }
 
+    /// Get the active local-model GGUF quant (None ⇒ engine uses the default).
+    pub async fn get_active_local_quant(
+        &self,
+    ) -> Option<crate::local_llm::download::quant::Quant> {
+        self.configs.read().await.active_local_quant
+    }
+
+    /// Persist the active local-model GGUF quant so the UI + engine agree.
+    pub async fn set_active_local_quant(
+        &self,
+        quant: crate::local_llm::download::quant::Quant,
+    ) -> Result<(), Error> {
+        let mut configs = self.configs.write().await;
+        configs.active_local_quant = Some(quant);
+        save_provider_configs(&configs, &self.configs_path)
+            .map_err(|e| Error::Internal(format!("Failed to save active local quant: {e}")))
+    }
+
     // ── Model listing ───────────────────────────────────────────────────────
 
     /// List available models for a given provider.
@@ -620,6 +638,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn active_local_quant_round_trips() {
+        use crate::local_llm::download::quant::Quant;
+        // Unique temp path so the disk write doesn't collide with `svc`'s shared
+        // fixed path / other tests.
+        let path = std::env::temp_dir().join(format!(
+            "uclaw-test-quant-{}.json",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let s = ProviderService {
+            configs: std::sync::Arc::new(tokio::sync::RwLock::new(ProviderConfigs::new())),
+            configs_path: path.clone(),
+        };
+
+        // Unset by default.
+        assert_eq!(s.get_active_local_quant().await, None);
+
+        // Set + read back.
+        s.set_active_local_quant(Quant::Q8_0).await.unwrap();
+        assert_eq!(s.get_active_local_quant().await, Some(Quant::Q8_0));
+
+        // Overwrite.
+        s.set_active_local_quant(Quant::F16).await.unwrap();
+        assert_eq!(s.get_active_local_quant().await, Some(Quant::F16));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
     async fn role_config_uses_exact_role_assignment() {
         let configs = ProviderConfigs {
             providers: vec![provider("local"), provider("deepseek")],
@@ -632,6 +679,7 @@ mod tests {
                 ModelRoleConfig { role: "chat".into(), model_ref: Some("deepseek/deepseek-v4".into()) },
                 ModelRoleConfig { role: "summarizer".into(), model_ref: Some("local/minicpm5-1b".into()) },
             ],
+            active_local_quant: None,
         };
         let s = svc(configs);
         let (pid, mid, _key, _url, _api) = s.get_role_llm_config("summarizer").await.unwrap();
@@ -649,6 +697,7 @@ mod tests {
                 role: "chat".into(),
                 model_ref: Some("deepseek/deepseek-v4".into()),
             }],
+            active_local_quant: None,
         };
         let s = svc(configs);
         let (pid, mid, _, _, _) = s.get_role_llm_config("summarizer").await.unwrap();
@@ -666,6 +715,7 @@ mod tests {
             }),
             selected_models: vec![],
             role_models: vec![],
+            active_local_quant: None,
         };
         let s = svc(configs);
         let (pid, mid, _, _, _) = s.get_role_llm_config("summarizer").await.unwrap();
@@ -695,6 +745,7 @@ mod tests {
                 ModelRoleConfig { role: "utility".into(), model_ref: Some("no-slash".into()) },
                 ModelRoleConfig { role: "chat".into(), model_ref: Some("deepseek/deepseek-v4".into()) },
             ],
+            active_local_quant: None,
         };
         let s = svc(configs);
         let (pid, mid, _, _, _) = s.get_role_llm_config("summarizer").await.unwrap();

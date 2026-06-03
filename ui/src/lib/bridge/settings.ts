@@ -364,6 +364,11 @@ export const settingsBridge = {
   warmupLocalModel: (): Promise<void> => invoke<void>('warmup_local_model'),
   /** Auto-assign the local MiniCPM to the cheap roles (summarizer + utility). */
   assignLocalModelToRoles: (): Promise<void> => invoke<void>('assign_local_model_to_roles'),
+  /** Persist + activate the local-model GGUF quant the engine should load.
+   * Writes to providers.json (UI + engine agree across restarts) and
+   * force-unloads any loaded model so the next call reloads the new quant. */
+  setLocalModelQuant: (quant: LocalModelQuant): Promise<void> =>
+    invoke<void>('set_local_model_quant', { quant }),
 }
 
 // ── Developer-options setup-script event stream (was `@tauri-apps/api/event`

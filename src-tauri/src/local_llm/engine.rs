@@ -96,6 +96,17 @@ impl LocalLlmEngine {
         matches!(&*self.state.read().await, EngineState::Loaded { .. })
     }
 
+    /// Force-unload the model now, regardless of idle time. Used when the
+    /// active quant changes so the next `complete`/`stream` reloads the new
+    /// GGUF. No-op if already unloaded.
+    pub async fn unload(&self) {
+        let mut s = self.state.write().await;
+        if matches!(&*s, EngineState::Loaded { .. }) {
+            *s = EngineState::Unloaded;
+            tracing::info!("local_llm: force-unloaded MiniCPM model (quant change)");
+        }
+    }
+
     pub async fn unload_if_idle(&self) {
         let mut s = self.state.write().await;
         if let EngineState::Loaded { last_used, .. } = &*s {
@@ -121,10 +132,13 @@ impl LocalLlmEngine {
 impl LoadedModel {
     async fn load(data_dir: &std::path::Path) -> Result<Self, LocalLlmError> {
         use mistralrs::GgufModelBuilder;
+        // Load the user-selected quant (persisted in providers.json, seeded into
+        // the local_llm active-quant static at startup). Defaults to Q4_K_M.
+        let quant = crate::local_llm::active_quant();
         let dir = crate::local_llm::paths::model_dir(data_dir);
         let inner = GgufModelBuilder::new(
             dir.to_string_lossy().to_string(),
-            vec![crate::local_llm::paths::MODEL_FILE.to_string()],
+            vec![quant.filename().to_string()],
         )
         .with_logging()
         .build()
@@ -250,7 +264,7 @@ impl LocalLlmEngine {
         max_tokens: u32,
         temperature: f32,
     ) -> Result<LocalCompletion, LocalLlmError> {
-        if !is_model_present(&self.data_dir, crate::local_llm::download::Quant::default()) {
+        if !is_model_present(&self.data_dir, crate::local_llm::active_quant()) {
             return Err(LocalLlmError::ModelMissing);
         }
 
@@ -319,7 +333,7 @@ impl LocalLlmEngine {
         ),
         LocalLlmError,
     > {
-        if !is_model_present(&self.data_dir, crate::local_llm::download::Quant::default()) {
+        if !is_model_present(&self.data_dir, crate::local_llm::active_quant()) {
             return Err(LocalLlmError::ModelMissing);
         }
 

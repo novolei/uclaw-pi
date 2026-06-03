@@ -7,6 +7,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::local_llm::download::quant::Quant;
+
 // ── Provider Category ───────────────────────────────────────────────────────
 
 /// Provider category for grouping in the UI.
@@ -321,6 +323,10 @@ pub struct ProviderConfigs {
     /// Per-role model assignments
     #[serde(default)]
     pub role_models: Vec<ModelRoleConfig>,
+    /// Active local-model GGUF quant the in-process engine should load.
+    /// `None` ⇒ the engine falls back to [`Quant::default`] (Q4_K_M).
+    #[serde(default)]
+    pub active_local_quant: Option<Quant>,
 }
 
 impl ProviderConfigs {

@@ -28,6 +28,7 @@ import { LABEL_CLASS, DESCRIPTION_CLASS, ROW_CLASS } from './primitives/Settings
 const CHARACTERS: Array<{ value: PetCharacter; label: string; description: string }> = [
   { value: 'astro', label: '小宇 Astro', description: '3D 磨砂塑料宇航小子' },
   { value: 'clawby', label: '爪宝 Clawby', description: 'Tom & Jerry 风浣熊宝宝' },
+  { value: 'clawd', label: 'Clawd', description: 'MiniCPM-Desk-Pet 螃蟹编程伙伴' },
 ]
 
 export function PetSettings() {
@@ -59,7 +60,12 @@ export function PetSettings() {
     setPersonaId(id)
     // Keep the rendered sprite in sync with the persona's character.
     const persona = personasValue.find((p) => p.id === id)
-    if (persona && (persona.character === 'astro' || persona.character === 'clawby')) {
+    if (
+      persona &&
+      (persona.character === 'astro' ||
+        persona.character === 'clawby' ||
+        persona.character === 'clawd')
+    ) {
       setCharacterAtom(persona.character)
     }
     setPetPersona(id).catch((e) => console.warn('[PetSettings] set_pet_persona failed:', e))

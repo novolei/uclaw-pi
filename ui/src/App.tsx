@@ -7,8 +7,9 @@
  */
 
 import * as React from 'react'
-import { useSetAtom } from 'jotai'
+import { useAtom, useSetAtom } from 'jotai'
 import { AppShell } from './components/app-shell/AppShell'
+import { OnboardingView } from './components/onboarding/OnboardingView'
 import { StartupSplash } from './components/startup/StartupSplash'
 import { TooltipProvider } from './components/ui/tooltip'
 import type { AppShellContextType } from './contexts/AppShellContext'
@@ -28,6 +29,17 @@ import {
 
 /** localStorage 键：语言偏好 */
 const LANGUAGE_CACHE_KEY = 'uclaw:language'
+/** localStorage 键：首次引导完成标志（'1' = 已完成/跳过，永不再次展示） */
+export const ONBOARDING_COMPLETE_KEY = 'uclaw.onboarding.complete'
+
+/** Read the onboarding-complete flag (best-effort; false if localStorage unavailable). */
+function readOnboardingComplete(): boolean {
+  try {
+    return localStorage.getItem(ONBOARDING_COMPLETE_KEY) === '1'
+  } catch {
+    return false
+  }
+}
 export const STARTUP_SPLASH_MIN_VISIBLE_MS = 1800
 export const STARTUP_SPLASH_EXIT_TRANSITION_MS = 220
 export const STARTUP_BROWSER_RUNTIME_STATUS_TIMEOUT_MS = 5000
@@ -44,7 +56,10 @@ export default function App(): React.ReactElement {
     React.useState<StartupRuntimePackStatusReport | undefined>()
   const [browserRuntimeStatusError, setBrowserRuntimeStatusError] = React.useState<string | undefined>()
   const setStickyUserMessageEnabled = useSetAtom(stickyUserMessageEnabledAtom)
-  const setActiveProviderModel = useSetAtom(activeProviderModelAtom)
+  const [activeProviderModel, setActiveProviderModel] = useAtom(activeProviderModelAtom)
+  // Onboarding-complete flag, mirrored into state so completing/skipping
+  // forces a re-render to AppShell without a reload.
+  const [onboardingComplete, setOnboardingComplete] = React.useState(readOnboardingComplete)
 
   useGlobalChatListeners()
   useGlobalAgentListeners()
@@ -184,6 +199,27 @@ export default function App(): React.ReactElement {
       >
         <StartupSplash viewModel={startupViewModel} />
       </div>
+    )
+  }
+
+  // First-run onboarding gate. First-run = no active model configured AND the
+  // onboarding-complete flag is unset. An already-configured user (active model
+  // set) NEVER sees onboarding, even without the flag — so a returning user is
+  // never re-prompted. Completing OR skipping sets the flag → AppShell.
+  const isFirstRun = activeProviderModel === null && !onboardingComplete
+  if (isFirstRun) {
+    const handleOnboardingComplete = () => {
+      try {
+        localStorage.setItem(ONBOARDING_COMPLETE_KEY, '1')
+      } catch {
+        // localStorage unavailable — best-effort; state still forces AppShell.
+      }
+      setOnboardingComplete(true)
+    }
+    return (
+      <TooltipProvider delayDuration={200}>
+        <OnboardingView onComplete={handleOnboardingComplete} />
+      </TooltipProvider>
     )
   }
 

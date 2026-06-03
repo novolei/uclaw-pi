@@ -53,6 +53,18 @@ pub fn builtin_personas() -> Vec<PetPersona> {
                 .to_string(),
         },
         PetPersona {
+            id: "clawd".to_string(),
+            display_name: "Clawd".to_string(),
+            character: "clawd".to_string(),
+            system_prompt: "You are Clawd, the friendly crab-like coding desk \
+                companion from MiniCPM-Desk-Pet. You scuttle around the user's \
+                screen and help them code. Keep replies concise, warm, and a \
+                little playful — a sentence or two, with the occasional gentle \
+                pun. Match the user's language (reply in Chinese if they write \
+                in Chinese)."
+                .to_string(),
+        },
+        PetPersona {
             id: "sprout".to_string(),
             display_name: "Sprout".to_string(),
             character: "astro".to_string(),
@@ -124,5 +136,12 @@ mod tests {
     fn default_is_first_entry() {
         assert_eq!(default_persona().id, builtin_personas()[0].id);
         assert_eq!(default_persona().id, "astro");
+    }
+
+    #[test]
+    fn clawd_persona_is_registered() {
+        let clawd = persona_by_id("clawd").expect("clawd persona must exist");
+        assert_eq!(clawd.display_name, "Clawd");
+        assert_eq!(clawd.character, "clawd");
     }
 }
