@@ -810,11 +810,13 @@ const DAYDREAM_SEED_TITLES: i64 = 6;
 /// memories to surface ONE novel idea. Plain prose out — stored verbatim and
 /// only surfaced in the UI (`agent:daydream`), never injected into the prompt.
 const DAYDREAM_SYSTEM_PROMPT: &str = "\
-You are free-associating. Be creative and speculative. From these unrelated \
-memories, generate ONE novel hypothesis, connection, or idea — something \
-non-obvious that links them or leaps off from them. Write a single short \
-paragraph of plain prose (no JSON, no markdown fences, no preamble, no list). \
-Favour the surprising over the safe.";
+You are free-associating. Be creative and speculative. From these memories \
+(some are durable reflections about the user, some are random), generate ONE novel \
+hypothesis, connection, or idea — something non-obvious that links them or leaps \
+off from them. Favour the surprising over the safe. Respond with ONLY a JSON \
+object, no prose, no markdown fences:\n\
+{\"content\":\"<one short paragraph>\",\"worth_remembering\":<true if this is a \
+genuinely useful durable insight about the user/project, false if it's just a fun leap>}";
 
 /// Build the daydream seed from grounded sources + some randomness. Up to 2 recent
 /// reflections + the user_model + up to 3 random titles. Keeping random titles
@@ -895,12 +897,16 @@ pub async fn run_daydream(app: tauri::AppHandle) {
         return;
     }
 
-    // Sample random memory titles. Hold the std::sync::Mutex only for the read,
-    // then drop it before the `.await` (the guard is not `Send`).
+    // Build the seed from grounded sources + randomness. Hold the std::sync::Mutex
+    // only for the reads, then drop it before the `.await` (the guard is not `Send`).
     let seed = {
         let Ok(conn) = state.db.lock() else {
             return;
         };
+        let reflections: Vec<String> = recent_reflections(&conn, 2)
+            .map(|rows| rows.into_iter().map(|r| r.insight).collect())
+            .unwrap_or_default();
+        let user_model = get_user_model(&conn).ok().flatten();
         let titles: Vec<String> = match conn.prepare(
             "SELECT title FROM memory_nodes
              WHERE title IS NOT NULL AND title != ''
@@ -923,11 +929,11 @@ pub async fn run_daydream(app: tauri::AppHandle) {
                 return;
             }
         };
-        if titles.is_empty() {
-            tracing::debug!("daydream: no memory_nodes titles to dream on; skipping");
+        if reflections.is_empty() && titles.is_empty() && user_model.is_none() {
+            tracing::debug!("daydream: no seed material; skipping");
             return;
         }
-        titles.join("\n")
+        build_daydream_seed(&reflections, user_model.as_deref(), &titles)
     };
 
     let user_prompt = format!(
@@ -949,9 +955,9 @@ pub async fn run_daydream(app: tauri::AppHandle) {
         }
     };
 
-    let text = output.text.trim();
-    if text.is_empty() {
-        tracing::debug!("daydream: empty text from LLM; skipping");
+    let (content, worth_remembering) = parse_daydream_output(&output.text);
+    if content.is_empty() {
+        tracing::debug!("daydream: empty content after parse; skipping");
         return;
     }
 
@@ -960,12 +966,23 @@ pub async fn run_daydream(app: tauri::AppHandle) {
         let Ok(conn) = state.db.lock() else {
             return;
         };
-        if let Err(e) = insert_daydream(&conn, &id, text) {
+        if let Err(e) = insert_daydream(&conn, &id, &content) {
             tracing::warn!(error = %e, "daydream: insert_daydream failed");
             return;
         }
+        // P5 reflow: a high-value daydream re-enters the convergent pipeline as a
+        // low-confidence reflection (0.4 < real reflections), where consolidation
+        // will later dedup/merge it. Closes the divergent→convergent loop.
+        if worth_remembering {
+            let rid = uuid::Uuid::new_v4().to_string();
+            if let Err(e) = insert_reflection(&conn, &rid, &content, 0.4, 0) {
+                tracing::warn!(error = %e, "daydream: reflow insert_reflection failed");
+            } else {
+                tracing::info!(%rid, "daydream: reflowed a high-value daydream into a reflection");
+            }
+        }
     }
-    tracing::info!(%id, chars = text.len(), "daydream: free-associated a new daydream");
+    tracing::info!(%id, worth_remembering, chars = content.len(), "daydream: free-associated a new daydream");
 
     // UI surface — emit `agent:daydream` so the frontend can render it live.
     // Best-effort: a failed emit (no webview yet, serialization) is logged by
@@ -973,7 +990,7 @@ pub async fn run_daydream(app: tauri::AppHandle) {
     let _ = app.emit(
         "agent:daydream",
         serde_json::json!({
-            "content": text,
+            "content": content,
             "created_at": chrono::Utc::now().to_rfc3339(),
         }),
     );
