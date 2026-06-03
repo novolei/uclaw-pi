@@ -14,7 +14,10 @@ use crate::error::Error;
 /// True iff the local MiniCPM GGUF is downloaded.
 #[tauri::command]
 pub async fn is_local_model_present(state: State<'_, AppState>) -> Result<bool, Error> {
-    Ok(crate::local_llm::paths::is_model_present(&state.data_dir))
+    Ok(crate::local_llm::paths::is_model_present(
+        &state.data_dir,
+        crate::local_llm::download::Quant::default(),
+    ))
 }
 
 /// Download the MiniCPM Q4_K_M GGUF from ModelScope, emitting progress on
