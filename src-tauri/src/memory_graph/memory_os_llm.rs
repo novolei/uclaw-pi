@@ -147,6 +147,19 @@ impl MemoryOsLlmClient {
     }
 }
 
+/// Map a Memory-OS `cost_tag` to the model role its completion should use.
+/// Unmapped tags fall back to `"chat"` (fail-safe, never fail-dead).
+/// Roles resolve through [`ProviderService::get_role_llm_config`]'s
+/// `role → chat → active` fallback chain.
+fn role_for_cost_tag(tag: &str) -> &'static str {
+    match tag {
+        "memory_consolidation" | "memory_wiki" => "summarizer",
+        "memory_reflection" | "memory_daydream" => "compiler",
+        "memory_promotion" | "memory_entity_synth" | "memory_lint" => "utility",
+        _ => "chat",
+    }
+}
+
 #[async_trait]
 impl MemoryOsLlm for MemoryOsLlmClient {
     async fn complete_text(
@@ -156,11 +169,21 @@ impl MemoryOsLlm for MemoryOsLlmClient {
         user_prompt: &str,
         max_tokens: u32,
     ) -> Result<MemoryOsLlmOutput, MemoryOsLlmError> {
+        let role = role_for_cost_tag(cost_tag);
         let (provider_id, model, api_key, base_url, _) = self
             .provider_service
-            .get_chat_llm_config()
+            .get_role_llm_config(role)
             .await
             .ok_or(MemoryOsLlmError::NoProvider)?;
+
+        // Per-scenario routing observability (S0): proves which role a given
+        // Memory-OS pass resolved to, and which model it landed on.
+        tracing::info!(
+            cost_tag,
+            role,
+            resolved_model = %model,
+            "memory_os_llm: routed completion to role"
+        );
 
         let cfg = llm_config_from_provider(
             &provider_id,
@@ -315,5 +338,18 @@ mod tests {
         let out = llm.complete_text("memory_lint", "sys", "usr", 512).await.unwrap();
         assert!(!out.text.is_empty());
         assert_eq!(llm.descriptor(), "mock:memory_os_llm");
+    }
+
+    #[test]
+    fn cost_tags_map_to_expected_roles() {
+        assert_eq!(role_for_cost_tag("memory_consolidation"), "summarizer");
+        assert_eq!(role_for_cost_tag("memory_wiki"), "summarizer");
+        assert_eq!(role_for_cost_tag("memory_reflection"), "compiler");
+        assert_eq!(role_for_cost_tag("memory_daydream"), "compiler");
+        assert_eq!(role_for_cost_tag("memory_promotion"), "utility");
+        assert_eq!(role_for_cost_tag("memory_entity_synth"), "utility");
+        assert_eq!(role_for_cost_tag("memory_lint"), "utility");
+        // Unknown tags default to the safe "chat" role.
+        assert_eq!(role_for_cost_tag("something_new"), "chat");
     }
 }

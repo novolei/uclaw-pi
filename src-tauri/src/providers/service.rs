@@ -162,34 +162,40 @@ impl ProviderService {
         ))
     }
 
-    /// Resolve the chat-role model → active_model fallback chain.
-    /// Priority: role_models['chat'] → active_model.
+    /// Resolve the LLM config for a model role with a graceful fallback chain.
+    /// Priority: role_models[role] → role_models["chat"] → active_model.
     /// Returns `(provider_id, model, api_key, base_url, api_override)`.
-    pub async fn get_chat_llm_config(
+    pub async fn get_role_llm_config(
         &self,
+        role: &str,
     ) -> Option<(String, String, String, String, Option<crate::providers::types::ApiType>)> {
         let configs = self.configs.read().await;
 
-        // Check role_models for 'chat' role first
-        if let Some(role_cfg) = configs.role_models.iter().find(|r| r.role == "chat") {
-            if let Some(model_ref) = &role_cfg.model_ref {
-                let parts: Vec<&str> = model_ref.splitn(2, '/').collect();
-                if parts.len() == 2 {
-                    let (pid, mid) = (parts[0], parts[1]);
-                    if let Some(provider) = configs.find_provider(pid) {
-                        return Some((
-                            pid.to_string(),
-                            mid.to_string(),
-                            provider.api_key.clone().unwrap_or_default(),
-                            provider.base_url.clone().unwrap_or_default(),
-                            provider.api.clone(),
-                        ));
-                    }
-                }
+        // 1) exact role assignment, then 2) "chat" role fallback.
+        for candidate in [role, "chat"] {
+            let Some(role_cfg) = configs.role_models.iter().find(|r| r.role == candidate) else {
+                continue;
+            };
+            let Some(model_ref) = &role_cfg.model_ref else {
+                continue;
+            };
+            let parts: Vec<&str> = model_ref.splitn(2, '/').collect();
+            if parts.len() != 2 {
+                continue;
+            }
+            let (pid, mid) = (parts[0], parts[1]);
+            if let Some(provider) = configs.find_provider(pid) {
+                return Some((
+                    pid.to_string(),
+                    mid.to_string(),
+                    provider.api_key.clone().unwrap_or_default(),
+                    provider.base_url.clone().unwrap_or_default(),
+                    provider.api.clone(),
+                ));
             }
         }
 
-        // Fall back to active_model
+        // 3) active_model fallback.
         let active = configs.active_model.as_ref()?;
         let provider = configs.find_provider(&active.provider_id)?;
         Some((
@@ -201,38 +207,27 @@ impl ProviderService {
         ))
     }
 
-    /// Resolve the ingestion-role model → active_model fallback chain.
-    /// Priority: role_models['ingestion'] → active_model.
+    /// Resolve the chat-role model → active_model fallback chain.
+    /// Thin wrapper over [`Self::get_role_llm_config`] with role `"chat"`.
+    /// Returns `(provider_id, model, api_key, base_url, api_override)`.
+    pub async fn get_chat_llm_config(
+        &self,
+    ) -> Option<(String, String, String, String, Option<crate::providers::types::ApiType>)> {
+        self.get_role_llm_config("chat").await
+    }
+
+    /// Resolve the ingestion-role model. Thin wrapper over
+    /// [`Self::get_role_llm_config`] with role `"ingestion"`; drops the
+    /// `api_override` field for callers that don't need it.
+    /// NOTE: unlike the pre-S0 version, ingestion now inherits the `chat`
+    /// role assignment before falling back to `active_model` (the generic
+    /// resolver's `role → chat → active` chain). This is intentional and
+    /// strictly more permissive — it never changes a configured-ingestion
+    /// or fully-unconfigured outcome.
     pub async fn get_ingestion_llm_config(&self) -> Option<(String, String, String, String)> {
-        let configs = self.configs.read().await;
-
-        // Check role_models for 'ingestion' role first
-        if let Some(role_cfg) = configs.role_models.iter().find(|r| r.role == "ingestion") {
-            if let Some(model_ref) = &role_cfg.model_ref {
-                let parts: Vec<&str> = model_ref.splitn(2, '/').collect();
-                if parts.len() == 2 {
-                    let (pid, mid) = (parts[0], parts[1]);
-                    if let Some(provider) = configs.find_provider(pid) {
-                        return Some((
-                            pid.to_string(),
-                            mid.to_string(),
-                            provider.api_key.clone().unwrap_or_default(),
-                            provider.base_url.clone().unwrap_or_default(),
-                        ));
-                    }
-                }
-            }
-        }
-
-        // Fall back to active_model
-        let active = configs.active_model.as_ref()?;
-        let provider = configs.find_provider(&active.provider_id)?;
-        Some((
-            active.provider_id.clone(),
-            active.model_id.clone(),
-            provider.api_key.clone().unwrap_or_default(),
-            provider.base_url.clone().unwrap_or_default(),
-        ))
+        self.get_role_llm_config("ingestion")
+            .await
+            .map(|(pid, mid, key, url, _api)| (pid, mid, key, url))
     }
 
     // ── Provider configuration ──────────────────────────────────────────────
@@ -586,5 +581,111 @@ mod tests {
             assert!(model.context_window.is_some(), "{} missing context window", model.id);
             assert!(model.max_tokens.is_some(), "{} missing max tokens", model.id);
         }
+    }
+
+    // ProviderConfig + ProviderConfigs are already in scope via `use super::*`.
+    use super::super::types::{ApiType, ModelRoleConfig, ModelSelection};
+
+    /// Build a ProviderService directly from in-memory configs (no disk I/O).
+    fn svc(configs: ProviderConfigs) -> ProviderService {
+        ProviderService {
+            configs: std::sync::Arc::new(tokio::sync::RwLock::new(configs)),
+            configs_path: std::path::PathBuf::from("/tmp/uclaw-test-providers.json"),
+        }
+    }
+
+    fn provider(id: &str) -> ProviderConfig {
+        ProviderConfig {
+            provider_id: id.to_string(),
+            display_name: id.to_string(),
+            api_key: Some(format!("key-{id}")),
+            base_url: Some(format!("https://{id}.example/v1")),
+            api: Some(ApiType::OpenAiCompletions),
+        }
+    }
+
+    #[tokio::test]
+    async fn role_config_uses_exact_role_assignment() {
+        let configs = ProviderConfigs {
+            providers: vec![provider("local"), provider("deepseek")],
+            active_model: Some(ModelSelection {
+                provider_id: "deepseek".into(),
+                model_id: "deepseek-v4".into(),
+            }),
+            selected_models: vec![],
+            role_models: vec![
+                ModelRoleConfig { role: "chat".into(), model_ref: Some("deepseek/deepseek-v4".into()) },
+                ModelRoleConfig { role: "summarizer".into(), model_ref: Some("local/minicpm5-1b".into()) },
+            ],
+        };
+        let s = svc(configs);
+        let (pid, mid, _key, _url, _api) = s.get_role_llm_config("summarizer").await.unwrap();
+        assert_eq!(pid, "local");
+        assert_eq!(mid, "minicpm5-1b");
+    }
+
+    #[tokio::test]
+    async fn role_config_falls_back_to_chat_when_role_unset() {
+        let configs = ProviderConfigs {
+            providers: vec![provider("deepseek")],
+            active_model: None,
+            selected_models: vec![],
+            role_models: vec![ModelRoleConfig {
+                role: "chat".into(),
+                model_ref: Some("deepseek/deepseek-v4".into()),
+            }],
+        };
+        let s = svc(configs);
+        let (pid, mid, _, _, _) = s.get_role_llm_config("summarizer").await.unwrap();
+        assert_eq!(pid, "deepseek");
+        assert_eq!(mid, "deepseek-v4");
+    }
+
+    #[tokio::test]
+    async fn role_config_falls_back_to_active_when_chat_unset() {
+        let configs = ProviderConfigs {
+            providers: vec![provider("deepseek")],
+            active_model: Some(ModelSelection {
+                provider_id: "deepseek".into(),
+                model_id: "deepseek-v4".into(),
+            }),
+            selected_models: vec![],
+            role_models: vec![],
+        };
+        let s = svc(configs);
+        let (pid, mid, _, _, _) = s.get_role_llm_config("summarizer").await.unwrap();
+        assert_eq!(pid, "deepseek");
+        assert_eq!(mid, "deepseek-v4");
+    }
+
+    #[tokio::test]
+    async fn role_config_none_when_nothing_configured() {
+        let s = svc(ProviderConfigs::default());
+        assert!(s.get_role_llm_config("summarizer").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn role_config_falls_through_unresolvable_assignment_to_chat() {
+        // The role is assigned, but neither candidate resolves cleanly:
+        // a dead provider reference AND a malformed (slash-less) ref must
+        // both fall THROUGH to the valid chat assignment — not return None.
+        let configs = ProviderConfigs {
+            providers: vec![provider("deepseek")],
+            active_model: None,
+            selected_models: vec![],
+            role_models: vec![
+                // points at a provider that isn't configured → find_provider miss
+                ModelRoleConfig { role: "summarizer".into(), model_ref: Some("ghost/missing".into()) },
+                // malformed: no '/' separator → split miss
+                ModelRoleConfig { role: "utility".into(), model_ref: Some("no-slash".into()) },
+                ModelRoleConfig { role: "chat".into(), model_ref: Some("deepseek/deepseek-v4".into()) },
+            ],
+        };
+        let s = svc(configs);
+        let (pid, mid, _, _, _) = s.get_role_llm_config("summarizer").await.unwrap();
+        assert_eq!(pid, "deepseek", "dead-provider role must fall through to chat");
+        assert_eq!(mid, "deepseek-v4");
+        let (pid2, _, _, _, _) = s.get_role_llm_config("utility").await.unwrap();
+        assert_eq!(pid2, "deepseek", "malformed model_ref must fall through to chat");
     }
 }
