@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use crate::local_llm::paths::{model_dir, model_file_path, MODEL_FILE};
 
 pub mod quant;
+pub mod resume;
 pub mod source;
 pub use quant::Quant;
 pub use source::Source;
