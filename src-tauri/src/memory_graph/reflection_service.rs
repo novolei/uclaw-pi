@@ -238,6 +238,54 @@ pub fn recent_daydreams(conn: &Connection, limit: usize) -> rusqlite::Result<Vec
     Ok(rows)
 }
 
+// ─── user_model_history store (P5: memory refinement audit trail) ────────────
+
+/// One `user_model_history` row, as read back for audit/restore.
+#[derive(Debug, Clone)]
+pub struct UserModelHistoryRow {
+    pub summary: String,
+    pub replaced_at: String,
+}
+
+/// Apply the V59 `user_model_history` DDL to a bare connection (tests only; the
+/// real table is created by the V59 migration).
+pub fn apply_user_model_history_schema(conn: &Connection) {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS user_model_history (
+            id          TEXT PRIMARY KEY,
+            summary     TEXT NOT NULL,
+            replaced_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );",
+    )
+    .expect("apply_user_model_history_schema");
+}
+
+/// Append one superseded user_model summary before a re-ground overwrites it.
+pub fn insert_user_model_history(conn: &Connection, id: &str, summary: &str) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO user_model_history (id, summary) VALUES (?1, ?2)",
+        params![id, summary],
+    )?;
+    Ok(())
+}
+
+/// Most-recent superseded summaries, newest first, capped at `limit`.
+pub fn recent_user_model_history(
+    conn: &Connection,
+    limit: usize,
+) -> rusqlite::Result<Vec<UserModelHistoryRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT summary, replaced_at FROM user_model_history
+         ORDER BY replaced_at DESC LIMIT ?1",
+    )?;
+    let rows = stmt
+        .query_map(params![limit as i64], |r| {
+            Ok(UserModelHistoryRow { summary: r.get(0)?, replaced_at: r.get(1)? })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
 /// System prompt for the reflection pass. Pins the JSON output contract so
 /// `parse_reflection_output` has a stable shape to parse.
 const REFLECTION_SYSTEM_PROMPT: &str = "\
@@ -746,5 +794,16 @@ mod tests {
         let recent = recent_daydreams(&conn, 5).unwrap();
         assert_eq!(recent.len(), 2);
         assert!(recent.iter().any(|d| d.content.contains("borrow-checker")));
+    }
+
+    #[test]
+    fn user_model_history_inserts_and_reads_recent() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        apply_user_model_history_schema(&conn);
+        insert_user_model_history(&conn, "h1", "old summary one").unwrap();
+        insert_user_model_history(&conn, "h2", "old summary two").unwrap();
+        let recent = recent_user_model_history(&conn, 5).unwrap();
+        assert_eq!(recent.len(), 2);
+        assert!(recent.iter().any(|h| h.summary.contains("old summary two")));
     }
 }

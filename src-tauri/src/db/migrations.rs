@@ -2377,6 +2377,22 @@ const SQL_V58: &str = r#"
     CREATE INDEX IF NOT EXISTS idx_daydreams_created ON daydreams(created_at DESC);
 "#;
 
+// ─── V59 — P5 memory refinement: reflections.archived_at + user_model_history ───
+// `reflections.archived_at`: soft-delete marker — NULL means live; set to an
+// ISO-8601 timestamp when a reflection is superseded during consolidation.
+// `user_model_history`: append-only audit trail of superseded user_model summaries;
+// one row is inserted before each re-ground overwrites the singleton summary.
+// ALTER TABLE errors on replay if the column already exists; the error-catch loop
+// below handles that (logs "skipped"), so this block is replay-safe.
+const SQL_V59: &str = r#"
+    ALTER TABLE reflections ADD COLUMN archived_at TEXT;
+    CREATE TABLE IF NOT EXISTS user_model_history (
+        id          TEXT PRIMARY KEY,
+        summary     TEXT NOT NULL,
+        replaced_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+"#;
+
 /// Test/dev helper: run the full migration stack on a fresh connection.
 ///
 /// The `_target` parameter is currently ignored. All migrations are
@@ -2840,6 +2856,14 @@ pub fn run(conn: &rusqlite::Connection) -> Result<(), rusqlite::Error> {
     for stmt in SQL_V58.split(';').map(|s| s.trim()).filter(|s| !s.is_empty()) {
         if let Err(e) = conn.execute(stmt, []) {
             tracing::debug!("V58 stmt skipped (likely already applied): {} :: {}", e, stmt);
+        }
+    }
+    // V59: P5 memory refinement — reflections.archived_at soft-delete + user_model_history audit table.
+    // ALTER TABLE errors on replay if column already exists; the catch loop logs "skipped" — replay-safe.
+    tracing::debug!("Running migration V59: archived_at + user_model_history");
+    for stmt in SQL_V59.split(';').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        if let Err(e) = conn.execute(stmt, []) {
+            tracing::debug!("V59 stmt skipped (likely already applied): {} :: {}", e, stmt);
         }
     }
     tracing::info!("Database migrations complete");
