@@ -615,6 +615,9 @@ impl AppState {
         // Providers
         let provider_service = Arc::new(ProviderService::new(&data_dir)?);
 
+        // Local LLM engine handle (lazy — does not load the model here).
+        crate::local_llm::init_local_engine(&data_dir);
+
         // Safety
         let safety_manager = Arc::new(tokio::sync::RwLock::new(SafetyManager::new(&data_dir)));
 
