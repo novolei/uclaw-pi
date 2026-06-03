@@ -385,8 +385,14 @@ impl Config {
     }
 
     /// Get the project configuration directory.
+    ///
+    /// uClaw renames the legacy `.pi` project dir to `.uclaw-pi` so it matches
+    /// the global `~/.uclaw-pi` home and sits beside the rest of a workspace's
+    /// uclaw-pi state (skills, plans, settings, package caches). Existing `.pi`
+    /// project dirs are migrated on first use by
+    /// [`crate::migrations::migrate_project_dir`].
     pub fn project_dir() -> PathBuf {
-        PathBuf::from(".pi")
+        PathBuf::from(".uclaw-pi")
     }
 
     /// Get the sessions directory.
