@@ -8,11 +8,12 @@
  * pattern + the shared settings primitives.
  */
 import * as React from 'react'
-import { Download, Loader2, CheckCircle2, X } from 'lucide-react'
+import { Download, Loader2, CheckCircle2, X, ListChecks, AlertTriangle, XCircle } from 'lucide-react'
 import { SettingsCard, SettingsSection, SettingsRow, SettingsSegmentedControl } from './primitives'
 import { Button } from '@/components/ui/button'
-import type { LocalModelQuant } from '@/lib/bridge/settings'
+import type { EnvReport, LocalModelQuant } from '@/lib/bridge/settings'
 import { useLocalModel } from '../hooks/useLocalModel'
+import { useLocalModelSetup } from '../hooks/useLocalModelSetup'
 
 /** Quant options with approximate on-disk sizes (from repo LFS metadata). */
 const QUANT_OPTIONS: Array<{ value: LocalModelQuant; label: string; size: string }> = [
@@ -34,6 +35,121 @@ const PHASE_LABEL: Record<string, string> = {
 
 function fmtMB(bytes: number): string {
   return `${(bytes / 1_048_576).toFixed(0)} MB`
+}
+
+function fmtGB(bytes: number): string {
+  return `${(bytes / 1_073_741_824).toFixed(1)} GB`
+}
+
+/** One env-report line for the Settings re-entry checklist. */
+function CheckRow({ ok, warn, label, detail }: { ok: boolean; warn?: boolean; label: string; detail: string }): React.ReactElement {
+  return (
+    <div className="flex items-center gap-2 text-xs">
+      {ok ? (
+        <CheckCircle2 className="size-3.5 shrink-0 text-emerald-500" />
+      ) : warn ? (
+        <AlertTriangle className="size-3.5 shrink-0 text-amber-500" />
+      ) : (
+        <XCircle className="size-3.5 shrink-0 text-destructive" />
+      )}
+      <span className="text-foreground">{label}</span>
+      <span className="truncate text-muted-foreground" title={detail}>
+        {detail}
+      </span>
+    </div>
+  )
+}
+
+function EnvChecklist({ report }: { report: EnvReport }): React.ReactElement {
+  return (
+    <div className="flex w-full max-w-[360px] flex-col gap-1.5">
+      <CheckRow
+        ok={report.diskOk}
+        label="磁盘"
+        detail={report.diskOk ? `可用 ${fmtGB(report.diskFreeBytes)}` : `需要约 ${fmtGB(report.diskRequiredBytes)}`}
+      />
+      <CheckRow ok={report.ramOk} warn label="内存" detail={`可用 ${fmtGB(report.ramAvailableBytes)}`} />
+      <CheckRow
+        ok={report.metalAvailable}
+        warn
+        label="GPU"
+        detail={report.metalAvailable ? 'Metal 加速' : '未检测到 Metal，将用 CPU（较慢）'}
+      />
+      <CheckRow
+        ok={report.network.anyReachable}
+        warn
+        label="网络"
+        detail={report.network.anyReachable ? '镜像可达' : '暂未连通镜像'}
+      />
+    </div>
+  )
+}
+
+/**
+ * Settings re-entry for the first-launch local-model setup (S3). Reuses the
+ * shared `useLocalModelSetup` orchestration so Settings and onboarding run the
+ * exact same check → download → warmup → assign flow.
+ */
+function LocalModelSetupReentry(): React.ReactElement {
+  const setup = useLocalModelSetup()
+  const { phase, report, progress, error, runChecks, downloadAndEnable } = setup
+  const busy = phase === 'checking' || phase === 'downloading' || phase === 'warming'
+
+  return (
+    <SettingsRow label="首启检查" description="检测运行环境并一键下载 / 启用本地模型，自动用于摘要等后台角色。">
+      <div className="flex w-full max-w-[360px] flex-col gap-2">
+        {report && phase !== 'checking' && <EnvChecklist report={report} />}
+
+        {phase === 'warming' && (
+          <div className="flex items-center gap-2 text-xs text-muted-foreground">
+            <Loader2 className="size-3.5 animate-spin text-primary" />
+            正在加载并预热模型…
+          </div>
+        )}
+        {phase === 'downloading' && progress && (
+          <div className="flex items-center gap-2 text-xs text-muted-foreground">
+            <Loader2 className="size-3.5 animate-spin text-primary" />
+            <span>{PHASE_LABEL[progress.phase] ?? progress.phase}</span>
+            {progress.phase === 'downloading' && progress.total > 0 && (
+              <span className="tabular-nums">{progress.percent}%</span>
+            )}
+          </div>
+        )}
+        {phase === 'done' && (
+          <div className="flex items-center gap-2 text-xs text-emerald-500">
+            <CheckCircle2 className="size-3.5" />
+            已下载并启用
+          </div>
+        )}
+        {phase === 'blocked' && (
+          <span className="text-xs text-destructive">磁盘空间不足，无法下载。</span>
+        )}
+        {error && phase === 'report' && (
+          <span className="truncate text-xs text-destructive" title={error}>
+            {error}
+          </span>
+        )}
+
+        <div className="flex items-center gap-2">
+          {phase === 'intro' || phase === 'skipped' ? (
+            <Button size="sm" variant="outline" onClick={() => void runChecks()} disabled={busy}>
+              <ListChecks className="mr-1 size-3" />
+              运行首启检查
+            </Button>
+          ) : (
+            <Button
+              size="sm"
+              onClick={() => void downloadAndEnable()}
+              disabled={busy || phase === 'blocked' || phase === 'done'}
+            >
+              <Download className="mr-1 size-3" />
+              {error ? '重试下载' : phase === 'done' ? '已启用' : '下载并启用'}
+            </Button>
+          )}
+        </div>
+      </div>
+    </SettingsRow>
+  )
 }
 
 export function LocalModelSettings(): React.ReactElement {
@@ -130,6 +246,9 @@ export function LocalModelSettings(): React.ReactElement {
             )}
           </div>
         </SettingsRow>
+
+        {/* S3 first-launch re-entry: shares useLocalModelSetup with onboarding. */}
+        <LocalModelSetupReentry />
       </SettingsCard>
     </SettingsSection>
   )
