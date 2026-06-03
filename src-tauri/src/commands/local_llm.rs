@@ -16,6 +16,17 @@ use tauri::{AppHandle, Emitter, State};
 use crate::app::AppState;
 use crate::error::Error;
 use crate::local_llm::download::{Quant, Source};
+use crate::local_llm::preflight::{self, EnvReport};
+
+/// Model ref (`provider_id/model_id`) the local MiniCPM is assigned under. Must
+/// match the `local-minicpm` registry id (`providers/registry.rs`) + the
+/// `minicpm5-1b` model id (`list_local_minicpm_models`); `set_role_model`
+/// stores it verbatim and the resolver `splitn(2, '/')`s it back apart.
+const LOCAL_MODEL_REF: &str = "local-minicpm/minicpm5-1b";
+
+/// Roles auto-assigned to the local model after warmup (cheap background work,
+/// editable later in Settings).
+const LOCAL_MODEL_ROLES: [&str; 2] = ["summarizer", "utility"];
 
 /// Probe budget for `probe_download_sources` (shorter than the download-time
 /// probe so the UI's "测速中" spinner stays snappy).
@@ -179,9 +190,64 @@ pub async fn download_local_model(
     Ok(path.to_string_lossy().to_string())
 }
 
+/// Run the first-launch environment preflight for `quant` (default Q4_K_M):
+/// disk free vs the quant's headroom requirement, available RAM, Metal/GPU
+/// availability, and per-source network reachability. Pure report — performs
+/// no download. Serialized camelCase for the onboarding checklist.
+#[tauri::command]
+pub async fn check_local_model_environment(
+    state: State<'_, AppState>,
+    quant: Option<String>,
+) -> Result<EnvReport, Error> {
+    let quant = parse_quant(quant)?;
+    Ok(preflight::check_environment(&state.data_dir, quant).await)
+}
+
+/// Warm up the local model: load the GGUF + JIT the runtime by running a
+/// trivial 1-token completion. The generated text is discarded; only the
+/// load/JIT side effect matters (subsequent role calls are then warm). Returns
+/// an error if the engine is uninitialized or the model is missing/corrupt.
+#[tauri::command]
+pub async fn warmup_local_model() -> Result<(), Error> {
+    let engine = crate::local_llm::local_engine()
+        .ok_or_else(|| Error::Internal("local engine not initialized".to_string()))?;
+    engine
+        .complete("", "ok", 1, 0.0)
+        .await
+        .map(|_| ())
+        .map_err(|e| Error::Internal(format!("local model warmup failed: {e}")))
+}
+
+/// Auto-assign the local MiniCPM to the cheap background roles (`summarizer`,
+/// `utility`) after a successful download + warmup. Best-effort per the S3
+/// design: a failure on either role surfaces as an error the UI can log, but is
+/// non-fatal to onboarding (the user can assign manually in Settings).
+#[tauri::command]
+pub async fn assign_local_model_to_roles(state: State<'_, AppState>) -> Result<(), Error> {
+    for role in LOCAL_MODEL_ROLES {
+        state
+            .provider_service
+            .set_role_model(role, Some(LOCAL_MODEL_REF.to_string()))
+            .await?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_model_ref_matches_registry_split() {
+        // The resolver splits on the FIRST '/': provider id then model id.
+        let parts: Vec<&str> = LOCAL_MODEL_REF.splitn(2, '/').collect();
+        assert_eq!(parts, vec!["local-minicpm", "minicpm5-1b"]);
+    }
+
+    #[test]
+    fn local_model_roles_are_summarizer_and_utility() {
+        assert_eq!(LOCAL_MODEL_ROLES, ["summarizer", "utility"]);
+    }
 
     #[test]
     fn parse_quant_defaults_to_q4km() {
