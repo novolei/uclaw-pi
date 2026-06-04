@@ -44,6 +44,8 @@ pub enum RawEvt {
     },
     TurnEnd,
     AgentEnd { error: Option<String> },
+    /// pi auto-compacted the context window (summary of the dropped older turns).
+    AutoCompacted { summary: String, tokens_before: u64 },
     /// Any event the ACL does not (yet) project to a frontend event.
     Other { name: String },
 }
@@ -104,6 +106,25 @@ pub fn demux(ev: &AgentEvent) -> RawEvt {
         AgentEvent::AgentEnd { error, .. } => RawEvt::AgentEnd {
             error: error.clone(),
         },
+        // pi auto-compaction completed: surface the summary so uClaw can persist a
+        // visible fold marker. Skip aborted / summary-less results (nothing to show).
+        AgentEvent::AutoCompactionEnd {
+            result: Some(result),
+            aborted: false,
+            ..
+        } => {
+            let summary = result
+                .get("summary")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let tokens_before = result.get("tokensBefore").and_then(|v| v.as_u64()).unwrap_or(0);
+            if summary.is_empty() {
+                RawEvt::Other { name: agentevent_tag(ev) }
+            } else {
+                RawEvt::AutoCompacted { summary, tokens_before }
+            }
+        }
         other => RawEvt::Other {
             name: agentevent_tag(other),
         },
@@ -373,6 +394,14 @@ impl Acl {
                     })
                 }
             }
+            RawEvt::AutoCompacted { summary, tokens_before } => Some(FeEvent {
+                name: event::CONTEXT_COMPACTED,
+                payload: json!({
+                    "conversationId": self.conv_id,
+                    "summary": summary,
+                    "tokensBefore": tokens_before,
+                }),
+            }),
             // AgentStart, TurnEnd, duplicate completes → no FE event.
             _ => None,
         }
@@ -495,6 +524,48 @@ mod tests {
         assert_eq!(e.name, event::STREAM_ERROR);
         assert_eq!(e.payload["conversationId"], "c1");
         assert_eq!(e.payload["error"], "boom");
+    }
+
+    #[test]
+    fn auto_compaction_end_projects_context_compacted_with_summary() {
+        let mut acl = Acl::new("c1");
+        let ev = AgentEvent::AutoCompactionEnd {
+            result: Some(serde_json::json!({
+                "summary": "Earlier: user asked about fish recipes.",
+                "firstKeptEntryId": "e42",
+                "tokensBefore": 9001u64,
+            })),
+            aborted: false,
+            will_retry: false,
+            error_message: None,
+        };
+        let raw = demux(&ev);
+        let e = acl.translate(&raw).expect("compacted event");
+        assert_eq!(e.name, event::CONTEXT_COMPACTED);
+        assert_eq!(e.payload["conversationId"], "c1");
+        assert_eq!(e.payload["summary"], "Earlier: user asked about fish recipes.");
+        assert_eq!(e.payload["tokensBefore"], 9001);
+    }
+
+    #[test]
+    fn auto_compaction_aborted_or_empty_produces_no_event() {
+        let mut acl = Acl::new("c1");
+        // Aborted → no fold.
+        let aborted = AgentEvent::AutoCompactionEnd {
+            result: Some(serde_json::json!({"summary": "x", "tokensBefore": 1})),
+            aborted: true,
+            will_retry: false,
+            error_message: None,
+        };
+        assert!(acl.translate(&demux(&aborted)).is_none());
+        // Empty summary → no fold.
+        let empty = AgentEvent::AutoCompactionEnd {
+            result: Some(serde_json::json!({"summary": "", "tokensBefore": 1})),
+            aborted: false,
+            will_retry: false,
+            error_message: None,
+        };
+        assert!(acl.translate(&demux(&empty)).is_none());
     }
 
     #[test]

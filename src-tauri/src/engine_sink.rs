@@ -159,6 +159,58 @@ impl TauriEventSink {
         }
     }
 
+    /// Persist a compaction fold marker after pi auto-compacts the context. Writes
+    /// a `## Earlier conversation (compacted)` synth user message into the Agent
+    /// session's `agent_messages` (matching the legacy `/compact` fold's content
+    /// prefix) so the frontend renders a `CompactionFoldCard` — durable across
+    /// reload. pi manages its own outbound context window; this is purely the
+    /// user-visible boundary. Best-effort; Agent sessions only.
+    fn persist_compaction_fold(&self, payload: &serde_json::Value) {
+        let Some(conv) = payload
+            .get("conversationId")
+            .and_then(serde_json::Value::as_str)
+        else {
+            return;
+        };
+        let summary = payload
+            .get("summary")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        if summary.is_empty() {
+            return;
+        }
+        let Some(state) = self.app.try_state::<crate::app::AppState>() else {
+            return;
+        };
+        let Ok(conn) = state.db.lock() else { return };
+        // Only Agent-view sessions render the fold card (chat lives in `messages`).
+        let is_agent_session = conn
+            .query_row("SELECT 1 FROM agent_sessions WHERE id = ?1", [conv], |_| Ok(()))
+            .is_ok();
+        if !is_agent_session {
+            return;
+        }
+        let id = uuid::Uuid::new_v4().to_string();
+        let content = format!("## Earlier conversation (compacted)\n\n{summary}");
+        let now = chrono::Utc::now().timestamp_millis();
+        if let Err(e) = conn.execute(
+            "INSERT INTO agent_messages (id, session_id, role, content, created_at, compacted)
+             VALUES (?1, ?2, 'user', ?3, ?4, 0)",
+            rusqlite::params![id, conv, content, now],
+        ) {
+            tracing::warn!("PiEngine compaction-fold persist failed: {e}");
+            return;
+        }
+        // Keep the session's message_count + updated_at honest (mirrors legacy).
+        let _ = conn.execute(
+            "UPDATE agent_sessions \
+             SET message_count = (SELECT COUNT(*) FROM agent_messages WHERE session_id = ?1), \
+                 updated_at = ?2 \
+             WHERE id = ?1",
+            rusqlite::params![conv, now],
+        );
+    }
+
     /// Append one `chat:stream-tool-activity` event to its conversation's turn
     /// buffer in the persisted `ChatToolActivity` shape (matching what
     /// `get_agent_session_messages` reconstructs from `agent_turns`): `tool_start`
@@ -399,6 +451,14 @@ impl EventSink for TauriEventSink {
         // flag as the routing (only fires when the engine path is active).
         if event == uclaw_pi_engine::event::STREAM_COMPLETE && pi_engine_enabled() {
             self.persist_assistant(&payload);
+        }
+        // [pi 闭环] pi auto-compacted the context — persist a visible fold marker so
+        // the Agent view shows a CompactionFoldCard (the pi counterpart of the
+        // legacy /compact fold). pi already trims its own outbound context; this is
+        // purely the durable, user-visible boundary. Persist BEFORE emitting so the
+        // post-turn get_agent_session_messages refresh picks it up.
+        if event == uclaw_pi_engine::event::CONTEXT_COMPACTED && pi_engine_enabled() {
+            self.persist_compaction_fold(&payload);
         }
         // [pi 闭环] On a turn error, record the failure for proactive avoidance —
         // the pi counterpart of the legacy agent loop's FailureMemory block, which

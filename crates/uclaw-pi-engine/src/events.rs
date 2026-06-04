@@ -19,6 +19,12 @@ pub mod event {
     pub const STREAM_COMPLETE: &str = "chat:stream-complete";
     /// `{conversationId, error}` — provider/agent error or user abort.
     pub const STREAM_ERROR: &str = "chat:stream-error";
+    /// `{conversationId, summary, tokensBefore}` — pi auto-compacted the context
+    /// window. uClaw persists a "## Earlier conversation (compacted)" fold marker
+    /// so the Agent view shows a CompactionFoldCard (durable boundary, matching
+    /// the legacy `/compact` fold). pi already trims its own outbound context —
+    /// this is purely the user-visible signal that older turns were summarized.
+    pub const CONTEXT_COMPACTED: &str = "chat:context-compacted";
 
     // ── [R3 交互] interaction-backfill request names ────────────────────────
     /// `{requestId, toolCallId, toolName, arguments}` — a tool needs approval
