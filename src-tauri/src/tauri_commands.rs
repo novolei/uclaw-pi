@@ -5212,6 +5212,33 @@ pub async fn send_agent_message(
             }
             .compose(12_000)
         };
+
+        // ── /<skill-name> slash command intercept (pi-engine path) ───────
+        // Mirror the legacy intercept: extract a leading `/<name>` and, if it
+        // resolves to a static/borrowed/learned skill, fold the skill prompt
+        // into this turn's prompt context. resolve_slash_skill also bumps
+        // cited_count + auto-promotes draft → promoted as a side effect, so
+        // pi-engine sessions get the same accounting as legacy ones.
+        //
+        // Legacy persists a `system` row that the next history load re-reads;
+        // pi rebuilds its prompt from `EngineCmd::Prompt { input, context }`
+        // and never re-reads agent_messages, so a system row would be invisible
+        // to the model. The skill prompt rides `context` instead — the same
+        // seam per-turn recall uses — keeping the persisted user turn clean.
+        let prompt_context = {
+            let slash_skill_prompt: Option<String> =
+                if let Some(cmd_name) = extract_slash_command_name(&input.user_message) {
+                    resolve_slash_skill(&state, &input.session_id, &cmd_name).await
+                } else {
+                    None
+                };
+            match (slash_skill_prompt, prompt_context) {
+                (Some(skill), Some(ctx)) => Some(format!("{skill}\n\n{ctx}")),
+                (Some(skill), None) => Some(skill),
+                (None, ctx) => ctx,
+            }
+        };
+
         engine.send(uclaw_pi_engine::EngineCmd::Prompt {
             conv_id,
             input: input.user_message.clone(),
