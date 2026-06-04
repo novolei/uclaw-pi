@@ -5237,6 +5237,15 @@ pub async fn send_agent_message(
                 app_handle.clone(),
             );
         }
+
+        // Publish the incoming message so ProactiveService can count messages +
+        // trigger proactive scenarios (conversation_learning, skill_extraction,
+        // …). This also previously lived only in the legacy branch after the
+        // return, so pi-engine turns were invisible to proactive learning.
+        state.infra_service.publish_incoming("local", &input.user_message, serde_json::json!({
+            "session_id": input.session_id,
+        })).await;
+
         return Ok(());
     }
 
