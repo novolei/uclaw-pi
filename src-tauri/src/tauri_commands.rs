@@ -6914,7 +6914,39 @@ pub struct AgentSteerInput {
 }
 
 #[tauri::command]
-pub async fn agent_steer(state: State<'_, AppState>, input: AgentSteerInput) -> Result<(), Error> {
+pub async fn agent_steer(
+    state: State<'_, AppState>,
+    app_handle: tauri::AppHandle,
+    input: AgentSteerInput,
+) -> Result<(), Error> {
+    // pi path: the legacy SteeringQueue is never drained by the pi engine's own
+    // loop, so a "引导" message would be lost + its banner card stuck. True
+    // mid-turn injection isn't reachable from the host today — pi's in-process
+    // queue_steering is `&mut self`, held by the running turn (no lock-free
+    // injector is exposed by AgentSessionHandle); that needs a pi-crate API and
+    // is deferred. For now route guidance through the same after-turn dispatch as
+    // agent_follow_up so the message is delivered (next turn) + the card clears.
+    if crate::engine_sink::pi_engine_enabled() {
+        if state.is_session_running(&input.session_id).await {
+            crate::engine_sink::queue_pi_followup(
+                &input.session_id,
+                input.uuid.clone().unwrap_or_default(),
+                input.user_message.clone(),
+            );
+            return Ok(());
+        }
+        // Idle session → just start a normal run (mirrors agent_follow_up).
+        let send_input = SendAgentMessageInput {
+            session_id: input.session_id,
+            user_message: input.user_message,
+            channel_id: None,
+            model_id: None,
+            workspace_id: None,
+            strategy: None,
+            prompt_id: None,
+        };
+        return send_agent_message(state, app_handle, send_input).await;
+    }
     let queues = state.agent_queues_for(&input.session_id);
     // Steering supersedes a pending follow-up for the same banner card (avoid double-processing).
     if let Some(uuid) = &input.uuid {
