@@ -277,6 +277,31 @@ impl EventSink for TauriEventSink {
                         obj.insert("costUsd".into(), serde_json::Value::String(cost_usd));
                     }
                 }
+                // [pi 闭环] Derive agent:context_stats from this turn so the
+                // context-window / token-usage meter has a denominator on pi.
+                // The legacy dispatcher emits it (observability.rs); pi never
+                // did, so the meter sat empty. modelContextLength comes from the
+                // model; freeTokens = window − total prompt tokens (input +
+                // cache). The per-turn inputTokens the meter shows still comes
+                // from the agent:turn_cost payload (which fires for this same
+                // event); skillsTokens isn't broken out on pi (the engine
+                // doesn't track the skills manifest separately) → 0. Frontend
+                // reads exactly these four fields (useGlobalAgentListeners).
+                let window = crate::agent::types::get_model_context_length(&model);
+                let cache_creation = payload
+                    .get("cacheCreationTokens")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0);
+                let free = window as i64 - (input + cache_read + cache_creation) as i64;
+                let _ = self.app.emit(
+                    "agent:context_stats",
+                    serde_json::json!({
+                        "conversationId": conv,
+                        "modelContextLength": window,
+                        "skillsTokens": 0,
+                        "freeTokens": free,
+                    }),
+                );
             }
             if let Some(conv) = payload.get("conversationId").and_then(serde_json::Value::as_str) {
                 if let Ok(mut cache) = self.turn_cost.lock() {

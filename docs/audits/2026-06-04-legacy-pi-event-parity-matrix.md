@@ -40,7 +40,7 @@ Legend: ✅ covered · ⚠️ GAP (pi missing / mis-shaped) · ⏭️ expected-s
 | `chat:stream-complete` | conversationId (+text) | ✅ | ✅ (acl) → persist_assistant | ✅ |
 | `chat:stream-error` | conversationId, error | ✅ | ✅ (acl) → failure record (#76) | ✅ |
 | `agent:turn_cost` | conversationId, inputTokens, outputTokens, costUsd | ✅ | ✅ (engine.rs) + cost recompute in bridge | ✅ |
-| `agent:context_stats` | conversationId, modelContextLength, skillsTokens, freeTokens | ✅ (observability) | ⚠️ **GAP** — pi emits nothing; the context-window / token-usage meter never updates on pi | ⚠️ |
+| `agent:context_stats` | conversationId, modelContextLength, skillsTokens, freeTokens | ✅ (observability) | ✅ derived from `agent:turn_cost` in the bridge (`engine_sink.rs`): `modelContextLength` via `get_model_context_length`, `freeTokens = window − (input+cache)`, `skillsTokens=0` (not broken out on pi) | ✅ |
 | `session:title-pending` / `session:title-updated` | sessionId, title, emoji | ✅ | ✅ (#71; emoji varied #78) | ✅ |
 | `agent:memory-recall` | totalCandidates, skillsCount, timestamp, conversationId | ✅ | ✅ (pi branch spawn) | ✅ |
 | `agent:skill-recalled` | conversationId, toolCallId, kind, … | ✅ (real conv id) | ⚠️ **GAP** — pi skill tools built with `PI_TOOL_CONV="pi-agent"` placeholder (engine_sink.rs:323), so events are mis-attributed; the live skill-recall panel can't match the real session | ⚠️ |
@@ -57,11 +57,12 @@ Legend: ✅ covered · ⚠️ GAP (pi missing / mis-shaped) · ⏭️ expected-s
 
 Ranked by user-visible impact. Each is its own small PR.
 
-1. **`agent:context_stats` on pi (HIGH).** The context-window / token-usage meter
-   is dead on pi. Fix: emit `context_stats` from the pi turn (the engine knows
-   `model_context_length` + token breakdown; either project a new `RawEvt` →
-   `agent:context_stats` in the ACL, or compute + emit from `engine_sink` on
-   `agent:turn_cost` where token counts are already in hand).
+1. ~~**`agent:context_stats` on pi (HIGH).**~~ **RESOLVED.** The bridge now
+   derives + emits `agent:context_stats` alongside `agent:turn_cost` (token
+   counts already in hand): `modelContextLength` from `get_model_context_length`,
+   `freeTokens = window − (input + cache)`, `skillsTokens = 0` (pi doesn't track
+   the skills manifest separately). The per-turn used-token figure still comes
+   from `agent:turn_cost` itself; this restores the meter's denominator.
 
 2. **`agent:skill-recalled` real conversation id (MEDIUM).** Thread the real
    `conv_id` into `RealToolRequestSink` instead of the `PI_TOOL_CONV="pi-agent"`
