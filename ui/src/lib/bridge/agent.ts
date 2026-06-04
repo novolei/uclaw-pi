@@ -76,9 +76,11 @@ export {
   // through the settings patch command (re-exported here so the agent feature
   // routes it via the agent bridge rather than reaching into the monolith).
   updateSettings,
-  // Per-session stream-complete + queued-consumed listeners the AgentView shell
-  // subscribes to (refresh-on-complete, dequeue-on-consume). CleanupFn-returning.
+  // Per-session stream-complete + error + queued-consumed listeners the AgentView
+  // shell subscribes to (refresh-on-complete, clear-orphan-banners-on-end,
+  // dequeue-on-consume). CleanupFn-returning.
   onStreamComplete,
+  onStreamError,
   onQueuedConsumed,
 } from '../tauri-bridge'
 

@@ -50,6 +50,7 @@ vi.mock('@/lib/bridge/agent', () => {
     getSttModelStatus: vi.fn(async () => ({ openflow_ready: false, openflow_model_dir: '' })),
     // listener wrappers (CleanupFn-returning, sync)
     onStreamComplete: vi.fn(unlisten),
+    onStreamError: vi.fn(unlisten),
     onQueuedConsumed: vi.fn(unlisten),
     // listener wrappers used by children (Promise<UnlistenFn>)
     onAgentHeartbeat: vi.fn(asyncUnlisten),

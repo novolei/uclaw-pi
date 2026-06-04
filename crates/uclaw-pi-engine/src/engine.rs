@@ -175,6 +175,11 @@ struct SessionEntry {
     handle: Arc<AMutex<AgentSessionHandle>>,
     /// The current run's abort handle (if any). `Stop` takes + fires it.
     abort: Arc<AMutex<Option<AbortHandle>>>,
+    /// Monotonic run counter. Each `start_run` claims the next value and records
+    /// it as the slot's owner; the run only clears the abort slot on completion
+    /// if it's still the owner (a newer run hasn't superseded it). Prevents a
+    /// finishing run from wiping a successor's abort handle (Stop-targets-wrong-run).
+    run_gen: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// Tokio-side handle to the engine. Holds the command sender and keeps the
@@ -431,6 +436,7 @@ async fn start_run(
                     SessionEntry {
                         handle: Arc::new(AMutex::new(h)),
                         abort: Arc::new(AMutex::new(None)),
+                        run_gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
                     },
                 );
             }
@@ -443,9 +449,14 @@ async fn start_run(
     let entry = sessions.get(&conv_id).expect("session present");
     let handle = Arc::clone(&entry.handle);
     let abort_slot = Arc::clone(&entry.abort);
+    let run_gen = Arc::clone(&entry.run_gen);
 
-    // Register this run's abort handle before spawning, so a Stop arriving
-    // mid-run finds it.
+    // Claim this run's generation + register its abort handle before spawning, so
+    // a Stop arriving mid-run finds it. A later run bumps run_gen and overwrites
+    // the slot (Stop always targets the newest run); this run will then decline to
+    // clear the slot on completion (see below), so it never wipes a successor's
+    // handle.
+    let my_gen = run_gen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
     let (abort_h, abort_sig) = AgentSessionHandle::new_abort_handle();
     if let Ok(mut slot) = abort_slot.lock(cx).await {
         *slot = Some(abort_h);
@@ -453,6 +464,8 @@ async fn start_run(
 
     let sink_task = Arc::clone(sink);
     let cx_task = cx.clone();
+    let abort_slot_task = Arc::clone(&abort_slot);
+    let run_gen_task = Arc::clone(&run_gen);
     // Own the model name BEFORE the 'static spawn — capturing `model_config`
     // (a borrow) inside the async move would escape the function (E0521).
     let cost_model = model_config.model.clone().unwrap_or_default();
@@ -496,7 +509,22 @@ async fn start_run(
             }
             Err(e) => emit_error(&sink_task, &conv_id, format!("session lock failed: {e:?}")),
         }
+        // Clear our abort handle now the run is done — but only if no newer run
+        // has claimed the slot (run_gen still ours). Otherwise we'd wipe the
+        // successor's handle and a subsequent Stop would no-op. (`abort_slot_owns`.)
+        if abort_slot_owns(&run_gen_task, my_gen) {
+            if let Ok(mut slot) = abort_slot_task.lock(&cx_task).await {
+                *slot = None;
+            }
+        }
     });
+}
+
+/// Whether the run that claimed `my_gen` is still the current owner of its
+/// session's abort slot (no later `start_run` has bumped the counter). Used so a
+/// finishing run clears the slot only when it hasn't been superseded.
+fn abort_slot_owns(run_gen: &std::sync::atomic::AtomicU64, my_gen: u64) -> bool {
+    run_gen.load(std::sync::atomic::Ordering::SeqCst) == my_gen
 }
 
 /// Switch a session's model. Takes the handle by value so the lock guard's
@@ -530,6 +558,22 @@ fn emit_error(sink: &Arc<dyn EventSink>, conv_id: &str, error: String) {
 mod tests {
     use super::*;
     use serde_json::Value;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// A finishing run clears its abort slot only while it's still the owner; once
+    /// a newer run bumps the generation, the older run must NOT clear (else it'd
+    /// wipe the successor's handle and Stop would no-op).
+    #[test]
+    fn abort_slot_owns_tracks_latest_generation() {
+        let gen = AtomicU64::new(0);
+        // run #1 claims gen 1.
+        let g1 = gen.fetch_add(1, Ordering::SeqCst) + 1;
+        assert!(abort_slot_owns(&gen, g1), "sole run owns the slot");
+        // run #2 claims gen 2 (supersedes run #1).
+        let g2 = gen.fetch_add(1, Ordering::SeqCst) + 1;
+        assert!(!abort_slot_owns(&gen, g1), "superseded run no longer owns");
+        assert!(abort_slot_owns(&gen, g2), "newest run owns");
+    }
 
     /// [R4/F7] The api_key must NEVER appear in Debug output — not as a bare
     /// RedactedString, nor inside an EngineCmd::Configure (which derives Debug and
