@@ -48,9 +48,9 @@ Legend: ✅ covered · ⚠️ GAP (pi missing / mis-shaped) · ⏭️ expected-s
 | `agent:need_approval` | toolName, toolId, sessionId, … | ✅ | ✅ functional — `approval.rs` emits `{requestId, toolCallId, toolName, arguments}`; round-trip keyed by `requestId` (works). Off by default (opt-in `UCLAW_PI_APPROVAL`). Cosmetic only: no `toolId`/`sessionId` | ✅ |
 | `agent:exit_plan_request` | requestId, (sessionId), plan | ✅ | ✅ functional — ExitPlanTool (`tool_factory.rs`) emits `{requestId, plan}`; ExitPlanModeBanner renders `plan`, `respond_exit_plan_mode` answers by `requestId`. `sessionId`/`allowedPrompts` absent but unused by the round-trip | ✅ |
 | `agent:ask_user_request` | requestId, sessionId, questions[] | ✅ (uClaw `AskUserTool`) | ✅ the legacy `AskUserTool` is now advertised as a pi IO tool (`RealToolRequestSink`); its emit / `pending_ask_users` / `respond_ask_user` round-trip is runtime-agnostic, so it works unchanged. `conv` (Gap 2) stamps the real session | ✅ |
-| `agent:stream-reset` | conversationId | ✅ (retry path) | ⚠️ likely GAP (pi retry doesn't emit) — low impact | ⚠️ |
-| `agent:queued-consumed` | sessionId, uuid | ✅ (steering) | ⚠️ verify (pi steering) — low impact | ⚠️ |
-| `agent:reflection_status` / `agent:reflection` | assistant_message_id, … | ✅ | ⚠️ pi runs `run_once` (#76 turn-count) but per-message reflection-status events unverified | ⚠️ |
+| `agent:stream-reset` | conversationId | ✅ (legacy SSE parser) | ⏭️ N/A — legacy `on_stream_reset` (`llm_stream.rs`) fires when uClaw's SSE parser sees a text-block restart; pi owns its streaming and the ACL accumulates one continuous per-turn `acc_text` with monotonic seq (no multi-block restart), so there's no reset to signal | ⏭️ |
+| `agent:queued-consumed` | sessionId, uuid | ✅ (legacy steering) | ⏭️ N/A — emitted by the legacy dual-queue steering (`turn_runner`); pi steers via `EngineCmd::FollowUp` and has no uuid-keyed queue (SoftInterruptQueue is deprecated), so nothing to "consume" | ⏭️ |
+| `agent:reflection_status` / `agent:reflection` | assistant_message_id, … | ✅ (legacy per-message) | ⏭️ N/A — a legacy per-message reflection affordance; pi reflection is a background turn-count distillation (`reflection_service::run_once`, #76) that doesn't emit these. A "reflection ran" UI signal on pi would be a separate enhancement, not a parity gap | ⏭️ |
 | `agent:daydream` | content | n/a | ✅ (own feature) | ✅ |
 | `agent:file-written` | path | 💀 no emitter | 💀 no emitter | 💀 dead on both — frontend `usePreviewRefresh` also uses `tauri://focus`; not pi-specific |
 
@@ -106,8 +106,28 @@ Ranked by user-visible impact. Each is its own small PR.
    uClaw tool; the answers return as the tool result.
 
 5. **`agent:stream-reset` / `agent:queued-consumed` / reflection-status (LOW).**
-   Retry-reset, steering-queue, and per-message reflection-status events — verify
-   and wire if the corresponding UI affordances are expected on pi.
+   **VERIFIED → N/A on pi** (no fix). All three are bound to legacy-only mechanisms
+   that pi either handles differently or doesn't have:
+   - **stream-reset** — legacy `on_stream_reset` (`llm_stream.rs`) fires on a
+     uClaw-SSE-parser text-block restart. pi owns its streaming; the ACL emits one
+     continuous per-turn `acc_text` with monotonic seq (no multi-block restart), so
+     there's nothing to reset. (Empirically: heavy pi use shows no post-tool text
+     garble/dup, which a missing reset would cause.)
+   - **queued-consumed** — the legacy dual-queue steering event; pi steers via
+     `EngineCmd::FollowUp` and has no uuid-keyed queue (SoftInterruptQueue is
+     deprecated). Nothing to consume.
+   - **reflection_status / reflection** — a legacy per-message affordance;
+     `reflection_service.rs` doesn't emit them. pi reflection is a background
+     turn-count distillation (`run_once`, #76). A pi "reflection ran" UI signal
+     would be a separate enhancement, not a parity gap.
+
+## Status: all gaps resolved
+
+Every ⚠️ from the original scan is now ✅ (wired) or ⏭️ (verified N/A on pi).
+Resolved across #81 (context_stats), #82 (tool_output_chunk), #83 (skill-recalled
+conv id), #84 (approval/exit_plan verified), #85 (ask_user), #86 (durable
+tool_activities), and this PR (Gap 5 verified N/A). The frontend-contract guard
+(`acl.rs::fe_contract_required_fields_present`) keeps the ✅ rows from regressing.
 
 ## Regression guard (this PR)
 
