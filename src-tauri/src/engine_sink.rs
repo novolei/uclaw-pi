@@ -629,6 +629,17 @@ impl uclaw_pi_engine::ToolRequestSink for RealToolRequestSink {
                 &serde_json::to_string(&input).unwrap_or_default(),
                 500,
             );
+            // [diag] The pi IO-tool path is otherwise silent (legacy logs via
+            // tool_dispatch; pi did not) — which is why ask_user issues couldn't be
+            // traced in the log. Log invoke + completion (name, request_id, conv,
+            // duration, error) so interaction tools (ask_user) are diagnosable:
+            // a fast error vs a long human wait vs a dropped late result are now
+            // distinguishable.
+            let started = std::time::Instant::now();
+            tracing::info!(
+                tool = %tool_name, request_id = %request_id, conv = %conv,
+                "pi IO tool invoked"
+            );
             // Route MCP tools (`mcp__server__tool`) to the bridged MCP executor;
             // everything else is a uClaw skill tool.
             let (text, is_error) = if crate::mcp::parse_mcp_tool_name(&tool_name).is_some() {
@@ -636,6 +647,12 @@ impl uclaw_pi_engine::ToolRequestSink for RealToolRequestSink {
             } else {
                 run_skill_tool(&app, &conv, &tool_name, input).await
             };
+            tracing::info!(
+                tool = %tool_name, request_id = %request_id, is_error,
+                dur_ms = started.elapsed().as_millis() as u64,
+                output_preview = %crate::agent::dispatcher::truncate_utf8(&text, 200),
+                "pi IO tool completed"
+            );
             // 写 seam: feed the pi tool execution to InfraService — the GeneCandidate
             // pool subscribes to InfraEventType::ToolExecuted, so this re-feeds gene
             // distillation + capsule fitness on the pi path. Fire-and-forget; the
