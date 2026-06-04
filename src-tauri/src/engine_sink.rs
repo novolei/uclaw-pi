@@ -458,14 +458,26 @@ impl RealToolRequestSink {
     }
 }
 
+/// Interaction tools block on a human, so they need a result-wait window far
+/// longer than the registry's ~5-min default — otherwise a slow answer is
+/// dropped as a "timeout" while the banner is still open. 30 min is generous but
+/// bounded (a truly-abandoned prompt eventually frees the slot; the user can also
+/// Stop the run). `ask_user` is the only IO interaction tool today.
+const INTERACTIVE_TOOL_RESULT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+const INTERACTIVE_IO_TOOLS: [&str; 1] = ["ask_user"];
+
 /// Map a uClaw `Tool`'s metadata into a pi `IoToolSpec` (the bridge wraps each as a
 /// `BridgedIoTool`). Pure — unit-tested.
 fn spec_from_tool(tool: &dyn Tool) -> uclaw_pi_engine::IoToolSpec {
+    let result_timeout = INTERACTIVE_IO_TOOLS
+        .contains(&tool.name())
+        .then_some(INTERACTIVE_TOOL_RESULT_TIMEOUT);
     uclaw_pi_engine::IoToolSpec {
         name: tool.name().to_string(),
         label: tool.name().to_string(),
         description: tool.description().to_string(),
         parameters: tool.parameters_schema(),
+        result_timeout,
     }
 }
 

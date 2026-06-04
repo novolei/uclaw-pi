@@ -120,6 +120,7 @@ impl ToolFactory for UclawToolFactory {
         // ToolResultRegistry (resolved by EngineCmd::ToolResult).
         if let Some(req_sink) = &self.tool_request_sink {
             for spec in req_sink.io_tool_specs() {
+                let result_timeout = spec.result_timeout;
                 reg.push(Box::new(BridgedIoTool::new(
                     spec.name,
                     spec.label,
@@ -128,6 +129,7 @@ impl ToolFactory for UclawToolFactory {
                     self.tool_results.clone(),
                     Arc::clone(req_sink),
                     self.conversation_id.clone(),
+                    result_timeout,
                 )));
             }
         }
