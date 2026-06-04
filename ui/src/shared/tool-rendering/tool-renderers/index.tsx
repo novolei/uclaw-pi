@@ -32,11 +32,17 @@ export function ToolResultRenderer({
     return <GbrainResultRenderer result={result} isError={isError} />
   }
   switch (toolName) {
+    // pi's built-ins are bare (`write`/`read`/`edit`/`hashline_edit`); legacy/
+    // Claude-style use `write_file`/`read_file`. Accept both so pi tool results
+    // render structured instead of falling through to the raw default.
     case 'write_file':
+    case 'write':
       return <WriteResultRenderer {...props} />
     case 'edit':
+    case 'hashline_edit':
       return <EditResultRenderer {...props} />
     case 'read_file':
+    case 'read':
       return <ReadResultRenderer {...props} />
     case 'bash':
       return <BashResultRenderer {...props} />
