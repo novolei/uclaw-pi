@@ -5218,6 +5218,25 @@ pub async fn send_agent_message(
             cwd: run_cwd,
             context: prompt_context,
         });
+
+        // Auto-generate the session title (emoji + title) on every message.
+        // This previously lived ONLY in the legacy branch below (after this
+        // `return`), so pi-engine sessions never got auto-renamed. Fire-and-
+        // forget; resolves the LLM via the `utility` role (local MiniCPM when
+        // assigned) inside spawn_agent_session_title_summary.
+        {
+            let title_request_id = uuid::Uuid::new_v4().to_string();
+            let llm_config_for_title = state.llm_config.read().await.clone();
+            spawn_agent_session_title_summary(
+                input.session_id.clone(),
+                input.user_message.clone(),
+                title_request_id,
+                Arc::clone(&state.db),
+                Arc::clone(&state.provider_service),
+                llm_config_for_title,
+                app_handle.clone(),
+            );
+        }
         return Ok(());
     }
 
