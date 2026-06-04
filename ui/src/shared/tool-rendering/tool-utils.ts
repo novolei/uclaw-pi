@@ -110,9 +110,34 @@ export const TOOL_ICONS: Record<string, LucideIcon> = {
  * MCP 工具（mcp__serverName__toolName）使用 Plug 图标
  * 未匹配时返回默认的 Wrench 图标
  */
+/**
+ * pi's built-in tools use bare lowercase names (`read`/`bash`/`edit`/`write`/
+ * `grep`/`find`/`ls`/`hashline_edit`, see `crates/pi/src/tools.rs`) whereas the
+ * renderer's icon/name/summary/diff tables are keyed by Claude-style capitalized
+ * names. Canonicalize so pi tool cards render with the right icon, label,
+ * summary, and edit diff instead of falling through to the generic "no
+ * recognizable input" state. Unknown names pass through (MCP / uClaw skill tools
+ * keep their own keys).
+ */
+const PI_TOOL_ALIASES: Record<string, string> = {
+  read: 'Read',
+  write: 'Write',
+  edit: 'Edit',
+  hashline_edit: 'Edit',
+  bash: 'Bash',
+  grep: 'Grep',
+  find: 'Glob',
+  ls: 'LS',
+}
+
+export function canonicalToolName(toolName: string): string {
+  return PI_TOOL_ALIASES[toolName] ?? toolName
+}
+
 export function getToolIcon(toolName: string): LucideIcon {
-  if (TOOL_ICONS[toolName]) return TOOL_ICONS[toolName]
-  if (toolName.startsWith('mcp__')) return Plug
+  const n = canonicalToolName(toolName)
+  if (TOOL_ICONS[n]) return TOOL_ICONS[n]
+  if (n.startsWith('mcp__')) return Plug
   return Wrench
 }
 
@@ -128,6 +153,7 @@ const TOOL_DISPLAY_NAMES: Record<string, string> = {
   WebFetch: '抓取网页',
   WebSearch: '搜索网页',
   NotebookEdit: '编辑笔记本',
+  LS: '列出目录',
   Skill: '使用技能',
   TodoWrite: '更新待办',
   TodoRead: '阅读待办',
@@ -161,7 +187,8 @@ const TOOL_DISPLAY_NAMES: Record<string, string> = {
  * 内置工具返回中文名称，其余返回原始名称
  */
 export function getToolDisplayName(toolName: string): string {
-  if (TOOL_DISPLAY_NAMES[toolName]) return TOOL_DISPLAY_NAMES[toolName]
+  const canonical = canonicalToolName(toolName)
+  if (TOOL_DISPLAY_NAMES[canonical]) return TOOL_DISPLAY_NAMES[canonical]
   // MCP 工具：mcp__serverName__toolName → "SERVERNAME / TOOLNAME"
   const parts = toolName.split('__')
   if (parts[0] === 'mcp' && parts.length >= 3 && parts[1]) {
@@ -178,7 +205,7 @@ export function getInputSummary(
   toolName: string,
   input: Record<string, unknown>
 ): string | null {
-  switch (toolName) {
+  switch (canonicalToolName(toolName)) {
     case 'Bash': {
       const command = input.command
       if (typeof command === 'string') {
@@ -286,7 +313,8 @@ export function getInputSummary(
     case 'Read':
     case 'Edit':
     case 'Write': {
-      const filePath = input.file_path
+      // pi's read/write/edit send `path`; Claude-style tools send `file_path`.
+      const filePath = input.file_path ?? input.path
       if (typeof filePath === 'string') {
         // 仅展示文件名，不展示完整路径
         return filePath.split('/').pop() ?? filePath
@@ -446,12 +474,13 @@ export function computeDiffStats(
   toolName: string,
   input: Record<string, unknown>
 ): { additions: number; deletions: number } | null {
-  if (toolName !== 'Edit') {
+  if (canonicalToolName(toolName) !== 'Edit') {
     return null
   }
 
-  const oldString = input.old_string
-  const newString = input.new_string
+  // Claude-style edit → old_string/new_string; pi's edit → oldText/newText.
+  const oldString = input.old_string ?? input.oldText
+  const newString = input.new_string ?? input.newText
 
   if (typeof oldString !== 'string' || typeof newString !== 'string') {
     return null
