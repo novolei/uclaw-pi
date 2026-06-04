@@ -180,7 +180,8 @@ function startAgentListeners(store: Store): void {
         const next = new Map(prev)
         const isNewStream = payload.seq === 0
         const content = isNewStream ? payload.delta : (existing.content + payload.delta)
-        next.set(sid, { ...existing, content })
+        // Text is flowing again → any in-flight retry succeeded; clear the notice.
+        next.set(sid, { ...existing, content, retrying: undefined })
         return next
       })
       store.set(agentStreamErrorsAtom, (prev) => {
@@ -193,6 +194,64 @@ function startAgentListeners(store: Store): void {
         if (!prev.has(sid)) return prev
         const next = new Set(prev)
         next.delete(sid)
+        return next
+      })
+    })
+  )
+
+  // agent:retry → pi is auto-retrying a transient error (status:"attempt") or has
+  // exhausted its budget (status:"exhausted"). Populates streamingStates.retrying,
+  // which StreamingMessageBubble's RetryingNotice + AgentStatusBar already render.
+  // On a transient retry the banner shows "重试中 N/M" with a countdown; on success
+  // the resumed stream-chunk clears it (above); on exhaustion it stays failed.
+  reg(
+    listen<{
+      conversationId: string
+      status: string
+      attempt?: number
+      maxAttempts?: number
+      delaySeconds?: number
+      reason?: string
+    }>('agent:retry', ({ payload }) => {
+      const sid = payload.conversationId
+      store.set(agentStreamingStatesAtom, (prev) => {
+        const existing = prev.get(sid)
+        if (!existing) return prev
+        const next = new Map(prev)
+        const cur = existing.retrying
+        if (payload.status === 'exhausted') {
+          next.set(sid, {
+            ...existing,
+            running: false,
+            retrying: {
+              currentAttempt: cur?.currentAttempt ?? 1,
+              maxAttempts: cur?.maxAttempts ?? 3,
+              history: cur?.history ?? [],
+              failed: true,
+            },
+          })
+        } else {
+          const attempt = payload.attempt ?? (cur?.currentAttempt ?? 0) + 1
+          const reason = payload.reason ?? ''
+          next.set(sid, {
+            ...existing,
+            retrying: {
+              currentAttempt: attempt,
+              maxAttempts: payload.maxAttempts ?? cur?.maxAttempts ?? 3,
+              history: [
+                ...(cur?.history ?? []),
+                {
+                  attempt,
+                  reason,
+                  errorMessage: reason,
+                  timestamp: Date.now(),
+                  delaySeconds: payload.delaySeconds ?? 0,
+                },
+              ],
+              failed: false,
+            },
+          })
+        }
         return next
       })
     })

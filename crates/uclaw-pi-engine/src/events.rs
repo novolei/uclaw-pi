@@ -19,6 +19,10 @@ pub mod event {
     pub const STREAM_COMPLETE: &str = "chat:stream-complete";
     /// `{conversationId, error}` — provider/agent error or user abort.
     pub const STREAM_ERROR: &str = "chat:stream-error";
+    /// `{conversationId, status:"attempt"|"exhausted", attempt, maxAttempts,
+    /// delaySeconds, reason}` — pi is auto-retrying a transient LLM/provider error
+    /// (or has exhausted retries). Drives the RetryingNotice banner + status bar.
+    pub const AGENT_RETRY: &str = "agent:retry";
     /// `{conversationId, summary, tokensBefore}` — pi auto-compacted the context
     /// window. uClaw persists a "## Earlier conversation (compacted)" fold marker
     /// so the Agent view shows a CompactionFoldCard (durable boundary, matching
