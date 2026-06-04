@@ -43,7 +43,7 @@ Legend: ✅ covered · ⚠️ GAP (pi missing / mis-shaped) · ⏭️ expected-s
 | `agent:context_stats` | conversationId, modelContextLength, skillsTokens, freeTokens | ✅ (observability) | ✅ derived from `agent:turn_cost` in the bridge (`engine_sink.rs`): `modelContextLength` via `get_model_context_length`, `freeTokens = window − (input+cache)`, `skillsTokens=0` (not broken out on pi) | ✅ |
 | `session:title-pending` / `session:title-updated` | sessionId, title, emoji | ✅ | ✅ (#71; emoji varied #78) | ✅ |
 | `agent:memory-recall` | totalCandidates, skillsCount, timestamp, conversationId | ✅ | ✅ (pi branch spawn) | ✅ |
-| `agent:skill-recalled` | conversationId, toolCallId, kind, … | ✅ (real conv id) | ⚠️ **GAP** — pi skill tools built with `PI_TOOL_CONV="pi-agent"` placeholder (engine_sink.rs:323), so events are mis-attributed; the live skill-recall panel can't match the real session | ⚠️ |
+| `agent:skill-recalled` | conversationId, toolCallId, kind, … | ✅ (real conv id) | ✅ real conv id threaded engine → `ToolRequestSink::request(conversation_id, …)` → `build_skill_tool`; per-conv `UclawToolFactory::with_conversation` so each session's `BridgedIoTool` carries its `conv_id` (falls back to `PI_TOOL_CONV` only when unknown) | ✅ |
 | `agent:proactive-learning` | scenario, items_extracted, … | ✅ | ✅ (publish_incoming #74 → ProactiveService) | ✅ |
 | `agent:need_approval` | toolName, toolId, sessionId, … | ✅ | ✅ via `crates/.../approval.rs` (ACP-style requestId/toolCallId) — **field-shape parity unverified** | ⚠️ verify |
 | `agent:ask_user_request` / `agent:exit_plan_request` | requestId, sessionId, … | ✅ | ✅ (events.rs + respond_* commands) — field-shape parity unverified | ⚠️ verify |
@@ -64,10 +64,13 @@ Ranked by user-visible impact. Each is its own small PR.
    the skills manifest separately). The per-turn used-token figure still comes
    from `agent:turn_cost` itself; this restores the meter's denominator.
 
-2. **`agent:skill-recalled` real conversation id (MEDIUM).** Thread the real
-   `conv_id` into `RealToolRequestSink` instead of the `PI_TOOL_CONV="pi-agent"`
-   placeholder so the live skill-recall panel attributes to the right session.
-   (Already flagged as a follow-up in `engine_sink.rs`.)
+2. ~~**`agent:skill-recalled` real conversation id (MEDIUM).**~~ **RESOLVED.** The
+   real `conv_id` is now threaded engine-side: `UclawToolFactory::with_conversation`
+   builds a per-session factory (sessions are 1:1 with `conv_id`), so each
+   `BridgedIoTool` carries its owning `conv_id` and passes it through
+   `ToolRequestSink::request(conversation_id, …)` → `build_skill_tool`. Skill tools
+   stamp the real session on `agent:skill-recalled`; `PI_TOOL_CONV` remains only as
+   the fallback when the conversation is unknown (e.g. spec advertisement).
 
 3. ~~**`tool_output_chunk` streaming on pi (MEDIUM).**~~ **RESOLVED.** The ACL now
    projects `RawEvt::ToolUpdate` → `chat:stream-tool-activity` `tool_output_chunk`.

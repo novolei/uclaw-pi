@@ -58,6 +58,10 @@ pub struct UclawToolFactory {
     /// uClaw's tokio executor; `None` = no IO tools wired (interaction tools still
     /// work). Declares its tools via `io_tool_specs()`.
     tool_request_sink: Option<Arc<dyn ToolRequestSink>>,
+    /// Owning conversation for the session this factory builds (set via
+    /// [`UclawToolFactory::with_conversation`]); `None` on the shared engine-level
+    /// factory. Captured into each `BridgedIoTool` for per-conv attribution.
+    conversation_id: Option<String>,
 }
 
 impl UclawToolFactory {
@@ -73,6 +77,24 @@ impl UclawToolFactory {
             sink,
             tool_results,
             tool_request_sink,
+            conversation_id: None,
+        })
+    }
+
+    /// Clone this factory bound to a specific conversation. The engine builds one
+    /// per session (sessions are 1:1 with `conv_id`), so each session's
+    /// `BridgedIoTool`s carry their owning `conv_id` — letting per-conv side-
+    /// effects (e.g. `agent:skill-recalled`) attribute to the right session
+    /// rather than a shared placeholder. All fields are cheap handles (Arc /
+    /// Clone registries).
+    #[must_use]
+    pub fn with_conversation(&self, conversation_id: String) -> Arc<Self> {
+        Arc::new(Self {
+            approval: self.approval.clone(),
+            sink: Arc::clone(&self.sink),
+            tool_results: self.tool_results.clone(),
+            tool_request_sink: self.tool_request_sink.clone(),
+            conversation_id: Some(conversation_id),
         })
     }
 }
@@ -105,6 +127,7 @@ impl ToolFactory for UclawToolFactory {
                     spec.parameters,
                     self.tool_results.clone(),
                     Arc::clone(req_sink),
+                    self.conversation_id.clone(),
                 )));
             }
         }

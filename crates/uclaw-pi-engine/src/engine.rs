@@ -420,7 +420,10 @@ async fn start_run(
         // reply that never lands. Default off = pi auto-runs tools (matches a yolo
         // safety mode); flip on once the round-trip is wired.
         opts.tool_approval = std::env::var_os("UCLAW_PI_APPROVAL").map(|_| approval_handler.clone());
-        opts.tool_factory = Some(tool_factory.clone());
+        // Per-conv factory clone so this session's BridgedIoTools carry their
+        // owning conv_id (sessions are 1:1 with conv_id) — lets per-conv side-
+        // effects (e.g. agent:skill-recalled) attribute to the right session.
+        opts.tool_factory = Some(tool_factory.with_conversation(conv_id.clone()));
         match create_agent_session(opts).await {
             Ok(h) => {
                 sessions.insert(
