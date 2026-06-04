@@ -454,6 +454,105 @@ mod tests {
         assert!(e.payload["activity"]["durationMs"].is_u64());
     }
 
+    /// Frontend event-shape CONTRACT guard. Each event the pi ACL projects must
+    /// carry the exact fields the frontend listeners hard-depend on (see
+    /// `docs/audits/2026-06-04-legacy-pi-event-parity-matrix.md`). A field the
+    /// frontend reads behind an early-return — e.g. `chat:stream-tool-activity`
+    /// `tool_start` needs `toolCallId`, else `useGlobalAgentListeners` returns
+    /// before opening the write preview — must never silently disappear from the
+    /// ACL output. This is the regression guard for the whole class of
+    /// "pi emits one fewer field than legacy → feature silently dies on pi" bugs
+    /// (the auto-preview `previewTarget` regression was exactly this shape).
+    ///
+    /// NOTE: `previewTarget` is injected by the uClaw bridge (`engine_sink.rs`,
+    /// covered by its own `inject_preview_target_*` test), not the ACL, so it is
+    /// asserted there. This test pins only what the engine-side ACL must emit.
+    #[test]
+    fn fe_contract_required_fields_present() {
+        let req = |payload: &serde_json::Value, keys: &[&str], ctx: &str| {
+            for k in keys {
+                assert!(
+                    payload.pointer(k).is_some(),
+                    "{ctx}: missing frontend-required field `{k}` in {payload}"
+                );
+            }
+        };
+
+        let mut acl = Acl::new("c1");
+
+        // chat:stream-chunk → conversationId, delta, seq
+        let chunk = acl
+            .translate(&RawEvt::TextDelta { delta: "hi".into() })
+            .expect("chunk");
+        assert_eq!(chunk.name, event::STREAM_CHUNK);
+        req(&chunk.payload, &["/conversationId", "/delta", "/seq"], "stream-chunk");
+
+        // chat:stream-reasoning → conversationId, delta, seq
+        let reasoning = acl
+            .translate(&RawEvt::ThinkingDelta { delta: "mm".into() })
+            .expect("reasoning");
+        assert_eq!(reasoning.name, event::STREAM_REASONING);
+        req(&reasoning.payload, &["/conversationId", "/delta", "/seq"], "stream-reasoning");
+
+        // chat:stream-tool-activity tool_start → conversationId + activity.{type,toolName,toolCallId,input}
+        let ts = acl
+            .translate(&RawEvt::ToolStart {
+                tool_name: "write".into(),
+                tool_call_id: "t1".into(),
+                input: json!({ "path": "/w/a.rs" }),
+            })
+            .expect("tool_start");
+        req(
+            &ts.payload,
+            &[
+                "/conversationId",
+                "/activity/type",
+                "/activity/toolName",
+                "/activity/toolCallId",
+                "/activity/input",
+            ],
+            "tool_start",
+        );
+
+        // chat:stream-tool-activity tool_result → + result, isError, durationMs
+        let tr = acl
+            .translate(&RawEvt::ToolEnd {
+                tool_name: "write".into(),
+                tool_call_id: "t1".into(),
+                result: json!({ "content": [] }),
+                is_error: false,
+            })
+            .expect("tool_result");
+        req(
+            &tr.payload,
+            &[
+                "/conversationId",
+                "/activity/type",
+                "/activity/toolName",
+                "/activity/toolCallId",
+                "/activity/result",
+                "/activity/isError",
+                "/activity/durationMs",
+            ],
+            "tool_result",
+        );
+
+        // chat:stream-complete → conversationId, text
+        let done = acl
+            .translate(&RawEvt::AgentEnd { error: None })
+            .expect("complete");
+        assert_eq!(done.name, event::STREAM_COMPLETE);
+        req(&done.payload, &["/conversationId", "/text"], "stream-complete");
+
+        // chat:stream-error → conversationId, error
+        let mut acl2 = Acl::new("c2");
+        let err = acl2
+            .translate(&RawEvt::AgentEnd { error: Some("boom".into()) })
+            .expect("error");
+        assert_eq!(err.name, event::STREAM_ERROR);
+        req(&err.payload, &["/conversationId", "/error"], "stream-error");
+    }
+
     /// [R2 Done-when#1] A whole realistic turn — think, speak, call a tool, speak
     /// again, finish — produces exactly the frontend-render event sequence:
     /// reasoning deltas (own seq space), chunk deltas (own seq space), a
