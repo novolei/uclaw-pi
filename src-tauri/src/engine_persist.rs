@@ -376,6 +376,49 @@ mod tests {
         assert_eq!(dur, Some(1200));
     }
 
+    /// The tool-call process is durable: `tool_activities_json` round-trips through
+    /// persist so `get_agent_session_messages` can hydrate `message.toolActivities`
+    /// and the frontend re-renders the cards after the turn / on reload (the
+    /// persistence half of the "tool history vanished" fix; the render half is
+    /// guarded by AgentMessageItem.test.tsx).
+    #[test]
+    fn agent_assistant_persists_tool_activities_json() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE agent_messages (
+                id TEXT PRIMARY KEY, session_id TEXT NOT NULL, role TEXT NOT NULL,
+                content TEXT NOT NULL, created_at INTEGER NOT NULL, reasoning TEXT,
+                input_tokens INTEGER, output_tokens INTEGER, cost_usd REAL, duration_ms INTEGER, tool_activities_json TEXT
+            );",
+        )
+        .unwrap();
+
+        let activities = r#"[{"toolCallId":"c1","type":"start","toolName":"edit","input":{"path":"a.md"}},{"toolCallId":"c1","type":"result","toolName":"edit","result":"ok","status":"completed","isError":false}]"#;
+        persist_agent_text_message(
+            &conn, "a1", "s1", "assistant", "done", None, &TurnUsage::default(), Some(activities),
+        )
+        .unwrap();
+
+        let stored: Option<String> = conn
+            .query_row(
+                "SELECT tool_activities_json FROM agent_messages WHERE id = 'a1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored.as_deref(), Some(activities), "tool_activities_json round-trips");
+
+        // None ⇒ NULL (user messages / no-tool turns).
+        persist_agent_text_message(
+            &conn, "a2", "s1", "assistant", "hi", None, &TurnUsage::default(), None,
+        )
+        .unwrap();
+        let none_stored: Option<String> = conn
+            .query_row("SELECT tool_activities_json FROM agent_messages WHERE id = 'a2'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(none_stored, None);
+    }
+
     /// Zero token counts collapse to None (no "0 输入" badge), but duration stays.
     #[test]
     fn turn_usage_drops_zero_tokens_keeps_duration() {
