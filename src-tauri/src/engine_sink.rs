@@ -208,6 +208,47 @@ fn spawn_failure_record(app: &AppHandle, error: String) {
     });
 }
 
+/// pi's built-in write tools whose `path` argument is the file they create/edit.
+/// (`crates/pi/src/tools.rs`: read, bash, edit, write, grep, find, ls,
+/// hashline_edit — these three are the writers, each with a required `path`.)
+const PI_WRITE_TOOLS: [&str; 3] = ["write", "edit", "hashline_edit"];
+
+/// [pi 闭环] Enrich a `chat:stream-tool-activity` `tool_start` payload with
+/// `previewTarget` so the frontend auto-preview (`useGlobalAgentListeners`)
+/// opens the file the agent is writing. The legacy `ToolDispatcher::emit_tool_start`
+/// sets `previewTarget` from `Tool::preview_target_path`; pi's tool_start carries
+/// the tool name + raw `input` args but not `previewTarget`, so the auto-open
+/// never fired on the pi path. Inject it for the built-in write tools, reading the
+/// target from `input.path`. Pure (mutates the payload in place) — unit-tested.
+/// No-op for non-write tools, non-tool_start activities, or a pre-set target.
+fn inject_preview_target(payload: &mut serde_json::Value) {
+    let Some(activity) = payload.get_mut("activity").and_then(|v| v.as_object_mut()) else {
+        return;
+    };
+    if activity.get("type").and_then(serde_json::Value::as_str) != Some("tool_start") {
+        return;
+    }
+    if activity.contains_key("previewTarget") {
+        return;
+    }
+    let tool = activity
+        .get("toolName")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    if !PI_WRITE_TOOLS.contains(&tool) {
+        return;
+    }
+    let target = activity
+        .get("input")
+        .and_then(|i| i.get("path"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
+    if let Some(target) = target {
+        activity.insert("previewTarget".to_string(), serde_json::Value::String(target));
+    }
+}
+
 impl EventSink for TauriEventSink {
     fn emit(&self, event: &str, payload: serde_json::Value) {
         let mut payload = payload;
@@ -242,6 +283,12 @@ impl EventSink for TauriEventSink {
                     cache.insert(conv.to_owned(), payload.clone());
                 }
             }
+        }
+        // [pi 闭环] Enrich write-tool tool_start with previewTarget so the frontend
+        // auto-opens the written file's preview (legacy did this via emit_tool_start;
+        // pi's tool_start lacked it). Translator-only — see ADR 2026-05-31.
+        if event == uclaw_pi_engine::event::STREAM_TOOL_ACTIVITY {
+            inject_preview_target(&mut payload);
         }
         // [R2 闭环] On complete, persist the assistant message BEFORE emitting so
         // the frontend's complete→refresh sees it. Gated by the same migration
@@ -558,6 +605,44 @@ mod tests {
         assert!(!pi_engine_enabled(), "override OFF must force legacy");
         // Restore to unset so the global doesn't leak to other code/tests.
         set_pi_engine_override(None);
+    }
+
+    #[test]
+    fn inject_preview_target_sets_path_for_write_tools_only() {
+        use serde_json::json;
+        // write tool → previewTarget injected from input.path
+        let mut p = json!({"conversationId":"c","activity":{
+            "type":"tool_start","toolName":"write","toolCallId":"t1",
+            "input":{"path":"/w/a.rs","content":"x"}}});
+        inject_preview_target(&mut p);
+        assert_eq!(p["activity"]["previewTarget"], "/w/a.rs");
+        // edit + hashline_edit are also writers
+        for tool in ["edit", "hashline_edit"] {
+            let mut p = json!({"activity":{"type":"tool_start","toolName":tool,
+                "toolCallId":"t","input":{"path":"/w/b.rs"}}});
+            inject_preview_target(&mut p);
+            assert_eq!(p["activity"]["previewTarget"], "/w/b.rs", "tool {tool}");
+        }
+        // non-write tool → untouched
+        let mut p = json!({"activity":{"type":"tool_start","toolName":"read",
+            "toolCallId":"t","input":{"path":"/w/c.rs"}}});
+        inject_preview_target(&mut p);
+        assert!(p["activity"].get("previewTarget").is_none());
+        // tool_result (not tool_start) → untouched
+        let mut p = json!({"activity":{"type":"tool_result","toolName":"write",
+            "toolCallId":"t","input":{"path":"/w/d.rs"}}});
+        inject_preview_target(&mut p);
+        assert!(p["activity"].get("previewTarget").is_none());
+        // pre-set previewTarget → not clobbered
+        let mut p = json!({"activity":{"type":"tool_start","toolName":"write",
+            "toolCallId":"t","previewTarget":"/keep","input":{"path":"/w/e.rs"}}});
+        inject_preview_target(&mut p);
+        assert_eq!(p["activity"]["previewTarget"], "/keep");
+        // missing/empty path → no previewTarget
+        let mut p = json!({"activity":{"type":"tool_start","toolName":"write",
+            "toolCallId":"t","input":{"path":""}}});
+        inject_preview_target(&mut p);
+        assert!(p["activity"].get("previewTarget").is_none());
     }
 
     #[test]
