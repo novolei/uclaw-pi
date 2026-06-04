@@ -18,7 +18,6 @@ import {
   pendingAgentRecommendationAtom,
 } from '@/atoms/chat-atoms'
 import { agentSessionsAtom } from '@/atoms/agent-atoms'
-import { tabsAtom, updateTabTitle } from '@/atoms/tab-atoms'
 import type { ConversationStreamState } from '@/atoms/chat-atoms'
 import {
   onStreamChunk,
@@ -27,8 +26,6 @@ import {
   onStreamError,
   onStreamToolActivity,
   listConversations as listConversationsIPC,
-  generateTitle,
-  updateConversationTitle,
 } from '@/lib/tauri-bridge'
 
 interface StreamChunkEvent { conversationId: string; delta: string; seq?: number }
@@ -36,20 +33,6 @@ interface StreamReasoningEvent { conversationId: string; delta: string; seq?: nu
 interface StreamCompleteEvent { conversationId: string }
 interface StreamErrorEvent { conversationId: string; error: string }
 interface StreamToolActivityEvent { conversationId: string; activity: any }
-
-/** 标题生成输入 */
-export interface GenerateTitleInput {
-  userMessage: string
-  channelId: string
-  modelId: string
-}
-
-/** 待生成标题的队列（按 conversationId 跟踪） */
-const pendingTitles = new Map<string, GenerateTitleInput>()
-
-export function registerPendingTitle(conversationId: string, input: GenerateTitleInput): void {
-  pendingTitles.set(conversationId, input)
-}
 
 // ─── Module-level singleton ───────────────────────────────────────────────────
 
@@ -139,21 +122,10 @@ function startChatListeners(store: Store): void {
         .then((convs: any) => store.set(conversationsAtom, convs))
         .catch(console.error)
 
-      const titleInput = pendingTitles.get(event.conversationId)
-      if (titleInput) {
-        pendingTitles.delete(event.conversationId)
-        generateTitle(titleInput).then((title: string) => {
-          if (!title) return
-          updateConversationTitle(event.conversationId, title)
-            .then((updated: any) => {
-              store.set(conversationsAtom, (prev: any[]) =>
-                prev.map((c: any) => (c.id === updated.id ? updated : c))
-              )
-              store.set(tabsAtom, (prev) => updateTabTitle(prev, event.conversationId, title))
-            })
-            .catch(console.error)
-        }).catch(console.error)
-      }
+      // Title generation is backend-driven: send_message generates the title
+      // (utility role → local MiniCPM) and emits `session:title-updated`, which
+      // the global agent listener applies to conversationsAtom. (The old
+      // frontend `generate_title` command never existed — removed.)
     })
   )
 
