@@ -118,8 +118,94 @@ impl TauriEventSink {
                     crate::memory_graph::reflection_service::run_once(app, n).await;
                 });
             }
+
+            // [pi 闭环] Preference extraction — the pi counterpart of the legacy
+            // agent loop's PreferenceExtractor block. Legacy had the user message
+            // in hand; here we pull the turn's user message back from
+            // agent_messages (the most recent 'user' row for this session — the
+            // turn that produced `text`). Fire-and-forget via spawn_preference_
+            // extraction so a poisoned proactive lock can never block the emit.
+            let last_user_msg: Option<String> = conn
+                .query_row(
+                    "SELECT content FROM agent_messages \
+                     WHERE session_id = ?1 AND role = 'user' \
+                     ORDER BY created_at DESC LIMIT 1",
+                    [conv],
+                    |r| r.get::<_, String>(0),
+                )
+                .ok();
+            if let Some(user_msg) = last_user_msg {
+                spawn_preference_extraction(&self.app, user_msg, text.to_string());
+            }
         }
     }
+}
+
+/// [pi 闭环] Spawn async preference extraction from a completed agent turn.
+/// Mirrors the legacy agent loop's `PreferenceExtractor` block (tauri_commands
+/// ~6642): pull learned preferences from `(user message, assistant response)`
+/// and store them under the default space. Called only from `persist_assistant`,
+/// which is pi-gated, so it never double-runs with the legacy inline extraction
+/// (legacy never routes through `EventSink`). Best-effort, fire-and-forget.
+fn spawn_preference_extraction(app: &AppHandle, user_message: String, assistant_response: String) {
+    if user_message.is_empty() || assistant_response.is_empty() {
+        return;
+    }
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let Some(state) = app.try_state::<AppState>() else {
+            return;
+        };
+        let extractor = {
+            let guard = state.proactive_service.read().await;
+            match guard.as_ref() {
+                Some(svc) => svc.preference_extractor().clone(),
+                None => return,
+            }
+        };
+        let prefs = extractor.extract_preferences(&user_message, Some(&assistant_response));
+        if !prefs.is_empty() {
+            let _ = extractor.store_preferences("default", &prefs);
+        }
+    });
+}
+
+/// [pi 闭环] Spawn async failure-memory recording from a pi-path turn error.
+/// Mirrors the legacy agent loop's `FailureMemory` block (tauri_commands ~6624):
+/// record the error pattern as a `FailureRecord` for proactive avoidance. Called
+/// only from the pi-gated `STREAM_ERROR` branch, so it never double-runs with the
+/// legacy inline recorder. Best-effort, fire-and-forget.
+fn spawn_failure_record(app: &AppHandle, error: String) {
+    if error.is_empty() {
+        return;
+    }
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let Some(state) = app.try_state::<AppState>() else {
+            return;
+        };
+        let failure_mem = {
+            let guard = state.proactive_service.read().await;
+            match guard.as_ref() {
+                Some(svc) => svc.failure_memory().clone(),
+                None => return,
+            }
+        };
+        use crate::proactive::failure_memory::{FailureRecord, FailureType, Severity};
+        let failure = FailureRecord {
+            failure_type: FailureType::infer("", &error),
+            error_pattern: error.clone(),
+            context: error.clone(),
+            resolution: None,
+            severity: Severity::Moderate,
+            occurred_at: chrono::Utc::now().to_rfc3339(),
+            resolved_at: None,
+            tool_name: None,
+            file_paths: vec![],
+            node_id: None,
+        };
+        let _ = failure_mem.record_failure("default", &failure);
+    });
 }
 
 impl EventSink for TauriEventSink {
@@ -162,6 +248,15 @@ impl EventSink for TauriEventSink {
         // flag as the routing (only fires when the engine path is active).
         if event == uclaw_pi_engine::event::STREAM_COMPLETE && pi_engine_enabled() {
             self.persist_assistant(&payload);
+        }
+        // [pi 闭环] On a turn error, record the failure for proactive avoidance —
+        // the pi counterpart of the legacy agent loop's FailureMemory block, which
+        // never runs for pi turns (they return early in send_agent_message). Gated
+        // on pi_engine_enabled() so it can't double-run with the legacy recorder.
+        if event == uclaw_pi_engine::event::STREAM_ERROR && pi_engine_enabled() {
+            if let Some(err) = payload.get("error").and_then(serde_json::Value::as_str) {
+                spawn_failure_record(&self.app, err.to_string());
+            }
         }
         // `app.emit` is thread-safe (callable from the engine thread). Failures
         // (no webview yet, serialization) are logged, never panic.

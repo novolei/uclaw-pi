@@ -26,9 +26,9 @@ NOT re-wire, would double-fire), **MISSING** (genuinely skipped — candidate to
 | Tool-execution publishing (gene distillation) | `engine_sink.rs:365-389` | COVERED | EventSink publishes tool-executed | none |
 | Message persistence (user/system INSERT) + `message_count` | ~5683-5698 | COVERED (different mechanism) | pi persists user at ~4978-4988; EventSink persists assistant — do NOT re-wire (would duplicate rows / double-count) | none |
 | `/compact` compaction + its `chat:stream-complete` | ~5297-5630 | EXPECTED-SKIP | pi branch explicitly excludes `/compact` (`msg != "/compact"`) | none |
-| **Slash-skill citation + system-prompt injection** | ~5646-5652, 4359-4399, 5683-5688 | **MISSING — deferred** | pi never calls `resolve_slash_skill`; `cited_count` not bumped, draft→promoted skipped, and the skill instructions aren't injected into the engine prompt | see below |
-| **Failure memory recording** (FailureRecord → proactive avoidance) | ~6580-6604 | **MISSING — deferred** | needs the turn's failure outcome, which the engine handles internally; belongs in `EventSink`, not the pre-dispatch branch | see below |
-| **Preference extraction** (user+assistant → learned prefs) | ~6606-6620 | **MISSING — deferred** | needs the assistant RESPONSE, which arrives async via `EventSink::persist_assistant`, not synchronously before the pi `return` | see below |
+| **Slash-skill citation + system-prompt injection** | ~5646-5652, 4359-4399, 5683-5688 | **RESOLVED** (#75) | pi branch now calls `resolve_slash_skill` before building the prompt and folds the skill into `EngineCmd::Prompt.context`; `cited_count` bump + draft→promoted ride the shared resolver | — |
+| **Failure memory recording** (FailureRecord → proactive avoidance) | ~6580-6604 | **RESOLVED** (this PR) | wired into `EventSink::emit` on `STREAM_ERROR` (pi-gated) via `spawn_failure_record`; no double-run since legacy never routes through `EventSink` | — |
+| **Preference extraction** (user+assistant → learned prefs) | ~6606-6620 | **RESOLVED** (this PR) | wired into `EventSink::persist_assistant` (pi-gated) via `spawn_preference_extraction`; the turn's user message is read back from `agent_messages` (most recent `user` row) and paired with the assistant response | — |
 
 ## Done in this PR
 
@@ -37,10 +37,16 @@ legacy call. Fire-and-forget, safe (pi branch did not call it, so no double-fire
 ProactiveService visibility (conversation_learning / skill_extraction / gene candidates) for
 pi-engine turns.
 
-## Deferred (with rationale — NOT wired, to avoid broken/half behavior)
+## Deferred (with rationale) — NOW ALL RESOLVED
 
-These are genuinely missing for pi turns but cannot be correctly fixed by copying into the
-pre-dispatch branch:
+> **Update (2026-06-04):** all three deferrals below have since been wired up.
+> #1 slash-skill landed in #75 (folded into `EngineCmd::Prompt.context`); #2 failure
+> memory + #3 preference extraction landed in this PR (in `EventSink`, where the
+> assistant response / error outcome is in hand). The rationale is kept below as the
+> design record for *why* they belonged in those seams rather than the pre-dispatch branch.
+
+These were genuinely missing for pi turns but could not be correctly fixed by copying into
+the pre-dispatch branch:
 
 1. **Slash-skill citation + injection.** Two coupled effects: (a) bump `cited_count` /
    auto-promote a learned skill when the user invokes `/slash-skill`, and (b) inject the
