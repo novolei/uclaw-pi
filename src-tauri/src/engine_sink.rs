@@ -15,6 +15,13 @@ pub struct TauriEventSink {
     /// write the token/cost/duration columns onto the assistant row — the
     /// metadata badge must survive reload. Keyed by conversationId.
     turn_cost: std::sync::Mutex<std::collections::HashMap<String, serde_json::Value>>,
+    /// Per-conversation tool-activity records accumulated across a turn from the
+    /// `chat:stream-tool-activity` events, in the persisted `ChatToolActivity`
+    /// shape (`start` + `result` entries). `persist_assistant` drains this into the
+    /// assistant row's `tool_activities_json` so the tool-call process survives the
+    /// turn / reload (pi otherwise persisted only text — the legacy path wrote
+    /// `process_meta.tool_activities_json`). Keyed by conversationId.
+    tool_activities: std::sync::Mutex<std::collections::HashMap<String, Vec<serde_json::Value>>>,
 }
 
 impl TauriEventSink {
@@ -23,6 +30,7 @@ impl TauriEventSink {
         Arc::new(Self {
             app,
             turn_cost: std::sync::Mutex::new(std::collections::HashMap::new()),
+            tool_activities: std::sync::Mutex::new(std::collections::HashMap::new()),
         })
     }
 }
@@ -78,9 +86,20 @@ impl TauriEventSink {
                 |_| Ok(()),
             )
             .is_ok();
+        // Drain the turn's accumulated tool activities → tool_activities_json so
+        // the tool-call process is durable (re-rendered by get_agent_session_messages
+        // after the turn / on reload). Removing the entry resets it for the next turn.
+        let activities_json: Option<String> = self
+            .tool_activities
+            .lock()
+            .ok()
+            .and_then(|mut m| m.remove(conv))
+            .filter(|v| !v.is_empty())
+            .and_then(|v| serde_json::to_string(&v).ok());
         let result = if is_agent_session {
             crate::engine_persist::persist_agent_text_message(
                 &conn, &id, conv, "assistant", text, reasoning, &usage,
+                activities_json.as_deref(),
             )
         } else {
             crate::engine_persist::persist_chat_text_message(&conn, &id, conv, "assistant", text, reasoning)
@@ -138,6 +157,63 @@ impl TauriEventSink {
                 spawn_preference_extraction(&self.app, user_msg, text.to_string());
             }
         }
+    }
+
+    /// Append one `chat:stream-tool-activity` event to its conversation's turn
+    /// buffer in the persisted `ChatToolActivity` shape (matching what
+    /// `get_agent_session_messages` reconstructs from `agent_turns`): `tool_start`
+    /// → a `{type:"start", …}` entry; `tool_result` → a `{type:"result", …,
+    /// status}` entry that copies the matching start's `input`. `tool_output_chunk`
+    /// (live stdout) is ephemeral and not persisted. Drained by `persist_assistant`.
+    fn accumulate_tool_activity(&self, payload: &serde_json::Value) {
+        let (Some(conv), Some(activity)) = (
+            payload.get("conversationId").and_then(serde_json::Value::as_str),
+            payload.get("activity"),
+        ) else {
+            return;
+        };
+        let kind = activity.get("type").and_then(serde_json::Value::as_str).unwrap_or_default();
+        let tool_call_id = activity.get("toolCallId").and_then(serde_json::Value::as_str).unwrap_or_default();
+        if tool_call_id.is_empty() {
+            return;
+        }
+        let tool_name = activity.get("toolName").cloned().unwrap_or(serde_json::Value::Null);
+        let Ok(mut map) = self.tool_activities.lock() else {
+            return;
+        };
+        let buf = map.entry(conv.to_string()).or_default();
+        let entry = match kind {
+            "tool_start" => serde_json::json!({
+                "toolCallId": tool_call_id,
+                "type": "start",
+                "toolName": tool_name,
+                "input": activity.get("input").cloned().unwrap_or(serde_json::Value::Null),
+            }),
+            "tool_result" => {
+                let is_error = activity.get("isError").and_then(serde_json::Value::as_bool).unwrap_or(false);
+                // Carry the matching start's input onto the result entry (the
+                // streamed tool_result event omits it) for shape parity.
+                let input = buf
+                    .iter()
+                    .rev()
+                    .find(|e| e.get("toolCallId").and_then(serde_json::Value::as_str) == Some(tool_call_id))
+                    .and_then(|e| e.get("input").cloned())
+                    .unwrap_or(serde_json::Value::Null);
+                serde_json::json!({
+                    "toolCallId": tool_call_id,
+                    "type": "result",
+                    "toolName": tool_name,
+                    "input": input,
+                    "result": activity.get("result").cloned().unwrap_or(serde_json::Value::Null),
+                    "status": if is_error { "failed" } else { "completed" },
+                    "isError": is_error,
+                    "durationMs": activity.get("durationMs").cloned().unwrap_or(serde_json::Value::Null),
+                })
+            }
+            // tool_output_chunk + anything else: live-only, not persisted.
+            _ => return,
+        };
+        buf.push(entry);
     }
 }
 
@@ -314,6 +390,9 @@ impl EventSink for TauriEventSink {
         // pi's tool_start lacked it). Translator-only — see ADR 2026-05-31.
         if event == uclaw_pi_engine::event::STREAM_TOOL_ACTIVITY {
             inject_preview_target(&mut payload);
+            // Accumulate tool_start/tool_result into the per-conv buffer so
+            // persist_assistant can write tool_activities_json (durable process).
+            self.accumulate_tool_activity(&payload);
         }
         // [R2 闭环] On complete, persist the assistant message BEFORE emitting so
         // the frontend's complete→refresh sees it. Gated by the same migration

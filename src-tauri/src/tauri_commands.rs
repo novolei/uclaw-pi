@@ -4983,6 +4983,7 @@ pub async fn send_agent_message(
                 &input.user_message,
                 None,
                 &crate::engine_persist::TurnUsage::default(),
+                None,
             ) {
                 tracing::warn!("PiEngine agent user-message persist failed: {e}");
             }
