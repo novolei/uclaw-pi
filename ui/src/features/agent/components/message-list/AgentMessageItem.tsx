@@ -32,6 +32,7 @@ import type { AgentMessage } from '@/lib/agent-types'
 import {
   agentActivitiesToChatActivities,
   extractToolActivities,
+  persistedToolActivitiesToEvents,
   parseAttachedFiles,
   formatRelativeShort,
 } from '../../lib/agent-message-helpers'
@@ -107,7 +108,12 @@ export function AgentMessageItem({ message, sessionPath, attachedDirs, sessionId
   }
 
   if (message.role === 'assistant') {
-    const toolActivities = extractToolActivities(message.events)
+    // Live messages carry `events`; persisted/reloaded messages carry
+    // `toolActivities` (ChatToolActivity[]) and no `events` — convert so the
+    // tool-call process renders after the turn / on reload, not just live.
+    const toolActivities = extractToolActivities(
+      message.events ?? persistedToolActivitiesToEvents(message.toolActivities),
+    )
     // Parse skill citations once — used both to clean the body for
     // markdown render and to drive the chip row below MessageContent.
     const parsed = message.content

@@ -6,8 +6,33 @@
  * the originals — this is a move, not a rewrite.
  */
 
-import type { AgentMessage } from '@/lib/agent-types'
+import type { AgentMessage, AgentEvent } from '@/lib/agent-types'
+import type { ChatToolActivity } from '@/lib/chat-types'
 import type { ToolActivity } from '@/atoms/agent-atoms'
+
+/**
+ * Map persisted tool activities (the `ChatToolActivity[]` the backend hydrates
+ * onto `AgentMessage.toolActivities` from `tool_activities_json` / `agent_turns`)
+ * into the streaming `AgentEvent[]` shape that {@link extractToolActivities}
+ * consumes. The assistant renderer keys off `message.events`, but loaded messages
+ * carry `toolActivities` (a `start` + `result` entry per call, keyed by
+ * `toolCallId`) and **no** `events` — so without this conversion the whole
+ * tool-call process vanishes on reload / after the turn. `start → tool_start`,
+ * `result → tool_result`, `toolCallId → toolUseId`.
+ */
+export function persistedToolActivitiesToEvents(
+  activities: ChatToolActivity[] | undefined,
+): AgentEvent[] {
+  if (!activities || activities.length === 0) return []
+  return activities.map((a) => ({
+    type: a.type === 'start' ? 'tool_start' : 'tool_result',
+    toolUseId: a.toolCallId,
+    toolName: a.toolName,
+    input: a.input,
+    result: a.result,
+    isError: a.isError,
+  }))
+}
 
 /**
  * 把流式 agent ToolActivity[] 转换为持久化展示用的 ChatToolActivity[] start/result 配对。
