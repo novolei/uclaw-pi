@@ -47,8 +47,11 @@ pub trait ToolRequestSink: Send + Sync + 'static {
     fn io_tool_specs(&self) -> Vec<IoToolSpec>;
 
     /// Dispatch `tool_name`(`input`) for `request_id`. Non-blocking: the result
-    /// arrives later as `EngineCmd::ToolResult { request_id, .. }`.
-    fn request(&self, request_id: &str, tool_name: &str, input: &Value);
+    /// arrives later as `EngineCmd::ToolResult { request_id, .. }`. `conversation_id`
+    /// is the owning session (when known) so the executor can attribute per-conv
+    /// side-effects (e.g. uClaw's `agent:skill-recalled` UI event) to the right
+    /// session instead of a placeholder; `None` keeps the executor's default.
+    fn request(&self, conversation_id: Option<&str>, request_id: &str, tool_name: &str, input: &Value);
 }
 
 type PendingMap = Arc<StdMutex<HashMap<String, oneshot::Sender<ToolOutput>>>>;
@@ -183,6 +186,10 @@ pub struct BridgedIoTool {
     parameters: Value,
     registry: ToolResultRegistry,
     sink: Arc<dyn ToolRequestSink>,
+    /// Owning conversation, captured when this session's registry is built (the
+    /// registry is per-session ⇒ per-conv), so `request()` can attribute per-conv
+    /// side-effects to the right session. `None` = the executor's default.
+    conversation_id: Option<String>,
 }
 
 impl BridgedIoTool {
@@ -194,6 +201,7 @@ impl BridgedIoTool {
         parameters: Value,
         registry: ToolResultRegistry,
         sink: Arc<dyn ToolRequestSink>,
+        conversation_id: Option<String>,
     ) -> Self {
         Self {
             name: name.into(),
@@ -202,6 +210,7 @@ impl BridgedIoTool {
             parameters,
             registry,
             sink,
+            conversation_id,
         }
     }
 }
@@ -229,7 +238,8 @@ impl Tool for BridgedIoTool {
         let request_id = self.registry.next_request_id();
         // Register BEFORE dispatching so a fast executor reply always lands.
         let ticket = self.registry.register(request_id.clone());
-        self.sink.request(&request_id, &self.name, &input);
+        self.sink
+            .request(self.conversation_id.as_deref(), &request_id, &self.name, &input);
         Ok(ticket.await_result().await)
     }
     fn effects(&self) -> ToolEffects {

@@ -401,15 +401,19 @@ fn tool_result_text(result: Result<ToolOutput, ToolError>) -> (String, bool) {
 
 /// Construct the named skill tool from `AppState` handles, or `None` for an unknown
 /// name. Used by both `io_tool_specs` (metadata) and `request` (execution).
-fn build_skill_tool(name: &str, state: &AppState, app: &AppHandle) -> Option<Box<dyn Tool>> {
+fn build_skill_tool(name: &str, state: &AppState, app: &AppHandle, conv: &str) -> Option<Box<dyn Tool>> {
     // `let _: Box<dyn Tool> = match …` makes each arm a trait-object coercion site.
+    // `conv` is the owning conversation id (threaded from the pi engine via the
+    // ToolRequestSink); skill_search / load_skill stamp it onto their
+    // `agent:skill-recalled` events so the live skill-recall panel attributes to
+    // the right session instead of the `PI_TOOL_CONV` placeholder.
     let tool: Box<dyn Tool> = match name {
         "skill_search" => Box::new(
             skill_search::SkillSearchTool::new(
                 Arc::clone(&state.skills_registry),
                 Arc::clone(&state.memory_graph_store),
                 app.clone(),
-                PI_TOOL_CONV.to_string(),
+                conv.to_string(),
                 "default".to_string(),
             )
             .with_memu(state.memu_client.clone()),
@@ -418,7 +422,7 @@ fn build_skill_tool(name: &str, state: &AppState, app: &AppHandle) -> Option<Box
             Arc::clone(&state.skills_registry),
             Arc::clone(&state.memory_graph_store),
             app.clone(),
-            PI_TOOL_CONV.to_string(),
+            conv.to_string(),
             "default".to_string(),
         )),
         "skill_marketplace_search" => {
@@ -449,12 +453,12 @@ fn build_skill_tool(name: &str, state: &AppState, app: &AppHandle) -> Option<Box
 
 /// Build + execute the named tool, returning `(text, is_error)`. The `AppState`
 /// guard is dropped before the `.await` (it is not `Send`).
-async fn run_skill_tool(app: &AppHandle, tool_name: &str, input: serde_json::Value) -> (String, bool) {
+async fn run_skill_tool(app: &AppHandle, conv: &str, tool_name: &str, input: serde_json::Value) -> (String, bool) {
     let tool = {
         let Some(state) = app.try_state::<AppState>() else {
             return ("agent state unavailable".to_string(), true);
         };
-        build_skill_tool(tool_name, &state, app)
+        build_skill_tool(tool_name, &state, app, conv)
     };
     match tool {
         Some(tool) => tool_result_text(tool.execute(input).await),
@@ -488,9 +492,11 @@ impl uclaw_pi_engine::ToolRequestSink for RealToolRequestSink {
         let Some(state) = self.app.try_state::<AppState>() else {
             return Vec::new();
         };
+        // Specs are metadata only (name/desc/schema) — the conv id baked into the
+        // tool here is never used for an event, so the placeholder is fine.
         let mut specs: Vec<uclaw_pi_engine::IoToolSpec> = PI_SKILL_TOOLS
             .iter()
-            .filter_map(|name| build_skill_tool(name, &state, &self.app))
+            .filter_map(|name| build_skill_tool(name, &state, &self.app, PI_TOOL_CONV))
             .map(|t| spec_from_tool(t.as_ref()))
             .collect();
         // Bridge connected MCP server tools (gbrain, playwright, …) so the pi
@@ -507,11 +513,20 @@ impl uclaw_pi_engine::ToolRequestSink for RealToolRequestSink {
         specs
     }
 
-    fn request(&self, request_id: &str, tool_name: &str, input: &serde_json::Value) {
+    fn request(
+        &self,
+        conversation_id: Option<&str>,
+        request_id: &str,
+        tool_name: &str,
+        input: &serde_json::Value,
+    ) {
         let app = self.app.clone();
         let engine = self.engine.get().cloned();
         let request_id = request_id.to_string();
         let tool_name = tool_name.to_string();
+        // The owning conversation (when the engine knows it) so skill tools stamp
+        // agent:skill-recalled with the real session; PI_TOOL_CONV is the fallback.
+        let conv = conversation_id.unwrap_or(PI_TOOL_CONV).to_string();
         let input = input.clone();
         // The engine thread is asupersync — spawn onto Tauri's tokio runtime, NOT
         // tokio::spawn (no tokio reactor on this thread).
@@ -527,7 +542,7 @@ impl uclaw_pi_engine::ToolRequestSink for RealToolRequestSink {
             let (text, is_error) = if crate::mcp::parse_mcp_tool_name(&tool_name).is_some() {
                 run_mcp_tool(&app, &tool_name, input).await
             } else {
-                run_skill_tool(&app, &tool_name, input).await
+                run_skill_tool(&app, &conv, &tool_name, input).await
             };
             // 写 seam: feed the pi tool execution to InfraService — the GeneCandidate
             // pool subscribes to InfraEventType::ToolExecuted, so this re-feeds gene
