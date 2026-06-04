@@ -114,6 +114,21 @@ export function AgentMessageItem({ message, sessionPath, attachedDirs, sessionId
     const toolActivities = extractToolActivities(
       message.events ?? persistedToolActivitiesToEvents(message.toolActivities),
     )
+    // Tool-call cards — rendered identically in BOTH the contentBlocks and the
+    // markdown-fallback branches so the process survives the turn (it used to
+    // only render in the no-contentBlocks branch, so persisted messages — which
+    // DO have contentBlocks — silently dropped the whole tool history). Prefer
+    // the persisted chat-format `toolActivities`; else the events-derived ones.
+    const toolCardsNode =
+      message.toolActivities && message.toolActivities.length > 0 ? (
+        <div className="mb-3">
+          <ChatToolActivityIndicator activities={message.toolActivities} />
+        </div>
+      ) : toolActivities.length > 0 ? (
+        <div className="mb-3">
+          <ChatToolActivityIndicator activities={agentActivitiesToChatActivities(toolActivities)} />
+        </div>
+      ) : null
     // Parse skill citations once — used both to clean the body for
     // markdown render and to drive the chip row below MessageContent.
     const parsed = message.content
@@ -133,10 +148,31 @@ export function AgentMessageItem({ message, sessionPath, attachedDirs, sessionId
         />
         <MessageContent>
           {message.contentBlocks && message.contentBlocks.length > 0 ? (
-            <NativeBlockRenderer
-              blocks={message.contentBlocks}
-              conversationId={message.sessionId ?? sessionId}
-            />
+            // contentBlocks path — split around the tool cards so the order is
+            // thinking → tool cards → body (matching the live view), instead of
+            // rendering all blocks together with no place for the cards.
+            (() => {
+              const thinking = message.contentBlocks.filter((b) => b.type === 'thinking')
+              const rest = message.contentBlocks.filter((b) => b.type !== 'thinking')
+              return (
+                <>
+                  {thinking.length > 0 && (
+                    <NativeBlockRenderer
+                      blocks={thinking}
+                      conversationId={message.sessionId ?? sessionId}
+                    />
+                  )}
+                  {toolCardsNode}
+                  <ToolResultInlineImages activities={toolActivities} />
+                  {rest.length > 0 && (
+                    <NativeBlockRenderer
+                      blocks={rest}
+                      conversationId={message.sessionId ?? sessionId}
+                    />
+                  )}
+                </>
+              )
+            })()
           ) : (
             <>
               {/* 历史消息的 thinking block — 从持久化的 reasoning 字段渲染 */}
@@ -149,18 +185,7 @@ export function AgentMessageItem({ message, sessionPath, attachedDirs, sessionId
                   />
                 </div>
               )}
-              {/* 历史消息工具调用 — 优先用 message.toolActivities（chat 格式，PR #5 持久化的）；
-                  若为空则把从 events 提取的 agent 格式转换为 chat 格式，统一用
-                  ChatToolActivityIndicator 渲染（🔧 工具名 + 折叠结果卡片）。 */}
-              {(message.toolActivities && message.toolActivities.length > 0) ? (
-                <div className="mb-3">
-                  <ChatToolActivityIndicator activities={message.toolActivities} />
-                </div>
-              ) : toolActivities.length > 0 ? (
-                <div className="mb-3">
-                  <ChatToolActivityIndicator activities={agentActivitiesToChatActivities(toolActivities)} />
-                </div>
-              ) : null}
+              {toolCardsNode}
               <ToolResultInlineImages activities={toolActivities} />
               {message.content && (
                 <MessageResponse sessionId={message.sessionId ?? sessionId ?? null}>{parsed.cleanedContent}</MessageResponse>
