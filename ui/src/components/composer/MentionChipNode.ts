@@ -81,27 +81,62 @@ export const MentionChipNode = Node.create({
 
   renderHTML({ node, HTMLAttributes }) {
     const attrs = node.attrs as MentionChipAttrs
-    const sigil = attrs.kind === 'skill' ? '/' : '@'
+    // contenteditable=false makes the chip a true atom in DOM too, matching
+    // ProseMirror's atom:true — otherwise the user can click inside and type.
+    if (attrs.kind === 'skill') {
+      // Skill → a rounded "command" pill: a leading hexagon glyph + the bare
+      // skill name (the leading `/` is implied by the icon; wire-format still
+      // emits `/name` via renderText, so the backend is unchanged). Neutral
+      // pill bg + blue text reads as a distinct, tappable command token.
+      return [
+        'span',
+        mergeAttributes(HTMLAttributes, {
+          'data-mention-chip': '',
+          class: [
+            'inline-flex items-center gap-1 px-2 py-[1px] rounded-full',
+            'text-[12px] leading-[1.5] align-baseline font-medium',
+            'bg-muted text-blue-600 dark:text-blue-400 border border-border/50',
+          ].join(' '),
+          contenteditable: 'false',
+        }),
+        [
+          'svg',
+          {
+            xmlns: 'http://www.w3.org/2000/svg',
+            width: '12',
+            height: '12',
+            viewBox: '0 0 24 24',
+            fill: 'none',
+            stroke: 'currentColor',
+            'stroke-width': '2',
+            'stroke-linecap': 'round',
+            'stroke-linejoin': 'round',
+            'aria-hidden': 'true',
+            class: 'shrink-0',
+          },
+          [
+            'path',
+            {
+              d: 'M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z',
+            },
+          ],
+        ],
+        attrs.display,
+      ]
+    }
+    // File → the @-prefixed tint chip (unchanged).
     return [
       'span',
       mergeAttributes(HTMLAttributes, {
         'data-mention-chip': '',
-        // Tailwind classes keep theme tokens — `bg-primary/10` adapts to
-        // every theme palette already used by the badge in PR #124's
-        // Settings → 内置技能.
         class: [
           'inline-flex items-center gap-0.5 px-1.5 py-0 rounded',
           'text-[12px] leading-[1.5] align-baseline',
-          attrs.kind === 'skill'
-            ? 'bg-violet-500/10 text-violet-700 dark:text-violet-300 border border-violet-500/20'
-            : 'bg-blue-500/10 text-blue-700 dark:text-blue-300 border border-blue-500/20',
-          // contenteditable=false makes the chip a true atom in DOM too,
-          // matching ProseMirror's atom: true at the schema level. Without
-          // this the user can sometimes click inside and start typing.
+          'bg-blue-500/10 text-blue-700 dark:text-blue-300 border border-blue-500/20',
         ].join(' '),
         contenteditable: 'false',
       }),
-      `${sigil}${attrs.display}`,
+      `@${attrs.display}`,
     ]
   },
 
