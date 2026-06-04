@@ -260,6 +260,53 @@ impl TauriEventSink {
         });
     }
 
+    /// Persist the assistant text streamed before an abort/error (`partialText` on
+    /// the STREAM_ERROR payload) so the interrupted reply isn't lost — the error
+    /// path skips STREAM_COMPLETE → `persist_assistant`. Routed to the right table
+    /// (agent_messages / messages); a trailing marker flags it as incomplete.
+    /// No-op when there's no partial text (e.g. a failure before any token).
+    fn persist_interrupted_assistant(&self, payload: &serde_json::Value) {
+        let (Some(conv), Some(partial)) = (
+            payload
+                .get("conversationId")
+                .and_then(serde_json::Value::as_str),
+            payload
+                .get("partialText")
+                .and_then(serde_json::Value::as_str),
+        ) else {
+            return;
+        };
+        if partial.trim().is_empty() {
+            return;
+        }
+        let Some(state) = self.app.try_state::<crate::app::AppState>() else {
+            return;
+        };
+        let Ok(conn) = state.db.lock() else { return };
+        let id = uuid::Uuid::new_v4().to_string();
+        let content = format!("{partial}\n\n_(回复已中断)_");
+        let is_agent_session = conn
+            .query_row("SELECT 1 FROM agent_sessions WHERE id = ?1", [conv], |_| Ok(()))
+            .is_ok();
+        let result = if is_agent_session {
+            crate::engine_persist::persist_agent_text_message(
+                &conn,
+                &id,
+                conv,
+                "assistant",
+                &content,
+                None,
+                &crate::engine_persist::TurnUsage::default(),
+                None,
+            )
+        } else {
+            crate::engine_persist::persist_chat_text_message(&conn, &id, conv, "assistant", &content, None)
+        };
+        if let Err(e) = result {
+            tracing::warn!("PiEngine interrupted-reply persist failed: {e}");
+        }
+    }
+
     /// Append one `chat:stream-tool-activity` event to its conversation's turn
     /// buffer in the persisted `ChatToolActivity` shape (matching what
     /// `get_agent_session_messages` reconstructs from `agent_turns`): `tool_start`
@@ -523,6 +570,11 @@ impl EventSink for TauriEventSink {
             if let Some(err) = payload.get("error").and_then(serde_json::Value::as_str) {
                 spawn_failure_record(&self.app, err.to_string());
             }
+            // Persist the reply streamed before the abort/error so it survives the
+            // turn (the error path skips STREAM_COMPLETE → persist_assistant). The
+            // error toast already tells the user it failed; this keeps what the
+            // model had produced instead of dropping it.
+            self.persist_interrupted_assistant(&payload);
         }
         // `app.emit` is thread-safe (callable from the engine thread). Failures
         // (no webview yet, serialization) are logged, never panic.

@@ -470,7 +470,10 @@ async fn start_run(
     // (a borrow) inside the async move would escape the function (E0521).
     let cost_model = model_config.model.clone().unwrap_or_default();
     rt.spawn(async move {
-        let acl = StdMutex::new(Acl::new(conv_id.clone()));
+        // Shared so the run task can read the streamed-so-far text after the run
+        // (to persist the partial reply on abort/error — see the Err arm below).
+        let acl = Arc::new(StdMutex::new(Acl::new(conv_id.clone())));
+        let acl_event = Arc::clone(&acl);
         let sink_cb = Arc::clone(&sink_task);
         let cost_conv = conv_id.clone();
         let run_start = std::time::Instant::now();
@@ -487,7 +490,7 @@ async fn start_run(
                 }
             }
             let raw = demux(&ev);
-            if let Ok(mut a) = acl.lock() {
+            if let Ok(mut a) = acl_event.lock() {
                 if let Some(fe) = a.translate(&raw) {
                     sink_cb.emit(fe.name, fe.payload);
                 }
@@ -504,7 +507,21 @@ async fn start_run(
                     RunKind::FollowUp => guard.continue_turn_with_abort(abort_sig, on_event).await,
                 };
                 if let Err(e) = res {
-                    emit_error(&sink_task, &conv_id, format!("run failed: {e}"));
+                    // Abort/error bypasses the ACL's STREAM_COMPLETE (which carries
+                    // the text), so the streamed-so-far reply would be lost. Read it
+                    // off the shared ACL and ride it on the error event for the sink
+                    // to persist as an interrupted assistant message.
+                    let partial = acl
+                        .lock()
+                        .ok()
+                        .map(|a| a.accumulated_text().to_string())
+                        .filter(|s| !s.is_empty());
+                    emit_error_with_partial(
+                        &sink_task,
+                        &conv_id,
+                        format!("run failed: {e}"),
+                        partial,
+                    );
                 }
             }
             Err(e) => emit_error(&sink_task, &conv_id, format!("session lock failed: {e:?}")),
@@ -551,6 +568,25 @@ fn emit_error(sink: &Arc<dyn EventSink>, conv_id: &str, error: String) {
     sink.emit(
         event::STREAM_ERROR,
         serde_json::json!({ "conversationId": conv_id, "error": error }),
+    );
+}
+
+/// Like [`emit_error`] but carries the assistant text streamed before the failure
+/// (`partialText`), so the sink can persist the interrupted reply instead of
+/// dropping it. `None`/empty ⇒ a plain error (no partial to keep).
+fn emit_error_with_partial(
+    sink: &Arc<dyn EventSink>,
+    conv_id: &str,
+    error: String,
+    partial: Option<String>,
+) {
+    sink.emit(
+        event::STREAM_ERROR,
+        serde_json::json!({
+            "conversationId": conv_id,
+            "error": error,
+            "partialText": partial,
+        }),
     );
 }
 

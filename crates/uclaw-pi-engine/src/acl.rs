@@ -231,6 +231,22 @@ impl Acl {
         }
     }
 
+    /// The assistant text streamed so far this turn. On a normal `AgentEnd` it
+    /// rides STREAM_COMPLETE; on an abort/error (which bypasses the ACL via the
+    /// run task's `emit_error`) the caller reads this to persist the partial reply
+    /// instead of losing it.
+    #[must_use]
+    pub fn accumulated_text(&self) -> &str {
+        &self.acc_text
+    }
+
+    /// The reasoning/thinking text streamed so far this turn (companion to
+    /// [`Self::accumulated_text`] for the interrupted-reply persist).
+    #[must_use]
+    pub fn accumulated_reasoning(&self) -> &str {
+        &self.acc_reasoning
+    }
+
     fn next_chunk_seq(&mut self) -> u64 {
         let s = self.chunk_seq;
         self.chunk_seq += 1;
