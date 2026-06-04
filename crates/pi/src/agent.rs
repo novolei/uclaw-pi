@@ -1974,10 +1974,15 @@ impl Agent {
                 context.messages.to_vec(),
             )
         };
-        let messages = self
+        let mut messages = self
             .dispatch_context_event(&base_messages)
             .await
             .unwrap_or(base_messages);
+        // Guarantee every assistant `tool_calls` has a following tool result —
+        // an orphan (left by an abort mid-tool, e.g. steering/stop during a
+        // long-running interaction tool like ask_user) makes OpenAI-style
+        // providers 400 ("insufficient tool messages following tool_calls").
+        backfill_orphan_tool_results(&mut messages);
         let context = Context::owned(system_prompt, messages, tools);
         let mut stream = provider.stream(&context, &stream_options).await?;
 
@@ -10270,6 +10275,67 @@ fn extract_tool_calls(content: &[ContentBlock]) -> Vec<ToolCall> {
         .collect()
 }
 
+/// Ensure every assistant `tool_calls` in the request has a matching tool result.
+///
+/// OpenAI-style providers reject a conversation where an assistant message with
+/// `tool_calls` isn't immediately followed by a tool message for each
+/// `tool_call_id` ("insufficient tool messages following tool_calls" → HTTP 400).
+/// An orphan arises when a turn is aborted while a tool is in-flight — e.g. the
+/// user stops/steers during a long-running interaction tool (`ask_user`) — so the
+/// partial assistant message is persisted but its tool result never lands. On the
+/// next turn the saved `assistant{tool_calls}` is followed by the new user
+/// message, not a tool result, and the request 400s.
+///
+/// Backfill a synthetic error tool result (inserted right after the orphan
+/// assistant message) for any unresolved `tool_call_id`. This only normalizes the
+/// outgoing request — the persisted session is untouched.
+fn backfill_orphan_tool_results(messages: &mut Vec<Message>) {
+    use std::collections::HashSet;
+    let resolved: HashSet<&str> = messages
+        .iter()
+        .filter_map(|m| match m {
+            Message::ToolResult(tr) => Some(tr.tool_call_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    let has_orphan = messages.iter().any(|m| match m {
+        Message::Assistant(a) => extract_tool_calls(&a.content)
+            .iter()
+            .any(|tc| !resolved.contains(tc.id.as_str())),
+        _ => false,
+    });
+    if !has_orphan {
+        return;
+    }
+    let resolved: HashSet<String> = resolved.into_iter().map(str::to_owned).collect();
+
+    let mut out: Vec<Message> = Vec::with_capacity(messages.len() + 2);
+    for m in messages.drain(..) {
+        let orphans: Vec<ToolCall> = if let Message::Assistant(a) = &m {
+            extract_tool_calls(&a.content)
+                .into_iter()
+                .filter(|tc| !resolved.contains(&tc.id))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        out.push(m);
+        for tc in orphans {
+            out.push(Message::tool_result(ToolResultMessage {
+                tool_call_id: tc.id,
+                tool_name: tc.name,
+                content: vec![ContentBlock::Text(TextContent::new(
+                    "Tool call was interrupted before completion and produced no result.",
+                ))],
+                details: None,
+                is_error: true,
+                timestamp: Utc::now().timestamp_millis(),
+            }));
+        }
+    }
+    *messages = out;
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -10283,6 +10349,62 @@ mod tests {
     use async_trait::async_trait;
     use futures::Stream;
     use std::collections::BTreeSet;
+
+    fn assistant_with_tool_call(id: &str) -> Message {
+        Message::assistant(AssistantMessage {
+            content: vec![ContentBlock::ToolCall(ToolCall {
+                id: id.to_string(),
+                name: "edit".to_string(),
+                arguments: serde_json::json!({}),
+                thought_signature: None,
+            })],
+            api: "openai".to_string(),
+            provider: "deepseek".to_string(),
+            model: "deepseek-v4".to_string(),
+            usage: Usage::default(),
+            stop_reason: StopReason::ToolUse,
+            error_message: None,
+            timestamp: 0,
+        })
+    }
+    fn user_msg(text: &str) -> Message {
+        Message::User(UserMessage { content: UserContent::Text(text.to_string()), timestamp: 0 })
+    }
+
+    #[test]
+    fn backfill_inserts_result_for_orphan_tool_call() {
+        // assistant{tool_calls:[t1]} followed by a user message (orphan) → a
+        // synthetic tool result must be inserted right after the assistant.
+        let mut msgs = vec![assistant_with_tool_call("t1"), user_msg("edit the file")];
+        backfill_orphan_tool_results(&mut msgs);
+        assert_eq!(msgs.len(), 3, "synthetic tool result inserted");
+        match &msgs[1] {
+            Message::ToolResult(tr) => {
+                assert_eq!(tr.tool_call_id, "t1");
+                assert!(tr.is_error);
+            }
+            other => panic!("expected ToolResult at [1], got {other:?}"),
+        }
+        assert!(matches!(msgs[2], Message::User(_)), "user message preserved after the result");
+    }
+
+    #[test]
+    fn backfill_noop_when_tool_call_already_resolved() {
+        let mut msgs = vec![
+            assistant_with_tool_call("t1"),
+            Message::tool_result(ToolResultMessage {
+                tool_call_id: "t1".to_string(),
+                tool_name: "edit".to_string(),
+                content: vec![ContentBlock::Text(TextContent::new("ok"))],
+                details: None,
+                is_error: false,
+                timestamp: 0,
+            }),
+        ];
+        let before = msgs.len();
+        backfill_orphan_tool_results(&mut msgs);
+        assert_eq!(msgs.len(), before, "already-resolved → no insertion");
+    }
     use std::collections::HashMap;
     use std::path::Path;
     use std::pin::Pin;
