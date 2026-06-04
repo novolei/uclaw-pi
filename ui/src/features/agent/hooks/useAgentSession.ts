@@ -42,8 +42,10 @@ import {
   estimateSessionContext,
   updateSettings,
   onStreamComplete,
+  onStreamError,
   onQueuedConsumed,
 } from '@/lib/bridge/agent'
+import { allPendingAskUserRequestsAtom } from '@/atoms/agent-atoms'
 
 export interface UseAgentSessionArgs {
   sessionId: string
@@ -191,6 +193,28 @@ export function useAgentSession(args: UseAgentSessionArgs): UseAgentSessionResul
       })
     })
     return unlisten
+  }, [sessionId, store])
+
+  // 运行结束(完成 或 错误/中断)后清理本会话遗留的 ask_user banner。正常作答时
+  // 请求已被 useAskUserBanner 提交流程移除,所以这里只在「提问过程中被 Stop/出错」
+  // 的孤儿场景生效 —— 否则 AskUserBanner 会在中断后永远挂着。complete + error 两路
+  // 都接,覆盖 abort(走 stream-error)。只动 ask_user map,不碰 streaming 态,无竞态。
+  React.useEffect(() => {
+    const clearOrphanAskUser = (payload: { conversationId: string }): void => {
+      if (payload.conversationId !== sessionId) return
+      store.set(allPendingAskUserRequestsAtom, (prev) => {
+        if (!prev.has(sessionId)) return prev
+        const next = new Map(prev)
+        next.delete(sessionId)
+        return next
+      })
+    }
+    const unComplete = onStreamComplete(clearOrphanAskUser)
+    const unError = onStreamError(clearOrphanAskUser)
+    return () => {
+      unComplete()
+      unError()
+    }
   }, [sessionId, store])
 
   // Pi Sprint 2 item ③ — remove a queued banner card when the backend confirms
