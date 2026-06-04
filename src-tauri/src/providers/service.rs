@@ -216,6 +216,41 @@ impl ProviderService {
         self.get_role_llm_config("chat").await
     }
 
+    /// Resolve the LLM config for a structured one-shot **quality** utility task
+    /// (session title / summary). Same tuple shape as [`Self::get_role_llm_config`].
+    ///
+    /// Quality-first with a local-only fallback: start from the `utility` role,
+    /// but if it resolves to the **local in-process model** (LocalMistralRs) —
+    /// whose 1B structured-JSON output is fragile (loose titles, emoji always 💬)
+    /// — prefer a non-local (cloud) model from the active selection when one is
+    /// configured. Falls back to the local utility model when no cloud is
+    /// available (offline / local-only setups), so privacy/cost-conscious users
+    /// still work without network. Title generation routes through this instead
+    /// of `get_role_llm_config("utility")`.
+    pub async fn get_utility_quality_llm_config(
+        &self,
+    ) -> Option<(String, String, String, String, Option<crate::providers::types::ApiType>)> {
+        let is_local = |cfg: &Option<(String, String, String, String, Option<crate::providers::types::ApiType>)>| {
+            cfg.as_ref().is_some_and(|c| {
+                c.0 == "local-minicpm"
+                    || c.4 == Some(crate::providers::types::ApiType::LocalMistralRs)
+            })
+        };
+        let utility = self.get_role_llm_config("utility").await;
+        if !is_local(&utility) {
+            // utility already resolves to a capable cloud model (or its chat/active
+            // fallback) — use it as-is.
+            return utility;
+        }
+        // utility is the local 1B model — prefer the active cloud model for quality.
+        let active = self.get_active_llm_config().await;
+        if active.is_some() && !is_local(&active) {
+            return active;
+        }
+        // No cloud configured (offline / local-only) — keep the local model.
+        utility
+    }
+
     /// Resolve the ingestion-role model. Thin wrapper over
     /// [`Self::get_role_llm_config`] with role `"ingestion"`; drops the
     /// `api_override` field for callers that don't need it.
@@ -720,6 +755,80 @@ mod tests {
         let s = svc(configs);
         let (pid, mid, _, _, _) = s.get_role_llm_config("summarizer").await.unwrap();
         assert_eq!(pid, "deepseek");
+        assert_eq!(mid, "deepseek-v4");
+    }
+
+    /// A local in-process MiniCPM provider (id + LocalMistralRs api), matching
+    /// the production registry entry that `get_utility_quality_llm_config`
+    /// detects as "local".
+    fn local_provider() -> ProviderConfig {
+        let mut p = provider("local-minicpm");
+        p.api = Some(ApiType::LocalMistralRs);
+        p
+    }
+
+    #[tokio::test]
+    async fn utility_quality_prefers_cloud_when_utility_is_local() {
+        // utility = local 1B, active = cloud → title routes to the cloud model.
+        let configs = ProviderConfigs {
+            providers: vec![local_provider(), provider("deepseek")],
+            active_model: Some(ModelSelection {
+                provider_id: "deepseek".into(),
+                model_id: "deepseek-v4".into(),
+            }),
+            selected_models: vec![],
+            role_models: vec![ModelRoleConfig {
+                role: "utility".into(),
+                model_ref: Some("local-minicpm/minicpm5-1b".into()),
+            }],
+            active_local_quant: None,
+        };
+        let s = svc(configs);
+        let (pid, mid, _, _, _) = s.get_utility_quality_llm_config().await.unwrap();
+        assert_eq!(pid, "deepseek", "local utility should prefer the cloud active model");
+        assert_eq!(mid, "deepseek-v4");
+    }
+
+    #[tokio::test]
+    async fn utility_quality_keeps_local_when_no_cloud_available() {
+        // utility = local AND active = local (offline / local-only) → keep local.
+        let configs = ProviderConfigs {
+            providers: vec![local_provider()],
+            active_model: Some(ModelSelection {
+                provider_id: "local-minicpm".into(),
+                model_id: "minicpm5-1b".into(),
+            }),
+            selected_models: vec![],
+            role_models: vec![ModelRoleConfig {
+                role: "utility".into(),
+                model_ref: Some("local-minicpm/minicpm5-1b".into()),
+            }],
+            active_local_quant: None,
+        };
+        let s = svc(configs);
+        let (pid, _, _, _, _) = s.get_utility_quality_llm_config().await.unwrap();
+        assert_eq!(pid, "local-minicpm", "no cloud → keep the local utility model");
+    }
+
+    #[tokio::test]
+    async fn utility_quality_uses_utility_as_is_when_already_cloud() {
+        // utility already cloud → use it verbatim, don't swap to the active model.
+        let configs = ProviderConfigs {
+            providers: vec![provider("deepseek"), provider("moonshot")],
+            active_model: Some(ModelSelection {
+                provider_id: "moonshot".into(),
+                model_id: "k2".into(),
+            }),
+            selected_models: vec![],
+            role_models: vec![ModelRoleConfig {
+                role: "utility".into(),
+                model_ref: Some("deepseek/deepseek-v4".into()),
+            }],
+            active_local_quant: None,
+        };
+        let s = svc(configs);
+        let (pid, mid, _, _, _) = s.get_utility_quality_llm_config().await.unwrap();
+        assert_eq!(pid, "deepseek", "cloud utility used as-is");
         assert_eq!(mid, "deepseek-v4");
     }
 
