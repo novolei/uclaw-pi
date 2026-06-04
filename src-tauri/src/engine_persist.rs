@@ -96,6 +96,11 @@ pub fn persist_agent_text_message(
     text: &str,
     reasoning: Option<&str>,
     usage: &TurnUsage,
+    // JSON array of tool-activity records (frontend `ChatToolActivity` shape: a
+    // `start` + a `result` entry per tool call). `None` ⇒ NULL. Persisted so
+    // `get_agent_session_messages` re-renders the tool-call process after the turn
+    // / on reload, like the legacy path's `process_meta.tool_activities_json`.
+    tool_activities_json: Option<&str>,
 ) -> rusqlite::Result<()> {
     // Content shape is role-specific, matching the legacy backend + the Agent view:
     // • user → PLAIN TEXT. The user bubble renders `message.content` directly
@@ -126,8 +131,8 @@ pub fn persist_agent_text_message(
     conn.execute(
         "INSERT INTO agent_messages \
          (id, session_id, role, content, created_at, reasoning, \
-          input_tokens, output_tokens, cost_usd, duration_ms) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+          input_tokens, output_tokens, cost_usd, duration_ms, tool_activities_json) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         rusqlite::params![
             id,
             session_id,
@@ -143,6 +148,7 @@ pub fn persist_agent_text_message(
             usage.output_tokens,
             usage.cost_usd,
             usage.duration_ms,
+            tool_activities_json,
         ],
     )?;
     Ok(())
@@ -264,12 +270,12 @@ mod tests {
                 content    TEXT NOT NULL,
                 created_at INTEGER NOT NULL,
                 reasoning  TEXT,
-                input_tokens INTEGER, output_tokens INTEGER, cost_usd REAL, duration_ms INTEGER
+                input_tokens INTEGER, output_tokens INTEGER, cost_usd REAL, duration_ms INTEGER, tool_activities_json TEXT
             );",
         )
         .unwrap();
 
-        persist_agent_text_message(&conn, "m1", "s1", "assistant", "hello", None, &TurnUsage::default())
+        persist_agent_text_message(&conn, "m1", "s1", "assistant", "hello", None, &TurnUsage::default(), None)
             .unwrap();
 
         // The exact read the reader performs — must not error.
@@ -305,14 +311,14 @@ mod tests {
             "CREATE TABLE agent_messages (
                 id TEXT PRIMARY KEY, session_id TEXT NOT NULL, role TEXT NOT NULL,
                 content TEXT NOT NULL, created_at INTEGER NOT NULL, reasoning TEXT,
-                input_tokens INTEGER, output_tokens INTEGER, cost_usd REAL, duration_ms INTEGER
+                input_tokens INTEGER, output_tokens INTEGER, cost_usd REAL, duration_ms INTEGER, tool_activities_json TEXT
             );",
         )
         .unwrap();
 
-        persist_agent_text_message(&conn, "u1", "s1", "user", "ls -a", None, &TurnUsage::default())
+        persist_agent_text_message(&conn, "u1", "s1", "user", "ls -a", None, &TurnUsage::default(), None)
             .unwrap();
-        persist_agent_text_message(&conn, "a1", "s1", "assistant", "done", None, &TurnUsage::default())
+        persist_agent_text_message(&conn, "a1", "s1", "assistant", "done", None, &TurnUsage::default(), None)
             .unwrap();
 
         let user_content: String = conn
@@ -341,7 +347,7 @@ mod tests {
             "CREATE TABLE agent_messages (
                 id TEXT PRIMARY KEY, session_id TEXT NOT NULL, role TEXT NOT NULL,
                 content TEXT NOT NULL, created_at INTEGER NOT NULL, reasoning TEXT,
-                input_tokens INTEGER, output_tokens INTEGER, cost_usd REAL, duration_ms INTEGER
+                input_tokens INTEGER, output_tokens INTEGER, cost_usd REAL, duration_ms INTEGER, tool_activities_json TEXT
             );",
         )
         .unwrap();
@@ -354,7 +360,7 @@ mod tests {
             "costUsd": "$0.0027",
             "durationMs": 1200,
         }));
-        persist_agent_text_message(&conn, "a1", "s1", "assistant", "hi", None, &usage).unwrap();
+        persist_agent_text_message(&conn, "a1", "s1", "assistant", "hi", None, &usage, None).unwrap();
 
         let (it, ot, cost, dur): (Option<i64>, Option<i64>, Option<f64>, Option<i64>) = conn
             .query_row(
