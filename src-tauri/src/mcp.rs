@@ -208,6 +208,13 @@ fn classify_gbrain_cli_failure(stderr: &str, status: &str) -> String {
         "page_not_found"
     } else if lower.contains("failed to spawn") || lower.contains("no such file") {
         "launcher_missing_or_unusable"
+    } else if lower.contains("cannot find module")
+        || lower.contains("cannot find package")
+        || lower.contains("error: cannot find")
+    {
+        // The bundled gbrain CLI is a Bun/TS project; this fires when its
+        // node_modules aren't installed (e.g. `@electric-sql/pglite/vector`).
+        "deps_missing"
     } else if lower.contains("timed out") {
         "timeout"
     } else {
@@ -226,6 +233,7 @@ fn gbrain_cli_error_hint(kind: &str) -> &'static str {
         "permission_denied" => "Fix permissions on the gbrain home directory or bundled launcher.",
         "path_mismatch" => "Refresh bundled gbrain configuration from System Diagnostics and restart gbrain.",
         "launcher_missing_or_unusable" => "Refresh bundled runtime paths and restart gbrain.",
+        "deps_missing" => "gbrain's dependencies aren't installed (missing node module). Run scripts/setup-gbrain-source.sh — or `bun install` in the gbrain dir — then restart gbrain.",
         _ => "Open System Diagnostics for gbrain runtime details, then retry.",
     }
 }
@@ -246,6 +254,7 @@ fn gbrain_cli_error_payload(tool: &str, kind: &str, status: &str, nearest_slugs:
             "permission_denied" => "gbrain permission denied",
             "path_mismatch" => "gbrain runtime path mismatch",
             "launcher_missing_or_unusable" => "gbrain launcher missing or unusable",
+            "deps_missing" => "gbrain dependencies not installed",
             _ => "gbrain CLI failed",
         },
         "hint": gbrain_cli_error_hint(kind),
@@ -3092,6 +3101,18 @@ pub type SharedMcpManager = Arc<RwLock<McpManager>>;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn classify_deps_missing_from_module_not_found() {
+        // The bundled gbrain CLI crashing on a missing node module → deps_missing,
+        // with a hint pointing at the setup script.
+        let kind = classify_gbrain_cli_failure(
+            "Cannot find module '@electric-sql/pglite/vector' from '.../gbrain/src/core/pglite-engine.ts'",
+            "exit status: 1",
+        );
+        assert_eq!(kind, "deps_missing");
+        assert!(gbrain_cli_error_hint(&kind).contains("setup-gbrain-source.sh"));
+    }
 
     fn cfg(id: &str, transport: TransportType) -> McpServerConfig {
         McpServerConfig {
