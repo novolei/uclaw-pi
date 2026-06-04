@@ -211,6 +211,55 @@ impl TauriEventSink {
         );
     }
 
+    /// Drain ONE queued follow-up for `conv` (parked by `agent_follow_up` while the
+    /// turn ran) and dispatch it as a fresh pi turn via `send_agent_message` (full
+    /// persist + memory recall + `EngineCmd::Prompt`), then emit
+    /// `agent:queued-consumed` so the banner card clears. FIFO + one-at-a-time:
+    /// the dispatched turn's own STREAM_COMPLETE drains the next. The session is
+    /// idle at this point (turn just completed), so the new prompt serializes
+    /// cleanly behind the releasing run.
+    fn dispatch_pi_followup(&self, payload: &serde_json::Value) {
+        let Some(conv) = payload
+            .get("conversationId")
+            .and_then(serde_json::Value::as_str)
+        else {
+            return;
+        };
+        let next = pi_pending_followups().lock().ok().and_then(|mut m| {
+            let q = m.get_mut(conv)?;
+            let item = q.pop_front();
+            if q.is_empty() {
+                m.remove(conv);
+            }
+            item
+        });
+        let Some((uuid, message)) = next else { return };
+        let app = self.app.clone();
+        let conv = conv.to_string();
+        tauri::async_runtime::spawn(async move {
+            let input = crate::tauri_commands::SendAgentMessageInput {
+                session_id: conv.clone(),
+                user_message: message,
+                channel_id: None,
+                model_id: None,
+                workspace_id: None,
+                strategy: None,
+                prompt_id: None,
+            };
+            let state = app.state::<crate::app::AppState>();
+            if let Err(e) =
+                crate::tauri_commands::send_agent_message(state, app.clone(), input).await
+            {
+                tracing::warn!("pi follow-up dispatch failed: {e}");
+            }
+            // Clear the banner card (matches legacy emit_queued_consumed shape).
+            let _ = app.emit(
+                "agent:queued-consumed",
+                serde_json::json!({ "sessionId": conv, "uuid": uuid }),
+            );
+        });
+    }
+
     /// Append one `chat:stream-tool-activity` event to its conversation's turn
     /// buffer in the persisted `ChatToolActivity` shape (matching what
     /// `get_agent_session_messages` reconstructs from `agent_turns`): `tool_start`
@@ -451,6 +500,12 @@ impl EventSink for TauriEventSink {
         // flag as the routing (only fires when the engine path is active).
         if event == uclaw_pi_engine::event::STREAM_COMPLETE && pi_engine_enabled() {
             self.persist_assistant(&payload);
+            // [pi 闭环] Drain one queued follow-up ("插话" while the agent ran). The
+            // legacy FollowUpQueue is never consumed on the pi path, so the message
+            // would be lost + its banner card stuck — dispatch it now that the turn
+            // ended (FIFO, one-at-a-time: the dispatched turn's own complete drains
+            // the next). The pi counterpart of agentic_loop's FollowUpQueue drain.
+            self.dispatch_pi_followup(&payload);
         }
         // [pi 闭环] pi auto-compacted the context — persist a visible fold marker so
         // the Agent view shows a CompactionFoldCard (the pi counterpart of the
@@ -797,6 +852,35 @@ pub fn pi_engine_enabled() -> bool {
         1 => true,
         2 => false,
         _ => std::env::var_os("UCLAW_PI_ENGINE").is_some(),
+    }
+}
+
+/// Per-conversation queue of follow-up messages ("插话" sent while a pi turn is
+/// running), as `(uuid, message)`. On the pi path the legacy `FollowUpQueue` is
+/// never drained (the pi engine runs its own loop), so `agent_follow_up` parks
+/// follow-ups here; `TauriEventSink::dispatch_pi_followup` drains one per
+/// STREAM_COMPLETE. Shared module state because the producer (`agent_follow_up`,
+/// a Tauri command) and the consumer (the event sink) are different objects.
+#[allow(clippy::type_complexity)]
+fn pi_pending_followups() -> &'static std::sync::Mutex<
+    std::collections::HashMap<String, std::collections::VecDeque<(String, String)>>,
+> {
+    static M: std::sync::OnceLock<
+        std::sync::Mutex<
+            std::collections::HashMap<String, std::collections::VecDeque<(String, String)>>,
+        >,
+    > = std::sync::OnceLock::new();
+    M.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Park a follow-up message for a running pi session; drained on the turn's
+/// STREAM_COMPLETE by [`TauriEventSink::dispatch_pi_followup`]. Used by
+/// `agent_follow_up` on the pi path instead of the (pi-unconsumed) legacy queue.
+pub fn queue_pi_followup(conversation_id: &str, uuid: String, message: String) {
+    if let Ok(mut m) = pi_pending_followups().lock() {
+        m.entry(conversation_id.to_string())
+            .or_default()
+            .push_back((uuid, message));
     }
 }
 

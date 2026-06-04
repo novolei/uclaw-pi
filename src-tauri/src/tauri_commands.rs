@@ -6934,10 +6934,22 @@ pub async fn agent_follow_up(
     input: AgentSteerInput,
 ) -> Result<(), Error> {
     if state.is_session_running(&input.session_id).await {
-        state
-            .agent_queues_for(&input.session_id)
-            .follow_up
-            .push_task(input.uuid.clone(), vec![crate::agent::types::ChatMessage::user(&input.user_message)]);
+        if crate::engine_sink::pi_engine_enabled() {
+            // pi path: the legacy FollowUpQueue is never drained by the pi engine's
+            // own loop, so park the follow-up where engine_sink drains it on this
+            // turn's STREAM_COMPLETE (then emits agent:queued-consumed). Without
+            // this the message is silently lost and the banner card stays stuck.
+            crate::engine_sink::queue_pi_followup(
+                &input.session_id,
+                input.uuid.clone().unwrap_or_default(),
+                input.user_message.clone(),
+            );
+        } else {
+            state
+                .agent_queues_for(&input.session_id)
+                .follow_up
+                .push_task(input.uuid.clone(), vec![crate::agent::types::ChatMessage::user(&input.user_message)]);
+        }
         Ok(())
     } else {
         // idle session → start a normal new run
