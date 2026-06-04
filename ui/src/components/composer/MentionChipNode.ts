@@ -140,6 +140,59 @@ export const MentionChipNode = Node.create({
     ]
   },
 
+  /** Live editor view. `renderHTML`'s array spec is serialized via
+   *  `document.createElement`, which builds the `<svg>`/`<path>` in the HTML
+   *  namespace → they don't render (the icon was invisible). The NodeView builds
+   *  the chip with `createElementNS` so the hexagon actually paints. Classes
+   *  mirror `renderHTML` so copy/serialize and the live view match. */
+  addNodeView() {
+    return ({ node }) => {
+      const attrs = node.attrs as MentionChipAttrs
+      const dom = document.createElement('span')
+      dom.setAttribute('data-mention-chip', '')
+      dom.setAttribute('data-kind', attrs.kind)
+      dom.contentEditable = 'false'
+
+      if (attrs.kind !== 'skill') {
+        dom.className = [
+          'inline-flex items-center gap-0.5 px-1.5 py-0 rounded',
+          'text-[12px] leading-[1.5] align-baseline',
+          'bg-blue-500/10 text-blue-700 dark:text-blue-300 border border-blue-500/20',
+        ].join(' ')
+        dom.textContent = `@${attrs.display}`
+        return { dom }
+      }
+
+      dom.className = [
+        'inline-flex items-center gap-1 px-2 py-[1px] rounded-full',
+        'text-[12px] leading-[1.5] align-baseline font-medium',
+        'bg-muted text-blue-600 dark:text-blue-400 border border-border/50',
+      ].join(' ')
+
+      const svgNS = 'http://www.w3.org/2000/svg'
+      const svg = document.createElementNS(svgNS, 'svg')
+      svg.setAttribute('width', '12')
+      svg.setAttribute('height', '12')
+      svg.setAttribute('viewBox', '0 0 24 24')
+      svg.setAttribute('fill', 'none')
+      svg.setAttribute('stroke', 'currentColor')
+      svg.setAttribute('stroke-width', '2')
+      svg.setAttribute('stroke-linecap', 'round')
+      svg.setAttribute('stroke-linejoin', 'round')
+      svg.setAttribute('aria-hidden', 'true')
+      svg.style.flex = '0 0 auto'
+      const path = document.createElementNS(svgNS, 'path')
+      path.setAttribute(
+        'd',
+        'M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z',
+      )
+      svg.appendChild(path)
+      dom.appendChild(svg)
+      dom.appendChild(document.createTextNode(attrs.display))
+      return { dom }
+    }
+  },
+
   /** TipTap calls this when computing `editor.getText()`. Emits the chip's
    *  wire-format inline form so the resulting plain string matches what a
    *  pre-PR #130 textarea would have contained. */
