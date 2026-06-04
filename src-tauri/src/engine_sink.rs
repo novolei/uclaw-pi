@@ -338,7 +338,7 @@ impl EventSink for TauriEventSink {
     }
 }
 
-use crate::agent::tools::builtin::{load_skill, skill_marketplace, skill_search};
+use crate::agent::tools::builtin::{ask_user, load_skill, skill_marketplace, skill_search};
 use crate::agent::tools::tool::{Tool, ToolError, ToolOutput};
 use crate::app::AppState;
 
@@ -347,8 +347,11 @@ use crate::app::AppState;
 /// placeholder; threading the real per-conversation id is a follow-up.
 const PI_TOOL_CONV: &str = "pi-agent";
 
-/// The skill tools pi may call, in advertised order.
-const PI_SKILL_TOOLS: &[&str] = &["skill_search", "load_skill", "skill_marketplace_search"];
+/// The uClaw tools pi may call via the IO bridge, in advertised order. Skill
+/// tools + `ask_user` (the interaction tool — its emit/respond round-trip rides
+/// the runtime-agnostic `pending_ask_users` registry, so it works unchanged on
+/// the pi path; without it the agent can't ask the user clarifying questions).
+const PI_SKILL_TOOLS: &[&str] = &["skill_search", "load_skill", "skill_marketplace_search", "ask_user"];
 
 /// [R4 IO 桥] The real uClaw tool executor for pi. `io_tool_specs()` advertises the
 /// skill tools; `request()` runs the named async `Tool::execute` on Tauri's tokio
@@ -424,6 +427,16 @@ fn build_skill_tool(name: &str, state: &AppState, app: &AppHandle, conv: &str) -
             app.clone(),
             conv.to_string(),
             "default".to_string(),
+        )),
+        // ask_user: emits agent:ask_user_request + awaits the answer via the
+        // pending_ask_users registry (resolved by the respond_ask_user command).
+        // Both are runtime-agnostic, so the legacy tool works as-is on pi. `conv`
+        // is the owning session id (threaded from the engine), stamped on the
+        // emitted payload so the AskUserBanner routes to the right session.
+        "ask_user" => Box::new(ask_user::AskUserTool::new(
+            app.clone(),
+            Arc::clone(&state.pending_ask_users),
+            conv.to_string(),
         )),
         "skill_marketplace_search" => {
             // Both keys: skillsmp is the keyless default; skills.sh needs its key.
