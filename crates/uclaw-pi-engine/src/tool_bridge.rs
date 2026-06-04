@@ -35,6 +35,12 @@ pub struct IoToolSpec {
     pub label: String,
     pub description: String,
     pub parameters: Value,
+    /// Per-tool override for the result-wait timeout. `None` ⇒ the registry's
+    /// default (~5 min). Interaction tools that block on a human (`ask_user`) set
+    /// a generous window so a slow answer isn't dropped: the default would
+    /// fail-close the tool while the banner is still open, then silently drop the
+    /// user's late answer (and leave an orphan tool_call — see #93).
+    pub result_timeout: Option<Duration>,
 }
 
 /// Engine → tokio: ask uClaw to execute a wrapped tool. uClaw provides the impl
@@ -141,6 +147,18 @@ impl ToolResultRegistry {
     /// **before** dispatching to the executor so a fast reply always lands.
     #[must_use]
     pub fn register(&self, request_id: String) -> ResultTicket {
+        self.register_with_timeout(request_id, None)
+    }
+
+    /// Like [`register`](Self::register) but with a per-tool timeout override
+    /// (`None` ⇒ the registry default). Used for interaction tools (`ask_user`)
+    /// that legitimately block on a human for minutes.
+    #[must_use]
+    pub fn register_with_timeout(
+        &self,
+        request_id: String,
+        timeout_override: Option<Duration>,
+    ) -> ResultTicket {
         let (tx, rx) = oneshot::channel();
         if let Ok(mut g) = self.pending.lock() {
             g.insert(request_id.clone(), tx);
@@ -151,7 +169,7 @@ impl ToolResultRegistry {
                 pending: Arc::clone(&self.pending),
                 key: request_id,
             },
-            timeout: self.timeout,
+            timeout: timeout_override.unwrap_or(self.timeout),
         }
     }
 }
@@ -190,6 +208,9 @@ pub struct BridgedIoTool {
     /// registry is per-session ⇒ per-conv), so `request()` can attribute per-conv
     /// side-effects to the right session. `None` = the executor's default.
     conversation_id: Option<String>,
+    /// Per-tool result-wait timeout (from `IoToolSpec`); `None` ⇒ registry
+    /// default. Interaction tools (`ask_user`) set a generous window.
+    result_timeout: Option<Duration>,
 }
 
 impl BridgedIoTool {
@@ -202,6 +223,7 @@ impl BridgedIoTool {
         registry: ToolResultRegistry,
         sink: Arc<dyn ToolRequestSink>,
         conversation_id: Option<String>,
+        result_timeout: Option<Duration>,
     ) -> Self {
         Self {
             name: name.into(),
@@ -211,6 +233,7 @@ impl BridgedIoTool {
             registry,
             sink,
             conversation_id,
+            result_timeout,
         }
     }
 }
@@ -237,7 +260,11 @@ impl Tool for BridgedIoTool {
     ) -> PiResult<ToolOutput> {
         let request_id = self.registry.next_request_id();
         // Register BEFORE dispatching so a fast executor reply always lands.
-        let ticket = self.registry.register(request_id.clone());
+        // Interaction tools (ask_user) carry a generous timeout so a human's
+        // slow answer isn't dropped as a "timeout".
+        let ticket = self
+            .registry
+            .register_with_timeout(request_id.clone(), self.result_timeout);
         self.sink
             .request(self.conversation_id.as_deref(), &request_id, &self.name, &input);
         Ok(ticket.await_result().await)
@@ -281,6 +308,26 @@ mod tests {
             let out = reg.register("tool-stuck".into()).await_result().await;
             assert!(out.is_error);
             assert_eq!(reg.pending_len(), 0, "slot cleaned on timeout");
+        });
+    }
+
+    #[test]
+    fn register_with_timeout_override_governs_over_registry_default() {
+        // The per-tool override (interaction tools like ask_user) must win over
+        // the registry default. Long default (60s) + short override (40ms): if the
+        // override were ignored this would wait ~60s; a fast fail-closed proves it
+        // applies. (The real direction is the inverse — a long override on top of
+        // a short default — but the same code path; a short override is the only
+        // way to assert it without sleeping for the default.)
+        let runtime = RuntimeBuilder::current_thread().build().expect("rt");
+        runtime.block_on(async {
+            let reg = ToolResultRegistry::new(AgentCx::for_testing(), Duration::from_secs(60));
+            let out = reg
+                .register_with_timeout("tool-x".into(), Some(Duration::from_millis(40)))
+                .await_result()
+                .await;
+            assert!(out.is_error, "short override governs over the 60s default");
+            assert_eq!(reg.pending_len(), 0);
         });
     }
 
