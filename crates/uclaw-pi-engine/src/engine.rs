@@ -441,7 +441,7 @@ async fn start_run(
                 );
             }
             Err(e) => {
-                emit_error(sink, &conv_id, format!("session create failed: {e:?}"));
+                emit_error(sink, &conv_id, format!("session create failed: {e}"));
                 return;
             }
         }
@@ -504,7 +504,7 @@ async fn start_run(
                     RunKind::FollowUp => guard.continue_turn_with_abort(abort_sig, on_event).await,
                 };
                 if let Err(e) = res {
-                    emit_error(&sink_task, &conv_id, format!("run failed: {e:?}"));
+                    emit_error(&sink_task, &conv_id, format!("run failed: {e}"));
                 }
             }
             Err(e) => emit_error(&sink_task, &conv_id, format!("session lock failed: {e:?}")),
@@ -540,7 +540,7 @@ async fn set_model_run(
     match handle.lock(cx).await {
         Ok(mut guard) => {
             if let Err(e) = guard.set_model(provider, model).await {
-                emit_error(sink, conv_id, format!("set_model failed: {e:?}"));
+                emit_error(sink, conv_id, format!("set_model failed: {e}"));
             }
         }
         Err(e) => emit_error(sink, conv_id, format!("session lock failed: {e:?}")),
