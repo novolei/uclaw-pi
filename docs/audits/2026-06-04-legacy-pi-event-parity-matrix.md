@@ -45,8 +45,9 @@ Legend: ✅ covered · ⚠️ GAP (pi missing / mis-shaped) · ⏭️ expected-s
 | `agent:memory-recall` | totalCandidates, skillsCount, timestamp, conversationId | ✅ | ✅ (pi branch spawn) | ✅ |
 | `agent:skill-recalled` | conversationId, toolCallId, kind, … | ✅ (real conv id) | ✅ real conv id threaded engine → `ToolRequestSink::request(conversation_id, …)` → `build_skill_tool`; per-conv `UclawToolFactory::with_conversation` so each session's `BridgedIoTool` carries its `conv_id` (falls back to `PI_TOOL_CONV` only when unknown) | ✅ |
 | `agent:proactive-learning` | scenario, items_extracted, … | ✅ | ✅ (publish_incoming #74 → ProactiveService) | ✅ |
-| `agent:need_approval` | toolName, toolId, sessionId, … | ✅ | ✅ via `crates/.../approval.rs` (ACP-style requestId/toolCallId) — **field-shape parity unverified** | ⚠️ verify |
-| `agent:ask_user_request` / `agent:exit_plan_request` | requestId, sessionId, … | ✅ | ✅ (events.rs + respond_* commands) — field-shape parity unverified | ⚠️ verify |
+| `agent:need_approval` | toolName, toolId, sessionId, … | ✅ | ✅ functional — `approval.rs` emits `{requestId, toolCallId, toolName, arguments}`; round-trip keyed by `requestId` (works). Off by default (opt-in `UCLAW_PI_APPROVAL`). Cosmetic only: no `toolId`/`sessionId` | ✅ |
+| `agent:exit_plan_request` | requestId, (sessionId), plan | ✅ | ✅ functional — ExitPlanTool (`tool_factory.rs`) emits `{requestId, plan}`; ExitPlanModeBanner renders `plan`, `respond_exit_plan_mode` answers by `requestId`. `sessionId`/`allowedPrompts` absent but unused by the round-trip | ✅ |
+| `agent:ask_user_request` | requestId, sessionId, questions[] | ✅ (uClaw `AskUserTool`) | ⚠️ **GAP** — the `ask_user` tool isn't in pi's tool set (pi built-ins + ExitPlanTool + skill/MCP only), so `ASK_USER_REQUEST` never fires; the agent can't ask clarifying questions on pi | ⚠️ |
 | `agent:stream-reset` | conversationId | ✅ (retry path) | ⚠️ likely GAP (pi retry doesn't emit) — low impact | ⚠️ |
 | `agent:queued-consumed` | sessionId, uuid | ✅ (steering) | ⚠️ verify (pi steering) — low impact | ⚠️ |
 | `agent:reflection_status` / `agent:reflection` | assistant_message_id, … | ✅ | ⚠️ pi runs `run_once` (#76 turn-count) but per-message reflection-status events unverified | ⚠️ |
@@ -80,10 +81,27 @@ Ranked by user-visible impact. Each is its own small PR.
    stdout+stderr). Verified end-to-end: pi emits `ToolExecutionUpdate` from bash
    (`agent.rs`) → demux → ACL.
 
-4. **Verify approval / ask_user / exit_plan field shapes (MEDIUM).** pi has a
-   dedicated `approval.rs` + `respond_*` flow; confirm the emitted payloads carry
-   the fields the frontend dialogs read (`toolId`/`sessionId` vs pi's
-   `requestId`/`toolCallId`), or add a translation in the bridge.
+4. **Verify approval / ask_user / exit_plan field shapes (MEDIUM).** **VERIFIED:**
+   - **need_approval** — functional. `approval.rs` emits `{requestId, toolCallId,
+     toolName, arguments}`; the user reply is keyed by `requestId`, so the
+     round-trip works. It's off by default (opt-in `UCLAW_PI_APPROVAL`). Missing
+     `toolId`/`sessionId` is cosmetic (the frontend tolerates it). No fix needed.
+   - **exit_plan** — functional. ExitPlanTool emits `{requestId, plan}`;
+     `ExitPlanModeBanner` renders `plan` and `respond_exit_plan_mode` answers by
+     `requestId`. `sessionId`/`allowedPrompts` are absent but unused by the
+     round-trip. No fix needed.
+   - **ask_user** — **NOT functional → new gap #6.** The `ask_user` tool isn't in
+     pi's tool registry (pi built-ins + ExitPlanTool + skill/MCP only), so
+     `ASK_USER_REQUEST` never fires and the agent can't ask the user clarifying
+     questions on pi. This is a missing-tool (feature) gap, not a field tweak.
+
+6. **`ask_user` tool on pi (MEDIUM).** Add a pi-side ask_user tool (mirroring the
+   injected `ExitPlanTool` in `tool_factory.rs`): emit `agent:ask_user_request`
+   `{requestId, questions[]}` and await via the approval registry; the existing
+   `respond_ask_user` command already closes the loop by `requestId`. (uClaw's
+   legacy `AskUserTool` lives in the `uclaw` crate, below `uclaw-pi-engine`, so it
+   can't be pushed into the engine factory directly — a small engine-side tool is
+   the clean shape.)
 
 5. **`agent:stream-reset` / `agent:queued-consumed` / reflection-status (LOW).**
    Retry-reset, steering-queue, and per-message reflection-status events — verify
