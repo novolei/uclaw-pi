@@ -188,6 +188,11 @@ pub struct Acl {
     acc_reasoning: String,
     completed: bool,
     tool_starts: HashMap<String, Instant>,
+    /// Per-tool-call (last cumulative output text already forwarded, next seq).
+    /// pi's `ToolUpdate` carries the CUMULATIVE (tail-truncated) output so far,
+    /// but the frontend `liveOutput` appends each chunk — so we diff against this
+    /// to emit only the new suffix. Cleared on `ToolEnd`.
+    tool_output_acc: HashMap<String, (String, u64)>,
 }
 
 impl Acl {
@@ -201,6 +206,7 @@ impl Acl {
             acc_reasoning: String::new(),
             completed: false,
             tool_starts: HashMap::new(),
+            tool_output_acc: HashMap::new(),
         }
     }
 
@@ -274,6 +280,7 @@ impl Acl {
                     .tool_starts
                     .remove(tool_call_id)
                     .map(|s| u64::try_from(s.elapsed().as_millis()).unwrap_or(u64::MAX));
+                self.tool_output_acc.remove(tool_call_id);
                 Some(FeEvent {
                     name: event::STREAM_TOOL_ACTIVITY,
                     payload: json!({
@@ -318,10 +325,76 @@ impl Acl {
                     }),
                 })
             }
-            // ToolUpdate (liveOutput), AgentStart, duplicate completes → no FE event yet.
+            // [pi 闭环] Streaming tool output → `tool_output_chunk` (drives the
+            // frontend `liveOutput`, e.g. live bash stdout). pi's update carries
+            // the CUMULATIVE tail-truncated buffer; the frontend appends, so we
+            // forward only the new suffix (common-prefix diff). On a tail-
+            // truncation reshuffle the prefix no longer matches and we resend the
+            // current view (rare; the live preview is ephemeral, and the terminal
+            // `tool_result` is authoritative). pi merges stdout+stderr into one
+            // buffer → stream "stdout".
+            RawEvt::ToolUpdate { tool_call_id, partial } => {
+                let cur = extract_tool_update_text(partial);
+                let (delta, seq) = {
+                    let entry = self
+                        .tool_output_acc
+                        .entry(tool_call_id.clone())
+                        .or_default();
+                    let delta = if cur.len() >= entry.0.len() && cur.starts_with(&entry.0) {
+                        cur[entry.0.len()..].to_string()
+                    } else {
+                        cur.clone()
+                    };
+                    entry.0 = cur;
+                    if delta.is_empty() {
+                        (delta, 0)
+                    } else {
+                        let s = entry.1;
+                        entry.1 += 1;
+                        (delta, s)
+                    }
+                };
+                if delta.is_empty() {
+                    None
+                } else {
+                    Some(FeEvent {
+                        name: event::STREAM_TOOL_ACTIVITY,
+                        payload: json!({
+                            "conversationId": self.conv_id,
+                            "activity": {
+                                "type": "tool_output_chunk",
+                                "toolCallId": tool_call_id,
+                                "seq": seq,
+                                "stream": "stdout",
+                                "chunk": delta,
+                                "timestamp": now_ms(),
+                            }
+                        }),
+                    })
+                }
+            }
+            // AgentStart, TurnEnd, duplicate completes → no FE event.
             _ => None,
         }
     }
+}
+
+/// Extract the plain text from a serialized pi `ToolOutput`/`ToolUpdate`
+/// (`{ "content": [{ "type": "text", "text": "…" }, …] }`) — the cumulative
+/// tool output carried by `RawEvt::ToolUpdate`. Non-text blocks are skipped.
+fn extract_tool_update_text(partial: &Value) -> String {
+    let Some(blocks) = partial.get("content").and_then(Value::as_array) else {
+        return String::new();
+    };
+    let mut out = String::new();
+    for b in blocks {
+        if b.get("type").and_then(Value::as_str) == Some("text") {
+            if let Some(t) = b.get("text").and_then(Value::as_str) {
+                out.push_str(t);
+            }
+        }
+    }
+    out
 }
 
 fn to_value<T: Serialize>(v: &T) -> Value {
@@ -551,6 +624,51 @@ mod tests {
             .expect("error");
         assert_eq!(err.name, event::STREAM_ERROR);
         req(&err.payload, &["/conversationId", "/error"], "stream-error");
+    }
+
+    #[test]
+    fn tool_update_emits_incremental_output_chunks() {
+        // pi sends CUMULATIVE tail-truncated output; the ACL must forward only
+        // the new suffix so the frontend's appending liveOutput isn't duplicated.
+        let mut acl = Acl::new("c1");
+        let upd = |text: &str| RawEvt::ToolUpdate {
+            tool_call_id: "t1".into(),
+            partial: json!({ "content": [{ "type": "text", "text": text }] }),
+        };
+
+        let a = acl.translate(&upd("hello")).expect("first chunk");
+        assert_eq!(a.payload["activity"]["type"], "tool_output_chunk");
+        assert_eq!(a.payload["activity"]["toolCallId"], "t1");
+        assert_eq!(a.payload["activity"]["stream"], "stdout");
+        assert_eq!(a.payload["activity"]["chunk"], "hello");
+        assert_eq!(a.payload["activity"]["seq"], 0);
+
+        // cumulative "hello world" → only " world" forwarded
+        let b = acl.translate(&upd("hello world")).expect("delta chunk");
+        assert_eq!(b.payload["activity"]["chunk"], " world");
+        assert_eq!(b.payload["activity"]["seq"], 1);
+
+        // identical cumulative (no new bytes) → no event
+        assert!(acl.translate(&upd("hello world")).is_none());
+
+        // a different tool call has its own accumulator
+        let other = acl
+            .translate(&RawEvt::ToolUpdate {
+                tool_call_id: "t2".into(),
+                partial: json!({ "content": [{ "type": "text", "text": "x" }] }),
+            })
+            .expect("t2 chunk");
+        assert_eq!(other.payload["activity"]["chunk"], "x");
+
+        // tool_result clears the accumulator so a re-used id starts fresh
+        let _ = acl.translate(&RawEvt::ToolEnd {
+            tool_name: "bash".into(),
+            tool_call_id: "t1".into(),
+            result: json!({ "content": [] }),
+            is_error: false,
+        });
+        let c = acl.translate(&upd("again")).expect("post-end chunk");
+        assert_eq!(c.payload["activity"]["chunk"], "again");
     }
 
     /// [R2 Done-when#1] A whole realistic turn — think, speak, call a tool, speak

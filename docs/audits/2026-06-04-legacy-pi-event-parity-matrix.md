@@ -36,7 +36,7 @@ Legend: ✅ covered · ⚠️ GAP (pi missing / mis-shaped) · ⏭️ expected-s
 | `chat:stream-reasoning` | conversationId, delta, seq | ✅ | ✅ (acl) | ✅ |
 | `chat:stream-tool-activity` `tool_start` | conversationId, activity.{type,toolName,toolCallId} (+previewTarget for write) | ✅ | ✅ (acl) + previewTarget via bridge (#79) | ✅ |
 | `chat:stream-tool-activity` `tool_result` | conversationId, activity.{type,toolName,toolCallId,result,isError,durationMs} | ✅ | ✅ (acl) | ✅ |
-| `chat:stream-tool-activity` `tool_output_chunk` | activity.{toolCallId,stream,chunk,seq} | ✅ (tool_dispatch drain) | ⚠️ **GAP** — `RawEvt::ToolUpdate` exists but ACL doesn't project it ("no FE event yet", acl.rs:321) | ⚠️ |
+| `chat:stream-tool-activity` `tool_output_chunk` | activity.{toolCallId,stream,chunk,seq} | ✅ (tool_dispatch drain) | ✅ ACL projects `RawEvt::ToolUpdate` → `tool_output_chunk`; pi sends cumulative tail-truncated output so the ACL forwards only the new suffix (common-prefix diff), stream `stdout` (pi merges streams) | ✅ |
 | `chat:stream-complete` | conversationId (+text) | ✅ | ✅ (acl) → persist_assistant | ✅ |
 | `chat:stream-error` | conversationId, error | ✅ | ✅ (acl) → failure record (#76) | ✅ |
 | `agent:turn_cost` | conversationId, inputTokens, outputTokens, costUsd | ✅ | ✅ (engine.rs) + cost recompute in bridge | ✅ |
@@ -69,10 +69,13 @@ Ranked by user-visible impact. Each is its own small PR.
    placeholder so the live skill-recall panel attributes to the right session.
    (Already flagged as a follow-up in `engine_sink.rs`.)
 
-3. **`tool_output_chunk` streaming on pi (MEDIUM).** Live bash/tool stdout/stderr
-   doesn't stream on pi. `RawEvt::ToolUpdate` already exists; project it in the
-   ACL to a `chat:stream-tool-activity` `tool_output_chunk` (type, toolCallId,
-   stream, chunk, seq).
+3. ~~**`tool_output_chunk` streaming on pi (MEDIUM).**~~ **RESOLVED.** The ACL now
+   projects `RawEvt::ToolUpdate` → `chat:stream-tool-activity` `tool_output_chunk`.
+   pi sends the *cumulative* tail-truncated buffer while the frontend appends, so
+   the ACL diffs against the last forwarded text and emits only the new suffix
+   (per `tool_call_id`, cleared on `ToolEnd`); `stream` is `stdout` (pi merges
+   stdout+stderr). Verified end-to-end: pi emits `ToolExecutionUpdate` from bash
+   (`agent.rs`) → demux → ACL.
 
 4. **Verify approval / ask_user / exit_plan field shapes (MEDIUM).** pi has a
    dedicated `approval.rs` + `respond_*` flow; confirm the emitted payloads carry
