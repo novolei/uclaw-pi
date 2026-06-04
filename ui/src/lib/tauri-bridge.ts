@@ -1616,9 +1616,6 @@ export const readAttachment = (localPath: string): Promise<string> =>
 export const getSystemPromptConfig = (): Promise<any> =>
   invoke('get_system_prompt_config').catch(() => ({ prompts: [] }))
 
-export const generateTitle = (input: any): Promise<string> =>
-  invoke<string>('generate_title', { input }).catch(() => '')
-
 // --- File dialogs ---
 export const openFileDialog = (): Promise<{ files: any[] }> =>
   invoke<{ files: any[] }>('open_file_dialog').catch(() => ({ files: [] }))

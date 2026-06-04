@@ -43,7 +43,6 @@ import {
   useConversationThinkingEnabled,
   useConversationPromptId,
 } from '@/hooks/useConversationSettings'
-import { registerPendingTitle } from '@/hooks/useGlobalChatListeners'
 import { draftSessionIdsAtom } from '@/atoms/draft-session-atoms'
 import { activeProviderModelAtom } from '@/atoms/active-model'
 import { cn } from '@/lib/utils'
@@ -239,13 +238,8 @@ function ChatViewInner({ conversationId }: ChatViewProps): React.ReactElement {
     const isFirstMessage = messageCountBeforeSend === 0
     console.log('[ChatView] 发送消息 - isFirstMessage:', isFirstMessage, 'messageCountBeforeSend:', messageCountBeforeSend, 'conversationId:', conversationId)
     if (isFirstMessage && content) {
-      console.log('[ChatView] 设置待生成标题:', { conversationId, userMessage: content.slice(0, 50) })
-      registerPendingTitle(conversationId, {
-        userMessage: content,
-        channelId: selectedModel?.channelId ?? '',
-        modelId: activeProviderModel?.modelId ?? selectedModel?.modelId ?? '',
-      })
-      // 取消 draft 标记，让会话出现在侧边栏
+      // 取消 draft 标记，让会话出现在侧边栏。标题由后端 send_message 生成
+      // (utility 角色 → 本地 MiniCPM) 并通过 session:title-updated 事件应用。
       setDraftSessionIds((prev: Set<string>) => {
         if (!prev.has(conversationId)) return prev
         const next = new Set(prev)

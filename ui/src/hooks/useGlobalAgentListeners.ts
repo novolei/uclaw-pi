@@ -38,6 +38,7 @@ import {
 } from '@/atoms/preview-panel-atoms'
 import { workspaceSessionsAtom, updateSessionTitleAtom, type WorkspaceSession } from '@/atoms/workspace'
 import { tabsAtom } from '@/atoms/tab-atoms'
+import { conversationsAtom } from '@/atoms/chat-atoms'
 import {
   browserTaskRunAtom,
   type BrowserTaskRunEntry,
@@ -753,6 +754,12 @@ function startAgentListeners(store: Store): void {
           prev.map((t: TabItem) =>
             t.sessionId === sessionId ? { ...t, title: tabTitle } : t
           )
+        )
+        // Chat conversations rename via this same backend emit (for chat,
+        // sessionId is the conversation id). Replaces the removed frontend
+        // generate_title path so chat sessions get live titles too.
+        store.set(conversationsAtom, (prev) =>
+          prev.map((c) => (c.id === sessionId ? { ...c, title } : c))
         )
       }
     )

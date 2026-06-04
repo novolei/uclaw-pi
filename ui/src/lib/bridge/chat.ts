@@ -16,5 +16,4 @@ export {
   updateConversationTitle,
   togglePinConversation,
   updateConversationModel,
-  generateTitle,
 } from '../tauri-bridge'
