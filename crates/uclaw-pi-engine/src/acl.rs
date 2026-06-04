@@ -46,6 +46,10 @@ pub enum RawEvt {
     AgentEnd { error: Option<String> },
     /// pi auto-compacted the context window (summary of the dropped older turns).
     AutoCompacted { summary: String, tokens_before: u64 },
+    /// pi is auto-retrying a transient LLM/provider error (about to wait + retry).
+    Retrying { attempt: u32, max_attempts: u32, delay_ms: u64, reason: String },
+    /// pi exhausted its retry budget (the turn will fail).
+    RetryExhausted { reason: String },
     /// Any event the ACL does not (yet) project to a frontend event.
     Other { name: String },
 }
@@ -125,6 +129,27 @@ pub fn demux(ev: &AgentEvent) -> RawEvt {
                 RawEvt::AutoCompacted { summary, tokens_before }
             }
         }
+        // pi auto-retry lifecycle: about to wait + retry a transient error.
+        AgentEvent::AutoRetryStart {
+            attempt,
+            max_attempts,
+            delay_ms,
+            error_message,
+        } => RawEvt::Retrying {
+            attempt: *attempt,
+            max_attempts: *max_attempts,
+            delay_ms: *delay_ms,
+            reason: error_message.clone(),
+        },
+        // Retry budget exhausted (failure) → surface as exhausted; a successful
+        // retry (success=true) needs no event (resumed text clears the banner).
+        AgentEvent::AutoRetryEnd {
+            success: false,
+            final_error,
+            ..
+        } => RawEvt::RetryExhausted {
+            reason: final_error.clone().unwrap_or_default(),
+        },
         other => RawEvt::Other {
             name: agentevent_tag(other),
         },
@@ -418,6 +443,25 @@ impl Acl {
                     "tokensBefore": tokens_before,
                 }),
             }),
+            RawEvt::Retrying { attempt, max_attempts, delay_ms, reason } => Some(FeEvent {
+                name: event::AGENT_RETRY,
+                payload: json!({
+                    "conversationId": self.conv_id,
+                    "status": "attempt",
+                    "attempt": attempt,
+                    "maxAttempts": max_attempts,
+                    "delaySeconds": (*delay_ms as f64) / 1000.0,
+                    "reason": reason,
+                }),
+            }),
+            RawEvt::RetryExhausted { reason } => Some(FeEvent {
+                name: event::AGENT_RETRY,
+                payload: json!({
+                    "conversationId": self.conv_id,
+                    "status": "exhausted",
+                    "reason": reason,
+                }),
+            }),
             // AgentStart, TurnEnd, duplicate completes → no FE event.
             _ => None,
         }
@@ -582,6 +626,37 @@ mod tests {
             error_message: None,
         };
         assert!(acl.translate(&demux(&empty)).is_none());
+    }
+
+    #[test]
+    fn auto_retry_projects_agent_retry_attempt_and_exhausted() {
+        let mut acl = Acl::new("c1");
+        let start = AgentEvent::AutoRetryStart {
+            attempt: 2,
+            max_attempts: 3,
+            delay_ms: 1500,
+            error_message: "HTTP 429 rate limited".into(),
+        };
+        let e = acl.translate(&demux(&start)).expect("retry attempt event");
+        assert_eq!(e.name, event::AGENT_RETRY);
+        assert_eq!(e.payload["conversationId"], "c1");
+        assert_eq!(e.payload["status"], "attempt");
+        assert_eq!(e.payload["attempt"], 2);
+        assert_eq!(e.payload["maxAttempts"], 3);
+        assert_eq!(e.payload["delaySeconds"], 1.5);
+
+        let exhausted = AgentEvent::AutoRetryEnd {
+            success: false,
+            attempt: 3,
+            final_error: Some("giving up after 3 attempts".into()),
+        };
+        let e2 = acl.translate(&demux(&exhausted)).expect("exhausted event");
+        assert_eq!(e2.name, event::AGENT_RETRY);
+        assert_eq!(e2.payload["status"], "exhausted");
+
+        // A SUCCESSFUL retry needs no event (resumed text clears the banner).
+        let ok = AgentEvent::AutoRetryEnd { success: true, attempt: 2, final_error: None };
+        assert!(acl.translate(&demux(&ok)).is_none());
     }
 
     #[test]
