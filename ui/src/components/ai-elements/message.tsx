@@ -2,6 +2,7 @@ import * as React from 'react'
 import type { ComponentProps } from 'react'
 import Markdown, { defaultUrlTransform } from 'react-markdown'
 import remarkGfm from 'remark-gfm'
+import { Hexagon } from 'lucide-react'
 
 import { cn } from '@/lib/utils'
 import { MarkdownCodeBlock } from '@/components/shared/code-block/CodeBlock'
@@ -563,9 +564,40 @@ export const MessageResponse = React.memo(
 )
 
 /** 用户消息：通过 MessageResponse 渲染 markdown，但保留换行 */
+/** A leading `/<command>` rendered as the same "command pill" the composer shows
+ *  (hexagon + bare name), so a sent slash-command message reads consistently with
+ *  what the user typed. The wire text keeps the `/`. */
+function SlashCommandPill({ name }: { name: string }): React.ReactElement {
+  return (
+    <span className="inline-flex items-center gap-1 px-2 py-[1px] rounded-full text-[12px] leading-[1.5] align-baseline font-medium bg-muted text-blue-600 dark:text-blue-400 border border-border/50">
+      <Hexagon size={12} className="shrink-0" aria-hidden="true" />
+      {name}
+    </span>
+  )
+}
+
+/** Split a leading `/<command>` (a single word at the very start) from the rest,
+ *  mirroring the backend's slash intercept. No leading slash ⇒ command is null. */
+function splitLeadingSlashCommand(text: string): { command: string | null; rest: string } {
+  const m = /^\s*\/([A-Za-z][\w-]*)(?:\s+([\s\S]*))?$/.exec(text)
+  if (!m) return { command: null, rest: text }
+  return { command: m[1], rest: m[2] ?? '' }
+}
+
 export function UserMessageContent({ children }: { children: React.ReactNode }): React.ReactElement {
   if (typeof children !== 'string') {
     return <div className="chat-content text-[15px] leading-relaxed whitespace-pre-wrap break-words">{children}</div>
+  }
+  // A sent `/<command> …` message renders the command as a pill + the rest as
+  // plain text (slash-command messages are plain — markdown there is rare).
+  const { command, rest } = splitLeadingSlashCommand(children)
+  if (command) {
+    return (
+      <div className="chat-content text-[15px] leading-relaxed whitespace-pre-wrap break-words">
+        <SlashCommandPill name={command} />
+        {rest ? <span>{' '}{rest}</span> : null}
+      </div>
+    )
   }
   return (
     <MessageResponse preserveBreaks className="break-words">
