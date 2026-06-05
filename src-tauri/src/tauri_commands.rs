@@ -1978,6 +1978,7 @@ pub async fn send_message(
             crate::skills_manifest::SYSTEM_PROMPT_MANIFEST_MAX_TOKENS,
             crate::skills_manifest::StrategyBias::Balanced,
             None,
+            Some(input.content.as_str()),
         );
         delegate.set_skills_manifest_block(manifest);
     }
@@ -6377,6 +6378,7 @@ pub async fn send_agent_message(
                 crate::skills_manifest::SYSTEM_PROMPT_MANIFEST_MAX_TOKENS,
                 crate::skills_manifest::StrategyBias::Balanced,
                 None,
+                Some(input.user_message.as_str()),
             );
             delegate.set_skills_manifest_block(manifest);
         }
