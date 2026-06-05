@@ -666,7 +666,7 @@ mod manifest_cap_tests {
         let store = fresh_store();
         let manifest = build_skills_manifest(
             &registry, &store, "default",
-            30, 800, StrategyBias::Balanced, None,
+            30, 800, StrategyBias::Balanced, None, None,
         );
         // No skills loaded → empty manifest is correct.
         assert!(manifest.is_empty() || manifest.contains("Learned Skills"),
@@ -683,7 +683,7 @@ mod manifest_cap_tests {
         let store = fresh_store();
         let manifest = build_skills_manifest(
             &registry, &store, "default",
-            30, 256, StrategyBias::Balanced, None,
+            30, 256, StrategyBias::Balanced, None, None,
         );
         // Empty registry + empty store → empty manifest, no panic.
         let _ = manifest;

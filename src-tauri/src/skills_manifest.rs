@@ -65,8 +65,23 @@ pub fn build_skills_manifest(
     max_tokens: usize,
     bias: StrategyBias,
     workspace_tags: Option<&[String]>,
+    query: Option<&str>,
 ) -> String {
-    let entries = collect_entries(registry, store, space_id, max_entries, &bias, workspace_tags);
+    // Lexical relevance terms from the current user message: learned skills whose
+    // title/summary overlap the query float to the top of the budget-capped
+    // manifest (recency stays the tiebreaker). Makes the injected skills
+    // *task-relevant* instead of just *recently used* — the model sees the skills
+    // for THIS turn. Empty query ⇒ pure recency/bias order (unchanged behavior).
+    let query_terms = query.map(extract_query_terms).unwrap_or_default();
+    let entries = collect_entries(
+        registry,
+        store,
+        space_id,
+        max_entries,
+        &bias,
+        workspace_tags,
+        &query_terms,
+    );
     if entries.is_empty() {
         return String::new();
     }
@@ -97,7 +112,8 @@ pub fn compute_active_manifest_entries(
     bias: StrategyBias,
     workspace_tags: Option<&[String]>,
 ) -> Vec<ManifestEntry> {
-    collect_entries(registry, store, space_id, max_entries, &bias, workspace_tags)
+    // Debug panel shows the recency/bias-ordered manifest (no live query context).
+    collect_entries(registry, store, space_id, max_entries, &bias, workspace_tags, &[])
 }
 
 /// Manifest filter rule for per-workspace skill tag scoping (V19+).
@@ -140,6 +156,59 @@ pub struct ManifestEntry {
     pub node_id: Option<String>,
 }
 
+/// Whether `c` is a CJK ideograph (so Chinese queries get bigram terms instead
+/// of relying on whitespace, which Chinese text lacks).
+fn is_cjk(c: char) -> bool {
+    matches!(c as u32, 0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xF900..=0xFAFF)
+}
+
+fn push_ascii_word(word: &mut String, out: &mut std::collections::BTreeSet<String>) {
+    if word.chars().count() >= 2 {
+        out.insert(std::mem::take(word));
+    } else {
+        word.clear();
+    }
+}
+
+fn push_cjk_run(run: &mut Vec<char>, out: &mut std::collections::BTreeSet<String>) {
+    if run.len() >= 2 {
+        // The whole short run (e.g. 清蒸桂鱼) + its 2-grams (清蒸, 蒸桂, 桂鱼),
+        // so a query overlaps a skill title even with different segmentation.
+        if run.len() <= 4 {
+            out.insert(run.iter().collect());
+        }
+        for w in run.windows(2) {
+            out.insert(w.iter().collect());
+        }
+    }
+    run.clear();
+}
+
+/// Tokenize a user query into lowercase relevance terms: ASCII alphanumeric words
+/// (≥2 chars) + CJK bigrams from contiguous Chinese runs. Deduped. Used to
+/// lexically rank learned skills against the current turn. Pure + unit-tested.
+fn extract_query_terms(query: &str) -> Vec<String> {
+    let lower = query.to_lowercase();
+    let mut terms: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut word = String::new();
+    let mut cjk: Vec<char> = Vec::new();
+    for c in lower.chars() {
+        if is_cjk(c) {
+            push_ascii_word(&mut word, &mut terms);
+            cjk.push(c);
+        } else if c.is_ascii_alphanumeric() {
+            push_cjk_run(&mut cjk, &mut terms);
+            word.push(c);
+        } else {
+            push_ascii_word(&mut word, &mut terms);
+            push_cjk_run(&mut cjk, &mut terms);
+        }
+    }
+    push_ascii_word(&mut word, &mut terms);
+    push_cjk_run(&mut cjk, &mut terms);
+    terms.into_iter().collect()
+}
+
 fn collect_entries(
     registry: &SkillsRegistry,
     store: &MemoryGraphStore,
@@ -147,6 +216,7 @@ fn collect_entries(
     max_entries: usize,
     bias: &StrategyBias,
     workspace_tags: Option<&[String]>,
+    query_terms: &[String],
 ) -> Vec<ManifestEntry> {
     let mut entries = Vec::new();
 
@@ -268,10 +338,21 @@ fn collect_entries(
             .and_then(|m| m.get("category"))
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
-        let bonus = if let (Some(bias_cat), Some(ref cat)) = (bias_category, &category) {
+        let bias_bonus = if let (Some(bias_cat), Some(ref cat)) = (bias_category, &category) {
             if cat.as_str() == bias_cat { 3.0_f32 } else { 0.0 }
         } else {
             0.0
+        };
+        // Lexical relevance to the current query: each distinct matched term in
+        // title+summary adds 1.5 (capped at 6.0 ≈ 4 terms). A 2-term match (3.0)
+        // matches a category bias, so a task-relevant skill floats above a merely
+        // recent one. Zero when there's no query (manifest stays recency-ordered).
+        let relevance_bonus = if query_terms.is_empty() {
+            0.0
+        } else {
+            let hay = format!("{} {}", detail.node.title, summary).to_lowercase();
+            let matched = query_terms.iter().filter(|t| hay.contains(t.as_str())).count();
+            (matched as f32 * 1.5).min(6.0)
         };
         Some(Candidate {
             entry: ManifestEntry {
@@ -281,12 +362,15 @@ fn collect_entries(
                 cited_count,
                 node_id: Some(detail.node.id.clone()),
             },
-            bonus,
+            bonus: bias_bonus + relevance_bonus,
         })
     }).collect();
 
-    // Stable sort by bonus descending (E3 order preserved within ties).
-    if *bias != StrategyBias::Balanced {
+    // Stable sort by combined bonus descending (recency/E3 order preserved within
+    // ties). Sort whenever there's a re-ranking signal — a strategy bias OR query
+    // relevance; a Balanced bias with no query keeps the original recency order.
+    let has_relevance = !query_terms.is_empty();
+    if *bias != StrategyBias::Balanced || has_relevance {
         candidates.sort_by(|a, b| b.bonus.partial_cmp(&a.bonus).unwrap_or(std::cmp::Ordering::Equal));
     }
 
@@ -479,7 +563,7 @@ mod tests {
         let store = MemoryGraphStore::new(conn);
         let registry = SkillsRegistry::new();
 
-        let manifest = build_skills_manifest(&registry, &store, "default", 30, 1500, StrategyBias::Balanced, None);
+        let manifest = build_skills_manifest(&registry, &store, "default", 30, 1500, StrategyBias::Balanced, None, None);
         assert!(manifest.is_empty(), "expected empty manifest, got: {}", manifest);
     }
 
@@ -534,12 +618,57 @@ mod tests {
     }
 
     #[test]
+    fn extract_query_terms_handles_ascii_and_cjk() {
+        // ASCII: words ≥2 chars, lowercased, deduped; 1-char dropped.
+        let t = extract_query_terms("Fix the Login API a");
+        assert!(t.contains(&"fix".to_string()));
+        assert!(t.contains(&"login".to_string()));
+        assert!(t.contains(&"api".to_string()));
+        assert!(t.contains(&"the".to_string()));
+        assert!(!t.iter().any(|s| s == "a"), "1-char token dropped");
+        // CJK: contiguous run → 2-grams (+ the whole short run).
+        let z = extract_query_terms("帮我做清蒸桂鱼");
+        assert!(z.contains(&"清蒸".to_string()));
+        assert!(z.contains(&"蒸桂".to_string()));
+        assert!(z.contains(&"桂鱼".to_string()));
+        // Empty / whitespace → no terms.
+        assert!(extract_query_terms("   ").is_empty());
+    }
+
+    #[test]
+    fn query_relevance_floats_matching_skill_above_more_recent_one() {
+        let store = fresh_store();
+        // Higher cited/usage ⇒ ranks first WITHOUT a query (recency/decay order).
+        make_learned_node(&store, "数据库迁移助手", "生成数据库迁移脚本", 50, 50);
+        // Low cited, but matches the query.
+        make_learned_node(&store, "清蒸桂鱼做法", "清蒸桂鱼的详细步骤", 1, 1);
+        let registry = SkillsRegistry::new();
+
+        // No query → the more-cited migration skill comes first.
+        let baseline = build_skills_manifest(
+            &registry, &store, "default", 30, 4000, StrategyBias::Balanced, None, None,
+        );
+        let mig = baseline.find("**数据库迁移助手**").expect("migration skill");
+        let fish = baseline.find("**清蒸桂鱼做法**").expect("fish skill");
+        assert!(mig < fish, "without a query, higher-cited skill ranks first");
+
+        // With a fish query → the relevant skill floats above the more-cited one.
+        let ranked = build_skills_manifest(
+            &registry, &store, "default", 30, 4000, StrategyBias::Balanced, None,
+            Some("帮我做清蒸桂鱼"),
+        );
+        let mig2 = ranked.find("**数据库迁移助手**").expect("migration skill");
+        let fish2 = ranked.find("**清蒸桂鱼做法**").expect("fish skill");
+        assert!(fish2 < mig2, "query-relevant skill should float above the recent one");
+    }
+
+    #[test]
     fn learned_only_renders_block_with_cited_count() {
         let store = fresh_store();
         make_learned_node(&store, "stock-research", "Cross-validate stock financials", 7, 12);
 
         let registry = SkillsRegistry::new();
-        let manifest = build_skills_manifest(&registry, &store, "default", 30, 1500, StrategyBias::Balanced, None);
+        let manifest = build_skills_manifest(&registry, &store, "default", 30, 1500, StrategyBias::Balanced, None, None);
 
         assert!(manifest.contains("## 你已学习到的技能"), "missing header");
         assert!(manifest.contains("**stock-research**"), "missing skill name");
@@ -553,7 +682,7 @@ mod tests {
         make_learned_node(&store, "newly-extracted", "Just extracted, never cited yet", 0, 1);
 
         let registry = SkillsRegistry::new();
-        let manifest = build_skills_manifest(&registry, &store, "default", 30, 1500, StrategyBias::Balanced, None);
+        let manifest = build_skills_manifest(&registry, &store, "default", 30, 1500, StrategyBias::Balanced, None, None);
 
         assert!(manifest.contains("[learned]"), "expected bare [learned] when cited=0; got:\n{}", manifest);
         assert!(!manifest.contains("cited 0"), "must not say 'cited 0'");
@@ -566,7 +695,7 @@ mod tests {
             make_learned_node(&store, &format!("skill-{}", i), "blah", 0, 0);
         }
         let registry = SkillsRegistry::new();
-        let manifest = build_skills_manifest(&registry, &store, "default", 2, 1500, StrategyBias::Balanced, None);
+        let manifest = build_skills_manifest(&registry, &store, "default", 2, 1500, StrategyBias::Balanced, None, None);
 
         let lines = manifest.matches("\n- **").count();
         assert_eq!(lines, 2, "expected exactly 2 entries; got:\n{}", manifest);
@@ -578,7 +707,7 @@ mod tests {
         let store = fresh_store();
         make_learned_node(&store, "long-skill", summary, 0, 0);
         let registry = SkillsRegistry::new();
-        let manifest = build_skills_manifest(&registry, &store, "default", 30, 1500, StrategyBias::Balanced, None);
+        let manifest = build_skills_manifest(&registry, &store, "default", 30, 1500, StrategyBias::Balanced, None, None);
 
         // Should be truncated with "…"
         assert!(manifest.contains("…"), "expected truncation marker; got:\n{}", manifest);
@@ -593,7 +722,7 @@ mod tests {
             make_learned_node(&store, &format!("skill-{}", i), "some summary text", 0, 0);
         }
         let registry = SkillsRegistry::new();
-        let manifest = build_skills_manifest(&registry, &store, "default", 30, 100, StrategyBias::Balanced, None);
+        let manifest = build_skills_manifest(&registry, &store, "default", 30, 100, StrategyBias::Balanced, None, None);
 
         let lines = manifest.matches("\n- **").count();
         assert!(lines < 30, "expected token budget to drop entries; got {} lines", lines);
@@ -616,6 +745,7 @@ mod tests {
             SYSTEM_PROMPT_MANIFEST_MAX_ENTRIES,
             SYSTEM_PROMPT_MANIFEST_MAX_TOKENS,
             StrategyBias::Balanced,
+            None,
             None,
         );
 
@@ -668,7 +798,7 @@ mod tests {
         registry.register(mk_skill("z-builtin", "Z builtin"));
         registry.register(mk_skill("a-builtin", "A builtin"));
 
-        let manifest = build_skills_manifest(&registry, &store, "default", 30, 4000, StrategyBias::Balanced, None);
+        let manifest = build_skills_manifest(&registry, &store, "default", 30, 4000, StrategyBias::Balanced, None, None);
 
         // Find positions of each skill name in the manifest body
         let a_builtin_pos = manifest.find("**a-builtin**").expect("a-builtin missing");
@@ -687,7 +817,7 @@ mod tests {
 
         // Runtime disable removes a builtin from the manifest
         registry.disable("a-builtin");
-        let manifest2 = build_skills_manifest(&registry, &store, "default", 30, 4000, StrategyBias::Balanced, None);
+        let manifest2 = build_skills_manifest(&registry, &store, "default", 30, 4000, StrategyBias::Balanced, None, None);
         assert!(
             !manifest2.contains("**a-builtin**"),
             "runtime-disabled skill should not appear; got:\n{}",
@@ -740,6 +870,7 @@ mod tests {
             30,
             4000,
             StrategyBias::Balanced,
+            None,
             None,
         );
 
@@ -800,13 +931,13 @@ mod tests {
         let registry = SkillsRegistry::new();
 
         // Balanced: optimize-skill (cited=10) comes before repair-skill (cited=1)
-        let balanced = build_skills_manifest(&registry, &store, "default", 30, 4000, StrategyBias::Balanced, None);
+        let balanced = build_skills_manifest(&registry, &store, "default", 30, 4000, StrategyBias::Balanced, None, None);
         let opt_pos = balanced.find("**optimize-skill**").expect("optimize-skill missing");
         let rep_pos = balanced.find("**repair-skill**").expect("repair-skill missing");
         assert!(opt_pos < rep_pos, "balanced: higher-cited skill should appear first");
 
         // Repair bias: repair-skill should float to the top of the learned block
-        let biased = build_skills_manifest(&registry, &store, "default", 30, 4000, StrategyBias::Repair, None);
+        let biased = build_skills_manifest(&registry, &store, "default", 30, 4000, StrategyBias::Repair, None, None);
         let opt_biased = biased.find("**optimize-skill**").expect("optimize-skill missing in biased");
         let rep_biased = biased.find("**repair-skill**").expect("repair-skill missing in biased");
         assert!(rep_biased < opt_biased, "repair bias: repair-tagged skill must precede unmatched skill");
