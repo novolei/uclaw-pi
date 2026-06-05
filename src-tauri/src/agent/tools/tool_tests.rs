@@ -35,6 +35,39 @@ fn kinded_with_source_keeps_source_field() {
     }
 }
 
+/// Regression: the `Kinded` Display used to drop `source_context`, so a wrapped
+/// reqwest DNS/connect failure reached the model as a bare `[NetworkError]
+/// Failed to fetch <url>` and got misread as a timeout. The cause must now be
+/// surfaced.
+#[test]
+fn kinded_display_surfaces_source_cause() {
+    let err = ToolError::kinded_with_source(
+        ToolErrorKind::NetworkError,
+        "Failed to fetch https://example.com",
+        "error sending request: dns error: failed to lookup address",
+    );
+    let shown = err.to_string();
+    assert!(shown.starts_with("[NetworkError] Failed to fetch https://example.com"));
+    assert!(
+        shown.contains("dns error"),
+        "cause must reach the model; got: {shown}"
+    );
+}
+
+/// Cause that merely repeats the message is suppressed — no `(X (X))` noise.
+#[test]
+fn kinded_display_suppresses_redundant_cause() {
+    let err = ToolError::kinded_with_source(ToolErrorKind::Other, "boom", "boom");
+    assert_eq!(err.to_string(), "[Other] boom");
+}
+
+/// No source → unchanged `[Kind] message` form (back-compat for `kinded`).
+#[test]
+fn kinded_display_without_source_unchanged() {
+    let err = ToolError::kinded(ToolErrorKind::ResourceNotFound, "Page returned 404");
+    assert_eq!(err.to_string(), "[NotFound] Page returned 404");
+}
+
 #[test]
 fn tool_context_derives_subcall_without_losing_parent_context() {
     let ctx = ToolExecutionContext::agent_turn(

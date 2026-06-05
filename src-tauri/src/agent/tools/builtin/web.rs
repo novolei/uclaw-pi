@@ -15,8 +15,16 @@ const DEFAULT_TIMEOUT_MS: u64 = 15_000;
 /// rather than rejected — partial content beats no content for the LLM.
 const MAX_RESPONSE_SIZE: usize = 10 * 1024 * 1024;
 
-/// User-Agent header.
+/// User-Agent header for the generic `http_request` tool (honest client id).
 const USER_AGENT: &str = "uClaw/0.1";
+
+/// User-Agent for `web_fetch`. A bare `uClaw/0.1` with no `Accept` headers reads
+/// as a bot to CDN bot managers (Akamai/Cloudflare), which on protected paths
+/// challenge or RST the connection — surfacing to reqwest as a non-timeout
+/// `NetworkError`. A real browser UA paired with browser `Accept` headers raises
+/// the pass rate at zero cost.
+const BROWSER_USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
+    AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 
 /// Largest prefix of `s` that's `<= max_bytes` AND ends at a UTF-8 char
 /// boundary. Returns the original on input shorter than the cap.
@@ -224,9 +232,29 @@ impl Tool for WebFetchTool {
 
         info!(url, timeout_ms, "Fetching web page");
 
+        // Browser-like request headers. CDN bot managers score on header
+        // presence; a bare UA with no Accept headers reads as a bot. Cheap signal.
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::ACCEPT,
+            reqwest::header::HeaderValue::from_static(
+                "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            ),
+        );
+        headers.insert(
+            reqwest::header::ACCEPT_LANGUAGE,
+            reqwest::header::HeaderValue::from_static("en-US,en;q=0.9"),
+        );
+
+        let total = std::time::Duration::from_millis(timeout_ms);
         let client = reqwest::Client::builder()
-            .user_agent(USER_AGENT)
-            .timeout(std::time::Duration::from_millis(timeout_ms))
+            .user_agent(BROWSER_USER_AGENT)
+            .default_headers(headers)
+            // Bound the connect phase independently so a transient DNS/connect
+            // stall fails fast enough to retry *within* the caller's budget,
+            // instead of one stalled attempt eating the whole window.
+            .connect_timeout(total.min(std::time::Duration::from_secs(8)))
+            .timeout(total)
             .build()
             .map_err(|e| ToolError::kinded_with_source(
                 ToolErrorKind::Other,
@@ -234,22 +262,39 @@ impl Tool for WebFetchTool {
                 e.to_string(),
             ))?;
 
-        let resp = client
-            .get(url)
-            .send()
-            .await
-            .map_err(|e| {
-                let kind = if e.is_timeout() {
-                    ToolErrorKind::Timeout
-                } else {
-                    ToolErrorKind::NetworkError
-                };
-                ToolError::kinded_with_source(
-                    kind,
-                    format!("Failed to fetch {}", url),
-                    e.to_string(),
-                )
-            })?;
+        // One bounded retry on a *transient connection* failure (DNS hiccup,
+        // connect reset) — never on timeouts or HTTP status errors. This is the
+        // exact failure class seen under tool-concurrency bursts: the OS
+        // resolver's ~5s default timeout fires and reqwest returns a non-timeout
+        // NetworkError well inside our own (15–30s) budget. GET is idempotent, so
+        // retrying is safe and turns a spurious hard failure into a success.
+        let resp = {
+            let mut attempt: u32 = 0;
+            loop {
+                match client.get(url).send().await {
+                    Ok(resp) => break resp,
+                    Err(e) => {
+                        let transient = e.is_connect() && !e.is_timeout();
+                        if transient && attempt == 0 {
+                            attempt += 1;
+                            warn!(url, cause = %e, "web_fetch: transient connect error — retrying once");
+                            tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+                            continue;
+                        }
+                        let kind = if e.is_timeout() {
+                            ToolErrorKind::Timeout
+                        } else {
+                            ToolErrorKind::NetworkError
+                        };
+                        return Err(ToolError::kinded_with_source(
+                            kind,
+                            format!("Failed to fetch {}", url),
+                            e.to_string(),
+                        ));
+                    }
+                }
+            }
+        };
 
         let status = resp.status();
         if !status.is_success() {

@@ -94,14 +94,34 @@ pub enum ToolError {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
     /// Structured error with a category and a user/LLM-friendly message.
-    /// Display formats as `[Kind] message` so the LLM can pattern-match
-    /// on the bracketed tag.
-    #[error("[{}] {message}", .kind.as_str())]
+    /// Display formats as `[Kind] message (cause)` so the LLM can pattern-match
+    /// on the bracketed tag AND see the underlying cause.
+    ///
+    /// History: the original Display dropped `source_context` entirely. That
+    /// silently swallowed the real reason behind every wrapped failure — e.g. a
+    /// transient reqwest DNS/connect error surfaced to the model as a bare
+    /// `[NetworkError] Failed to fetch <url>`, which both the agent and users
+    /// repeatedly misread as a *timeout*. The captured cause now reaches the
+    /// model so it (and we) can tell DNS/connect blips apart from real timeouts.
+    #[error("{}", render_kinded(.kind, &.message, &.source_context))]
     Kinded {
         kind: ToolErrorKind,
         message: String,
         source_context: Option<String>,
     },
+}
+
+/// Render a `Kinded` error to its model-facing string: `[Kind] message`, with
+/// the captured `source_context` appended as `(cause)` when it adds signal.
+/// Suppressed when the cause is empty or already contained in `message` so we
+/// don't emit `[NetworkError] Failed to fetch X (Failed to fetch X)`.
+fn render_kinded(kind: &ToolErrorKind, message: &str, source: &Option<String>) -> String {
+    match source.as_deref() {
+        Some(cause) if !cause.is_empty() && !message.contains(cause) => {
+            format!("[{}] {} ({})", kind.as_str(), message, cause)
+        }
+        _ => format!("[{}] {}", kind.as_str(), message),
+    }
 }
 
 impl ToolError {
