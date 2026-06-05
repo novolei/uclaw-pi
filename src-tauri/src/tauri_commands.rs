@@ -1979,6 +1979,7 @@ pub async fn send_message(
             crate::skills_manifest::StrategyBias::Balanced,
             None,
             Some(input.content.as_str()),
+            &[],
         );
         delegate.set_skills_manifest_block(manifest);
     }
@@ -6069,6 +6070,9 @@ pub async fn send_agent_message(
     let cancellation_registry_for_spawn = Arc::clone(&state.cancellation_registry);
     let skills_registry_for_manifest = Arc::clone(&state.skills_registry);
     let memory_graph_store_for_manifest = Arc::clone(&state.memory_graph_store);
+    // Cloned before the 'static spawn so the semantic skill recall can embed the
+    // query inside the task (state itself can't cross the spawn boundary).
+    let memu_client_for_manifest = state.memu_client.clone();
     let proactive_service_for_spawn = Arc::clone(&state.proactive_service);
     // Sprint 2.0 — learning pipeline handles for the spawned delegate.
     let learning_buffer_for_spawn = Arc::clone(&state.learning_buffer);
@@ -6370,6 +6374,18 @@ pub async fn send_agent_message(
             // uncapped format_for_system_prompt_xml (~34KB/turn for ~100 skills);
             // see SYSTEM_PROMPT_MANIFEST_MAX_TOKENS. Skills beyond the budget stay
             // reachable via skill_search / load_skill.
+            // Semantic skill recall (embedding cosine over learned-skill
+            // embeddings) for THIS query → boosts the manifest beyond lexical
+            // term overlap (paraphrase/synonym). Empty when memU/fastembed is
+            // unavailable, in which case the lexical path still ranks.
+            let skill_boost_ids = crate::skills_manifest::recall_skill_ids_by_embedding(
+                &memory_graph_store_for_manifest,
+                memu_client_for_manifest.as_ref(),
+                "default",
+                &input.user_message,
+                8,
+            )
+            .await;
             let manifest = crate::skills_manifest::build_skills_manifest(
                 &registry,
                 &memory_graph_store_for_manifest,
@@ -6379,6 +6395,7 @@ pub async fn send_agent_message(
                 crate::skills_manifest::StrategyBias::Balanced,
                 None,
                 Some(input.user_message.as_str()),
+                &skill_boost_ids,
             );
             // Cache the manifest's token estimate so engine_sink's
             // agent:context_stats reports an accurate "技能" line on pi (was 0).
