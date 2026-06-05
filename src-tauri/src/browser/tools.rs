@@ -2256,17 +2256,16 @@ impl Tool for BrowserCloseAllTool {
 
 // ── 27. BrowserTaskTool ──────────────────────────────────────────────────────
 
-#[async_trait]
-impl Tool for BrowserTaskTool {
-    fn name(&self) -> &str {
-        "browser_task"
-    }
+impl BrowserTaskTool {
+    /// Name / description / parameters as associated items so the pi bridge can
+    /// advertise the spec (`engine_sink::io_tool_specs`) WITHOUT constructing this
+    /// 12-field tool in a sync context — pi builds the real tool lazily at execute
+    /// time (`run_browser_task`). The `Tool` impl below delegates here so the
+    /// advertised spec and the executed tool can never drift.
+    pub const PI_NAME: &'static str = "browser_task";
+    pub const PI_DESCRIPTION: &'static str = "Run an autonomous browser task loop: observe page state, ask the active LLM for the next browser action, execute it, recover from stale page errors, and emit structured browser task events.";
 
-    fn description(&self) -> &str {
-        "Run an autonomous browser task loop: observe page state, ask the active LLM for the next browser action, execute it, recover from stale page errors, and emit structured browser task events."
-    }
-
-    fn parameters_schema(&self) -> serde_json::Value {
+    pub fn pi_parameters_schema() -> serde_json::Value {
         serde_json::json!({
             "type": "object",
             "properties": {
@@ -2311,6 +2310,21 @@ impl Tool for BrowserTaskTool {
             },
             "required": ["task"]
         })
+    }
+}
+
+#[async_trait]
+impl Tool for BrowserTaskTool {
+    fn name(&self) -> &str {
+        Self::PI_NAME
+    }
+
+    fn description(&self) -> &str {
+        Self::PI_DESCRIPTION
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        Self::pi_parameters_schema()
     }
 
     async fn execute(&self, params: serde_json::Value) -> Result<ToolOutput, ToolError> {

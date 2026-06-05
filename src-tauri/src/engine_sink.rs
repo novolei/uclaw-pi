@@ -788,6 +788,11 @@ fn build_skill_tool(name: &str, state: &AppState, app: &AppHandle, conv: &str) -
 /// Build + execute the named tool, returning `(text, is_error)`. The `AppState`
 /// guard is dropped before the `.await` (it is not `Send`).
 async fn run_skill_tool(app: &AppHandle, conv: &str, tool_name: &str, input: serde_json::Value) -> (String, bool) {
+    // browser_task is built here (async) rather than in the sync build_skill_tool:
+    // it needs 12 deps incl. an LLM provider + settings resolved via async reads.
+    if tool_name == crate::browser::tools::BrowserTaskTool::PI_NAME {
+        return run_browser_task(app, conv, input).await;
+    }
     let tool = {
         let Some(state) = app.try_state::<AppState>() else {
             return ("agent state unavailable".to_string(), true);
@@ -798,6 +803,69 @@ async fn run_skill_tool(app: &AppHandle, conv: &str, tool_name: &str, input: ser
         Some(tool) => tool_result_text(tool.execute(input).await),
         None => (format!("unknown IO tool: {tool_name}"), true),
     }
+}
+
+/// Build + execute the autonomous `browser_task` tool on pi. Mirrors the legacy
+/// registration's dependency wiring (browser context manager, task store, ask-user
+/// bridge, long-term memory, identity registry, runtime status/config, safety,
+/// approvals) and a fresh LLM decision adapter resolved from the active provider.
+/// Runs on Tauri's tokio runtime (via the IO bridge), so the async resolution is
+/// available here even though the spec was advertised synchronously.
+async fn run_browser_task(app: &AppHandle, conv: &str, input: serde_json::Value) -> (String, bool) {
+    use crate::browser::decision::LlmBrowserDecisionAdapter;
+    use crate::browser::intervention_bridge::BrowserAskUserBridge;
+    use crate::browser::memory_adapter::BrowserLongTermMemoryAdapter;
+    use crate::browser::task_store::BrowserTaskStore;
+    use crate::browser::tools::BrowserTaskTool;
+    use std::sync::Arc;
+
+    let Some(state) = app.try_state::<AppState>() else {
+        return ("agent state unavailable".to_string(), true);
+    };
+    // The decision loop drives its own LLM — resolve the active provider/model.
+    let Some((provider_id, model, api_key, base_url, api_override)) =
+        state.provider_service.get_active_llm_config().await
+    else {
+        return ("browser_task: no LLM provider configured".to_string(), true);
+    };
+    let effective_api = api_override
+        .or_else(|| crate::providers::registry::find(&provider_id).map(|k| k.default_api));
+    let llm_cfg = crate::llm::llm_config_from_provider(
+        &provider_id, &model, &api_key, &base_url, 4096, 0.2, effective_api,
+    );
+    let llm = match crate::llm::create_provider(&llm_cfg) {
+        Ok(p) => p,
+        Err(e) => return (format!("browser_task: provider init failed: {e:?}"), true),
+    };
+    let runtime_provider_config = state
+        .settings
+        .read()
+        .await
+        .browser_runtime_provider_config
+        .clone();
+
+    let tool = BrowserTaskTool {
+        ctx_mgr: Arc::clone(&state.browser_context_manager),
+        session_id: conv.to_string(),
+        decision_adapter: Arc::new(LlmBrowserDecisionAdapter::new(Arc::clone(&llm), model)),
+        task_store: Some(Arc::new(BrowserTaskStore::new(Arc::clone(&state.db)))),
+        ask_user_bridge: Some(Arc::new(BrowserAskUserBridge::new(
+            app.clone(),
+            Arc::clone(&state.pending_ask_users),
+            conv.to_string(),
+        ))),
+        long_term_memory: Some(Arc::new(BrowserLongTermMemoryAdapter::new(
+            Arc::clone(&state.memory_store),
+            Some(Arc::clone(&state.mcp_manager)),
+        ))),
+        identity_task_registry: Some(Arc::clone(&state.browser_identity_task_registry)),
+        runtime_status_service: Some(Arc::clone(&state.browser_runtime_status_service)),
+        runtime_provider_config,
+        mcp_manager: Some(Arc::clone(&state.mcp_manager)),
+        safety_manager: Some(Arc::clone(&state.safety_manager)),
+        pending_approvals: Some(Arc::clone(&state.pending_approvals)),
+    };
+    tool_result_text(tool.execute(input).await)
 }
 
 /// Build + execute a bridged MCP tool (`mcp__server__tool`), returning
@@ -844,6 +912,18 @@ impl uclaw_pi_engine::ToolRequestSink for RealToolRequestSink {
                 specs.push(spec_from_tool(&proxy));
             }
         }
+        // browser_task: the autonomous browser loop, exposed on pi. Its spec is
+        // static (BrowserTaskTool has 12 deps → can't be built in this sync
+        // context; run_browser_task builds it lazily at execute time, where async
+        // provider/settings resolution works). Long result timeout — a task runs
+        // up to 25 LLM+action steps, far past the default ~5-min IO timeout.
+        specs.push(uclaw_pi_engine::IoToolSpec {
+            name: crate::browser::tools::BrowserTaskTool::PI_NAME.to_string(),
+            label: crate::browser::tools::BrowserTaskTool::PI_NAME.to_string(),
+            description: crate::browser::tools::BrowserTaskTool::PI_DESCRIPTION.to_string(),
+            parameters: crate::browser::tools::BrowserTaskTool::pi_parameters_schema(),
+            result_timeout: Some(INTERACTIVE_TOOL_RESULT_TIMEOUT),
+        });
         specs
     }
 
