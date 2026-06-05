@@ -2393,6 +2393,24 @@ const SQL_V59: &str = r#"
     );
 "#;
 
+// ─── V60 — memory_versions.updated_at (schema-drift repair) ───
+// The V4 `memory_versions` CREATE TABLE shipped `created_at` but omitted
+// `updated_at`, yet every writer (proactive::personality_model and
+// proactive::preference_extractor) inserts/updates an `updated_at` value —
+// mirroring `memory_nodes`. The mismatch made those writes fail with
+// "no such column: updated_at": `update_personality_profile` aborted on its
+// first `UPDATE memory_versions ... updated_at` and logged
+// "personality update failed" every cycle. This adds the missing column so the
+// existing callers succeed; no caller change needed.
+//
+// Nullable, no DEFAULT: SQLite forbids a non-constant default (datetime('now'))
+// on ALTER ADD COLUMN, and existing rows simply keep NULL (they retain
+// created_at). ALTER errors on replay if the column already exists; the catch
+// loop logs "skipped" — replay-safe.
+const SQL_V60: &str = r#"
+    ALTER TABLE memory_versions ADD COLUMN updated_at TEXT;
+"#;
+
 /// Test/dev helper: run the full migration stack on a fresh connection.
 ///
 /// The `_target` parameter is currently ignored. All migrations are
@@ -2866,6 +2884,14 @@ pub fn run(conn: &rusqlite::Connection) -> Result<(), rusqlite::Error> {
             tracing::debug!("V59 stmt skipped (likely already applied): {} :: {}", e, stmt);
         }
     }
+    // V60: memory_versions.updated_at — repair V4 schema drift so personality /
+    // preference writers stop failing with "no such column: updated_at".
+    tracing::debug!("Running migration V60: memory_versions.updated_at");
+    for stmt in SQL_V60.split(';').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        if let Err(e) = conn.execute(stmt, []) {
+            tracing::debug!("V60 stmt skipped (likely already applied): {} :: {}", e, stmt);
+        }
+    }
     tracing::info!("Database migrations complete");
     Ok(())
 }
@@ -2895,6 +2921,45 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 6);
+    }
+
+    #[test]
+    fn v60_memory_versions_has_updated_at_and_accepts_personality_write() {
+        let conn = Connection::open_in_memory().unwrap();
+        super::run(&conn).expect("first run");
+        super::run(&conn).expect("second run must not error (idempotent)");
+
+        // The column the V4 schema forgot must now exist.
+        let has_col: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('memory_versions') WHERE name = 'updated_at'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_col, 1, "memory_versions.updated_at must exist after V60");
+
+        // Reproduce the exact write shape that used to fail with
+        // "no such column: updated_at" in upsert_personality_boot_node.
+        conn.execute(
+            "INSERT INTO memory_nodes (id, space_id, kind, title, created_at, updated_at)
+             VALUES ('n1', 'global', 'identity', 't', '2026-01-01', '2026-01-01')",
+            [],
+        )
+        .expect("memory_nodes insert");
+        conn.execute(
+            "INSERT INTO memory_versions
+             (id, node_id, content, status, embedding_json, created_at, updated_at)
+             VALUES ('v1', 'n1', 'c', 'active', NULL, '2026-01-01', '2026-01-01')",
+            [],
+        )
+        .expect("memory_versions insert with updated_at must succeed");
+        conn.execute(
+            "UPDATE memory_versions SET status = 'superseded', updated_at = '2026-01-02'
+             WHERE node_id = 'n1' AND status = 'active'",
+            [],
+        )
+        .expect("memory_versions update of updated_at must succeed");
     }
 
     #[test]
