@@ -6380,6 +6380,12 @@ pub async fn send_agent_message(
                 None,
                 Some(input.user_message.as_str()),
             );
+            // Cache the manifest's token estimate so engine_sink's
+            // agent:context_stats reports an accurate "技能" line on pi (was 0).
+            crate::engine_sink::set_pi_skills_tokens(
+                &input.session_id,
+                crate::agent::types::estimate_tokens(&manifest) as u64,
+            );
             delegate.set_skills_manifest_block(manifest);
         }
 
