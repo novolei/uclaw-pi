@@ -7513,7 +7513,7 @@ pub(crate) async fn sync_playwright_mcp_workspace_root(state: &AppState) -> Resu
 /// header). Without this lookup, switching from a TEST-workspace session
 /// to a 2222-workspace session while TEST is still globally active would
 /// leave tools pinned to TEST's folder.
-fn session_workspace_root(state: &AppState, session_id: &str) -> Option<std::path::PathBuf> {
+pub(crate) fn session_workspace_root(state: &AppState, session_id: &str) -> Option<std::path::PathBuf> {
     let conn = state.db.lock().ok()?;
     let space_id: String = conn.query_row(
         "SELECT space_id FROM agent_sessions WHERE id = ?1",
