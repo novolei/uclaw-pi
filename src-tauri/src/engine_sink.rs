@@ -508,21 +508,28 @@ impl EventSink for TauriEventSink {
                 // model; freeTokens = window − total prompt tokens (input +
                 // cache). The per-turn inputTokens the meter shows still comes
                 // from the agent:turn_cost payload (which fires for this same
-                // event); skillsTokens isn't broken out on pi (the engine
-                // doesn't track the skills manifest separately) → 0. Frontend
-                // reads exactly these four fields (useGlobalAgentListeners).
+                // event); skillsTokens is the manifest estimate cached by the
+                // manifest build (set_pi_skills_tokens). Frontend reads exactly
+                // these four fields (useGlobalAgentListeners).
                 let window = crate::agent::types::get_model_context_length(&model);
                 let cache_creation = payload
                     .get("cacheCreationTokens")
                     .and_then(serde_json::Value::as_u64)
                     .unwrap_or(0);
                 let free = window as i64 - (input + cache_read + cache_creation) as i64;
+                // Real skills-manifest token estimate cached by the manifest build
+                // (set_pi_skills_tokens); 0 only if this turn never built one.
+                let skills_tokens = pi_skills_tokens()
+                    .lock()
+                    .ok()
+                    .and_then(|m| m.get(conv.as_str()).copied())
+                    .unwrap_or(0);
                 let _ = self.app.emit(
                     "agent:context_stats",
                     serde_json::json!({
                         "conversationId": conv,
                         "modelContextLength": window,
-                        "skillsTokens": 0,
+                        "skillsTokens": skills_tokens,
                         "freeTokens": free,
                     }),
                 );
@@ -1076,6 +1083,24 @@ pub fn queue_pi_followup(conversation_id: &str, uuid: String, message: String) {
         m.entry(conversation_id.to_string())
             .or_default()
             .push_back((uuid, message));
+    }
+}
+
+/// Per-conversation skills-manifest token estimate, set when the manifest is
+/// built (send_agent_message) and read by the `agent:context_stats` emit so the
+/// context-usage meter's "技能" line is accurate on pi (it was hardcoded to 0,
+/// since the engine doesn't see the manifest the way the legacy dispatcher does).
+fn pi_skills_tokens() -> &'static std::sync::Mutex<std::collections::HashMap<String, u64>> {
+    static M: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, u64>>> =
+        std::sync::OnceLock::new();
+    M.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Record the current turn's skills-manifest token estimate for `conversation_id`
+/// (called from the manifest build site). Read back into `agent:context_stats`.
+pub fn set_pi_skills_tokens(conversation_id: &str, tokens: u64) {
+    if let Ok(mut m) = pi_skills_tokens().lock() {
+        m.insert(conversation_id.to_string(), tokens);
     }
 }
 
