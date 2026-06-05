@@ -584,7 +584,10 @@ impl EventSink for TauriEventSink {
     }
 }
 
-use crate::agent::tools::builtin::{ask_user, load_skill, skill_marketplace, skill_search};
+use crate::agent::tools::builtin::{
+    ask_user, load_skill, plan, plan_mode, skill_marketplace, skill_search, skill_write, web,
+};
+use crate::agent::tools::memu_tools;
 use crate::agent::tools::tool::{Tool, ToolError, ToolOutput};
 use crate::app::AppState;
 
@@ -597,7 +600,24 @@ const PI_TOOL_CONV: &str = "pi-agent";
 /// tools + `ask_user` (the interaction tool — its emit/respond round-trip rides
 /// the runtime-agnostic `pending_ask_users` registry, so it works unchanged on
 /// the pi path; without it the agent can't ask the user clarifying questions).
-const PI_SKILL_TOOLS: &[&str] = &["skill_search", "load_skill", "skill_marketplace_search", "ask_user"];
+const PI_SKILL_TOOLS: &[&str] = &[
+    "skill_search",
+    "load_skill",
+    "skill_marketplace_search",
+    "ask_user",
+    // Exposed from the legacy registry so the pi agent reaches feature parity:
+    // web (pi builtins had NO net access), the skill-authoring loop (write +
+    // install), the plan-mode workflow, and explicit memU memory/todos.
+    "web_fetch",
+    "http_request",
+    "skill_write",
+    "skill_install_from_marketplace",
+    "plan_write",
+    "plan_update",
+    "request_plan_mode_switch",
+    "memu_memory",
+    "memu_todos",
+];
 
 /// [R4 IO 桥] The real uClaw tool executor for pi. `io_tool_specs()` advertises the
 /// skill tools; `request()` runs the named async `Tool::execute` on Tauri's tokio
@@ -668,6 +688,13 @@ fn build_skill_tool(name: &str, state: &AppState, app: &AppHandle, conv: &str) -
     // ToolRequestSink); skill_search / load_skill stamp it onto their
     // `agent:skill-recalled` events so the live skill-recall panel attributes to
     // the right session instead of the `PI_TOOL_CONV` placeholder.
+    // Lazily resolve the session's project workspace (for skill_write / plan_*),
+    // falling back to the global root. A closure so the common arms don't pay the
+    // lookup. session_workspace_root is sync.
+    let workspace = || {
+        crate::tauri_commands::session_workspace_root(state, conv)
+            .unwrap_or_else(|| state.workspace_root.clone())
+    };
     let tool: Box<dyn Tool> = match name {
         "skill_search" => Box::new(
             skill_search::SkillSearchTool::new(
@@ -717,6 +744,42 @@ fn build_skill_tool(name: &str, state: &AppState, app: &AppHandle, conv: &str) -
                 skillsmp_key,
             ))
         }
+        // ── Exposed from legacy (pi tool parity) ─────────────────────────────
+        // web: pi's builtins have no network access at all — without these the
+        // agent can't even read a URL the user pastes.
+        "web_fetch" => Box::new(web::WebFetchTool::new()),
+        "http_request" => Box::new(web::HttpRequestTool::new()),
+        // skill-authoring loop: pi could search + load skills but not create or
+        // install them. `workspace()` resolves the session's project dir (project-
+        // scoped skills/plans) with the global root as fallback.
+        "skill_write" => Box::new(skill_write::SkillWriteTool::new(
+            Arc::clone(&state.skills_registry),
+            state.data_dir.clone(),
+            Some(workspace()),
+            app.clone(),
+            conv.to_string(),
+        )),
+        "skill_install_from_marketplace" => {
+            Box::new(skill_marketplace::SkillInstallFromMarketplaceTool::new(
+                Arc::clone(&state.skills_registry),
+                state.data_dir.clone(),
+                app.clone(),
+                conv.to_string(),
+            ))
+        }
+        // plan-mode workflow: pi already has exit_plan + ask_user; these complete
+        // it (write/update the plan, request a mode switch).
+        "plan_write" => Box::new(plan::PlanWriteTool::new(workspace(), app.clone())),
+        "plan_update" => Box::new(plan::PlanUpdateTool::new(workspace(), app.clone())),
+        "request_plan_mode_switch" => Box::new(plan_mode::RequestPlanModeSwitchTool::new(
+            app.clone(),
+            conv.to_string(),
+            Arc::clone(&state.db),
+        )),
+        // memU: pi auto-recalls memory via load_context, but had no tool to
+        // explicitly memorize / manage todos.
+        "memu_memory" => Box::new(memu_tools::MemuMemoryTool::new(state.memu_client.clone())),
+        "memu_todos" => Box::new(memu_tools::MemuTodosTool::new(state.memu_client.clone())),
         _ => return None,
     };
     Some(tool)
