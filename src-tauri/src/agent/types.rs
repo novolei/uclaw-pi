@@ -325,6 +325,12 @@ pub fn get_model_context_length(model: &str) -> u32 {
     {
         return 1_000_000;
     }
+    // DeepSeek V4 family ships a 1M context window (api-docs.deepseek.com pricing).
+    // Must precede the generic `deepseek` arm below, which keeps older V3 / chat /
+    // reasoner models at their 128K window.
+    if m.contains("deepseek-v4") || m.contains("deepseek_v4") || m.contains("deepseekv4") {
+        return 1_000_000;
+    }
     if m.contains("claude") { 200_000 }
     else if m.contains("gpt-4o") || m.contains("gpt-4") || m.contains("deepseek") { 128_000 }
     else if m.contains("qwen") { 131_072 }
@@ -947,5 +953,18 @@ mod conversational_guard_tests {
         // Should not match — no conversational signal keyword
         assert!(!is_purely_conversational("这是什么意思"));
         assert!(!is_purely_conversational("为什么会这样"));
+    }
+
+    #[test]
+    fn deepseek_v4_gets_1m_context_window() {
+        use super::get_model_context_length;
+        // V4 family → 1M (api-docs.deepseek.com pricing).
+        assert_eq!(get_model_context_length("deepseek-v4-flash"), 1_000_000);
+        assert_eq!(get_model_context_length("deepseek-v4"), 1_000_000);
+        assert_eq!(get_model_context_length("DeepSeek-V4-Chat"), 1_000_000);
+        // Older deepseek stays at 128K; the V4 arm must not widen them.
+        assert_eq!(get_model_context_length("deepseek-chat"), 128_000);
+        assert_eq!(get_model_context_length("deepseek-reasoner"), 128_000);
+        assert_eq!(get_model_context_length("deepseek-v3"), 128_000);
     }
 }
