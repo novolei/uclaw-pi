@@ -11,9 +11,9 @@ export interface StatPillProps extends React.HTMLAttributes<HTMLSpanElement> {
 
 const TONE: Record<StatTone, { root: string; value: string }> = {
   neutral: { root: 'bg-muted border-border', value: 'text-foreground' },
-  success: { root: 'bg-success-bg border-transparent', value: 'text-success' },
-  warning: { root: 'bg-warning-bg border-transparent', value: 'text-warning' },
-  danger: { root: 'bg-danger-bg border-transparent', value: 'text-danger' },
+  success: { root: 'bg-success-bg border-transparent', value: 'text-success-strong' },
+  warning: { root: 'bg-warning-bg border-transparent', value: 'text-warning-strong' },
+  danger: { root: 'bg-danger-bg border-transparent', value: 'text-danger-strong' },
 }
 
 /**
@@ -39,7 +39,7 @@ export function StatPill({
       )}
       {...props}
     >
-      <span className="text-muted-foreground">{label}</span>
+      <span className="text-foreground/80">{label}</span>
       <span className={cn('font-medium tabular-nums', t.value)}>{value}</span>
     </span>
   )

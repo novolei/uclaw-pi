@@ -57,14 +57,23 @@ export default {
         success: {
           DEFAULT: 'hsl(var(--success))',
           bg: 'hsl(var(--success-bg))',
+          // Text on a tinted surface (pill / callout): the tone pulled toward the
+          // foreground so it keeps ≥ 4.5:1 on its -bg in every theme.
+          strong: 'color-mix(in oklab, hsl(var(--success)) 65%, hsl(var(--foreground)))',
         },
         warning: {
           DEFAULT: 'hsl(var(--warning))',
           bg: 'hsl(var(--warning-bg))',
+          // Text on a tinted surface (pill / callout): the tone pulled toward the
+          // foreground so it keeps ≥ 4.5:1 on its -bg in every theme.
+          strong: 'color-mix(in oklab, hsl(var(--warning)) 65%, hsl(var(--foreground)))',
         },
         danger: {
           DEFAULT: 'hsl(var(--danger))',
           bg: 'hsl(var(--danger-bg))',
+          // Text on a tinted surface (pill / callout): the tone pulled toward the
+          // foreground so it keeps ≥ 4.5:1 on its -bg in every theme.
+          strong: 'color-mix(in oklab, hsl(var(--danger)) 65%, hsl(var(--foreground)))',
         },
         // Memory UI kind tokens (docs/design/memory-ui.md). `bg-memory-fact` = the
         // kind's ink (dots, bars); `bg-memory-fact-bg` = tinted badge surface;

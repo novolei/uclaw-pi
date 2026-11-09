@@ -250,8 +250,8 @@ function FailedBody({
     <div role="alert" className="flex gap-2.5 rounded-lg border border-danger/20 bg-danger-bg/50 px-3 py-3">
       <AlertCircle aria-hidden size={14} className="mt-[3px] shrink-0 text-danger" />
       <div className="min-w-0 flex-1">
-        <div className="text-[13px] font-medium leading-5 text-danger">模型下载失败</div>
-        <p className="mt-0.5 text-[12px] leading-[18px] text-muted-foreground">
+        <div className="text-[13px] font-medium leading-5 text-danger-strong">模型下载失败</div>
+        <p className="mt-0.5 text-[12px] leading-[18px] text-foreground/75">
           {describeDownloadError(reason)}目前仍可按关键词检索。
         </p>
         <div className="mt-2.5 flex flex-wrap items-center gap-2">
@@ -279,7 +279,7 @@ function ErrorDetails({ reason }: { reason: string }) {
       <CollapsibleTrigger
         className={cn(
           'group -ml-1 inline-flex items-center gap-0.5 rounded px-1 py-0.5 text-[11px] leading-4',
-          'text-muted-foreground transition-colors duration-[120ms] hover:text-foreground',
+          'text-foreground/70 transition-colors duration-[120ms] hover:text-foreground',
           'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
         )}
       >
@@ -291,7 +291,7 @@ function ErrorDetails({ reason }: { reason: string }) {
         详情
       </CollapsibleTrigger>
       <CollapsibleContent>
-        <pre className="mt-1 max-h-32 overflow-auto whitespace-pre-wrap break-words rounded-md bg-background/60 px-2 py-1.5 font-mono text-[11px] leading-4 text-muted-foreground">
+        <pre className="mt-1 max-h-32 overflow-auto whitespace-pre-wrap break-words rounded-md bg-background/60 px-2 py-1.5 font-mono text-[11px] leading-4 text-foreground/75">
           {reason}
         </pre>
       </CollapsibleContent>
@@ -305,7 +305,7 @@ function OffBody() {
       <Search aria-hidden size={14} className="mt-[3px] shrink-0 text-muted-foreground" />
       <div className="min-w-0 flex-1">
         <div className="text-[13px] font-medium leading-5 text-foreground">当前仅按关键词找回记忆</div>
-        <p className="mt-0.5 text-[12px] leading-[18px] text-muted-foreground">
+        <p className="mt-0.5 text-[12px] leading-[18px] text-foreground/75">
           开启后，助手能理解意思相近的说法：问“出差安排”，也能想起“下周去上海开会”。
           首次开启会下载约 1.1 GB 模型，之后完全在本机运行。
         </p>
@@ -427,8 +427,8 @@ function LoadError({ error, onRetry }: { error: string; onRetry: () => void }) {
       <div role="alert" className="flex gap-2.5 rounded-lg border border-danger/20 bg-danger-bg/50 px-3 py-3">
         <AlertCircle aria-hidden size={14} className="mt-[3px] shrink-0 text-danger" />
         <div className="min-w-0 flex-1">
-          <div className="text-[13px] font-medium leading-5 text-danger">无法读取检索引擎状态</div>
-          <p className="mt-0.5 text-[12px] leading-[18px] text-muted-foreground">
+          <div className="text-[13px] font-medium leading-5 text-danger-strong">无法读取检索引擎状态</div>
+          <p className="mt-0.5 text-[12px] leading-[18px] text-foreground/75">
             请稍后重试；若持续出现，可在系统诊断中查看服务状态。
           </p>
           <Button

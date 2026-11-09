@@ -856,11 +856,11 @@
     /* Memory UI — kind tokens (fg / tinted bg, fg≥4.5:1 on bg; hues ≥30° apart and ≥25° from success/warning/danger — checked by memory-tokens.test.ts) + progress. docs/design/memory-ui.md */
     --memory-kind-fact: 234 55% 77%; --memory-kind-fact-bg: 234 22% 13%;
     --memory-kind-preference: 318 55% 74%; --memory-kind-preference-bg: 318 22% 13%;
-    --memory-kind-episode: 70 55% 50%; --memory-kind-episode-bg: 70 22% 13%;
+    --memory-kind-episode: 66 38% 60%; --memory-kind-episode-bg: 66 18% 13%;
     --memory-kind-lesson: 108 55% 56%; --memory-kind-lesson-bg: 108 22% 13%;
     --memory-kind-entity: 270 55% 76%; --memory-kind-entity-bg: 270 22% 13%;
     --memory-kind-procedure: 200 55% 67%; --memory-kind-procedure-bg: 200 22% 13%;
-    --progress-track: 235 7% 20%; --progress-fill: 43 55% 52%;
+    --progress-track: 235 7% 20%; --progress-fill: 240 5% 80%;
     --focus-glow: 43 70% 58%;
     --focus-glow-bright: 43 85% 68%;
   }

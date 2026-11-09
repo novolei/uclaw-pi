@@ -95,15 +95,16 @@ describe('ProgressBar accessible name', () => {
 describe('StatPill', () => {
   it.each([
     ['neutral', 'text-foreground'],
-    ['success', 'text-success'],
-    ['warning', 'text-warning'],
-    ['danger', 'text-danger'],
+    ['success', 'text-success-strong'],
+    ['warning', 'text-warning-strong'],
+    ['danger', 'text-danger-strong'],
   ] as const)('%s tone colors the value with semantic tokens', (tone, cls) => {
     const { container } = render(<StatPill label="记忆" value={1204} tone={tone} />)
     const pill = container.firstElementChild!
     expect(pill).toHaveAttribute('data-tone', tone)
     expect(screen.getByText('1204').className).toContain(cls)
-    expect(screen.getByText('记忆').className).toContain('text-muted-foreground')
+    // Label sits on a tinted pill: foreground/80 keeps ≥ 4.5:1 where muted-foreground doesn't.
+    expect(screen.getByText('记忆').className).toContain('text-foreground/80')
     expect(allClassNames(pill)).not.toMatch(RAW_PALETTE)
   })
 })
