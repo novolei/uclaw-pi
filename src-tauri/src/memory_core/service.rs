@@ -130,10 +130,10 @@ fn guarded_update(
     }
 }
 
-/// Download both model specs. `keep_going` is checked between specs: once it
-/// returns false the remaining specs are skipped (a file already streaming is
-/// allowed to finish, silently: no further status writes) and `false` is
-/// returned without a Failed status.
+/// Download both model specs. `keep_going` is polled between specs and per
+/// streamed chunk: once it returns false the download in flight is cancelled
+/// (its `.part` deleted), the remaining specs are skipped, and `false` is
+/// returned without a Failed status (and no further status writes).
 async fn ensure_models(
     core: &Arc<MemoryCore>,
     client: &reqwest::Client,
@@ -171,7 +171,11 @@ async fn ensure_models(
             );
             guarded_update(&c, keep_going, true, |s| s.download = Some(d));
         };
-        if let Err(e) = models::ensure_model(client, &root, spec, &on_progress).await {
+        if let Err(e) = models::ensure_model(client, &root, spec, &on_progress, keep_going).await {
+            if models::is_cancelled(&e) || !keep_going() {
+                tracing::info!("memory_core: model download cancelled ({})", spec.id);
+                return false;
+            }
             tracing::warn!("memory_core: model {} unavailable: {e:#}", spec.id);
             let d = download_status(DownloadPhase::Failed, spec.id, file0, None, base, Some(format!("{e:#}")));
             guarded_update(core, keep_going, false, |s| s.download = Some(d));
@@ -195,9 +199,9 @@ async fn ensure_models(
 pub trait ModelOps: Send + Sync + 'static {
     /// Both model specs are fully on disk.
     fn models_ready(&self) -> bool;
-    /// Fetch the model files; `true` on success. `keep_going` turning false aborts
-    /// between specs (a file already streaming finishes) and suppresses further
-    /// status writes; returns `false`.
+    /// Fetch the model files; `true` on success. `keep_going` turning false cancels
+    /// the download (mid-stream too), suppresses further status writes and
+    /// returns `false`.
     fn download<'a>(
         &'a self,
         keep_going: Arc<dyn Fn() -> bool + Send + Sync>,

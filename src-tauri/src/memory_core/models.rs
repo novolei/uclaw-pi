@@ -99,18 +99,42 @@ pub struct ProgressTick {
 
 pub type OnProgress<'a> = &'a (dyn Fn(ProgressTick) + Send + Sync);
 
+/// Polled per streamed chunk and between files; returning false cancels the download.
+pub type KeepGoing<'a> = &'a (dyn Fn() -> bool + Send + Sync);
+
+/// The download was cancelled through `keep_going` (models toggled off). Distinct
+/// from a source failure: no other source is tried and it is not a "failed" download.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Cancelled;
+
+impl std::fmt::Display for Cancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("model download cancelled")
+    }
+}
+
+impl std::error::Error for Cancelled {}
+
+/// True when `e` (anywhere in its chain) is a [`Cancelled`].
+pub fn is_cancelled(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| c.is::<Cancelled>())
+}
+
 fn host_of(url: &str) -> String {
     url.split("://").nth(1).and_then(|r| r.split('/').next()).unwrap_or(url).to_string()
 }
 
 /// Download one URL to `part`, returning bytes written (validated).
 /// `on_progress` fires on headers, at most every 250 ms, and at completion.
+/// `keep_going` is polled before every chunk; once false the stream is dropped
+/// and [`Cancelled`] is returned (the caller deletes the `.part`).
 async fn fetch_to(
     client: &reqwest::Client,
     url: &str,
     file_name: &str,
     part: &Path,
     on_progress: OnProgress<'_>,
+    keep_going: KeepGoing<'_>,
 ) -> anyhow::Result<u64> {
     use futures_util::StreamExt;
     use tokio::io::AsyncWriteExt;
@@ -139,6 +163,9 @@ async fn fetch_to(
     let mut total = 0u64;
     let mut first_byte: Option<u8> = None;
     loop {
+        if !keep_going() {
+            return Err(anyhow::Error::new(Cancelled));
+        }
         // 60 s read timeout between chunks.
         let next = tokio::time::timeout(std::time::Duration::from_secs(60), stream.next())
             .await
@@ -185,12 +212,27 @@ fn spec_lock(id: &'static str) -> std::sync::Arc<tokio::sync::Mutex<()>> {
 ///
 /// Time-to-headers (15 s) and per-chunk read (60 s) timeouts are enforced here;
 /// there is no overall timeout (files are ~570 MB). Concurrent calls for the
-/// same spec are serialised.
+/// same spec are serialised. `keep_going` turning false cancels mid-stream: the
+/// `.part` is deleted and an error that [`is_cancelled`] is returned.
 pub async fn ensure_model(
     client: &reqwest::Client,
     models_root: &Path,
     spec: &ModelSpec,
     on_progress: OnProgress<'_>,
+    keep_going: KeepGoing<'_>,
+) -> anyhow::Result<PathBuf> {
+    let sources = |file: &str| source_urls(spec, file).to_vec();
+    ensure_model_from(client, models_root, spec, &sources, on_progress, keep_going).await
+}
+
+/// [`ensure_model`] with the source list injected (tests point it at a local server).
+async fn ensure_model_from(
+    client: &reqwest::Client,
+    models_root: &Path,
+    spec: &ModelSpec,
+    sources: &(dyn Fn(&str) -> Vec<String> + Send + Sync),
+    on_progress: OnProgress<'_>,
+    keep_going: KeepGoing<'_>,
 ) -> anyhow::Result<PathBuf> {
     // Process-wide per-spec guard so concurrent callers don't clobber `.part`.
     let lock = spec_lock(spec.id);
@@ -200,6 +242,9 @@ pub async fn ensure_model(
         if file_ready(&dir, f) {
             continue;
         }
+        if !keep_going() {
+            return Err(anyhow::Error::new(Cancelled));
+        }
         let dest = dir.join(f.path);
         if let Some(parent) = dest.parent() {
             tokio::fs::create_dir_all(parent).await?;
@@ -207,8 +252,8 @@ pub async fn ensure_model(
         let part = PathBuf::from(format!("{}.part", dest.display()));
         let mut last_err = anyhow::anyhow!("no sources");
         let mut done = false;
-        for url in source_urls(spec, f.path) {
-            let res = fetch_to(client, &url, f.path, &part, on_progress).await.and_then(|n| {
+        for url in sources(f.path) {
+            let res = fetch_to(client, &url, f.path, &part, on_progress, keep_going).await.and_then(|n| {
                 if n >= f.min_bytes {
                     Ok(n)
                 } else {
@@ -221,6 +266,11 @@ pub async fn ensure_model(
                     tracing::info!(file = f.path, source = %url, bytes = n, "memory model file downloaded");
                     done = true;
                     break;
+                }
+                Err(e) if is_cancelled(&e) => {
+                    let _ = tokio::fs::remove_file(&part).await;
+                    tracing::info!(file = f.path, "memory model download cancelled");
+                    return Err(e);
                 }
                 Err(e) => {
                     tracing::warn!(file = f.path, source = %url, error = %e, "memory model source failed");
@@ -315,7 +365,7 @@ mod tests {
             .connect_timeout(std::time::Duration::from_secs(15))
             .build()
             .unwrap();
-        let dir = ensure_model(&client, t.path(), &spec, &|_| {}).await.unwrap();
+        let dir = ensure_model(&client, t.path(), &spec, &|_| {}, &|| true).await.unwrap();
         assert!(is_ready(t.path(), &spec));
         assert!(dir.join("tokenizer.json").exists());
     }
@@ -333,8 +383,92 @@ mod tests {
             .build()
             .unwrap();
         for spec in [&BGE_M3_INT8, &BGE_RERANKER_V2_M3_INT8] {
-            ensure_model(&client, &root, spec, &|_| {}).await.unwrap();
+            ensure_model(&client, &root, spec, &|_| {}, &|| true).await.unwrap();
             assert!(is_ready(&root, spec), "{} not ready", spec.id);
         }
+    }
+
+    /// Local HTTP server that streams an endless-ish octet body slowly (one
+    /// 16 KiB chunk every 5 ms). Returns its base URL and a "bytes sent" counter.
+    async fn slow_server() -> (String, std::sync::Arc<std::sync::atomic::AtomicU64>) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let sent = std::sync::Arc::new(AtomicU64::new(0));
+        let sent2 = sent.clone();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let sent = sent2.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let _ = sock.read(&mut buf).await; // request head (small)
+                    let len: u64 = 600_000_000;
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {len}\r\n\r\n"
+                    );
+                    if sock.write_all(head.as_bytes()).await.is_err() {
+                        return;
+                    }
+                    let chunk = vec![1u8; 16 * 1024];
+                    loop {
+                        if sock.write_all(&chunk).await.is_err() {
+                            return; // client went away
+                        }
+                        sent.fetch_add(chunk.len() as u64, Ordering::SeqCst);
+                        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                    }
+                });
+            }
+        });
+        (format!("http://{addr}"), sent)
+    }
+
+    #[tokio::test]
+    async fn keep_going_false_mid_stream_cancels_and_removes_part() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        const ONE: &[ModelFile] = &[ModelFile { path: "onnx/model_int8.onnx", min_bytes: 500_000_000 }];
+        let spec = ModelSpec { id: "cancel-test-spec", files: ONE, ..BGE_M3_INT8 };
+        let (base, sent) = slow_server().await;
+        let t = tempfile::tempdir().unwrap();
+        let client = reqwest::Client::new();
+        let sources = move |file: &str| vec![format!("{base}/{file}"), format!("{base}/second/{file}")];
+        // Flip to false after a few chunks (the toggle turned off mid-stream).
+        let polls = AtomicUsize::new(0);
+        let keep = move || polls.fetch_add(1, Ordering::SeqCst) < 6;
+        let ticks = AtomicUsize::new(0);
+        let started = std::time::Instant::now();
+        let err = ensure_model_from(&client, t.path(), &spec, &sources, &|_| {
+            ticks.fetch_add(1, Ordering::SeqCst);
+        }, &keep)
+        .await
+        .expect_err("cancelled");
+        assert!(is_cancelled(&err), "distinct Cancelled error, got {err:#}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(10), "stopped promptly");
+        let dest = model_dir(t.path(), &spec).join("onnx/model_int8.onnx");
+        assert!(!dest.exists(), "no final file");
+        assert!(!PathBuf::from(format!("{}.part", dest.display())).exists(), ".part removed");
+        // The second source was not tried and the stream stopped: the server stops
+        // sending once the connection is dropped (well short of 600 MB).
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let after = sent.load(Ordering::SeqCst);
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(sent.load(Ordering::SeqCst), after, "server no longer streaming");
+        assert!(after < 100_000_000);
+        assert!(ticks.load(Ordering::SeqCst) >= 1);
+    }
+
+    #[tokio::test]
+    async fn keep_going_false_before_start_downloads_nothing() {
+        const ONE: &[ModelFile] = &[ModelFile { path: "config.json", min_bytes: 1 }];
+        let spec = ModelSpec { id: "cancel-before-spec", files: ONE, ..BGE_M3_INT8 };
+        let t = tempfile::tempdir().unwrap();
+        let client = reqwest::Client::new();
+        let sources = |_: &str| -> Vec<String> { panic!("no source should be tried") };
+        let err = ensure_model_from(&client, t.path(), &spec, &sources, &|_| {}, &|| false)
+            .await
+            .expect_err("cancelled");
+        assert!(is_cancelled(&err));
+        assert!(!model_dir(t.path(), &spec).join("config.json").exists());
     }
 }
