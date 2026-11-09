@@ -95,7 +95,12 @@ pub fn segment_query(text: &str) -> Vec<String> {
         .collect()
 }
 
-/// FTS5 MATCH expression: quoted query tokens joined by ` OR `; `None` if empty.
+/// Max distinct tokens in a MATCH expression: a long pasted message would otherwise
+/// become thousands of OR terms.
+pub const MAX_QUERY_TOKENS: usize = 32;
+
+/// FTS5 MATCH expression: the first [`MAX_QUERY_TOKENS`] distinct quoted query
+/// tokens joined by ` OR `; `None` if empty.
 pub fn fts_match_query(text: &str) -> Option<String> {
     let toks = segment_query(text);
     if toks.is_empty() {
@@ -103,6 +108,7 @@ pub fn fts_match_query(text: &str) -> Option<String> {
     }
     Some(
         toks.iter()
+            .take(MAX_QUERY_TOKENS)
             .map(|t| format!("\"{}\"", t.replace('"', "\"\"")))
             .collect::<Vec<_>>()
             .join(" OR "),
@@ -143,6 +149,17 @@ mod tests {
         assert_eq!(fts_match_query(""), None);
         let q = fts_match_query("a \"b\"").unwrap();
         assert_eq!(q.matches('"').count() % 2, 0, "{q}");
+    }
+
+    #[test]
+    fn fts_query_caps_distinct_tokens() {
+        let long: String = (0..200).map(|i| format!("word{i} ")).collect();
+        let q = fts_match_query(&long).unwrap();
+        assert_eq!(q.matches(" OR ").count() + 1, MAX_QUERY_TOKENS);
+        assert!(q.starts_with("\"word0\"") && q.contains("\"word31\"") && !q.contains("\"word32\""));
+        // Repeats don't consume the budget: the cap counts distinct tokens.
+        let rep = format!("{} tail", "alpha ".repeat(100));
+        assert_eq!(fts_match_query(&rep).unwrap(), "\"alpha\" OR \"tail\"");
     }
 
     #[test]

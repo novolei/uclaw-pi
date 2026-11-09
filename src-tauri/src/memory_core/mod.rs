@@ -15,6 +15,15 @@ use rusqlite::Connection;
 
 use embed::{Embedder, Reranker};
 
+/// Max chars of the query fed to the embedder and the reranker, so a long pasted
+/// message neither dominates the cross-encoder input nor slows the query embed.
+const MAX_MODEL_QUERY_CHARS: usize = 256;
+
+/// First `max` chars of `s` (char-safe).
+fn truncate_chars(s: &str, max: usize) -> &str {
+    s.char_indices().nth(max).map_or(s, |(i, _)| &s[..i])
+}
+
 #[derive(Debug, Clone)]
 pub struct MemoryCoreConfig {
     pub bm25_top: usize,
@@ -122,6 +131,7 @@ impl MemoryCore {
         if match_q.is_none() && embedder.is_none() {
             return Ok(Vec::new());
         }
+        let model_query = truncate_chars(query, MAX_MODEL_QUERY_CHARS);
 
         // BM25 (lock for SQL only).
         let mut bm25_ids: Vec<String> = Vec::new();
@@ -142,7 +152,7 @@ impl MemoryCore {
         if let Some(emb) = &embedder {
             // Never queue behind a background backfill batch: if the embedder is busy,
             // skip the vector arm for this query (BM25 + rerank still run).
-            let qv = match emb.try_embed(&[query.to_string()]) {
+            let qv = match emb.try_embed(&[model_query.to_string()]) {
                 Some(Ok(v)) => v.into_iter().next().unwrap_or_default(),
                 Some(Err(e)) => {
                     tracing::warn!("memory_core: query embed failed, BM25 only: {e:#}");
@@ -207,7 +217,7 @@ impl MemoryCore {
         }
 
         if let Some(rr) = reranker {
-            hits = self.apply_rerank(query, hits, |q, t| rr.rerank(q, t));
+            hits = self.apply_rerank(model_query, hits, |q, t| rr.rerank(q, t));
         }
         hits.truncate(limit);
         Ok(hits)
@@ -308,6 +318,13 @@ mod tests {
         let hits = core.search("我儿子叫什么名字", 5).unwrap();
         assert!(!hits.is_empty());
         assert!(hits[0].content.contains("刘书维"));
+    }
+
+    #[test]
+    fn truncate_chars_is_char_safe() {
+        assert_eq!(truncate_chars("abc", 5), "abc");
+        assert_eq!(truncate_chars("记忆检索", 2), "记忆");
+        assert_eq!(truncate_chars(&"字".repeat(300), MAX_MODEL_QUERY_CHARS).chars().count(), 256);
     }
 
     #[test]
