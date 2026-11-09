@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use asupersync::channel::mpsc;
 use asupersync::runtime::{reactor::create_reactor, RuntimeBuilder, RuntimeHandle};
-use asupersync::sync::Mutex as AMutex;
+use asupersync::sync::{Mutex as AMutex, OwnedMutexGuard};
 use pi::agent::{ToolApprovalDecision, ToolApprovalHandler};
 use pi::agent_cx::AgentCx;
 use pi::sdk::{create_agent_session, AbortHandle, AgentEvent, AgentSessionHandle, SessionOptions};
@@ -196,6 +196,16 @@ pub struct PiEngine {
     _thread: JoinHandle<()>,
 }
 
+/// Stack for the engine thread (which polls every task of its `current_thread`
+/// runtime inside `block_on`) and for the runtime's own worker thread.
+///
+/// pi 0.8's session-creation and agent-turn futures no longer fit the 2 MiB
+/// default in an unoptimised build: the first `Prompt` aborted the whole app
+/// with "thread 'pi-engine' has overflowed its stack". Upstream's CLI hit the
+/// same wall and uses the same 16 MiB (`RUNTIME_WORKER_STACK_BYTES` in pi's
+/// main.rs). The reservation is virtual; pages are committed only when touched.
+const ENGINE_STACK_BYTES: usize = 16 * 1024 * 1024;
+
 impl PiEngine {
     /// Spawn the dedicated asupersync engine thread.
     #[must_use]
@@ -207,6 +217,7 @@ impl PiEngine {
         let (cmd_tx, cmd_rx) = mpsc::channel::<EngineCmd>(1024);
         let thread = std::thread::Builder::new()
             .name("pi-engine".into())
+            .stack_size(ENGINE_STACK_BYTES)
             .spawn(move || run_engine_thread(cmd_rx, sink, tool_request_sink, config))
             .expect("spawn pi-engine thread");
         Self {
@@ -236,7 +247,11 @@ fn run_engine_thread(
             return;
         }
     };
-    let runtime = match RuntimeBuilder::current_thread().with_reactor(reactor).build() {
+    let runtime = match RuntimeBuilder::current_thread()
+        .with_reactor(reactor)
+        .thread_stack_size(ENGINE_STACK_BYTES)
+        .build()
+    {
         Ok(r) => r,
         Err(e) => {
             emit_error(&sink, "", format!("engine runtime init failed: {e:?}"));
@@ -476,12 +491,7 @@ async fn start_run(
     // Own the model name BEFORE the 'static spawn — capturing `model_config`
     // (a borrow) inside the async move would escape the function (E0521).
     let cost_model = model_config.model.clone().unwrap_or_default();
-    // `spawn_local`: asupersync 0.5's `MutexGuard` is `!Send`, and this task
-    // holds the session guard across the prompt await. The engine runtime is
-    // `current_thread` and `start_run` runs inside its `block_on` root, so local
-    // spawning is allowed and every task already ran on this one thread anyway.
-    // Dropping the handle detaches the task, same as before.
-    let _ = rt.spawn_local(async move {
+    rt.spawn(async move {
         // Shared so the run task can read the streamed-so-far text after the run
         // (to persist the partial reply on abort/error — see the Err arm below).
         let acl = Arc::new(StdMutex::new(Acl::new(conv_id.clone())));
@@ -509,7 +519,12 @@ async fn start_run(
             }
         };
 
-        match handle.lock(&cx_task).await {
+        // Owned guard: asupersync 0.5's borrowed `MutexGuard` is `!Send`, and this
+        // task holds the session across the prompt await. Do NOT switch to
+        // `spawn_local` instead — a cross-thread wake of a local task can leave
+        // the current_thread driver parked in its reactor until an unrelated
+        // timer fires (observed: random ~60 s stalls before provider requests).
+        match OwnedMutexGuard::lock(Arc::clone(&handle), &cx_task).await {
             Ok(mut guard) => {
                 let res = match kind {
                     RunKind::Prompt { input, context } => {
