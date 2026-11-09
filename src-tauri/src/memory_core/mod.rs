@@ -1,7 +1,320 @@
-//! Hybrid memory retrieval core (P1): segmentation, FTS index, vector recall.
-//! Modules are added incrementally; see the memory P1 plan.
+//! Hybrid memory retrieval core (P1): segmentation, FTS index, vector recall,
+//! rank fusion and reranking.
 
 pub mod segment;
 pub mod models;
 pub mod embed;
 pub mod index;
+pub mod search;
+
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex, RwLock};
+
+use rusqlite::Connection;
+
+use embed::{Embedder, Reranker};
+
+#[derive(Debug, Clone)]
+pub struct MemoryCoreConfig {
+    pub bm25_top: usize,
+    pub vector_top: usize,
+    pub rrf_k: f32,
+    pub rerank_top_n: usize,
+    pub min_rerank_score: f32,
+    pub limit: usize,
+}
+
+impl Default for MemoryCoreConfig {
+    fn default() -> Self {
+        Self { bm25_top: 50, vector_top: 50, rrf_k: 60.0, rerank_top_n: 20, min_rerank_score: 0.05, limit: 6 }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct MemoryHit {
+    pub doc_id: String,
+    pub source: String,
+    pub title: String,
+    pub content: String,
+    pub score: f32,
+}
+
+pub struct MemoryCore {
+    db: Arc<Mutex<Connection>>,
+    models_root: PathBuf,
+    embedder: RwLock<Option<Arc<Embedder>>>,
+    reranker: RwLock<Option<Arc<Reranker>>>,
+    config: MemoryCoreConfig,
+}
+
+impl MemoryCore {
+    pub fn new(db: Arc<Mutex<Connection>>, models_root: PathBuf, config: MemoryCoreConfig) -> Self {
+        Self { db, models_root, embedder: RwLock::new(None), reranker: RwLock::new(None), config }
+    }
+
+    pub fn config(&self) -> &MemoryCoreConfig {
+        &self.config
+    }
+
+    /// Load whichever models are on disk and not yet loaded. Idempotent.
+    /// Returns true iff the embedder is loaded afterwards.
+    pub fn try_load_models(&self) -> bool {
+        if self.embedder().is_none() && models::is_ready(&self.models_root, &models::BGE_M3_INT8) {
+            match Embedder::load(&self.models_root) {
+                Ok(e) => {
+                    if let Ok(mut g) = self.embedder.write() {
+                        *g = Some(Arc::new(e));
+                    }
+                }
+                Err(e) => tracing::warn!("memory_core: embedder load failed: {e:#}"),
+            }
+        }
+        let have_reranker = self.reranker.read().map(|g| g.is_some()).unwrap_or(false);
+        if !have_reranker && models::is_ready(&self.models_root, &models::BGE_RERANKER_V2_M3_INT8) {
+            match Reranker::load(&self.models_root) {
+                Ok(r) => {
+                    if let Ok(mut g) = self.reranker.write() {
+                        *g = Some(Arc::new(r));
+                    }
+                }
+                Err(e) => tracing::warn!("memory_core: reranker load failed: {e:#}"),
+            }
+        }
+        self.embedder().is_some()
+    }
+
+    pub fn embedder(&self) -> Option<Arc<Embedder>> {
+        self.embedder.read().ok().and_then(|g| g.clone())
+    }
+
+    /// Hybrid search. Synchronous; callers use `spawn_blocking`. The DB lock is held
+    /// only around SQL, never while embedding or reranking.
+    ///
+    /// If the query has no searchable tokens but an embedder is loaded, the search is
+    /// vector-only (a stopword-only query can still carry semantic content).
+    pub fn search(&self, query: &str, limit: usize) -> anyhow::Result<Vec<MemoryHit>> {
+        let cfg = &self.config;
+        let embedder = self.embedder();
+        let reranker = self.reranker.read().ok().and_then(|g| g.clone());
+        let match_q = segment::fts_match_query(query);
+        if match_q.is_none() && embedder.is_none() {
+            return Ok(Vec::new());
+        }
+
+        // BM25 (lock for SQL only).
+        let mut bm25_ids: Vec<String> = Vec::new();
+        if let Some(mq) = &match_q {
+            let conn = self.db.lock().map_err(|_| anyhow::anyhow!("memory db lock poisoned"))?;
+            let mut stmt = conn.prepare(
+                "SELECT doc_id FROM memory_search_fts WHERE memory_search_fts MATCH ?1
+                 ORDER BY bm25(memory_search_fts) LIMIT ?2",
+            )?;
+            let rows = stmt.query_map(rusqlite::params![mq, cfg.bm25_top as i64], |r| r.get::<_, String>(0))?;
+            for r in rows {
+                bm25_ids.push(r?);
+            }
+        }
+
+        // Vector (embed without lock; load vectors under lock; cosine without lock).
+        let mut vec_ids: Vec<String> = Vec::new();
+        if let Some(emb) = &embedder {
+            let qv = emb.embed(&[query.to_string()])?.into_iter().next().unwrap_or_default();
+            if !qv.is_empty() {
+                let rows: Vec<(String, Vec<u8>)> = {
+                    let conn = self.db.lock().map_err(|_| anyhow::anyhow!("memory db lock poisoned"))?;
+                    let mut stmt = conn.prepare(
+                        "SELECT doc_id, embedding FROM memory_search_vectors WHERE model_id = ?1",
+                    )?;
+                    let it = stmt.query_map([emb.model_id()], |r| Ok((r.get(0)?, r.get(1)?)))?;
+                    it.collect::<rusqlite::Result<_>>()?
+                };
+                let want = emb.dim() * 4;
+                let mut scored: Vec<(String, f32)> = rows
+                    .into_iter()
+                    .filter(|(_, b)| b.len() == want)
+                    .map(|(id, b)| {
+                        let s = embed::cosine(&qv, &embed::unpack(&b));
+                        (id, s)
+                    })
+                    .collect();
+                scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                vec_ids = scored.into_iter().take(cfg.vector_top).map(|(id, _)| id).collect();
+            }
+        }
+
+        let mut fused = search::rrf_fuse(&[bm25_ids, vec_ids], cfg.rrf_k);
+        fused.truncate(cfg.rerank_top_n.max(limit));
+        if fused.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Fetch candidate docs (lock for SQL only).
+        let mut hits: Vec<MemoryHit> = Vec::with_capacity(fused.len());
+        {
+            let conn = self.db.lock().map_err(|_| anyhow::anyhow!("memory db lock poisoned"))?;
+            let mut stmt = conn.prepare(
+                "SELECT source, title, content FROM memory_search_docs WHERE doc_id = ?1",
+            )?;
+            for (id, score) in &fused {
+                let row = stmt
+                    .query_row([id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)));
+                match row {
+                    Ok((source, title, content)) => hits.push(MemoryHit {
+                        doc_id: id.clone(),
+                        source,
+                        title,
+                        content,
+                        score: *score,
+                    }),
+                    Err(rusqlite::Error::QueryReturnedNoRows) => {}
+                    Err(e) => return Err(e.into()),
+                }
+            }
+        }
+
+        if let Some(rr) = reranker {
+            hits.truncate(cfg.rerank_top_n);
+            let texts: Vec<String> = hits
+                .iter()
+                .map(|h| if h.title.is_empty() { h.content.clone() } else { format!("{}\n{}", h.title, h.content) })
+                .collect();
+            let ranked = rr.rerank(query, &texts)?;
+            let mut out = Vec::new();
+            for (i, logit) in ranked {
+                let p = search::sigmoid(logit);
+                if p < cfg.min_rerank_score {
+                    continue;
+                }
+                if let Some(h) = hits.get(i) {
+                    let mut h = h.clone();
+                    h.score = p;
+                    out.push(h);
+                }
+            }
+            hits = out;
+        }
+        hits.truncate(limit);
+        Ok(hits)
+    }
+
+    pub fn render_block(hits: &[MemoryHit]) -> Option<String> {
+        if hits.is_empty() {
+            return None;
+        }
+        let mut s = String::from("<relevant_memories>\n");
+        for h in hits {
+            let content: String = h
+                .content
+                .chars()
+                .take(300)
+                .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
+                .collect();
+            if h.title.is_empty() {
+                s.push_str(&format!("- {content}\n"));
+            } else {
+                s.push_str(&format!("- [{}] {content}\n", h.title));
+            }
+        }
+        s.push_str("</relevant_memories>\n");
+        Some(s)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn core_with(docs: &[(&str, &str, &str)]) -> MemoryCore {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::migrations::run_migrations_up_to(&conn, 61).unwrap();
+        let sd: Vec<index::SourceDoc> = docs
+            .iter()
+            .map(|(id, t, c)| index::SourceDoc {
+                doc_id: format!("graph:{id}"),
+                source: "graph",
+                source_id: id.to_string(),
+                title: t.to_string(),
+                content: c.to_string(),
+                updated_at: None,
+            })
+            .collect();
+        index::sync(&conn, &sd, None).unwrap();
+        MemoryCore::new(Arc::new(Mutex::new(conn)), PathBuf::from("/nonexistent"), MemoryCoreConfig::default())
+    }
+
+    fn hit(title: &str, content: &str) -> MemoryHit {
+        MemoryHit { doc_id: "x".into(), source: "graph".into(), title: title.into(), content: content.into(), score: 1.0 }
+    }
+
+    #[test]
+    fn bm25_only_search_ranks_son_doc_first() {
+        let core = core_with(&[("a", "家庭", "用户的儿子叫刘书维"), ("b", "饮食", "用户喜欢吃鱼")]);
+        let hits = core.search("我儿子叫什么名字", 5).unwrap();
+        assert!(!hits.is_empty());
+        assert!(hits[0].content.contains("刘书维"));
+    }
+
+    #[test]
+    fn unsearchable_query_is_empty_ok() {
+        let core = core_with(&[("a", "家庭", "用户的儿子叫刘书维")]);
+        assert!(core.search("？？", 5).unwrap().is_empty());
+    }
+
+    #[test]
+    fn render_block_formats_and_truncates() {
+        assert!(MemoryCore::render_block(&[]).is_none());
+        let long = "字".repeat(400);
+        let b = MemoryCore::render_block(&[hit("T", "a\nb"), hit("", &long)]).unwrap();
+        let lines: Vec<&str> = b.lines().collect();
+        assert_eq!(lines[0], "<relevant_memories>");
+        assert_eq!(lines[1], "- [T] a b");
+        assert_eq!(lines[2], format!("- {}", "字".repeat(300)));
+        assert_eq!(lines[3], "</relevant_memories>");
+        assert!(b.ends_with("</relevant_memories>\n"));
+    }
+
+    #[test]
+    fn try_load_models_without_models_is_false() {
+        let core = core_with(&[]);
+        assert!(!core.try_load_models());
+        assert!(core.embedder().is_none());
+    }
+
+    #[test]
+    #[ignore]
+    fn search_cross_lingual_real_models() {
+        let Ok(root) = std::env::var("UCLAW_TEST_MODELS") else { return };
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::migrations::run_migrations_up_to(&conn, 61).unwrap();
+        let mk = |id: &str, c: &str| index::SourceDoc {
+            doc_id: format!("graph:{id}"),
+            source: "graph",
+            source_id: id.into(),
+            title: String::new(),
+            content: c.into(),
+            updated_at: None,
+        };
+        let docs = vec![
+            mk("1", "The user enjoys playing table tennis."),
+            mk("2", "用户的儿子叫刘书维"),
+            mk("3", "The user ran the 'ls -a' command in a terminal."),
+            mk("4", "用户喜欢吃馒头和饺子"),
+        ];
+        let core = MemoryCore::new(Arc::new(Mutex::new(conn)), PathBuf::from(&root), MemoryCoreConfig::default());
+        assert!(core.try_load_models());
+        {
+            let emb = core.embedder().unwrap();
+            let conn = core.db.lock().unwrap();
+            index::sync(&conn, &docs, Some(emb.as_ref())).unwrap();
+        }
+        for (q, want) in [("我喜欢什么运动", "table tennis"), ("What is my son's name?", "刘书维")] {
+            let t = std::time::Instant::now();
+            let hits = core.search(q, 3).unwrap();
+            eprintln!("query {q:?} total {:?}", t.elapsed());
+            for h in &hits {
+                eprintln!("  {:.4} {}", h.score, h.content);
+            }
+            assert!(hits[0].content.contains(want), "{q}: {:?}", hits.first());
+        }
+    }
+}
