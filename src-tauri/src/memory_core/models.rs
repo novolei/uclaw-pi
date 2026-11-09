@@ -63,20 +63,56 @@ pub fn source_urls(spec: &ModelSpec, file: &str) -> [String; 3] {
     ]
 }
 
-/// Download one URL to `part`, returning bytes written.
-async fn fetch_to(client: &reqwest::Client, url: &str, part: &Path) -> anyhow::Result<u64> {
+/// Pure post-download validation (rejects HTML error pages, non-JSON json,
+/// and truncated bodies).
+fn validate_download(
+    file_name: &str,
+    content_type: Option<&str>,
+    expected_len: Option<u64>,
+    written: u64,
+    first_byte: Option<u8>,
+) -> anyhow::Result<()> {
+    if let Some(ct) = content_type {
+        if ct.trim_start().to_ascii_lowercase().starts_with("text/html") {
+            anyhow::bail!("unexpected content-type {ct}");
+        }
+    }
+    if file_name.ends_with(".json") && first_byte != Some(b'{') {
+        anyhow::bail!("{file_name} does not look like JSON");
+    }
+    if let Some(exp) = expected_len {
+        if written != exp {
+            anyhow::bail!("length mismatch: wrote {written}, expected {exp}");
+        }
+    }
+    Ok(())
+}
+
+/// Download one URL to `part`, returning bytes written (validated).
+async fn fetch_to(
+    client: &reqwest::Client,
+    url: &str,
+    file_name: &str,
+    part: &Path,
+) -> anyhow::Result<u64> {
     use futures_util::StreamExt;
     use tokio::io::AsyncWriteExt;
 
-    let resp = client
-        .get(url)
-        .timeout(std::time::Duration::from_secs(60 * 60 * 6))
-        .send()
-        .await?
+    // Bound connect + time-to-headers regardless of how the client was built.
+    let resp = tokio::time::timeout(std::time::Duration::from_secs(15), client.get(url).send())
+        .await
+        .map_err(|_| anyhow::anyhow!("connect/headers timeout"))??
         .error_for_status()?;
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    let expected_len = resp.content_length();
     let mut file = tokio::fs::File::create(part).await?;
     let mut stream = resp.bytes_stream();
     let mut total = 0u64;
+    let mut first_byte: Option<u8> = None;
     loop {
         // 60 s read timeout between chunks.
         let next = tokio::time::timeout(std::time::Duration::from_secs(60), stream.next())
@@ -85,6 +121,9 @@ async fn fetch_to(client: &reqwest::Client, url: &str, part: &Path) -> anyhow::R
         match next {
             Some(chunk) => {
                 let chunk = chunk?;
+                if first_byte.is_none() {
+                    first_byte = chunk.iter().copied().find(|b| !b.is_ascii_whitespace());
+                }
                 total += chunk.len() as u64;
                 file.write_all(&chunk).await?;
             }
@@ -93,19 +132,38 @@ async fn fetch_to(client: &reqwest::Client, url: &str, part: &Path) -> anyhow::R
     }
     file.flush().await?;
     file.sync_all().await?;
+    validate_download(file_name, content_type.as_deref(), expected_len, total, first_byte)?;
     Ok(total)
+}
+
+fn spec_lock(id: &'static str) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, OnceLock};
+    static LOCKS: OnceLock<Mutex<HashMap<&'static str, Arc<tokio::sync::Mutex<()>>>>> =
+        OnceLock::new();
+    LOCKS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .entry(id)
+        .or_default()
+        .clone()
 }
 
 /// Ensure all files of `spec` exist under `<models_root>/<id>`; downloads the
 /// missing ones, trying each source in order. Returns the model dir.
 ///
-/// Callers should build `client` with `connect_timeout(15s)`; a per-chunk read
-/// timeout (60 s) is enforced here. No overall timeout is applied.
+/// Time-to-headers (15 s) and per-chunk read (60 s) timeouts are enforced here;
+/// there is no overall timeout (files are ~570 MB). Concurrent calls for the
+/// same spec are serialised.
 pub async fn ensure_model(
     client: &reqwest::Client,
     models_root: &Path,
     spec: &ModelSpec,
 ) -> anyhow::Result<PathBuf> {
+    // Process-wide per-spec guard so concurrent callers don't clobber `.part`.
+    let lock = spec_lock(spec.id);
+    let _guard = lock.lock().await;
     let dir = model_dir(models_root, spec);
     for f in spec.files {
         if file_ready(&dir, f) {
@@ -119,7 +177,7 @@ pub async fn ensure_model(
         let mut last_err = anyhow::anyhow!("no sources");
         let mut done = false;
         for url in source_urls(spec, f.path) {
-            let res = fetch_to(client, &url, &part).await.and_then(|n| {
+            let res = fetch_to(client, &url, f.path, &part).await.and_then(|n| {
                 if n >= f.min_bytes {
                     Ok(n)
                 } else {
@@ -201,6 +259,16 @@ mod tests {
         fs::remove_file(d.join("onnx/model_int8.onnx")).unwrap();
         write_sparse(&d.join("onnx/model_int8.onnx.part"), 600_000_000);
         assert!(!is_ready(t.path(), &BGE_M3_INT8));
+    }
+
+    #[test]
+    fn validate_download_cases() {
+        assert!(validate_download("a.json", Some("text/html; charset=utf-8"), None, 5, Some(b'{')).is_err());
+        assert!(validate_download("a.json", Some("application/json"), None, 5, Some(b'<')).is_err());
+        assert!(validate_download("a.json", None, None, 0, None).is_err());
+        assert!(validate_download("m.onnx", None, Some(100), 99, Some(0)).is_err());
+        assert!(validate_download("a.json", Some("application/json"), Some(5), 5, Some(b'{')).is_ok());
+        assert!(validate_download("m.onnx", Some("application/octet-stream"), Some(7), 7, Some(1)).is_ok());
     }
 
     #[tokio::test]
