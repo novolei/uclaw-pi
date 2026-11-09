@@ -53,6 +53,9 @@ pub struct MemoryHit {
     pub title: String,
     pub content: String,
     pub score: f32,
+    /// True only when `score` came from the cross-encoder reranker (sigmoid);
+    /// false for fusion-only / reranker-busy / rerank-error paths (RRF score).
+    pub reranked: bool,
 }
 
 pub struct MemoryCore {
@@ -331,6 +334,7 @@ impl MemoryCore {
                         title,
                         content,
                         score: *score,
+                        reranked: false,
                     }),
                     Err(rusqlite::Error::QueryReturnedNoRows) => {}
                     Err(e) => return Err(e.into()),
@@ -378,6 +382,7 @@ impl MemoryCore {
             if let Some(h) = hits.get(i) {
                 let mut h = h.clone();
                 h.score = p;
+                h.reranked = true;
                 out.push(h);
             }
         }
@@ -438,7 +443,7 @@ mod tests {
     }
 
     fn hit(title: &str, content: &str) -> MemoryHit {
-        MemoryHit { doc_id: "x".into(), source: "graph".into(), title: title.into(), content: content.into(), score: 1.0 }
+        MemoryHit { doc_id: "x".into(), source: "graph".into(), title: title.into(), content: content.into(), score: 1.0, reranked: false }
     }
 
     #[test]
@@ -539,6 +544,7 @@ mod tests {
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].content, "first");
         assert_eq!(out[0].score, 1.0);
+        assert!(out.iter().all(|h| !h.reranked));
     }
 
     #[test]
@@ -549,6 +555,7 @@ mod tests {
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].content, "first");
         assert_eq!(out[0].score, 1.0);
+        assert!(out.iter().all(|h| !h.reranked));
     }
 
     #[test]
@@ -559,6 +566,7 @@ mod tests {
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].content, "c");
         assert!(out[0].score > 0.8 && out[0].score < 1.0);
+        assert!(out.iter().all(|h| h.reranked));
         let none = core.apply_rerank("q", vec![hit("", "a")], |_, _| Ok(Some(vec![(0, -11.0)])));
         assert!(none.is_empty());
     }

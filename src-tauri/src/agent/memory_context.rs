@@ -250,9 +250,69 @@ fn snippet_of(content: &str, max: usize) -> String {
     }
 }
 
+/// Build the `agent:memory-recall` payload. `plan` is `None` when graph recall
+/// failed or found nothing (zero counts, empty items) so the schema is stable.
+fn build_recall_event(
+    plan: Option<&crate::memory_graph::recall::MemoryRecallPlan>,
+    total: usize,
+    core_hits: &[crate::memory_core::MemoryHit],
+    core_mode: Value,
+    conversation_id: &str,
+) -> Value {
+    let (skills_count, items, boot, triggered, relevant, expanded, recent) = match plan {
+        Some(plan) => {
+            let all = || {
+                plan.boot
+                    .iter()
+                    .chain(plan.triggered.iter())
+                    .chain(plan.relevant.iter())
+                    .chain(plan.expanded.iter())
+            };
+            let skills = all()
+                .filter(|c| c.kind == crate::memory_graph::models::MemoryNodeKind::Procedure)
+                .count();
+            let items: Vec<Value> = all()
+                .take(20)
+                .map(|c| {
+                    serde_json::json!({
+                        "nodeId": c.node_id,
+                        "title": c.title,
+                        "kind": c.kind,
+                        "source": c.source,
+                    })
+                })
+                .collect();
+            (
+                skills,
+                items,
+                plan.boot.len(),
+                plan.triggered.len(),
+                plan.relevant.len(),
+                plan.expanded.len(),
+                plan.recent.len(),
+            )
+        }
+        None => (0, Vec::new(), 0, 0, 0, 0, 0),
+    };
+    serde_json::json!({
+        "totalCandidates": total,
+        "skillsCount": skills_count,
+        "bootCount": boot,
+        "triggeredCount": triggered,
+        "relevantCount": relevant,
+        "expandedCount": expanded,
+        "recentCount": recent,
+        "items": items,
+        "coreHits": core_hits_json(core_hits),
+        "mode": core_mode,
+        "conversationId": conversation_id,
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+    })
+}
+
 /// JSON entries for the recall event's `coreHits`. Chunk hits have no title, so
 /// fall back to the first ~24 chars of the snippet (never the source ref).
-fn core_hits_json(hits: &[crate::memory_core::MemoryHit], score_kind: &str) -> Vec<Value> {
+fn core_hits_json(hits: &[crate::memory_core::MemoryHit]) -> Vec<Value> {
     hits.iter()
         .map(|h| {
             let snippet = snippet_of(&h.content, 120);
@@ -266,7 +326,7 @@ fn core_hits_json(hits: &[crate::memory_core::MemoryHit], score_kind: &str) -> V
                 "snippet": snippet,
                 "source": h.source,
                 "score": h.score,
-                "scoreKind": score_kind,
+                "scoreKind": if h.reranked { "rerank" } else { "rrf" },
             })
         })
         .collect()
@@ -279,6 +339,10 @@ pub async fn load_context(inputs: MemoryContextInputs<'_>) -> LoadedMemoryContex
     // Spawned first so the MemoryCore search runs concurrently with graph recall.
     let core_deadline = tokio::time::Instant::now() + CORE_SEARCH_TIMEOUT;
     let core_handle = spawn_core_search(inputs.core.clone(), inputs.query);
+    let core_mode: Value = match inputs.core.as_ref() {
+        Some(c) => serde_json::to_value(c.status().mode).unwrap_or_else(|_| Value::from("keyword")),
+        None => Value::from("keyword"),
+    };
     let plan = match inputs
         .recall_engine
         .build_recall_plan(inputs.space_id, inputs.query, false)
@@ -290,7 +354,10 @@ pub async fn load_context(inputs: MemoryContextInputs<'_>) -> LoadedMemoryContex
             let core_hits = join_core_search(core_handle, core_deadline).await;
             let core_block = crate::memory_core::MemoryCore::render_block(&core_hits);
             let context = compose_memory_context(core_block.as_deref(), None, None, None, None);
-            return LoadedMemoryContext { context, recall_event: None };
+            let recall_event = (!core_hits.is_empty()).then(|| {
+                build_recall_event(None, 0, &core_hits, core_mode.clone(), inputs.conversation_id)
+            });
+            return LoadedMemoryContext { context, recall_event };
         }
     };
 
@@ -329,18 +396,6 @@ pub async fn load_context(inputs: MemoryContextInputs<'_>) -> LoadedMemoryContex
 
     let core_hits = join_core_search(core_handle, core_deadline).await;
     let core_block: Option<String> = crate::memory_core::MemoryCore::render_block(&core_hits);
-    let (core_mode, score_kind) = match inputs.core.as_ref() {
-        Some(c) => {
-            let st = c.status();
-            (
-                serde_json::to_value(st.mode).unwrap_or_else(|_| Value::from("keyword")),
-                if st.reranker_loaded { "rerank" } else { "rrf" },
-            )
-        }
-        None => (Value::from("keyword"), "rrf"),
-    };
-    let core_hits_value = core_hits_json(&core_hits, score_kind);
-
     if total > 0 || !core_hits.is_empty() {
         let budget = inputs.recall_engine.config().token_budget;
         let graph_block = (total > 0)
@@ -353,52 +408,23 @@ pub async fn load_context(inputs: MemoryContextInputs<'_>) -> LoadedMemoryContex
             adapter_block.as_deref(),
         );
 
-        let skills_count = plan
-            .boot
-            .iter()
-            .chain(plan.triggered.iter())
-            .chain(plan.relevant.iter())
-            .chain(plan.expanded.iter())
-            .filter(|c| c.kind == crate::memory_graph::models::MemoryNodeKind::Procedure)
-            .count();
-        let items: Vec<Value> = plan
-            .boot
-            .iter()
-            .chain(plan.triggered.iter())
-            .chain(plan.relevant.iter())
-            .chain(plan.expanded.iter())
-            .take(20)
-            .map(|c| {
-                serde_json::json!({
-                    "nodeId": c.node_id,
-                    "title": c.title,
-                    "kind": c.kind,
-                    "source": c.source,
-                })
-            })
-            .collect();
-        let recall_event = Some(serde_json::json!({
-            "totalCandidates": total,
-            "skillsCount": skills_count,
-            "bootCount": plan.boot.len(),
-            "triggeredCount": plan.triggered.len(),
-            "relevantCount": plan.relevant.len(),
-            "expandedCount": plan.expanded.len(),
-            "recentCount": plan.recent.len(),
-            "items": items,
-            "coreHits": core_hits_value,
-            "mode": core_mode,
-            "conversationId": inputs.conversation_id,
-            "timestamp": chrono::Utc::now().to_rfc3339(),
-        }));
+        let recall_event = Some(build_recall_event(
+            Some(&plan),
+            total,
+            &core_hits,
+            core_mode,
+            inputs.conversation_id,
+        ));
 
-        // Bump usage_count on every learned skill we emitted (soft ranking
-        // signal, best-effort).
         if total > 0 {
             inputs.recall_engine.record_used_skills(&plan);
         }
         if context.is_some() {
-            tracing::info!(total_candidates = total, "Memory recall injected into system prompt");
+            tracing::info!(
+                total_candidates = total,
+                core_hits = core_hits.len(),
+                "Memory recall injected into system prompt"
+            );
         }
         LoadedMemoryContext { context, recall_event }
     } else {
@@ -425,13 +451,14 @@ mod tests {
             title: title.into(),
             content: content.into(),
             score: 0.5,
+            reranked: false,
         }
     }
 
     #[test]
     fn core_hits_json_snippet_and_title_fallback() {
         let long = format!("a  b\n{}", "字".repeat(200));
-        let v = core_hits_json(&[mk_hit("", &long), mk_hit("T", "x")], "rrf");
+        let v = core_hits_json(&[mk_hit("", &long), mk_hit("T", "x")]);
         let snip = v[0]["snippet"].as_str().unwrap();
         assert_eq!(snip.chars().count(), 121);
         assert!(snip.starts_with("a b 字") && snip.ends_with('\u{2026}'));
@@ -439,6 +466,53 @@ mod tests {
         assert_eq!(v[1]["title"], "T");
         assert_eq!(v[1]["snippet"], "x");
         assert_eq!(v[0]["scoreKind"], "rrf");
+        let mut r = mk_hit("T", "x");
+        r.reranked = true;
+        assert_eq!(core_hits_json(&[r])[0]["scoreKind"], "rerank");
+        // exactly 120 chars: no ellipsis; 121: ellipsis
+        assert_eq!(snippet_of(&"a".repeat(120), 120), "a".repeat(120));
+        assert_eq!(snippet_of(&"a".repeat(121), 120).chars().count(), 121);
+    }
+
+    #[test]
+    fn build_recall_event_none_plan_has_stable_schema() {
+        let ev = build_recall_event(None, 0, &[mk_hit("T", "x")], Value::from("hybrid"), "c9");
+        assert_eq!(ev["mode"], "hybrid");
+        assert_eq!(ev["totalCandidates"], 0);
+        assert_eq!(ev["items"].as_array().unwrap().len(), 0);
+        assert_eq!(ev["coreHits"].as_array().unwrap().len(), 1);
+        assert_eq!(ev["conversationId"], "c9");
+    }
+
+    #[tokio::test]
+    async fn recall_event_emitted_when_graph_plan_fails() {
+        use crate::memory::MemoryStore;
+        use crate::memory_core::{index, MemoryCore, MemoryCoreConfig};
+        use crate::memory_graph::{recall::{MemoryRecallConfig, MemoryRecallEngine}, store::MemoryGraphStore};
+        use rusqlite::Connection;
+        use std::sync::Mutex;
+
+        // Graph DB with no tables -> build_recall_plan errors.
+        let gstore = Arc::new(MemoryGraphStore::new(Arc::new(Mutex::new(Connection::open_in_memory().unwrap()))));
+        let engine = MemoryRecallEngine::new(gstore, MemoryRecallConfig::default());
+        assert!(engine.build_recall_plan("default", "q", false).await.is_err(), "precondition");
+        let kv = MemoryStore::new(Arc::new(Mutex::new(Connection::open_in_memory().unwrap())));
+        kv.ensure_table();
+        let cconn = Connection::open_in_memory().unwrap();
+        crate::db::migrations::run_migrations_up_to(&cconn, 61).unwrap();
+        index::sync(&cconn, &[index::SourceDoc {
+            doc_id: "graph:a".into(), source: "graph", source_id: "a".into(),
+            title: "家庭".into(), content: "用户的儿子叫刘书维".into(), updated_at: None,
+        }], None).unwrap();
+        let core = Arc::new(MemoryCore::new(Arc::new(Mutex::new(cconn)), std::path::PathBuf::from("/nonexistent"), MemoryCoreConfig::default()));
+        let loaded = load_context(MemoryContextInputs {
+            recall_engine: &engine, memory_store: &kv, space_id: "default", conversation_id: "c1",
+            query: "我儿子叫什么名字", browser_ctx: None, adapter_recall: None, core: Some(core),
+        }).await;
+        let ev = loaded.recall_event.expect("event despite graph failure");
+        assert_eq!(ev["coreHits"].as_array().unwrap().len(), 1);
+        assert_eq!(ev["totalCandidates"], 0);
+        assert!(loaded.context.unwrap().contains("刘书维"));
     }
 
     #[tokio::test]
