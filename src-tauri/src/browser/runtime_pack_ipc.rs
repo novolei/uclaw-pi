@@ -546,7 +546,10 @@ mod tests {
         assert_eq!(mcp_probe.state, BrowserRuntimeProviderProbeState::Passed);
     }
 
+    /// Manual diagnostic: dumps this machine's real runtime-pack status, then
+    /// panics on purpose so the report is shown. Run with `--ignored`.
     #[test]
+    #[ignore = "manual diagnostic: reads the real ~/.uclaw-pi runtime pack and always panics to show output"]
     fn print_real_status_diagnostics() {
         let report = inspect_default_browser_runtime_status().unwrap();
         println!("REAL_BROWSER_STATUS_REPORT_START");
