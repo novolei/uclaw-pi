@@ -218,6 +218,10 @@ mockito = "0.32"
 name = "echo_plugin"
 path = "examples/echo_plugin/main.rs"
 
+[[example]]
+name = "memory_recall_eval"
+path = "examples/memory_recall_eval/main.rs"
+
 [features]
 default = []
 
