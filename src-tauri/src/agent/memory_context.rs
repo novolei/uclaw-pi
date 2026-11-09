@@ -55,12 +55,15 @@ pub struct LoadedMemoryContext {
 }
 
 /// Concatenate the optional blocks in the canonical order
-/// (core → adapter → graph → session → browser). Returns `None` when nothing is
-/// present. The core block (MemoryCore hybrid hits) is small, query-matched and
-/// the highest-precision source, so it goes very first; the adapter block is small (≤ limit × 200 chars) and
-/// query-matched, so it goes first: downstream truncation
-/// (`PiPromptContext::compose`'s recall cap) cuts from the tail, and a long
-/// graph block used to push it out on every turn.
+/// core → adapter → graph → session → browser. Returns `None` when nothing is
+/// present.
+///
+/// Why this order: downstream truncation (`PiPromptContext::compose`'s recall cap)
+/// cuts from the tail, so the small, query-matched blocks go first and the long
+/// graph block can no longer push them out. The core block (MemoryCore hybrid
+/// hits) is the highest-precision source, so it leads; the adapter block
+/// (≤ limit × 200 chars, also query-matched) follows; then the graph recall
+/// block, and finally the session and browser blocks.
 fn compose_memory_context(
     core_block: Option<&str>,
     graph_block: Option<String>,

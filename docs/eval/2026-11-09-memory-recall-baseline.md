@@ -212,6 +212,7 @@ embedding failure; (3) one episode question answered only from a long raw chunk 
 investigated further). 2 of 37 questions have no stored answer at
 all, so the ceiling is 94.6%. Many misses are still saved in the prompt by the
 `user_model` / reflections blocks, which is why pi hit (86.5%) exceeds ranked hit@5
-(70.3%); the recall block alone carries 78.4%. Next lever: a cheaper reranker input
-(truncate candidates to ~256 tokens) so `rerank_top_n` can return to ~12–20 within
-the latency budget.
+(70.3%); the recall block alone carries 78.4%. Next lever: a faster reranker or a
+cheaper first stage so `rerank_top_n` can return to ~12–20 within the latency
+budget (shorter reranker inputs alone were tried and rejected, see the rerank
+experiment above).

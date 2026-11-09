@@ -275,7 +275,9 @@ impl MemoryCore {
                 .take(300)
                 .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
                 .collect();
-            if h.title.is_empty() {
+            // Chunk docs carry `source_ref` as their title (an opaque reference, not a
+            // human title), so only graph-style hits get a `[title]` prefix.
+            if h.title.is_empty() || h.source == "chunk" {
                 s.push_str(&format!("- {content}\n"));
             } else {
                 s.push_str(&format!("- [{}] {content}\n", h.title));
@@ -337,12 +339,14 @@ mod tests {
     fn render_block_formats_and_truncates() {
         assert!(MemoryCore::render_block(&[]).is_none());
         let long = "字".repeat(400);
-        let b = MemoryCore::render_block(&[hit("T", "a\nb"), hit("", &long)]).unwrap();
+        let chunk = MemoryHit { source: "chunk".into(), ..hit("ref-123", "from a chunk") };
+        let b = MemoryCore::render_block(&[hit("T", "a\nb"), hit("", &long), chunk]).unwrap();
         let lines: Vec<&str> = b.lines().collect();
         assert_eq!(lines[0], "<relevant_memories>");
         assert_eq!(lines[1], "- [T] a b");
         assert_eq!(lines[2], format!("- {}", "字".repeat(300)));
-        assert_eq!(lines[3], "</relevant_memories>");
+        assert_eq!(lines[3], "- from a chunk", "chunk hits render without their source_ref title");
+        assert_eq!(lines[4], "</relevant_memories>");
         assert!(b.ends_with("</relevant_memories>\n"));
     }
 
