@@ -27,7 +27,9 @@ pub async fn memory_core_set_models_enabled(
         .map_err(|e| Error::Internal(format!("memory_core_set_models_enabled: {e:#}")))
 }
 
-/// Retry a failed model download now. No-op unless the download phase is `failed`.
+/// Retry what failed: a failed model download (phase `failed`), or a failed
+/// model load (`loadError`) — re-runs the load when the files are on disk,
+/// otherwise re-downloads. No-op when nothing failed.
 #[tauri::command]
 pub async fn memory_core_retry_download(state: State<'_, AppState>) -> Result<MemoryCoreStatus, Error> {
     Ok(state.memory_core_service.retry_download().await)

@@ -238,10 +238,14 @@ export function describeDownloadError(reason: string | null): string {
 }
 
 function FailedBody({
+  title,
+  description,
   reason,
   onRetry,
   busy,
 }: {
+  title: string
+  description: string
   reason: string | null
   onRetry: () => void
   busy: boolean
@@ -250,10 +254,8 @@ function FailedBody({
     <div role="alert" className="flex gap-2.5 rounded-lg border border-danger/20 bg-danger-bg/50 px-3 py-3">
       <AlertCircle aria-hidden size={14} className="mt-[3px] shrink-0 text-danger" />
       <div className="min-w-0 flex-1">
-        <div className="text-[13px] font-medium leading-5 text-danger-strong">模型下载失败</div>
-        <p className="mt-0.5 text-[12px] leading-[18px] text-foreground/75">
-          {describeDownloadError(reason)}目前仍可按关键词检索。
-        </p>
+        <div className="text-[13px] font-medium leading-5 text-danger-strong">{title}</div>
+        <p className="mt-0.5 text-[12px] leading-[18px] text-foreground/75">{description}</p>
         <div className="mt-2.5 flex flex-wrap items-center gap-2">
           <Button
             variant="outline"
@@ -503,7 +505,18 @@ export function MemoryEngineCard(): React.ReactElement {
               )}
               {state === 'failed' && (
                 <FailedBody
+                  title="模型下载失败"
+                  description={`${describeDownloadError(status.download?.error ?? null)}目前仍可按关键词检索。`}
                   reason={status.download?.error ?? null}
+                  onRetry={() => void retry()}
+                  busy={pending}
+                />
+              )}
+              {state === 'loadFailed' && (
+                <FailedBody
+                  title="模型加载失败"
+                  description="本地模型未能加载，目前仍可按关键词检索。"
+                  reason={status.loadError}
                   onRetry={() => void retry()}
                   busy={pending}
                 />

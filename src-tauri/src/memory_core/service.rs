@@ -335,10 +335,27 @@ impl ServiceHandle {
         Ok(self.status())
     }
 
-    /// Only acts when the last download failed; otherwise returns the status as is.
+    /// Retry whatever failed: a failed download (re-download, then load), or a
+    /// failed model load with the files on disk (clears `load_error` and re-runs
+    /// the load in the background). Otherwise returns the status as is.
     pub async fn retry_download(self: &Arc<Self>) -> MemoryCoreStatus {
-        let failed = self.status().download.is_some_and(|d| d.phase == DownloadPhase::Failed);
-        if failed {
+        let st = self.status();
+        let download_failed = st.download.as_ref().is_some_and(|d| d.phase == DownloadPhase::Failed);
+        let load_failed = st.load_error.is_some() && !st.embedder_loaded;
+        if load_failed && !download_failed && self.desired() {
+            let me = self.clone();
+            let ready = tokio::task::spawn_blocking(move || me.ops.models_ready()).await.unwrap_or(false);
+            if ready {
+                // Back to "loading" right away; the load reports its own outcome.
+                self.core.update_status(|s| s.load_error = None);
+                let me = self.clone();
+                tauri::async_runtime::spawn(async move { me.load_now().await });
+                return self.status();
+            }
+            // Files went missing: fall through to a fresh download (which loads after).
+            self.core.update_status(|s| s.load_error = None);
+        }
+        if download_failed || (load_failed && self.desired()) {
             let (spawn_task, waiting) = {
                 let mut c = self.ctl.lock().unwrap_or_else(|p| p.into_inner());
                 if c.desired && !c.running {
@@ -615,6 +632,9 @@ mod tests {
         /// When set, the download ticks progress through `guarded_update` after the gate.
         core: Mutex<Option<Arc<MemoryCore>>>,
         keep_seen: Mutex<Option<bool>>,
+        /// Next loads fail (recording `load_error` on `load_core`, like `try_load_models`).
+        fail_load: AtomicBool,
+        load_core: Mutex<Option<Arc<MemoryCore>>>,
     }
 
     impl FakeOps {
@@ -629,6 +649,8 @@ mod tests {
                 gate: gated.then(|| Arc::new(tokio::sync::Semaphore::new(0))),
                 core: Mutex::new(None),
                 keep_seen: Mutex::new(None),
+                fail_load: AtomicBool::new(false),
+                load_core: Mutex::new(None),
             })
         }
     }
@@ -664,8 +686,15 @@ mod tests {
         }
         fn load(&self) -> bool {
             self.loads.fetch_add(1, Ordering::SeqCst);
-            self.loaded.store(true, Ordering::SeqCst);
-            true
+            let ok = !self.fail_load.load(Ordering::SeqCst);
+            if let Some(c) = self.load_core.lock().unwrap().clone() {
+                c.update_status(|s| {
+                    s.load_error = (!ok).then(|| "load bge-m3: bad onnx".to_string());
+                    s.embedder_loaded = ok;
+                });
+            }
+            self.loaded.store(ok, Ordering::SeqCst);
+            ok
         }
         fn unload(&self) {
             self.loaded.store(false, Ordering::SeqCst);
@@ -820,5 +849,75 @@ mod tests {
         .join();
         assert!(c.update_status(|s| s.index.docs = 7));
         assert_eq!(c.status().index.docs, 7);
+    }
+    #[tokio::test]
+    async fn retry_reruns_a_failed_load_when_files_are_ready() {
+        let ops = FakeOps::new(true, false, &[]);
+        let (h, c) = handle_with(ops.clone(), Duration::from_secs(3600));
+        *ops.load_core.lock().unwrap() = Some(c.clone());
+        ops.fail_load.store(true, Ordering::SeqCst);
+        let st = h.set_models_enabled(true).await.unwrap();
+        assert_eq!(ops.loads.load(Ordering::SeqCst), 1);
+        assert!(st.load_error.is_some(), "load failure is visible");
+
+        ops.fail_load.store(false, Ordering::SeqCst);
+        let st = h.retry_download().await;
+        assert!(st.load_error.is_none(), "retry goes back to loading at once");
+        wait_until("reload", || ops.loaded.load(Ordering::SeqCst)).await;
+        assert_eq!(ops.loads.load(Ordering::SeqCst), 2);
+        assert_eq!(ops.downloads.load(Ordering::SeqCst), 0, "no download for a load failure");
+        assert!(c.status().load_error.is_none());
+    }
+
+    #[tokio::test]
+    async fn retry_after_load_failure_redownloads_when_files_are_gone() {
+        let ops = FakeOps::new(true, false, &[]);
+        let (h, c) = handle_with(ops.clone(), Duration::from_secs(3600));
+        *ops.load_core.lock().unwrap() = Some(c.clone());
+        ops.fail_load.store(true, Ordering::SeqCst);
+        h.set_models_enabled(true).await.unwrap();
+        ops.fail_load.store(false, Ordering::SeqCst);
+        ops.ready.store(false, Ordering::SeqCst);
+        h.retry_download().await;
+        wait_until("redownload + load", || ops.loaded.load(Ordering::SeqCst)).await;
+        assert_eq!(ops.downloads.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn try_load_models_records_and_clears_load_error() {
+        use crate::memory_core::models::{model_dir, BGE_M3_INT8, BGE_RERANKER_V2_M3_INT8};
+        let t = tempfile::tempdir().unwrap();
+        // Both specs "on disk" (sizes pass `is_ready`), but the onnx files are
+        // unreadable, so both loads fail fast without reading 500 MB.
+        for spec in [&BGE_M3_INT8, &BGE_RERANKER_V2_M3_INT8] {
+            for f in spec.files {
+                let p = model_dir(t.path(), spec).join(f.path);
+                std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+                std::fs::File::create(&p).unwrap().set_len(f.min_bytes).unwrap();
+            }
+            let onnx = model_dir(t.path(), spec).join("onnx/model_int8.onnx");
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&onnx, std::fs::Permissions::from_mode(0o000)).unwrap();
+        }
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::migrations::run_migrations_up_to(&conn, 61).unwrap();
+        let core = MemoryCore::new(Arc::new(Mutex::new(conn)), t.path().to_path_buf(), MemoryCoreConfig::default());
+        assert!(!core.try_load_models());
+        let st = core.status();
+        let err = st.load_error.expect("load_error set");
+        assert!(err.contains("bge-m3"), "{err}");
+        assert!(!st.embedder_loaded);
+        // Unload clears it (back to plain keyword mode).
+        core.unload_models();
+        assert!(core.status().load_error.is_none());
+    }
+
+    #[test]
+    fn try_load_models_without_failures_clears_a_stale_load_error() {
+        let c = core();
+        c.update_status(|s| s.load_error = Some("old".into()));
+        assert!(!c.try_load_models()); // nothing on disk: nothing attempted, nothing failed
+        let st = c.status();
+        assert!(st.load_error.is_none());
     }
 }

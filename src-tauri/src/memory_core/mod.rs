@@ -204,6 +204,7 @@ impl MemoryCore {
         if let Ok(mut g) = self.reranker.write() {
             *g = None;
         }
+        self.update_status(|s| s.load_error = None);
         self.refresh_model_status();
         // Pending/vector counts depend on the loaded embedder's model id.
         self.refresh_index_status(false);
@@ -214,6 +215,7 @@ impl MemoryCore {
     pub fn try_load_models(&self) -> bool {
         // Serialize loads: the second caller waits, then sees the models loaded.
         let _load = self.load_lock.lock().unwrap_or_else(|p| p.into_inner());
+        let mut errors: Vec<String> = Vec::new();
         if self.embedder().is_none() && models::is_ready(&self.models_root, &models::BGE_M3_INT8) {
             match Embedder::load(&self.models_root) {
                 Ok(e) => {
@@ -221,7 +223,10 @@ impl MemoryCore {
                         *g = Some(Arc::new(e));
                     }
                 }
-                Err(e) => tracing::warn!("memory_core: embedder load failed: {e:#}"),
+                Err(e) => {
+                    tracing::warn!("memory_core: embedder load failed: {e:#}");
+                    errors.push(format!("{e:#}"));
+                }
             }
         }
         let have_reranker = self.reranker.read().map(|g| g.is_some()).unwrap_or(false);
@@ -232,9 +237,15 @@ impl MemoryCore {
                         *g = Some(Arc::new(r));
                     }
                 }
-                Err(e) => tracing::warn!("memory_core: reranker load failed: {e:#}"),
+                Err(e) => {
+                    tracing::warn!("memory_core: reranker load failed: {e:#}");
+                    errors.push(format!("{e:#}"));
+                }
             }
         }
+        // Set on any failure, cleared when this attempt had none.
+        let load_error = (!errors.is_empty()).then(|| errors.join("\n"));
+        self.update_status(|s| s.load_error = load_error);
         self.refresh_model_status();
         // Pending/vector counts depend on the loaded embedder's model id.
         self.refresh_index_status(false);

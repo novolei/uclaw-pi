@@ -428,7 +428,7 @@ export function shouldInstallDevTauriMock(): boolean {
 }
 
 export function createUclawMockIpcHandler(): MockHandler {
-  // Settings › 记忆 engine: `?memoryCore=ready|downloading|failed|off|empty|loading`.
+  // Settings › 记忆 engine: `?memoryCore=ready|downloading|failed|off|empty|loading|loadfailed`.
   const memoryCore = createMemoryCoreMock(
     parseMemoryCoreMockState(typeof window !== 'undefined' ? window.location.search : ''),
     (status: MemoryCoreStatus) => emit('memory-core:status', status),

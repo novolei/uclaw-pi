@@ -104,6 +104,24 @@ describe('MemoryEngineCard', () => {
     expect(await screen.findByRole('progressbar', { name: '下载记忆模型' })).toBeInTheDocument()
   })
 
+  it('load failed: calm callout, raw error behind 详情, 重试 re-runs the load', async () => {
+    const { user } = await renderState('loadfailed', 5)
+    expect(screen.queryByText('正在加载模型')).toBeNull()
+    const alert = screen.getByRole('alert')
+    expect(within(alert).getByText('模型加载失败')).toBeInTheDocument()
+    expect(within(alert).getByText('本地模型未能加载，目前仍可按关键词检索。')).toBeInTheDocument()
+    expect(within(alert).queryByText(/Protobuf parsing failed/)).toBeNull()
+    await user.click(within(alert).getByRole('button', { name: '详情' }))
+    expect(within(alert).getByText(/Protobuf parsing failed/)).toBeInTheDocument()
+    h.invoke.mockImplementation(async (cmd: string) => {
+      if (cmd === 'memory_core_retry_download') return { ...memoryCoreFixture('loading', 6) }
+      throw new Error(cmd)
+    })
+    await user.click(within(alert).getByRole('button', { name: '重试' }))
+    expect(h.invoke).toHaveBeenCalledWith('memory_core_retry_download')
+    expect(await screen.findByText('正在加载模型')).toBeInTheDocument()
+  })
+
   it('off: keyword-only explanation and the first-download size', async () => {
     await renderState('off')
     expect(screen.getByRole('switch', { name: '使用本地检索模型' })).not.toBeChecked()

@@ -38,6 +38,8 @@ export interface MemoryCoreStatus {
   embedderLoaded: boolean
   rerankerLoaded: boolean
   download: MemoryDownloadStatus | null
+  /** Last model load error (files on disk, load failed); null once a load succeeds or models are off. */
+  loadError: string | null
   index: MemoryIndexStatus
 }
 
@@ -48,6 +50,7 @@ export const memoryCoreBridge = {
   /** Turn the local models on (downloads them if missing) or off (keyword-only). */
   setModelsEnabled: (enabled: boolean): Promise<MemoryCoreStatus> =>
     invoke<MemoryCoreStatus>('memory_core_set_models_enabled', { enabled }),
+  /** Retry a failed download, or a failed model load (`loadError`). */
   retryDownload: (): Promise<MemoryCoreStatus> =>
     invoke<MemoryCoreStatus>('memory_core_retry_download'),
 }

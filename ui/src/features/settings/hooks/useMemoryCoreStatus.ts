@@ -90,7 +90,14 @@ memoryCoreSyncAtom.onMount = (dispatch) => {
 }
 
 /** What the engine is doing, from the user's point of view. */
-export type MemoryEngineState = 'off' | 'queued' | 'downloading' | 'failed' | 'loading' | 'ready'
+export type MemoryEngineState =
+  | 'off'
+  | 'queued'
+  | 'downloading'
+  | 'failed'
+  | 'loadFailed'
+  | 'loading'
+  | 'ready'
 
 export function memoryEngineState(s: MemoryCoreStatus): MemoryEngineState {
   if (!s.modelsEnabled) return 'off'
@@ -102,15 +109,19 @@ export function memoryEngineState(s: MemoryCoreStatus): MemoryEngineState {
     case 'downloading':
       return s.download.downloadedBytes > 0 ? 'downloading' : 'queued'
     default:
-      return s.embedderLoaded ? 'ready' : 'loading'
+      if (s.embedderLoaded) return 'ready'
+      // Files on disk but the load failed: say so instead of "loading" forever.
+      if (s.loadError) return 'loadFailed'
+      return 'loading'
   }
 }
 
-/** Settings nav attention dot: active while a download is queued/running, danger when it failed. */
+/** Settings nav attention dot: active while a download is queued/running, danger when it (or the load) failed. */
 export function memoryCoreAttention(s: MemoryCoreStatus | null): 'none' | 'active' | 'failed' {
   if (!s?.modelsEnabled) return 'none'
   const phase = s.download?.phase
   if (phase === 'failed') return 'failed'
+  if (s.loadError && !s.embedderLoaded && phase !== 'queued' && phase !== 'downloading') return 'failed'
   if (phase === 'queued' || phase === 'downloading') return 'active'
   return 'none'
 }
@@ -154,7 +165,7 @@ export function useMemoryCoreStatus() {
     try {
       await dispatch({ type: 'response', status: await memoryCoreBridge.retryDownload() })
     } catch (e) {
-      toast.error('重试下载失败', { description: message(e) })
+      toast.error('重试失败', { description: message(e) })
     } finally {
       setPending(false)
     }

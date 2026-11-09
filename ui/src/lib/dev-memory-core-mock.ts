@@ -2,10 +2,11 @@
  * Browser-mock for the MemoryCore engine (Settings › 记忆). Used by
  * `dev-tauri-mock.ts` and by component tests as fixtures.
  *
- * `?memoryCore=ready|downloading|failed|off|empty|loading` picks the initial
- * state (default `ready`). Toggling / retrying transitions plausibly: off→on
- * streams a fake ~1.14 GB download over `memory-core:status`, then "loads" the
- * models and fills the vector index.
+ * `?memoryCore=ready|downloading|failed|off|empty|loading|loadfailed` picks the
+ * initial state (default `ready`). Toggling / retrying transitions plausibly:
+ * off→on streams a fake ~1.14 GB download over `memory-core:status`, then
+ * "loads" the models and fills the vector index. `loadfailed` is models on disk
+ * whose load failed (重试 reloads).
  */
 import {
   MEMORY_MODELS,
@@ -27,6 +28,7 @@ export const MEMORY_CORE_MOCK_STATES = [
   'off',
   'empty',
   'loading',
+  'loadfailed',
 ] as const
 export type MemoryCoreMockState = (typeof MEMORY_CORE_MOCK_STATES)[number]
 
@@ -59,6 +61,7 @@ export function memoryCoreFixture(state: MemoryCoreMockState, seq = 1): MemoryCo
     embedderLoaded: true,
     rerankerLoaded: true,
     download: null,
+    loadError: null,
     index,
   }
   switch (state) {
@@ -73,6 +76,16 @@ export function memoryCoreFixture(state: MemoryCoreMockState, seq = 1): MemoryCo
         mode: 'keyword',
         embedderLoaded: false,
         rerankerLoaded: false,
+        index: { ...index, vectors: 0, pendingEmbeddings: 1284 },
+      }
+    case 'loadfailed':
+      return {
+        ...base,
+        mode: 'keyword',
+        embedderLoaded: false,
+        rerankerLoaded: false,
+        loadError:
+          'load bge-m3: Failed to create session: Load model from onnx/model_int8.onnx failed: Protobuf parsing failed.',
         index: { ...index, vectors: 0, pendingEmbeddings: 1284 },
       }
     case 'loading':
@@ -121,7 +134,8 @@ const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms
 /** Stateful mock of the three `memory_core_*` commands + the status event stream. */
 export function createMemoryCoreMock(initial: MemoryCoreMockState, emit: Emit) {
   let state = memoryCoreFixture(initial)
-  let modelsOnDisk = initial === 'ready' || initial === 'empty' || initial === 'loading'
+  let modelsOnDisk =
+    initial === 'ready' || initial === 'empty' || initial === 'loading' || initial === 'loadfailed'
   let run = 0 // bumped to cancel an in-flight simulation
   let started = false
 
@@ -175,7 +189,9 @@ export function createMemoryCoreMock(initial: MemoryCoreMockState, emit: Emit) {
     if (run !== expectedRun) return // the user already toggled/retried; their run owns the state
     const myRun = ++run
     if (state.download?.phase === 'downloading') void downloadModels(myRun)
-    else if (state.modelsEnabled && !state.embedderLoaded && modelsOnDisk) void loadModelsAndIndex(myRun)
+    else if (state.modelsEnabled && !state.embedderLoaded && modelsOnDisk && !state.loadError) {
+      void loadModelsAndIndex(myRun)
+    }
   }
 
   return {
@@ -198,6 +214,7 @@ export function createMemoryCoreMock(initial: MemoryCoreMockState, emit: Emit) {
           embedderLoaded: false,
           rerankerLoaded: false,
           download: null,
+          loadError: null,
         })
         // Vectors stay on disk; with no model loaded the backend counts them all.
         return snapshot()
@@ -212,6 +229,13 @@ export function createMemoryCoreMock(initial: MemoryCoreMockState, emit: Emit) {
       return snapshot()
     },
     retryDownload(): MemoryCoreStatus {
+      if (state.modelsEnabled && state.loadError && !state.embedderLoaded) {
+        const myRun = ++run
+        state.seq += 1
+        state.loadError = null // back to "loading"; the load reports its outcome
+        void loadModelsAndIndex(myRun)
+        return snapshot()
+      }
       const myRun = ++run
       state.seq += 1
       state.download = download('queued', 0)

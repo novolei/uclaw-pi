@@ -29,6 +29,10 @@ describe('useMemoryCoreStatus helpers', () => {
     expect(memoryEngineState(memoryCoreFixture('failed'))).toBe('failed')
     expect(memoryEngineState(memoryCoreFixture('downloading'))).toBe('downloading')
     expect(memoryEngineState(memoryCoreFixture('loading'))).toBe('loading')
+    expect(memoryEngineState(memoryCoreFixture('loadfailed'))).toBe('loadFailed')
+    // a stale load error never hides a loaded embedder
+    expect(memoryEngineState({ ...memoryCoreFixture('ready'), loadError: 'x' })).toBe('ready')
+    expect(memoryCoreAttention(memoryCoreFixture('loadfailed'))).toBe('failed')
     expect(memoryCoreAttention(null)).toBe('none')
     expect(memoryCoreAttention(memoryCoreFixture('ready'))).toBe('none')
     expect(memoryCoreAttention(memoryCoreFixture('loading'))).toBe('none') // phase done
@@ -59,6 +63,7 @@ describe('useMemoryCoreStatus helpers', () => {
 
   it('mock URL flag picks the state, defaulting to ready', () => {
     expect(parseMemoryCoreMockState('?memoryCore=failed')).toBe('failed')
+    expect(parseMemoryCoreMockState('?memoryCore=loadfailed')).toBe('loadfailed')
     expect(parseMemoryCoreMockState('?memoryCore=nope')).toBe('ready')
     expect(parseMemoryCoreMockState('')).toBe('ready')
   })

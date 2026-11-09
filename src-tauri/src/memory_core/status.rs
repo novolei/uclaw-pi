@@ -64,6 +64,9 @@ pub struct MemoryCoreStatus {
     pub embedder_loaded: bool,
     pub reranker_loaded: bool,
     pub download: Option<DownloadStatus>,
+    /// Last model load error (files on disk but onnx/tokenizer failed to load).
+    /// Set by `try_load_models` on failure, cleared on success and on unload.
+    pub load_error: Option<String>,
     pub index: IndexStatus,
 }
 
@@ -76,6 +79,7 @@ impl Default for MemoryCoreStatus {
             embedder_loaded: false,
             reranker_loaded: false,
             download: None,
+            load_error: None,
             index: IndexStatus { docs: 0, vectors: 0, pending_embeddings: 0, last_sync_at: None },
         }
     }
@@ -139,6 +143,7 @@ mod tests {
         assert_eq!(v["embedderLoaded"], false);
         assert_eq!(v["index"]["pendingEmbeddings"], 0);
         assert!(v["download"].is_null());
+        assert!(v["loadError"].is_null());
         let d = DownloadStatus {
             phase: DownloadPhase::Downloading,
             model: "m".into(),
