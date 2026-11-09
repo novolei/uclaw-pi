@@ -210,8 +210,9 @@ fn spawn_core_search(
 /// Upper bound on how long `load_context` waits for the MemoryCore search,
 /// measured from when the search was spawned. Kept well under the pi path's
 /// `PI_RECALL_DEADLINE_MS` (1500 ms) so a slow search drops only the core block
-/// instead of the whole memory context.
-const CORE_SEARCH_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1000);
+/// instead of the whole memory context. 1300 ms fits English/skill queries
+/// (p50 ~1.1 s on CPU) while leaving ~200 ms headroom for composing the prompt.
+const CORE_SEARCH_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1300);
 
 /// Await the core search until `deadline`. On timeout, logs a warning and yields
 /// `None`; the blocking task is detached (not aborted) and finishes in the background.

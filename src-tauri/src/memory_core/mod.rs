@@ -217,16 +217,17 @@ impl MemoryCore {
         }
 
         if let Some(rr) = reranker {
-            hits = self.apply_rerank(model_query, hits, |q, t| rr.rerank(q, t));
+            hits = self.apply_rerank(model_query, hits, |q, t| rr.try_rerank(q, t).transpose());
         }
         hits.truncate(limit);
         Ok(hits)
     }
 
-    /// Rerank `hits`; on rerank error keep the fused order (scores stay RRF).
+    /// Rerank `hits`; when the reranker is busy (`Ok(None)`) or errors, keep the
+    /// fused order (scores stay RRF).
     fn apply_rerank<F>(&self, query: &str, mut hits: Vec<MemoryHit>, rerank: F) -> Vec<MemoryHit>
     where
-        F: FnOnce(&str, &[String]) -> anyhow::Result<Vec<(usize, f32)>>,
+        F: FnOnce(&str, &[String]) -> anyhow::Result<Option<Vec<(usize, f32)>>>,
     {
         let cfg = &self.config;
         hits.truncate(cfg.rerank_top_n);
@@ -235,7 +236,11 @@ impl MemoryCore {
             .map(|h| if h.title.is_empty() { h.content.clone() } else { format!("{}\n{}", h.title, h.content) })
             .collect();
         let ranked = match rerank(query, &texts) {
-            Ok(r) => r,
+            Ok(Some(r)) => r,
+            Ok(None) => {
+                tracing::debug!("memory_core: reranker busy, keeping RRF order");
+                return hits;
+            }
             Err(e) => {
                 tracing::warn!("memory_core: rerank failed, keeping RRF order: {e:#}");
                 return hits;
@@ -415,14 +420,24 @@ mod tests {
     }
 
     #[test]
+    fn rerank_busy_keeps_rrf_order() {
+        let core = core_with(&[]);
+        let hits = vec![hit("", "first"), hit("", "second")];
+        let out = core.apply_rerank("q", hits, |_, _| Ok(None));
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].content, "first");
+        assert_eq!(out[0].score, 1.0);
+    }
+
+    #[test]
     fn rerank_reorders_and_thresholds() {
         let core = core_with(&[]);
         let hits = vec![hit("", "a"), hit("", "b"), hit("", "c")];
-        let out = core.apply_rerank("q", hits, |_, _| Ok(vec![(2, 2.0), (0, -1.0), (1, -11.0)]));
+        let out = core.apply_rerank("q", hits, |_, _| Ok(Some(vec![(2, 2.0), (0, -1.0), (1, -11.0)])));
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].content, "c");
         assert!(out[0].score > 0.8 && out[0].score < 1.0);
-        let none = core.apply_rerank("q", vec![hit("", "a")], |_, _| Ok(vec![(0, -11.0)]));
+        let none = core.apply_rerank("q", vec![hit("", "a")], |_, _| Ok(Some(vec![(0, -11.0)])));
         assert!(none.is_empty());
     }
 }

@@ -131,15 +131,33 @@ impl Reranker {
         if docs.is_empty() {
             return Ok(Vec::new());
         }
-        let refs: Vec<&str> = docs.iter().map(String::as_str).collect();
         let mut g = self.inner.lock().map_err(|_| anyhow!("reranker mutex poisoned"))?;
-        let res = g
-            .rerank(query, &refs, false, Some(BATCH_SIZE))
-            .map_err(|e| anyhow!("rerank: {e}"))?;
-        let mut v: Vec<(usize, f32)> = res.into_iter().map(|r| (r.index, r.score)).collect();
-        v.sort_by(|a, b| b.1.total_cmp(&a.1));
-        Ok(v)
+        run_rerank(&mut g, query, docs)
     }
+
+    /// Like [`Self::rerank`] but never waits: `None` when another search (e.g. a
+    /// detached one that already timed out) is still using the reranker, so the
+    /// caller can keep its fused order instead of queueing behind it.
+    pub fn try_rerank(&self, query: &str, docs: &[String]) -> Option<anyhow::Result<Vec<(usize, f32)>>> {
+        if docs.is_empty() {
+            return Some(Ok(Vec::new()));
+        }
+        match self.inner.try_lock() {
+            Ok(mut g) => Some(run_rerank(&mut g, query, docs)),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+            Err(std::sync::TryLockError::Poisoned(_)) => Some(Err(anyhow!("reranker mutex poisoned"))),
+        }
+    }
+}
+
+fn run_rerank(engine: &mut TextRerank, query: &str, docs: &[String]) -> anyhow::Result<Vec<(usize, f32)>> {
+    let refs: Vec<&str> = docs.iter().map(String::as_str).collect();
+    let res = engine
+        .rerank(query, &refs, false, Some(BATCH_SIZE))
+        .map_err(|e| anyhow!("rerank: {e}"))?;
+    let mut v: Vec<(usize, f32)> = res.into_iter().map(|r| (r.index, r.score)).collect();
+    v.sort_by(|a, b| b.1.total_cmp(&a.1));
+    Ok(v)
 }
 
 /// Cosine similarity; 0.0 for mismatched lengths or zero vectors.
