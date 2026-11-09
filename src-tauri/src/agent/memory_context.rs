@@ -188,20 +188,21 @@ async fn recall_adapter_block(ar: &AdapterRecall<'_>, query: &str) -> Option<Str
 }
 
 /// Start a `MemoryCore` search on the blocking pool (the search is sync and can
-/// take hundreds of ms with models loaded). Resolves to the rendered block;
-/// any DB error / join error logs a warning and yields `None`.
+/// take hundreds of ms with models loaded). Resolves to the raw hits (they feed
+/// both the prompt block and the recall event); any DB error / join error logs
+/// a warning and yields no hits.
 fn spawn_core_search(
     core: Option<Arc<crate::memory_core::MemoryCore>>,
     query: &str,
-) -> Option<tokio::task::JoinHandle<Option<String>>> {
+) -> Option<tokio::task::JoinHandle<Vec<crate::memory_core::MemoryHit>>> {
     let core = core?;
     let q = query.to_string();
     Some(tokio::task::spawn_blocking(move || {
         match core.search(&q, core.config().limit) {
-            Ok(hits) => crate::memory_core::MemoryCore::render_block(&hits),
+            Ok(hits) => hits,
             Err(e) => {
                 tracing::warn!(error = %e, "MemoryCore search failed; skipping");
-                None
+                Vec::new()
             }
         }
     }))
@@ -215,25 +216,60 @@ fn spawn_core_search(
 const CORE_SEARCH_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1300);
 
 /// Await the core search until `deadline`. On timeout, logs a warning and yields
-/// `None`; the blocking task is detached (not aborted) and finishes in the background.
+/// no hits; the blocking task is detached (not aborted) and finishes in the background.
 async fn join_core_search(
-    h: Option<tokio::task::JoinHandle<Option<String>>>,
+    h: Option<tokio::task::JoinHandle<Vec<crate::memory_core::MemoryHit>>>,
     deadline: tokio::time::Instant,
-) -> Option<String> {
-    match tokio::time::timeout_at(deadline, h?).await {
+) -> Vec<crate::memory_core::MemoryHit> {
+    let Some(h) = h else { return Vec::new() };
+    match tokio::time::timeout_at(deadline, h).await {
         Ok(Ok(b)) => b,
         Ok(Err(e)) => {
             tracing::warn!(error = %e, "MemoryCore search task failed; skipping");
-            None
+            Vec::new()
         }
         Err(_) => {
             tracing::warn!(
                 timeout_ms = CORE_SEARCH_TIMEOUT.as_millis() as u64,
                 "MemoryCore search timed out; dropping core block"
             );
-            None
+            Vec::new()
         }
     }
+}
+
+/// Collapse whitespace and cut to `max` chars (char-safe), appending "…" when cut.
+fn snippet_of(content: &str, max: usize) -> String {
+    let flat = content.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() <= max {
+        flat
+    } else {
+        let mut t: String = flat.chars().take(max).collect();
+        t.push('\u{2026}');
+        t
+    }
+}
+
+/// JSON entries for the recall event's `coreHits`. Chunk hits have no title, so
+/// fall back to the first ~24 chars of the snippet (never the source ref).
+fn core_hits_json(hits: &[crate::memory_core::MemoryHit], score_kind: &str) -> Vec<Value> {
+    hits.iter()
+        .map(|h| {
+            let snippet = snippet_of(&h.content, 120);
+            let title = if h.title.trim().is_empty() {
+                snippet.chars().take(24).collect::<String>()
+            } else {
+                h.title.clone()
+            };
+            serde_json::json!({
+                "title": title,
+                "snippet": snippet,
+                "source": h.source,
+                "score": h.score,
+                "scoreKind": score_kind,
+            })
+        })
+        .collect()
 }
 
 /// Assemble the prompt memory block from graph recall + session KV + the
@@ -251,7 +287,8 @@ pub async fn load_context(inputs: MemoryContextInputs<'_>) -> LoadedMemoryContex
         Ok(plan) => plan,
         Err(e) => {
             tracing::warn!(error = %e, "Memory recall failed, proceeding without memory context");
-            let core_block = join_core_search(core_handle, core_deadline).await;
+            let core_hits = join_core_search(core_handle, core_deadline).await;
+            let core_block = crate::memory_core::MemoryCore::render_block(&core_hits);
             let context = compose_memory_context(core_block.as_deref(), None, None, None, None);
             return LoadedMemoryContext { context, recall_event: None };
         }
@@ -290,14 +327,27 @@ pub async fn load_context(inputs: MemoryContextInputs<'_>) -> LoadedMemoryContex
         None => None,
     };
 
-    let core_block: Option<String> = join_core_search(core_handle, core_deadline).await;
+    let core_hits = join_core_search(core_handle, core_deadline).await;
+    let core_block: Option<String> = crate::memory_core::MemoryCore::render_block(&core_hits);
+    let (core_mode, score_kind) = match inputs.core.as_ref() {
+        Some(c) => {
+            let st = c.status();
+            (
+                serde_json::to_value(st.mode).unwrap_or_else(|_| Value::from("keyword")),
+                if st.reranker_loaded { "rerank" } else { "rrf" },
+            )
+        }
+        None => (Value::from("keyword"), "rrf"),
+    };
+    let core_hits_value = core_hits_json(&core_hits, score_kind);
 
-    if total > 0 {
+    if total > 0 || !core_hits.is_empty() {
         let budget = inputs.recall_engine.config().token_budget;
-        let graph_block = MemoryRecallEngine::format_recall_for_prompt(&plan, budget);
+        let graph_block = (total > 0)
+            .then(|| MemoryRecallEngine::format_recall_for_prompt(&plan, budget));
         let context = compose_memory_context(
             core_block.as_deref(),
-            Some(graph_block),
+            graph_block,
             session_block.as_deref(),
             inputs.browser_ctx.as_deref(),
             adapter_block.as_deref(),
@@ -336,13 +386,17 @@ pub async fn load_context(inputs: MemoryContextInputs<'_>) -> LoadedMemoryContex
             "expandedCount": plan.expanded.len(),
             "recentCount": plan.recent.len(),
             "items": items,
+            "coreHits": core_hits_value,
+            "mode": core_mode,
             "conversationId": inputs.conversation_id,
             "timestamp": chrono::Utc::now().to_rfc3339(),
         }));
 
         // Bump usage_count on every learned skill we emitted (soft ranking
         // signal, best-effort).
-        inputs.recall_engine.record_used_skills(&plan);
+        if total > 0 {
+            inputs.recall_engine.record_used_skills(&plan);
+        }
         if context.is_some() {
             tracing::info!(total_candidates = total, "Memory recall injected into system prompt");
         }
@@ -363,6 +417,88 @@ pub async fn load_context(inputs: MemoryContextInputs<'_>) -> LoadedMemoryContex
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn mk_hit(title: &str, content: &str) -> crate::memory_core::MemoryHit {
+        crate::memory_core::MemoryHit {
+            doc_id: "x".into(),
+            source: "chunk".into(),
+            title: title.into(),
+            content: content.into(),
+            score: 0.5,
+        }
+    }
+
+    #[test]
+    fn core_hits_json_snippet_and_title_fallback() {
+        let long = format!("a  b\n{}", "字".repeat(200));
+        let v = core_hits_json(&[mk_hit("", &long), mk_hit("T", "x")], "rrf");
+        let snip = v[0]["snippet"].as_str().unwrap();
+        assert_eq!(snip.chars().count(), 121);
+        assert!(snip.starts_with("a b 字") && snip.ends_with('\u{2026}'));
+        assert_eq!(v[0]["title"].as_str().unwrap().chars().count(), 24);
+        assert_eq!(v[1]["title"], "T");
+        assert_eq!(v[1]["snippet"], "x");
+        assert_eq!(v[0]["scoreKind"], "rrf");
+    }
+
+    #[tokio::test]
+    async fn recall_event_carries_core_hits_when_graph_empty() {
+        use crate::memory::MemoryStore;
+        use crate::memory_core::{index, MemoryCore, MemoryCoreConfig};
+        use crate::memory_graph::{recall::{MemoryRecallConfig, MemoryRecallEngine}, store::MemoryGraphStore};
+        use rusqlite::Connection;
+        use std::sync::Mutex;
+
+        let gconn = Connection::open_in_memory().unwrap();
+        crate::db::migrations::run_migrations_up_to(&gconn, 61).unwrap();
+        let gstore = Arc::new(MemoryGraphStore::new(Arc::new(Mutex::new(gconn))));
+        let engine = MemoryRecallEngine::new(gstore, MemoryRecallConfig::default());
+        let kv_conn = Connection::open_in_memory().unwrap();
+        let kv = MemoryStore::new(Arc::new(Mutex::new(kv_conn)));
+        kv.ensure_table();
+
+        let cconn = Connection::open_in_memory().unwrap();
+        crate::db::migrations::run_migrations_up_to(&cconn, 61).unwrap();
+        index::sync(
+            &cconn,
+            &[index::SourceDoc {
+                doc_id: "graph:a".into(),
+                source: "graph",
+                source_id: "a".into(),
+                title: "家庭".into(),
+                content: "用户的儿子叫刘书维".into(),
+                updated_at: None,
+            }],
+            None,
+        )
+        .unwrap();
+        let core = Arc::new(MemoryCore::new(
+            Arc::new(Mutex::new(cconn)),
+            std::path::PathBuf::from("/nonexistent"),
+            MemoryCoreConfig::default(),
+        ));
+
+        let loaded = load_context(MemoryContextInputs {
+            recall_engine: &engine,
+            memory_store: &kv,
+            space_id: "default",
+            conversation_id: "c1",
+            query: "我儿子叫什么名字",
+            browser_ctx: None,
+            adapter_recall: None,
+            core: Some(core),
+        })
+        .await;
+        let ev = loaded.recall_event.expect("event emitted for core hits");
+        let hits = ev["coreHits"].as_array().unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0]["title"], "家庭");
+        assert_eq!(hits[0]["source"], "graph");
+        assert!(hits[0]["snippet"].as_str().unwrap().contains("刘书维"));
+        assert_eq!(ev["mode"], "keyword");
+        assert_eq!(ev["totalCandidates"], 0);
+        assert!(loaded.context.unwrap().contains("刘书维"));
+    }
 
     #[test]
     fn compose_orders_graph_session_browser() {
@@ -424,17 +560,17 @@ mod tests {
     async fn join_core_search_times_out_without_blocking() {
         let slow = tokio::task::spawn_blocking(|| {
             std::thread::sleep(std::time::Duration::from_millis(500));
-            Some("late".to_string())
+            vec![mk_hit("T", "late")]
         });
         let t = std::time::Instant::now();
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(50);
-        assert!(join_core_search(Some(slow), deadline).await.is_none());
+        assert!(join_core_search(Some(slow), deadline).await.is_empty());
         assert!(t.elapsed() < std::time::Duration::from_millis(400), "must not wait for the task");
 
-        let fast = tokio::task::spawn_blocking(|| Some("hit".to_string()));
+        let fast = tokio::task::spawn_blocking(|| vec![mk_hit("T", "hit")]);
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-        assert_eq!(join_core_search(Some(fast), deadline).await.as_deref(), Some("hit"));
-        assert!(join_core_search(None, deadline).await.is_none());
+        assert_eq!(join_core_search(Some(fast), deadline).await.len(), 1);
+        assert!(join_core_search(None, deadline).await.is_empty());
     }
 
     #[tokio::test]
