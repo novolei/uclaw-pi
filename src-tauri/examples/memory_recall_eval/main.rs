@@ -9,6 +9,10 @@
 //!                   layers (triggered → relevant → expanded), in that order
 //! * `bucket_seal` — `BucketSealAdapter::recall` (namespace "global") with the
 //!                   inert embedder, i.e. FTS5-only (what runs when memU is down)
+//! * `memory_core` — `MemoryCore::search` (BM25 + bge-m3 vectors + RRF + rerank) over
+//!                   an index built once per run on the migrated snapshot
+//!                   (`--models-dir`, `--rerank-top-n`, `--min-rerank-score`,
+//!                   `--core-limit` override the model dir / config)
 //! * `pi_context`  — the pi-path prompt block: `load_context` (graph + adapter
 //!                   supplement per the user's `promptRecallBackend`) composed
 //!                   with user_model + reflections via `PiPromptContext::compose`
@@ -47,6 +51,7 @@ use uclaw_core::memory_adapter::{MemoryAdapter, RecallOpts};
 use uclaw_core::memory_bucket_seal::{
     BucketSealAdapter, BucketSealStore, Embedder, InertEmbedder, InertSummariser, Summariser,
 };
+use uclaw_core::memory_core::{MemoryCore, MemoryCoreConfig};
 use uclaw_core::memory_graph::recall::{
     MemoryRecallConfig, MemoryRecallConfigDto, MemoryRecallEngine,
 };
@@ -57,7 +62,7 @@ const KS: [usize; 4] = [1, 3, 5, 10];
 const SPACE_ID: &str = "default";
 const BS_NAMESPACE: &str = "global";
 const PI_CONTEXT_BUDGET: usize = 12_000;
-const RANKED_BACKENDS: [&str; 3] = ["graph_fts", "graph_plan", "bucket_seal"];
+const RANKED_BACKENDS: [&str; 4] = ["graph_fts", "graph_plan", "bucket_seal", "memory_core"];
 
 #[derive(Debug, Deserialize)]
 struct GoldenItem {
@@ -133,6 +138,11 @@ struct Args {
     verbose: bool,
     /// Print each query's composed pi context (for debugging what the model sees).
     dump_context: bool,
+    /// Model dir for memory_core (default `<data-dir>/models/memory`).
+    models_dir: Option<PathBuf>,
+    rerank_top_n: Option<usize>,
+    min_rerank_score: Option<f32>,
+    core_limit: Option<usize>,
 }
 
 fn parse_args() -> Result<Args> {
@@ -143,6 +153,10 @@ fn parse_args() -> Result<Args> {
         out: None,
         verbose: false,
         dump_context: false,
+        models_dir: None,
+        rerank_top_n: None,
+        min_rerank_score: None,
+        core_limit: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
@@ -152,6 +166,10 @@ fn parse_args() -> Result<Args> {
             "--out" => args.out = Some(PathBuf::from(it.next().context("--out value")?)),
             "--verbose" | "-v" => args.verbose = true,
             "--dump-context" => args.dump_context = true,
+            "--models-dir" => args.models_dir = Some(PathBuf::from(it.next().context("--models-dir value")?)),
+            "--rerank-top-n" => args.rerank_top_n = Some(it.next().context("--rerank-top-n value")?.parse()?),
+            "--min-rerank-score" => args.min_rerank_score = Some(it.next().context("--min-rerank-score value")?.parse()?),
+            "--core-limit" => args.core_limit = Some(it.next().context("--core-limit value")?.parse()?),
             other => anyhow::bail!("unknown argument: {other}"),
         }
     }
@@ -269,6 +287,42 @@ async fn main() -> Result<()> {
     let mut adapters: HashMap<String, Arc<dyn MemoryAdapter>> = HashMap::new();
     adapters.insert("bucket_seal".into(), bucket_seal.clone() as Arc<dyn MemoryAdapter>);
 
+    // ── memory_core: migrate the SNAPSHOT (temp copy), index once ─────────
+    {
+        let c = conn.lock().unwrap();
+        uclaw_core::db::migrations::run(&c).context("migrate snapshot")?;
+    }
+    let mut core_cfg = MemoryCoreConfig::default();
+    if let Some(v) = args.rerank_top_n { core_cfg.rerank_top_n = v; }
+    if let Some(v) = args.min_rerank_score { core_cfg.min_rerank_score = v; }
+    if let Some(v) = args.core_limit { core_cfg.limit = v; }
+    let core_limit = core_cfg.limit;
+    eprintln!("memory_core config: {core_cfg:?}");
+    let models_dir = args
+        .models_dir
+        .clone()
+        .unwrap_or_else(|| args.data_dir.join("models").join("memory"));
+    let core = Arc::new(MemoryCore::new(conn.clone(), models_dir.clone(), core_cfg));
+    let t_idx = Instant::now();
+    let embedder_loaded = core.try_load_models();
+    eprintln!("memory_core: models dir {} | embedder loaded={} | model load {:.1}s",
+        models_dir.display(), embedder_loaded, t_idx.elapsed().as_secs_f64());
+    {
+        let chunks_ro = Connection::open_with_flags(&bs_db, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let c = conn.lock().unwrap();
+        let mut docs = uclaw_core::memory_core::index::graph_docs(&c)?;
+        docs.extend(uclaw_core::memory_core::index::chunk_docs(&chunks_ro)?);
+        let n = docs.len();
+        uclaw_core::memory_core::index::sync(&c, &docs, None)?;
+        drop(c);
+        let embedded = match core.embedder() {
+            Some(e) => uclaw_core::memory_core::index::embed_pending(&conn, &e)?,
+            None => 0,
+        };
+        eprintln!("memory_core: indexed {n} docs, embedded {embedded} | index build {:.1}s (incl. model load)",
+            t_idx.elapsed().as_secs_f64());
+    }
+
     // Query-independent pi prompt dims we can reproduce from the DB.
     let (graph_texts, user_model, reflections) = {
         let c = conn.lock().unwrap();
@@ -345,6 +399,19 @@ async fn main() -> Result<()> {
         };
         backends.insert("bucket_seal".to_string(), ranked(texts, &m, ms(t), err));
 
+        // memory_core
+        let t = Instant::now();
+        let (texts, err) = {
+            let core = Arc::clone(&core);
+            let q = item.query.clone();
+            match tokio::task::spawn_blocking(move || core.search(&q, core_limit.max(K))).await {
+                Ok(Ok(hs)) => (hs.into_iter().map(|h| format!("{}\n{}", h.title, h.content)).collect(), None),
+                Ok(Err(e)) => (Vec::new(), Some(e.to_string())),
+                Err(e) => (Vec::new(), Some(e.to_string())),
+            }
+        };
+        backends.insert("memory_core".to_string(), ranked(texts, &m, ms(t), err));
+
         // pi_context
         let t = Instant::now();
         let adapter_recall = prompt_backend.as_deref().map(|backend| AdapterRecall {
@@ -361,7 +428,7 @@ async fn main() -> Result<()> {
             query: &item.query,
             browser_ctx: None,
             adapter_recall,
-            core: None,
+            core: Some(Arc::clone(&core)),
         })
         .await;
         let recall_block = loaded.context.clone().unwrap_or_default();
@@ -423,7 +490,7 @@ fn print_query(r: &QueryReport) {
             .unwrap_or_else(|| "-".into())
     };
     println!(
-        "[{}|{}] {} | stored g={} c={} | fts={} plan={} bs={} | pi={} ",
+        "[{}|{}] {} | stored g={} c={} | fts={} plan={} bs={} core={} | pi={} ",
         r.lang,
         r.id,
         r.query,
@@ -432,6 +499,7 @@ fn print_query(r: &QueryReport) {
         rank("graph_fts"),
         rank("graph_plan"),
         rank("bucket_seal"),
+        rank("memory_core"),
         yn(r.pi_context_hit),
     );
 }
