@@ -396,7 +396,7 @@ impl ServiceHandle {
         if !self.desired() {
             return;
         }
-        let mut c = self.ctl.lock().unwrap_or_else(|p| p.into_inner());
+        let c = self.ctl.lock().unwrap_or_else(|p| p.into_inner());
         if c.loaded && !force {
             return;
         }
