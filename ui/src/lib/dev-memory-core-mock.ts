@@ -199,7 +199,7 @@ export function createMemoryCoreMock(initial: MemoryCoreMockState, emit: Emit) {
           rerankerLoaded: false,
           download: null,
         })
-        state.index = { ...state.index, vectors: 0, pendingEmbeddings: state.index.docs }
+        // Vectors stay on disk; with no model loaded the backend counts them all.
         return snapshot()
       }
       state.modelsEnabled = true

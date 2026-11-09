@@ -1,6 +1,10 @@
 import { describe, it, expect } from 'vitest'
 import { memoryCoreFixture, parseMemoryCoreMockState } from '@/lib/dev-memory-core-mock'
-import { formatBytes, formatSince } from '../components/memory/MemoryEngineCard'
+import {
+  describeDownloadError,
+  formatBytes,
+  formatSince,
+} from '../components/memory/MemoryEngineCard'
 import {
   acceptMemoryCoreStatus,
   memoryCoreAttention,
@@ -30,6 +34,8 @@ describe('useMemoryCoreStatus helpers', () => {
     expect(memoryCoreAttention(memoryCoreFixture('loading'))).toBe('none') // phase done
     expect(memoryCoreAttention(memoryCoreFixture('downloading'))).toBe('active')
     expect(memoryCoreAttention(memoryCoreFixture('failed'))).toBe('failed')
+    // a stale download record never lights the dot once models are off
+    expect(memoryCoreAttention({ ...memoryCoreFixture('failed'), modelsEnabled: false })).toBe('none')
   })
 
   it('formats bytes and relative sync time', () => {
@@ -41,6 +47,14 @@ describe('useMemoryCoreStatus helpers', () => {
     expect(formatSince('2026-11-09T09:57:00Z', now)).toBe('上次同步 3 分钟前')
     expect(formatSince('2026-11-09T07:00:00Z', now)).toBe('上次同步 3 小时前')
     expect(formatSince('2026-11-07T10:00:00Z', now)).toBe('上次同步 2 天前')
+  })
+
+  it('classifies download errors into an actionable cause', () => {
+    expect(describeDownloadError('error sending request for url (...): operation timed out')).toMatch(/检查网络/)
+    expect(describeDownloadError('write onnx: No space left on device (os error 28)')).toMatch(/磁盘空间不足/)
+    expect(describeDownloadError('Permission denied (os error 13)')).toMatch(/权限/)
+    expect(describeDownloadError('checksum mismatch')).toBe('下载未完成，请稍后重试。')
+    expect(describeDownloadError(null)).toBe('下载未完成，请稍后重试。')
   })
 
   it('mock URL flag picks the state, defaulting to ready', () => {

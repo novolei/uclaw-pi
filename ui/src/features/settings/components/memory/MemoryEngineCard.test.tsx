@@ -56,6 +56,7 @@ describe('MemoryEngineCard', () => {
     renderWithProviders(<MemoryEngineCard />)
     const sk = await screen.findByTestId('memory-engine-skeleton', {}, { timeout: 1000 })
     expect(sk).toHaveAttribute('aria-busy', 'true')
+    expect(sk).toHaveAttribute('role', 'status')
     expect(screen.queryByText(/加载中/)).toBeNull()
   })
 
@@ -68,6 +69,9 @@ describe('MemoryEngineCard', () => {
     expect(screen.getAllByText('已就绪').length).toBeGreaterThanOrEqual(2)
     expect(screen.getByRole('progressbar', { name: '语义覆盖' })).toHaveAttribute('aria-valuenow', '100')
     expect(screen.getByText(/上次同步 3 分钟前/)).toBeInTheDocument()
+    // the coverage row carries the count; no duplicate 记忆 pill
+    expect(screen.getByText(/1,284 \/ 1,284 条/)).toBeInTheDocument()
+    expect(screen.queryByText('记忆', { selector: 'span' })).toBeNull()
   })
 
   it('downloading: overall progress with bytes and friendly source', async () => {
@@ -86,7 +90,11 @@ describe('MemoryEngineCard', () => {
     const { user } = await renderState('failed')
     const alert = screen.getByRole('alert')
     expect(within(alert).getByText('模型下载失败')).toBeInTheDocument()
-    expect(within(alert).getByText(/operation timed out/)).toBeInTheDocument()
+    expect(within(alert).getByText(/请检查网络后重试。目前仍可按关键词检索/)).toBeInTheDocument()
+    // raw error sits behind 详情, untruncated
+    expect(within(alert).queryByText(/operation timed out/)).toBeNull()
+    await user.click(within(alert).getByRole('button', { name: '详情' }))
+    expect(within(alert).getByText(/https:\/\/hf-mirror\.com\/Xenova\/bge-m3.*operation timed out/)).toBeInTheDocument()
     h.invoke.mockImplementation(async (cmd: string) => {
       if (cmd === 'memory_core_retry_download') return memoryCoreFixture('downloading', 9)
       throw new Error(cmd)
@@ -102,6 +110,7 @@ describe('MemoryEngineCard', () => {
     expect(screen.getByText('仅关键词')).toBeInTheDocument()
     expect(screen.getByText(/首次开启会下载约 1\.1 GB/)).toBeInTheDocument()
     expect(screen.queryByRole('progressbar', { name: '语义覆盖' })).toBeNull()
+    expect(screen.getByText('开启本地模型后，将为 1,284 条记忆建立语义索引')).toBeInTheDocument()
   })
 
   it('empty index: first-run empty state', async () => {
@@ -133,6 +142,41 @@ describe('MemoryEngineCard', () => {
     expect(sw).toBeChecked() // optimistic
     await act(async () => resolve(memoryCoreFixture('downloading', 9)))
     expect(await screen.findByRole('progressbar', { name: '下载记忆模型' })).toBeInTheDocument()
+  })
+
+  it('keeps the optimistic toggle while older-state progress events arrive mid-call', async () => {
+    const { user } = await renderState('off', 5)
+    let resolve!: (s: MemoryCoreStatus) => void
+    h.invoke.mockImplementation((cmd: string) =>
+      cmd === 'memory_core_set_models_enabled'
+        ? new Promise((r) => { resolve = r })
+        : Promise.reject(new Error(cmd)),
+    )
+    const sw = screen.getByRole('switch', { name: '使用本地检索模型' })
+    await user.click(sw)
+    // backend still reports modelsEnabled=false (persist not done) on a newer seq
+    pushEvent(memoryCoreFixture('off', 6))
+    expect(sw).toBeChecked()
+    await act(async () => resolve(memoryCoreFixture('downloading', 7)))
+    expect(sw).toBeChecked()
+    // once settled, pushed events are taken at face value again
+    pushEvent(memoryCoreFixture('off', 8))
+    expect(sw).not.toBeChecked()
+  })
+
+  it('shares one get_status call and one listener across consumers', async () => {
+    serve(memoryCoreFixture('ready', 3))
+    const { listen } = await import('@tauri-apps/api/event')
+    vi.mocked(listen).mockClear()
+    renderWithProviders(
+      <>
+        <MemoryEngineCard />
+        <MemoryEngineCard />
+      </>,
+    )
+    await screen.findAllByRole('switch', { name: '使用本地检索模型' })
+    expect(h.invoke.mock.calls.filter(([c]) => c === 'memory_core_get_status')).toHaveLength(1)
+    expect(vi.mocked(listen)).toHaveBeenCalledTimes(1)
   })
 
   it('rolls back the toggle and toasts when the command fails', async () => {

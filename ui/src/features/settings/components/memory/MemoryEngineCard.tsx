@@ -8,10 +8,13 @@
  * docs/design/memory-ui.md.
  */
 import * as React from 'react'
-import { AnimatePresence, motion, useReducedMotion } from 'motion/react'
-import { AlertCircle, CheckCircle2, Circle, Database, RotateCw, Search } from 'lucide-react'
+import { motion, useReducedMotion } from 'motion/react'
+import {
+  AlertCircle, CheckCircle2, ChevronRight, Circle, Database, RotateCw, Search,
+} from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible'
 import { MemorySkeleton, ProgressBar, StatPill } from '@/components/memory/primitives'
 import {
   MEMORY_MODELS,
@@ -97,7 +100,6 @@ function FadeIn({ children, className }: { children: React.ReactNode; className?
       className={className}
       initial={{ opacity: 0, y: reduce ? 0 : 4 }}
       animate={{ opacity: 1, y: 0, transition: { duration: reduce ? 0.12 : 0.18, ease: EASE_OUT } }}
-      exit={{ opacity: 0, transition: { duration: 0.12, ease: 'easeIn' } }}
     >
       {children}
     </motion.div>
@@ -188,7 +190,7 @@ function DownloadingBody({ status, queued }: { status: MemoryCoreStatus; queued:
   return (
     <div>
       <div className="flex items-baseline justify-between gap-3">
-        <span id="memory-download-title" className="text-[13px] font-medium leading-5 text-foreground">
+        <span className="text-[13px] font-medium leading-5 text-foreground">
           {queued ? '正在准备下载' : '正在下载模型'}
         </span>
         {!queued && (
@@ -224,6 +226,17 @@ function DownloadingBody({ status, queued }: { status: MemoryCoreStatus; queued:
   )
 }
 
+/** Turn the backend's error chain into a short cause the user can act on. */
+export function describeDownloadError(reason: string | null): string {
+  const r = (reason ?? '').toLowerCase()
+  if (/no space|disk full|enospc|磁盘/.test(r)) return '磁盘空间不足，请清理出约 1.2 GB 后重试。'
+  if (/permission denied|eacces|read-only/.test(r)) return '没有写入模型目录的权限，请检查后重试。'
+  if (/timed out|timeout|error sending request|dns|connect|network|unreachable|tls|certificate/.test(r)) {
+    return '已依次尝试 Hugging Face、镜像站和 ModelScope，均未连通。请检查网络后重试。'
+  }
+  return '下载未完成，请稍后重试。'
+}
+
 function FailedBody({
   reason,
   onRetry,
@@ -234,33 +247,55 @@ function FailedBody({
   busy: boolean
 }) {
   return (
-    <div role="alert" className="flex gap-2.5 rounded-lg bg-danger-bg px-3 py-3">
+    <div role="alert" className="flex gap-2.5 rounded-lg border border-danger/20 bg-danger-bg/50 px-3 py-3">
       <AlertCircle aria-hidden size={14} className="mt-[3px] shrink-0 text-danger" />
       <div className="min-w-0 flex-1">
         <div className="text-[13px] font-medium leading-5 text-danger">模型下载失败</div>
         <p className="mt-0.5 text-[12px] leading-[18px] text-muted-foreground">
-          已依次尝试 Hugging Face、镜像站和 ModelScope。请检查网络后重试，目前仍可按关键词检索。
+          {describeDownloadError(reason)}目前仍可按关键词检索。
         </p>
-        {reason && (
-          <p
-            title={reason}
-            className="mt-1.5 line-clamp-2 break-all font-mono text-[11px] leading-4 text-muted-foreground/80"
+        <div className="mt-2.5 flex flex-wrap items-center gap-2">
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={onRetry}
+            disabled={busy}
+            className="h-7 gap-1.5 bg-background/60 px-2.5 text-[12px]"
           >
-            {reason}
-          </p>
-        )}
-        <Button
-          variant="outline"
-          size="sm"
-          onClick={onRetry}
-          disabled={busy}
-          className="mt-2.5 h-7 gap-1.5 bg-background/60 px-2.5 text-[12px]"
-        >
-          <RotateCw aria-hidden className={cn('!size-3', busy && 'motion-safe:animate-spin')} />
-          重试
-        </Button>
+            <RotateCw aria-hidden className={cn('!size-3', busy && 'motion-safe:animate-spin')} />
+            重试
+          </Button>
+        </div>
+        {reason && <ErrorDetails reason={reason} />}
       </div>
     </div>
+  )
+}
+
+/** Raw error behind a small disclosure; wraps and scrolls, never truncated. */
+function ErrorDetails({ reason }: { reason: string }) {
+  return (
+    <Collapsible className="mt-2">
+      <CollapsibleTrigger
+        className={cn(
+          'group -ml-1 inline-flex items-center gap-0.5 rounded px-1 py-0.5 text-[11px] leading-4',
+          'text-muted-foreground transition-colors duration-[120ms] hover:text-foreground',
+          'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
+        )}
+      >
+        <ChevronRight
+          aria-hidden
+          size={12}
+          className="transition-transform duration-[180ms] group-data-[state=open]:rotate-90 motion-reduce:transition-none"
+        />
+        详情
+      </CollapsibleTrigger>
+      <CollapsibleContent>
+        <pre className="mt-1 max-h-32 overflow-auto whitespace-pre-wrap break-words rounded-md bg-background/60 px-2 py-1.5 font-mono text-[11px] leading-4 text-muted-foreground">
+          {reason}
+        </pre>
+      </CollapsibleContent>
+    </Collapsible>
   )
 }
 
@@ -319,26 +354,34 @@ function IndexSection({ status }: { status: MemoryCoreStatus }) {
             和助手聊几句后，值得记住的内容会自动整理到这里。
           </p>
         </div>
+      ) : showCoverage ? (
+        <div className="mt-2.5">
+          <div className="flex items-baseline justify-between gap-3 text-[12px] leading-[18px]">
+            <span className="text-muted-foreground">语义覆盖</span>
+            <span className="tabular-nums text-foreground">
+              {numberFmt.format(vectors)} / {numberFmt.format(docs)} 条
+              <span className="text-muted-foreground"> · {pct(coverage)}%</span>
+            </span>
+          </div>
+          <ProgressBar label="语义覆盖" value={coverage} className="mt-1.5" />
+          {pendingEmbeddings > 0 && (
+            <p className="mt-1.5 text-[12px] leading-[18px] tabular-nums text-muted-foreground">
+              还有 {numberFmt.format(pendingEmbeddings)} 条正在建立语义索引
+            </p>
+          )}
+        </div>
       ) : (
         <>
           <div className="mt-2.5 flex flex-wrap gap-2">
             <StatPill label="记忆" value={numberFmt.format(docs)} />
-            {showCoverage && pendingEmbeddings > 0 && (
-              <StatPill label="待索引" value={numberFmt.format(pendingEmbeddings)} />
-            )}
           </div>
-          {showCoverage && (
-            <div className="mt-3">
-              <div className="flex items-baseline justify-between gap-3 text-[12px] leading-[18px]">
-                <span className="text-muted-foreground">语义覆盖</span>
-                <span className="tabular-nums text-foreground">
-                  {numberFmt.format(vectors)} / {numberFmt.format(docs)}
-                  <span className="text-muted-foreground"> · {pct(coverage)}%</span>
-                </span>
-              </div>
-              <ProgressBar label="语义覆盖" value={coverage} className="mt-1.5" />
-            </div>
-          )}
+          <p className="mt-2 text-[12px] leading-[18px] tabular-nums text-muted-foreground">
+            {pendingEmbeddings === 0
+              ? '开启本地模型后即可按意思检索这些记忆'
+              : status.modelsEnabled
+                ? `模型就绪后将为 ${numberFmt.format(pendingEmbeddings)} 条记忆建立语义索引`
+                : `开启本地模型后，将为 ${numberFmt.format(pendingEmbeddings)} 条记忆建立语义索引`}
+          </p>
         </>
       )}
     </div>
@@ -349,7 +392,8 @@ function IndexSection({ status }: { status: MemoryCoreStatus }) {
 
 function EngineSkeleton() {
   return (
-    <div data-testid="memory-engine-skeleton" aria-busy="true" aria-label="正在读取检索引擎状态">
+    <div data-testid="memory-engine-skeleton" role="status" aria-busy="true">
+      <span className="sr-only">正在加载</span>
       <div className="flex items-center justify-between border-t border-border/50 px-4 py-3.5">
         <div className="space-y-1.5">
           <MemorySkeleton className="h-3.5 w-28" />
@@ -380,12 +424,12 @@ function EngineSkeleton() {
 function LoadError({ error, onRetry }: { error: string; onRetry: () => void }) {
   return (
     <div className="border-t border-border/50 px-4 py-4">
-      <div role="alert" className="flex gap-2.5 rounded-lg bg-danger-bg px-3 py-3">
+      <div role="alert" className="flex gap-2.5 rounded-lg border border-danger/20 bg-danger-bg/50 px-3 py-3">
         <AlertCircle aria-hidden size={14} className="mt-[3px] shrink-0 text-danger" />
         <div className="min-w-0 flex-1">
           <div className="text-[13px] font-medium leading-5 text-danger">无法读取检索引擎状态</div>
-          <p title={error} className="mt-0.5 line-clamp-2 break-all text-[12px] leading-[18px] text-muted-foreground">
-            {error}
+          <p className="mt-0.5 text-[12px] leading-[18px] text-muted-foreground">
+            请稍后重试；若持续出现，可在系统诊断中查看服务状态。
           </p>
           <Button
             variant="outline"
@@ -396,6 +440,7 @@ function LoadError({ error, onRetry }: { error: string; onRetry: () => void }) {
             <RotateCw aria-hidden className="!size-3" />
             重试
           </Button>
+          <ErrorDetails reason={error} />
         </div>
       </div>
     </div>
@@ -450,23 +495,22 @@ export function MemoryEngineCard(): React.ReactElement {
           </div>
 
           <div className="px-4 pb-4">
-            <AnimatePresence mode="wait" initial={false}>
-              <FadeIn key={state === 'queued' ? 'downloading' : state}>
-                {state === 'ready' && <ReadyBody status={status} />}
-                {(state === 'downloading' || state === 'queued') && (
-                  <DownloadingBody status={status} queued={state === 'queued'} />
-                )}
-                {state === 'failed' && (
-                  <FailedBody
-                    reason={status.download?.error ?? null}
-                    onRetry={() => void retry()}
-                    busy={pending}
-                  />
-                )}
-                {state === 'off' && <OffBody />}
-                {state === 'loading' && <LoadingModelsBody />}
-              </FadeIn>
-            </AnimatePresence>
+            {/* Keyed remount = enter-only fade (180 ms); no exit, so a swap never exceeds 200 ms. */}
+            <FadeIn key={state === 'queued' ? 'downloading' : state}>
+              {state === 'ready' && <ReadyBody status={status} />}
+              {(state === 'downloading' || state === 'queued') && (
+                <DownloadingBody status={status} queued={state === 'queued'} />
+              )}
+              {state === 'failed' && (
+                <FailedBody
+                  reason={status.download?.error ?? null}
+                  onRetry={() => void retry()}
+                  busy={pending}
+                />
+              )}
+              {state === 'off' && <OffBody />}
+              {state === 'loading' && <LoadingModelsBody />}
+            </FadeIn>
           </div>
 
           <div className="border-t border-border/50 px-4 py-4">

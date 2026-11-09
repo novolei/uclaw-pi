@@ -72,9 +72,15 @@ sweep — fades ≤120 ms or instant (`motion-safe:` / `motion-reduce:` variants
 - **Empty.** Centered in the pane: a 20 px lucide icon in `text-muted-foreground/60`,
   one 13 px/500 line saying what's missing ("还没有记忆"), one 12 px muted line with
   why/what next, at most one secondary button. No illustrations.
-- **Error.** Inline callout, not a toast: `bg-danger-bg`, 12 px `text-danger` icon +
-  short cause ("索引失败：磁盘空间不足"), and a concrete action button (重试 / 打开设置).
-  Keep the stale data visible underneath when there is any.
+- **Error.** Inline callout, not a toast, kept soft: `bg-danger-bg/50` tint + a
+  `border-danger/20` hairline, `rounded-lg`, a 14 px `text-danger` icon and a 13 px/500
+  title in `text-danger`; everything else muted. One 12 px line with the cause derived
+  from the error (network / 磁盘空间不足 / 权限 — never claim a cause the error doesn't
+  show; fall back to a neutral "下载未完成，请稍后重试") plus what still works ("目前仍可按
+  关键词检索"), then a concrete action button (重试 / 打开设置). The raw error goes behind a
+  small "详情" disclosure (Radix Collapsible, 11 px mono, wraps and scrolls — never
+  truncated mid-URL), not in primary text. Keep the stale data visible underneath when
+  there is any.
 - **Progress.** `ProgressBar` — 4 px hairline, `--progress-track` / `--progress-fill`.
   Determinate glides 240 ms; indeterminate (unknown total) sweeps; it must be named
   (`label` or `aria-labelledby`, enforced by the type) ("下载记忆模型") and show the numbers as text next to it (`12.4 / 90 MB`).
