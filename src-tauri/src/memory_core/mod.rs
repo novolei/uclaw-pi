@@ -101,14 +101,14 @@ impl MemoryCore {
         self.status.read().unwrap_or_else(|p| p.into_inner()).clone()
     }
 
-    /// The notifier runs on whatever thread changed the status, possibly while
-    /// `load_lock` is held, so it must be cheap and must NOT call `try_load_models`
-    /// (or anything else that takes `load_lock`).
     #[cfg(test)]
     pub(crate) fn status_lock_for_test(&self) -> std::sync::RwLockWriteGuard<'_, MemoryCoreStatus> {
         self.status.write().unwrap()
     }
 
+    /// The notifier runs on whatever thread changed the status, possibly while
+    /// `load_lock` is held, so it must be cheap and must NOT call `try_load_models`
+    /// (or anything else that takes `load_lock`).
     pub fn set_notifier(&self, n: Option<StatusNotifier>) {
         if let Ok(mut g) = self.notifier.lock() {
             *g = n;

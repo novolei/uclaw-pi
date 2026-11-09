@@ -112,9 +112,28 @@ fn download_status(
     }
 }
 
+/// Status write for the download path: a no-op once `keep_going` is false (toggle
+/// off), so a download still streaming never resurrects `download` after "off".
+fn guarded_update(
+    core: &MemoryCore,
+    keep_going: &(dyn Fn() -> bool + Send + Sync),
+    progress: bool,
+    f: impl FnOnce(&mut MemoryCoreStatus),
+) {
+    if !keep_going() {
+        return;
+    }
+    if progress {
+        core.update_status_progress(f);
+    } else {
+        core.update_status(f);
+    }
+}
+
 /// Download both model specs. `keep_going` is checked between specs: once it
 /// returns false the remaining specs are skipped (a file already streaming is
-/// allowed to finish) and `false` is returned without a Failed status.
+/// allowed to finish, silently: no further status writes) and `false` is
+/// returned without a Failed status.
 async fn ensure_models(
     core: &Arc<MemoryCore>,
     client: &reqwest::Client,
@@ -135,7 +154,7 @@ async fn ensure_models(
             return false;
         }
         let file0 = spec.files.first().map(|f| f.path).unwrap_or("");
-        core.update_status(|s| {
+        guarded_update(core, keep_going, false, |s| {
             s.download = Some(download_status(DownloadPhase::Queued, spec.id, file0, None, base, None));
         });
         let c = core.clone();
@@ -150,18 +169,18 @@ async fn ensure_models(
                 downloaded,
                 None,
             );
-            c.update_status_progress(|s| s.download = Some(d));
+            guarded_update(&c, keep_going, true, |s| s.download = Some(d));
         };
         if let Err(e) = models::ensure_model(client, &root, spec, &on_progress).await {
             tracing::warn!("memory_core: model {} unavailable: {e:#}", spec.id);
             let d = download_status(DownloadPhase::Failed, spec.id, file0, None, base, Some(format!("{e:#}")));
-            core.update_status(|s| s.download = Some(d));
+            guarded_update(core, keep_going, false, |s| s.download = Some(d));
             return false;
         }
         base += onnx_bytes;
     }
     // Only reached with a download in flight or everything already on disk.
-    core.update_status(|s| {
+    guarded_update(core, keep_going, false, |s| {
         if let Some(d) = s.download.as_mut() {
             d.phase = DownloadPhase::Done;
             d.downloaded_bytes = d.total_bytes;
@@ -177,13 +196,14 @@ pub trait ModelOps: Send + Sync + 'static {
     /// Both model specs are fully on disk.
     fn models_ready(&self) -> bool;
     /// Fetch the model files; `true` on success. `keep_going` turning false aborts
-    /// between files/specs (returning `false`).
+    /// between specs (a file already streaming finishes) and suppresses further
+    /// status writes; returns `false`.
     fn download<'a>(
         &'a self,
         keep_going: Arc<dyn Fn() -> bool + Send + Sync>,
     ) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>>;
-    /// Blocking, idempotent: load whatever is on disk.
-    fn load(&self);
+    /// Blocking, idempotent: load whatever is on disk. True iff the embedder is loaded.
+    fn load(&self) -> bool;
     /// Blocking: drop the loaded models.
     fn unload(&self);
 }
@@ -221,7 +241,7 @@ impl ModelOps for RealModelOps {
         })
     }
 
-    fn load(&self) {
+    fn load(&self) -> bool {
         let loaded = self.core.try_load_models();
         // Download (if any) is finished either way; clear it from the status.
         self.core.update_status(|s| s.download = None);
@@ -230,6 +250,7 @@ impl ModelOps for RealModelOps {
         } else {
             tracing::warn!("memory_core: model load did not produce an embedder");
         }
+        loaded
     }
 
     fn unload(&self) {
@@ -243,6 +264,10 @@ struct Ctl {
     desired: bool,
     /// A `model_task` is alive (single-flight guard).
     running: bool,
+    /// The task is parked in its retry wait (only then is a wake-up useful).
+    waiting: bool,
+    /// Models are currently loaded by us (skips redundant loads; guarded by `apply`).
+    loaded: bool,
 }
 
 /// Runtime control of the model download/load, stored in `AppState`.
@@ -257,6 +282,8 @@ pub struct ServiceHandle {
     ctl: Mutex<Ctl>,
     /// Serialises load/unload application against the desired state.
     apply: Mutex<()>,
+    /// Serialises whole toggles (persist + desired + status) so DB and runtime agree.
+    toggle: tokio::sync::Mutex<()>,
     /// Wakes the retry wait of a failed download.
     wake: tokio::sync::Notify,
     retry: Duration,
@@ -271,8 +298,9 @@ impl ServiceHandle {
         Arc::new(Self {
             core,
             ops,
-            ctl: Mutex::new(Ctl { desired: true, running: false }),
+            ctl: Mutex::new(Ctl { desired: true, running: false, waiting: false, loaded: false }),
             apply: Mutex::new(()),
+            toggle: tokio::sync::Mutex::new(()),
             wake: tokio::sync::Notify::new(),
             retry,
         })
@@ -293,7 +321,11 @@ impl ServiceHandle {
     /// Persist the setting, then apply it: on → download (if needed) + load;
     /// off → stop retrying, unload, keyword mode.
     pub async fn set_models_enabled(self: &Arc<Self>, enabled: bool) -> anyhow::Result<MemoryCoreStatus> {
-        persist_models_enabled(&self.core, enabled)?;
+        let _t = self.toggle.lock().await;
+        let core = self.core.clone();
+        tokio::task::spawn_blocking(move || persist_models_enabled(&core, enabled))
+            .await
+            .map_err(|e| anyhow::anyhow!("persist task: {e}"))??;
         self.core.update_status(|s| s.models_enabled = enabled);
         self.apply_desired(enabled).await;
         Ok(self.status())
@@ -303,18 +335,18 @@ impl ServiceHandle {
     pub async fn retry_download(self: &Arc<Self>) -> MemoryCoreStatus {
         let failed = self.status().download.is_some_and(|d| d.phase == DownloadPhase::Failed);
         if failed {
-            let spawn_task = {
+            let (spawn_task, waiting) = {
                 let mut c = self.ctl.lock().unwrap_or_else(|p| p.into_inner());
                 if c.desired && !c.running {
                     c.running = true;
-                    true
+                    (true, false)
                 } else {
-                    false
+                    (false, c.waiting)
                 }
             };
             if spawn_task {
                 tauri::async_runtime::spawn(self.clone().model_task());
-            } else {
+            } else if waiting {
                 self.wake.notify_one(); // cut the 30-min wait short
             }
         }
@@ -324,21 +356,21 @@ impl ServiceHandle {
     /// Load models now if wanted and on disk (used by the periodic load retry).
     pub async fn load_now(self: &Arc<Self>) {
         let me = self.clone();
-        let _ = tokio::task::spawn_blocking(move || me.apply_load()).await;
+        let _ = tokio::task::spawn_blocking(move || me.apply_load(true)).await;
     }
 
     async fn apply_desired(self: &Arc<Self>, enabled: bool) {
-        let (spawn_task, was_running) = {
+        let ready = self.ops.models_ready(); // stat calls: not under `ctl`
+        let (spawn_task, was_waiting) = {
             let mut c = self.ctl.lock().unwrap_or_else(|p| p.into_inner());
             c.desired = enabled;
-            let was_running = c.running;
-            let spawn_task = enabled && !was_running && !self.ops.models_ready();
+            let spawn_task = enabled && !c.running && !ready;
             if spawn_task {
                 c.running = true;
             }
-            (spawn_task, was_running)
+            (spawn_task, c.waiting)
         };
-        if was_running {
+        if was_waiting {
             self.wake.notify_one(); // re-evaluate a pending retry wait
         }
         if spawn_task {
@@ -347,8 +379,8 @@ impl ServiceHandle {
         let me = self.clone();
         let _ = tokio::task::spawn_blocking(move || {
             if enabled {
-                if me.ops.models_ready() {
-                    me.apply_load();
+                if ready {
+                    me.apply_load(false);
                 }
             } else {
                 me.apply_unload();
@@ -358,17 +390,26 @@ impl ServiceHandle {
     }
 
     /// Load iff still wanted; checked under `apply` so it can't race an unload.
-    fn apply_load(&self) {
+    /// `force` re-runs a load even if we think models are loaded (periodic retry).
+    fn apply_load(&self, force: bool) {
         let _g = self.apply.lock().unwrap_or_else(|p| p.into_inner());
-        if self.desired() {
-            self.ops.load();
+        if !self.desired() {
+            return;
         }
+        let mut c = self.ctl.lock().unwrap_or_else(|p| p.into_inner());
+        if c.loaded && !force {
+            return;
+        }
+        drop(c);
+        let loaded = self.ops.load();
+        self.ctl.lock().unwrap_or_else(|p| p.into_inner()).loaded = loaded;
     }
 
     fn apply_unload(&self) {
         let _g = self.apply.lock().unwrap_or_else(|p| p.into_inner());
         if !self.desired() {
             self.ops.unload();
+            self.ctl.lock().unwrap_or_else(|p| p.into_inner()).loaded = false;
             self.core.update_status(|s| s.download = None);
         }
     }
@@ -404,10 +445,12 @@ impl ServiceHandle {
                 self.load_now().await;
                 return;
             }
+            self.ctl.lock().unwrap_or_else(|p| p.into_inner()).waiting = true;
             tokio::select! {
                 _ = tokio::time::sleep(self.retry) => {}
                 _ = self.wake.notified() => {}
             }
+            self.ctl.lock().unwrap_or_else(|p| p.into_inner()).waiting = false;
         }
     }
 }
@@ -427,8 +470,8 @@ fn models_enabled(core: &MemoryCore) -> bool {
 }
 
 /// Spawn the background tasks (called from a Tauri/Tokio async context).
-/// Model download/load runs in its own task; the sync loop never waits on it
-/// and embeds as soon as the embedder becomes available.
+/// Model download/load runs in its own task; the sync loop (including the first
+/// cycle) never waits on it and embeds as soon as the embedder becomes available.
 ///
 /// The `memory_core_models_enabled` setting is read once here to seed the handle;
 /// afterwards it is driven at runtime through `ServiceHandle`.
@@ -447,11 +490,16 @@ pub fn spawn(handle: Arc<ServiceHandle>, chunks_db_path: PathBuf, notifier: Opti
             .await
             .unwrap_or(true)
         };
-        if models_on {
-            handle.apply_desired(true).await;
-        } else {
-            handle.apply_desired(false).await;
+        if !models_on {
             tracing::info!("MemoryCore models disabled by setting");
+        }
+        // Not awaited: the first BM25 sync must not wait for a model load.
+        {
+            let h = handle.clone();
+            tauri::async_runtime::spawn(async move {
+                let _t = h.toggle.lock().await;
+                h.apply_desired(models_on).await;
+            });
         }
         let chunks_db_path = Arc::new(chunks_db_path);
         // Warm up jieba once so the first sync doesn't pay for dictionary load mid-lock.
@@ -560,6 +608,9 @@ mod tests {
         downloads: AtomicUsize,
         results: Mutex<VecDeque<bool>>,
         gate: Option<Arc<tokio::sync::Semaphore>>,
+        /// When set, the download ticks progress through `guarded_update` after the gate.
+        core: Mutex<Option<Arc<MemoryCore>>>,
+        keep_seen: Mutex<Option<bool>>,
     }
 
     impl FakeOps {
@@ -572,6 +623,8 @@ mod tests {
                 downloads: AtomicUsize::new(0),
                 results: Mutex::new(results.iter().copied().collect()),
                 gate: gated.then(|| Arc::new(tokio::sync::Semaphore::new(0))),
+                core: Mutex::new(None),
+                keep_seen: Mutex::new(None),
             })
         }
     }
@@ -582,12 +635,21 @@ mod tests {
         }
         fn download<'a>(
             &'a self,
-            _keep: Arc<dyn Fn() -> bool + Send + Sync>,
+            keep: Arc<dyn Fn() -> bool + Send + Sync>,
         ) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>> {
             Box::pin(async move {
                 self.downloads.fetch_add(1, Ordering::SeqCst);
                 if let Some(g) = &self.gate {
                     g.acquire().await.unwrap().forget();
+                }
+                if let Some(c) = self.core.lock().unwrap().clone() {
+                    *self.keep_seen.lock().unwrap() = Some(keep());
+                    guarded_update(&c, &*keep, true, |s| {
+                        s.download = Some(download_status(DownloadPhase::Downloading, "m", "f", None, 5, None))
+                    });
+                    guarded_update(&c, &*keep, false, |s| {
+                        s.download = Some(download_status(DownloadPhase::Done, "m", "f", None, 9, None))
+                    });
                 }
                 let ok = self.results.lock().unwrap().pop_front().unwrap_or(true);
                 if ok {
@@ -596,10 +658,10 @@ mod tests {
                 ok
             })
         }
-        fn load(&self) {
-            if !self.loaded.swap(true, Ordering::SeqCst) {
-                self.loads.fetch_add(1, Ordering::SeqCst);
-            }
+        fn load(&self) -> bool {
+            self.loads.fetch_add(1, Ordering::SeqCst);
+            self.loaded.store(true, Ordering::SeqCst);
+            true
         }
         fn unload(&self) {
             self.loaded.store(false, Ordering::SeqCst);
@@ -656,9 +718,14 @@ mod tests {
     async fn rapid_off_on_on_yields_one_load() {
         let ops = FakeOps::new(true, false, &[]);
         let (h, _c) = handle_with(ops.clone(), Duration::from_secs(3600));
-        h.set_models_enabled(false).await.unwrap();
-        h.set_models_enabled(true).await.unwrap();
-        h.set_models_enabled(true).await.unwrap();
+        let (a, b, c) = tokio::join!(
+            h.set_models_enabled(false),
+            h.set_models_enabled(true),
+            h.set_models_enabled(true)
+        );
+        a.unwrap();
+        b.unwrap();
+        c.unwrap();
         assert_eq!(ops.loads.load(Ordering::SeqCst), 1);
         assert!(ops.loaded.load(Ordering::SeqCst));
     }
@@ -687,6 +754,20 @@ mod tests {
         wait_until("task exit", || !h.ctl.lock().unwrap().running).await;
         assert_eq!(ops.loads.load(Ordering::SeqCst), 0);
         assert!(!ops.loaded.load(Ordering::SeqCst));
+        assert!(c.status().download.is_none());
+    }
+
+    #[tokio::test]
+    async fn no_download_status_writes_after_off() {
+        let ops = FakeOps::new(false, true, &[]);
+        let (h, c) = handle_with(ops.clone(), Duration::from_secs(3600));
+        *ops.core.lock().unwrap() = Some(c.clone());
+        h.set_models_enabled(true).await.unwrap();
+        wait_until("download start", || ops.downloads.load(Ordering::SeqCst) == 1).await;
+        h.set_models_enabled(false).await.unwrap();
+        ops.gate.as_ref().unwrap().add_permits(1); // ticks + Done arrive after "off"
+        wait_until("task exit", || !h.ctl.lock().unwrap().running).await;
+        assert_eq!(*ops.keep_seen.lock().unwrap(), Some(false));
         assert!(c.status().download.is_none());
     }
 
