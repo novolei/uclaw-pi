@@ -63,3 +63,24 @@ blocks, not from recall.
 Re-run after each memory change; the numbers above are the bar to beat. Target
 for the unified memory upgrade: pi-context hit / stored ≥ 80% on this set, with
 the recall block (not user_model) carrying the hit.
+
+## After P0 (prompt-budget fix)
+
+P0: `PiPromptContext::compose` counts characters (was bytes); the recall block
+renders query-dependent sections first (Triggered → Relevant → Expanded → Boot →
+Learned Skills → Recent); boot-only skills become a one-line index; the
+bucket_seal supplement goes before the graph block.
+
+| | baseline | after P0 |
+|---|---|---|
+| fact present in composed pi context | 32.4% | 37.8% |
+| …zh / en | 22.2% / 60.0% | 29.6% / 60.0% |
+| hits carried by the query-dependent recall block | 4 | 6 |
+| bucket_seal block survives | 0 / 37 | 2 / 37 |
+| median recall block | 8,669 chars | 7,290 chars |
+
+Ranked retrieval is unchanged (P0 does not touch search). `--dump-context` on
+the remaining misses shows the cause has moved to retrieval: e.g. for
+`我儿子叫什么名字` no profile fact is retrieved at all — the "rank 5" plan hit is a
+learned-skill SOP that mentions the name. Next gain needs P1 (segmentation +
+multilingual embeddings + rerank).

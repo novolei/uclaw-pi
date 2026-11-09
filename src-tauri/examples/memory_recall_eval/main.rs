@@ -131,6 +131,8 @@ struct Args {
     golden: Option<PathBuf>,
     out: Option<PathBuf>,
     verbose: bool,
+    /// Print each query's composed pi context (for debugging what the model sees).
+    dump_context: bool,
 }
 
 fn parse_args() -> Result<Args> {
@@ -140,6 +142,7 @@ fn parse_args() -> Result<Args> {
         golden: None,
         out: None,
         verbose: false,
+        dump_context: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
@@ -148,6 +151,7 @@ fn parse_args() -> Result<Args> {
             "--golden" => args.golden = Some(PathBuf::from(it.next().context("--golden value")?)),
             "--out" => args.out = Some(PathBuf::from(it.next().context("--out value")?)),
             "--verbose" | "-v" => args.verbose = true,
+            "--dump-context" => args.dump_context = true,
             other => anyhow::bail!("unknown argument: {other}"),
         }
     }
@@ -369,6 +373,9 @@ async fn main() -> Result<()> {
         .compose(PI_CONTEXT_BUDGET)
         .unwrap_or_default();
         let pi_ms = ms(t);
+        if args.dump_context {
+            println!("===== [{}] {}\n{}\n", item.id, item.query, composed);
+        }
 
         let report = QueryReport {
             id: item.id.clone(),
