@@ -342,7 +342,7 @@ mod tests {
             mk("1", "The user enjoys playing table tennis."),
             mk("2", "用户的儿子叫刘书维"),
             mk("3", "The user ran the 'ls -a' command in a terminal."),
-            mk("4", "用户喜欢吃馒头和饺子"),
+            mk("4", "用户喜欢喝绿茶"),
         ];
         let core = MemoryCore::new(Arc::new(Mutex::new(conn)), PathBuf::from(&root), MemoryCoreConfig::default());
         assert!(core.try_load_models());
