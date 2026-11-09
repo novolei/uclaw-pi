@@ -365,6 +365,13 @@ pub struct SessionOptions {
     /// configured enabled models; an empty vector explicitly clears that scope.
     pub model_scope: Option<Vec<String>>,
     pub api_key: Option<String>,
+    /// uclaw-patch(F7): override the resolved model's endpoint + API shape with
+    /// the user's configured values (uClaw provider tab: Base URL + API type),
+    /// so any OpenAI-compatible provider (DeepSeek, custom proxies, ...) works
+    /// with exactly the user's config instead of pi's static metadata.
+    /// `None` keeps upstream behavior.
+    pub base_url: Option<String>,
+    pub api: Option<String>,
     pub thinking: Option<crate::model::ThinkingLevel>,
     /// One-shot handoff after planning and the first successful project edit.
     /// Explicitly opt in for this session; resumed sessions never re-arm it
@@ -618,6 +625,8 @@ impl Default for SessionOptions {
             model: None,
             model_scope: None,
             api_key: None,
+            base_url: None, // uclaw-patch(F7)
+            api: None,      // uclaw-patch(F7)
             thinking: None,
             prewalk: None,
             system_prompt: None,
@@ -4287,7 +4296,7 @@ pub(crate) async fn create_agent_session_deferred_mcp(
         )
         .map_err(|error| Error::validation(error.to_string()))?
     };
-    let selection = if has_extensions {
+    let mut selection = if has_extensions {
         extension_bootstrap::provisional_selection(&model_registry)?
     } else {
         app::select_model_and_thinking(
@@ -4300,6 +4309,15 @@ pub(crate) async fn create_agent_session_deferred_mcp(
         )
         .map_err(|err| Error::validation(err.to_string()))?
     };
+    // uclaw-patch(F7): apply the user's Base URL + API type (from uClaw's
+    // provider config) onto the resolved model entry, so the provider talks to
+    // the exact endpoint/API the user configured (e.g. DeepSeek's /v1).
+    if let Some(base_url) = options.base_url.as_deref().filter(|s| !s.is_empty()) {
+        selection.model_entry.model.base_url = base_url.to_string();
+    }
+    if let Some(api) = options.api.as_deref().filter(|s| !s.is_empty()) {
+        selection.model_entry.model.api = api.to_string();
+    }
     if !has_extensions {
         app::update_session_for_selection(&mut session, &selection, &model_registry);
     }

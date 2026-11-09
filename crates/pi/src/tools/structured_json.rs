@@ -672,7 +672,17 @@ fn query_funs() -> impl Iterator<Item = native::Fun<QueryData>> {
                 .into_iter()
                 .map(native::run),
         )
-        .chain(replacements.into_vec().into_iter().map(native::run))
+        // uclaw-patch(rustc-1.95): stable 1.95 fails to unify the normalized
+        // `RunPtr<QueryData>` (V<'a> = Val) with `native::run`'s generic
+        // `RunPtr<D>` under the `for<'a>` binder; upstream builds on nightly
+        // 1.100, which can. Build the `Native` directly with D fixed instead
+        // (this is exactly what `native::run` does).
+        .chain(
+            replacements
+                .into_vec()
+                .into_iter()
+                .map(|(name, arity, run)| (name, arity, jaq_core::Native::<QueryData>::new(run))),
+        )
 }
 
 fn tabular_value(value: &Val, tsv: bool) -> jaq_json::ValR {

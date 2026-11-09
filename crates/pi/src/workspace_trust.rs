@@ -96,7 +96,7 @@ impl WorkspaceTrustSurface {
             ".codex/config.toml",
             ".cursor/mcp.json",
             ".gemini/settings.json",
-            ".pi/mcp.json",
+            ".uclaw-pi/mcp.json", // uclaw-patch: project dir renamed .pi -> .uclaw-pi
             ".windsurf/mcp.json",
         ];
 
@@ -152,7 +152,7 @@ impl WorkspaceTrustSurface {
             hash_surface_record(
                 &mut surface_hasher,
                 b"settings",
-                Path::new(".pi/settings.json"),
+                Path::new(".uclaw-pi/settings.json"),
                 bytes,
             );
         }
@@ -165,7 +165,7 @@ impl WorkspaceTrustSurface {
                         escaped_path(&found.absolute)
                     ))
                 })?;
-            let relative = Path::new(".pi/extensions").join(&found.relative);
+            let relative = Path::new(".uclaw-pi/extensions").join(&found.relative);
             hash_surface_record(&mut surface_hasher, b"extension", &relative, &bytes);
             extension_entries.push(escaped_path(&relative));
         }

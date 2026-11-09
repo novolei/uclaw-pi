@@ -60,3 +60,10 @@ rust-version  = "1.78"
 # bundled binary lean — was ~80 MB unstripped, ~50 MB stripped.
 [profile.release]
 strip = true
+
+# [pi upstream sync] Mirrors crates/pi's own [patch.crates-io] (a member's
+# [patch] is ignored by cargo — only the workspace root's applies). Upstream
+# pi_agent_rust ships rquickjs-sys 0.12.2 with a quickjs-ng use-after-free fix
+# (JS_FreeContext vs. unsettled top-level-await). See crates/pi/UPSTREAM.md.
+[patch.crates-io]
+rquickjs-sys = { path = "crates/pi/vendor/rquickjs-sys" }
