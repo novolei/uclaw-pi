@@ -232,7 +232,9 @@ export function createMemoryCoreMock(initial: MemoryCoreMockState, emit: Emit) {
           download: null,
           loadError: null,
         })
-        // Vectors stay on disk; with no model loaded the backend counts them all.
+        // Vectors stay on disk; with no model loaded the backend counts them all
+        // and pending is the docs lacking any vector.
+        state.index.pendingEmbeddings = Math.max(0, state.index.docs - state.index.vectors)
         return snapshot()
       }
       state.modelsEnabled = true
@@ -244,18 +246,24 @@ export function createMemoryCoreMock(initial: MemoryCoreMockState, emit: Emit) {
       }
       return snapshot()
     },
+    /** Like the backend: acts only on a failed download or a failed load. */
     retryDownload(): MemoryCoreStatus {
-      if (state.modelsEnabled && state.loadError && !state.embedderLoaded) {
+      if (!state.modelsEnabled) return snapshot()
+      if (state.download?.phase === 'failed') {
+        // The backend returns at once; its task writes `queued` a moment later.
+        const myRun = ++run
+        void sleep(300)
+          .then(() => update((s) => { s.download = download('queued', 0) }, myRun))
+          .then((ok) => (ok ? sleep(500).then(() => downloadModels(myRun)) : undefined))
+        return snapshot()
+      }
+      if (state.loadError && !state.embedderLoaded) {
         const myRun = ++run
         state.seq += 1
         state.loadError = null // back to "loading"; the load reports its outcome
         void loadModelsAndIndex(myRun)
         return snapshot()
       }
-      const myRun = ++run
-      state.seq += 1
-      state.download = download('queued', 0)
-      void sleep(500).then(() => downloadModels(myRun))
       return snapshot()
     },
   }

@@ -402,7 +402,7 @@ export function memoryRecallFixture(sessionId: string, mode: 'hybrid' | 'keyword
     coreHits: [
       { title: '家庭', snippet: '用户的儿子叫刘书维，今年上小学二年级，周末常去公园踢球。', source: 'graph', ...scored(0.86, 0.0328) },
       { title: '上周讨论的旅行计划：十二月去', snippet: '上周讨论的旅行计划：十二月去京都，住在岚山附近，想避开周末人流，顺路看看金阁寺和伏见稻荷。', source: 'chunk', ...scored(0.41, 0.032) },
-      { title: '常用工具', snippet: '写代码主要用 VS Code，终端用 iTerm2，偏好深色主题。', source: 'item', score: 0.0312, scoreKind: 'rrf' },
+      { title: '常用工具', snippet: '写代码主要用 VS Code，终端用 iTerm2，偏好深色主题。', source: 'chunk', ...scored(0.33, 0.0312) },
     ],
     mode,
     conversationId: sessionId || null,

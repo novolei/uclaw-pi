@@ -1,5 +1,9 @@
 import { describe, it, expect } from 'vitest'
-import { memoryCoreFixture, parseMemoryCoreMockState } from '@/lib/dev-memory-core-mock'
+import {
+  createMemoryCoreMock,
+  memoryCoreFixture,
+  parseMemoryCoreMockState,
+} from '@/lib/dev-memory-core-mock'
 import {
   describeDownloadError,
   formatBytes,
@@ -70,5 +74,26 @@ describe('useMemoryCoreStatus helpers', () => {
     expect(parseMemoryCoreMockState('?memoryCore=loadfailed')).toBe('loadfailed')
     expect(parseMemoryCoreMockState('?memoryCore=nope')).toBe('ready')
     expect(parseMemoryCoreMockState('')).toBe('ready')
+  })
+
+  it('mock retry acts only on a failed download or a failed load', async () => {
+    const emitted: number[] = []
+    const ready = createMemoryCoreMock('ready', (st) => void emitted.push(st.seq))
+    const before = ready.getStatus()
+    expect(ready.retryDownload()).toEqual(before) // nothing failed: unchanged
+    const lf = createMemoryCoreMock('loadfailed', () => {})
+    lf.getStatus()
+    const after = lf.retryDownload()
+    expect(after.loadError).toBeNull()
+    expect(memoryEngineState(after)).toBe('loading')
+  })
+
+  it('mock off recomputes pending like the backend (docs lacking any vector)', () => {
+    const m = createMemoryCoreMock('ready', () => {})
+    m.getStatus()
+    const off = m.setModelsEnabled(false)
+    expect(off.index.pendingEmbeddings).toBe(off.index.docs - off.index.vectors)
+    expect(off.modelsOnDisk).toBe(true)
+    expect(memoryCoreFixture('off').modelsOnDisk).toBe(false)
   })
 })
