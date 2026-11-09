@@ -156,11 +156,16 @@ hold the skeleton) in `docs/design/screenshots/p1-ui/`. File names are
 | Ready | ![](screenshots/p1-ui/settings-ready-light-1280.png) | ![](screenshots/p1-ui/settings-ready-dark-1280.png) |
 | Downloading | ![](screenshots/p1-ui/settings-downloading-light-1280.png) | ![](screenshots/p1-ui/settings-downloading-dark-1280.png) |
 | Failed (callout) | ![](screenshots/p1-ui/settings-failed-light-1280.png) | ![](screenshots/p1-ui/settings-failed-dark-1280.png) |
-| Off (keyword only) | ![](screenshots/p1-ui/settings-off-light-1280.png) | ![](screenshots/p1-ui/settings-off-dark-1280.png) |
+| Load failed (callout) | ![](screenshots/p1-ui/settings-loadfailed-light-1280.png) | ![](screenshots/p1-ui/settings-loadfailed-dark-1280.png) |
+| Off, models not on disk (promises the ~1.1 GB first download) | ![](screenshots/p1-ui/settings-off-light-1280.png) | ![](screenshots/p1-ui/settings-off-dark-1280.png) |
+| Off, models already on disk (开启后立即可用) | ![](screenshots/p1-ui/settings-offondisk-light-1280.png) | — |
 | Loading skeleton | ![](screenshots/p1-ui/settings-skeleton-light-1280.png) | ![](screenshots/p1-ui/settings-skeleton-dark-1280.png) |
 | Recall chip (hybrid) | ![](screenshots/p1-ui/chip-hybrid-light-1280.png) | ![](screenshots/p1-ui/chip-hybrid-dark-1280.png) |
 | Recall chip (keyword) | ![](screenshots/p1-ui/chip-keyword-light-1280.png) | ![](screenshots/p1-ui/chip-keyword-dark-1280.png) |
 
 Named themes (warm-paper, qingye, black, slate-dark) and the ~720 px narrow layout are in
-the same folder.
+the same folder. Mock states: `ready`, `downloading`, `failed`, `off`, `offondisk`,
+`empty`, `loading`, `loadfailed`. The keyword-chip shots for warm-paper / qingye predate
+the neutral hint copy (本轮按关键词检索；本地检索模型就绪后可按意思找回 · 打开记忆设置); the
+light/dark ones are current.
 
