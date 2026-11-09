@@ -6,16 +6,12 @@ use std::sync::Mutex;
 
 use anyhow::{anyhow, Context};
 use fastembed::{
-    InitOptionsUserDefined, Pooling, RerankInitOptionsUserDefined, TextEmbedding, TextRerank,
+    AutoDevicePolicy, InitOptionsUserDefined, Pooling, RerankInitOptionsUserDefined, TextEmbedding, TextRerank,
     TokenizerFiles, UserDefinedEmbeddingModel, UserDefinedRerankingModel,
 };
 
-use ort::session::builder::AutoDevicePolicy;
-
 use super::models::{is_ready, model_dir, ModelSpec, BGE_M3_INT8, BGE_RERANKER_V2_M3_INT8};
 
-// Never let ORT auto-register CoreML on macOS: with dynamic shapes it recompiles per
-// batch shape and balloons to tens of GB. Plain CPU is predictable.
 const MAX_LENGTH: usize = 512;
 const BATCH_SIZE: usize = 16;
 
@@ -60,6 +56,8 @@ impl Embedder {
             model,
             InitOptionsUserDefined::default()
                 .with_max_length(MAX_LENGTH)
+                // Never let ORT auto-register CoreML on macOS: with dynamic shapes it recompiles per
+                // batch shape and balloons to tens of GB. Plain CPU is predictable.
                 .with_auto_device(AutoDevicePolicy::PreferCPU),
         )
         .map_err(|e| anyhow!("load bge-m3: {e}"))?;
@@ -102,6 +100,8 @@ impl Reranker {
         );
         let opts = RerankInitOptionsUserDefined::default()
             .with_max_length(MAX_LENGTH)
+            // Never let ORT auto-register CoreML on macOS: with dynamic shapes it recompiles per
+            // batch shape and balloons to tens of GB. Plain CPU is predictable.
             .with_auto_device(AutoDevicePolicy::PreferCPU);
         let engine = TextRerank::try_new_from_user_defined(model, opts)
             .map_err(|e| anyhow!("load reranker: {e}"))?;

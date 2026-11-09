@@ -133,6 +133,42 @@ build; BM25-only index: 0.9 s. Per-query p50 in run 1 is dominated by the cross-
 `--core-limit` were not tuned: latency, not precision, was the failing criterion
 and the gate on hit@5 is already at its limit with only 6 reranked candidates.
 
+**Trade-off of the shipped default.** At `rerank_top_n=6` `memory_core` is worse
+on Chinese than the BM25-only fallback: zh hit@5 70.4% vs 74.1% (overall 70.3% vs
+67.6%, only +2.7 pts), at ~700 ms vs ~1 ms. `search` cuts the RRF-fused list to
+`rerank_top_n.max(limit)` and `apply_rerank` cuts it again, so with a 6-candidate pool
+vector-side candidates can push correct BM25 hits out before the reranker sees them.
+The shipped default buys latency, not quality; deeper pools (runs 1 and 3) are
+clearly better on both languages but fail the 800 ms criterion.
+
+Footnote: for reranked runs `memory_core` returns at most `rerank_top_n` results, so
+its hit@10 can only exceed hit@5 when the pool is deeper than 5 (final default,
+`rerank_top_n=6`: both 70.3%). pi hit/stored is 91.4% in every reranked run because the pi prompt also
+carries the `user_model` / reflections blocks and the recall block's other sections,
+so it saturates independently of the reranked pool size.
+
+Latency headroom: the pi path gives recall a 1500 ms deadline. The final default's
+overall p50 (697 ms) fits, but the en (1235 ms) and skill-category (1405 ms) p50s sit
+close to it, so slow queries can be dropped from the prompt on this hardware.
+
+### Rerank experiment: 256-token reranker input (rejected)
+
+Hypothesis: truncating reranker inputs to 256 tokens (embedder stays at 512) lets a
+deeper pool fit the latency budget. Adopt only if every gate criterion passes AND zh
+hit@5 >= 74.1% AND overall hit@5 > 70.3%.
+
+| rerank max_length | `rerank_top_n` | hit@5 all / zh / en | MRR | p50 ms | pi hit/stored |
+|---|---|---|---|---|---|
+| 512 (shipped) | 6 | 70.3% / 70.4% / 70.0% | 0.557 | 697 | 91.4% |
+| 256 | 12 | 81.1% / 85.2% / 70.0% | 0.664 | 1113 | 91.4% |
+| 256 | 20 | 83.8% / 88.9% / 70.0% | 0.674 | 1848 | 91.4% |
+
+Quality is clearly better, but p50 fails the 800 ms gate in both runs (256-token
+truncation saved only ~10–25% vs 512 tokens: 20 candidates 2850 -> 1848 ms), so the
+change was **not adopted**; reranker `max_length` stays 512 and `rerank_top_n=6`.
+To get the deeper pool inside 800 ms would need a faster reranker or a cheaper
+first stage, not just shorter inputs.
+
 ### Gate
 
 | criterion | result | verdict |
