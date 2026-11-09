@@ -123,12 +123,29 @@ fn pending_batch(conn: &Connection, model_id: &str, max: usize) -> rusqlite::Res
     rows.collect()
 }
 
-/// Embed a batch (no DB access) and write the vectors in one transaction.
-/// Returns the number stored; docs with a wrong-dim vector are skipped.
-fn embed_and_store(conn: &Connection, emb: &Embedder, batch: &[(String, String)]) -> anyhow::Result<usize> {
-    let texts: Vec<String> = batch.iter().map(|(_, t)| t.clone()).collect();
-    let vecs = emb.embed(&texts)?;
-    store_vectors(conn, emb.model_id(), emb.dim(), batch, &vecs)
+fn batch_texts(batch: &[(String, String)]) -> Vec<String> {
+    batch.iter().map(|(_, t)| t.clone()).collect()
+}
+
+/// Drain all pending docs on one connection using `embed`. Stops when nothing is
+/// pending or a batch stores nothing (e.g. persistent dim mismatch), so it cannot spin.
+fn embed_all_pending<F>(conn: &Connection, model_id: &str, dim: usize, mut embed: F) -> anyhow::Result<usize>
+where
+    F: FnMut(&[String]) -> anyhow::Result<Vec<Vec<f32>>>,
+{
+    let mut total = 0;
+    loop {
+        let batch = pending_batch(conn, model_id, EMBED_BATCH)?;
+        if batch.is_empty() {
+            return Ok(total);
+        }
+        let vecs = embed(&batch_texts(&batch))?;
+        let n = store_vectors(conn, model_id, dim, &batch, &vecs)?;
+        total += n;
+        if n == 0 {
+            return Ok(total);
+        }
+    }
 }
 
 fn store_vectors(
@@ -168,8 +185,7 @@ pub fn embed_pending(db: &std::sync::Mutex<Connection>, embedder: &Embedder) -> 
         if batch.is_empty() {
             return Ok(total);
         }
-        let texts: Vec<String> = batch.iter().map(|(_, t)| t.clone()).collect();
-        let vecs = embedder.embed(&texts)?;
+        let vecs = embedder.embed(&batch_texts(&batch))?;
         let conn = db.lock().map_err(|_| anyhow::anyhow!("memory db lock poisoned"))?;
         let n = store_vectors(&conn, embedder.model_id(), embedder.dim(), &batch, &vecs)?;
         total += n;
@@ -242,13 +258,7 @@ pub fn sync(
     tx.commit()?;
 
     if let Some(emb) = embedder {
-        loop {
-            let batch = pending_batch(conn, emb.model_id(), usize::MAX)?;
-            if batch.is_empty() {
-                break;
-            }
-            stats.embedded += embed_and_store(conn, emb, &batch)?;
-        }
+        stats.embedded += embed_all_pending(conn, emb.model_id(), emb.dim(), |t| emb.embed(t))?;
     }
     Ok(stats)
 }
@@ -361,6 +371,19 @@ mod tests {
             .unwrap();
         assert_eq!((n, dim), (3, 1024));
         assert_eq!(sync(&conn, &docs, Some(&emb)).unwrap().embedded, 0);
+    }
+
+    #[test]
+    fn embed_all_pending_stops_on_wrong_dim() {
+        let conn = db();
+        let docs: Vec<_> = (0..20).map(|i| doc(&format!("d{i:02}"), "", "x")).collect();
+        sync(&conn, &docs, None).unwrap();
+        // Always-wrong-dim embedder: must terminate and store nothing.
+        let n = embed_all_pending(&conn, "m", 4, |t| Ok(t.iter().map(|_| vec![0.0; 3]).collect())).unwrap();
+        assert_eq!(n, 0);
+        // Correct-dim embedder drains all 20 across two batches.
+        let n = embed_all_pending(&conn, "m", 4, |t| Ok(t.iter().map(|_| vec![0.5; 4]).collect())).unwrap();
+        assert_eq!(n, 20);
     }
 
     #[test]
