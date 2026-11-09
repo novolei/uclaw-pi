@@ -1,15 +1,24 @@
 import * as React from 'react'
 import { cn } from '@/lib/utils'
 
-export interface ProgressBarProps extends Omit<React.HTMLAttributes<HTMLDivElement>, 'role'> {
+interface ProgressBarBaseProps
+  extends Omit<React.HTMLAttributes<HTMLDivElement>, 'role' | 'aria-label' | 'aria-labelledby'> {
   /** Fraction complete, 0..1. Ignored when `indeterminate`. Clamped; NaN → 0. */
   value?: number
   /** Unknown total (e.g. waiting for the first byte): a slow sweep instead of a fill. */
   indeterminate?: boolean
-  /** Accessible name — what is progressing ("下载记忆模型"). */
-  label?: string
   size?: 'sm' | 'md'
 }
+
+/**
+ * A progressbar needs an accessible name: pass `label` ("下载记忆模型"), or
+ * `aria-labelledby` pointing at a visible caption.
+ */
+export type ProgressBarProps = ProgressBarBaseProps &
+  (
+    | { label: string; 'aria-labelledby'?: undefined }
+    | { label?: undefined; 'aria-labelledby': string }
+  )
 
 function clamp01(v: number | undefined): number {
   if (v === undefined || Number.isNaN(v)) return 0
@@ -27,6 +36,7 @@ export function ProgressBar({
   value,
   indeterminate = false,
   label,
+  'aria-labelledby': labelledBy,
   size = 'sm',
   className,
   ...props
@@ -37,6 +47,7 @@ export function ProgressBar({
     <div
       role="progressbar"
       aria-label={label}
+      aria-labelledby={labelledBy}
       aria-valuemin={0}
       aria-valuemax={100}
       aria-valuenow={indeterminate ? undefined : pct}

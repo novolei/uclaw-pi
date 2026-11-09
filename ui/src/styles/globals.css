@@ -401,13 +401,13 @@
     --warning-bg: 40 95% 92%;
     --danger:     0 70% 45%;
     --danger-bg:  0 80% 96%;
-    /* Memory UI — kind tokens (fg / tinted bg, fg≥4.5:1 on bg, checked by memory-tokens.test.ts) + progress. docs/design/memory-ui.md */
-    --memory-kind-fact: 215 42% 42%; --memory-kind-fact-bg: 215 38% 95%;
-    --memory-kind-preference: 340 42% 45%; --memory-kind-preference-bg: 340 38% 95%;
-    --memory-kind-episode: 32 42% 36%; --memory-kind-episode-bg: 32 38% 95%;
-    --memory-kind-lesson: 150 42% 31%; --memory-kind-lesson-bg: 150 38% 95%;
-    --memory-kind-entity: 262 42% 51%; --memory-kind-entity-bg: 262 38% 95%;
-    --memory-kind-procedure: 188 42% 33%; --memory-kind-procedure-bg: 188 38% 95%;
+    /* Memory UI — kind tokens (fg / tinted bg, fg≥4.5:1 on bg; hues ≥30° apart and ≥25° from success/warning/danger — checked by memory-tokens.test.ts) + progress. docs/design/memory-ui.md */
+    --memory-kind-fact: 234 42% 51%; --memory-kind-fact-bg: 234 38% 95%;
+    --memory-kind-preference: 318 42% 43%; --memory-kind-preference-bg: 318 38% 95%;
+    --memory-kind-episode: 70 42% 30%; --memory-kind-episode-bg: 70 38% 95%;
+    --memory-kind-lesson: 108 42% 31%; --memory-kind-lesson-bg: 108 38% 95%;
+    --memory-kind-entity: 270 42% 49%; --memory-kind-entity-bg: 270 38% 95%;
+    --memory-kind-procedure: 200 42% 36%; --memory-kind-procedure-bg: 200 38% 95%;
     --progress-track: 0 0% 91%; --progress-fill: 0 0% 20%;
     /* Elevation: 1 = resting card / chip, 2 = popover / floating sheet */
     --elevation-1: 0 1px 2px hsl(var(--foreground) / 0.05), 0 1px 1px hsl(var(--foreground) / 0.03);
@@ -455,13 +455,13 @@
     --warning-bg: 35 40% 18%;
     --danger:     0 65% 65%;
     --danger-bg:  0 40% 18%;
-    /* Memory UI — kind tokens (fg / tinted bg, fg≥4.5:1 on bg, checked by memory-tokens.test.ts) + progress. docs/design/memory-ui.md */
-    --memory-kind-fact: 215 42% 67%; --memory-kind-fact-bg: 215 22% 15%;
-    --memory-kind-preference: 340 42% 69%; --memory-kind-preference-bg: 340 22% 15%;
-    --memory-kind-episode: 32 42% 62%; --memory-kind-episode-bg: 32 22% 15%;
-    --memory-kind-lesson: 150 42% 55%; --memory-kind-lesson-bg: 150 22% 15%;
-    --memory-kind-entity: 262 42% 71%; --memory-kind-entity-bg: 262 22% 15%;
-    --memory-kind-procedure: 188 42% 58%; --memory-kind-procedure-bg: 188 22% 15%;
+    /* Memory UI — kind tokens (fg / tinted bg, fg≥4.5:1 on bg; hues ≥30° apart and ≥25° from success/warning/danger — checked by memory-tokens.test.ts) + progress. docs/design/memory-ui.md */
+    --memory-kind-fact: 234 42% 71%; --memory-kind-fact-bg: 234 22% 15%;
+    --memory-kind-preference: 318 42% 68%; --memory-kind-preference-bg: 318 22% 15%;
+    --memory-kind-episode: 70 42% 50%; --memory-kind-episode-bg: 70 22% 15%;
+    --memory-kind-lesson: 108 42% 55%; --memory-kind-lesson-bg: 108 22% 15%;
+    --memory-kind-entity: 270 42% 70%; --memory-kind-entity-bg: 270 22% 15%;
+    --memory-kind-procedure: 200 42% 63%; --memory-kind-procedure-bg: 200 22% 15%;
     --progress-track: 0 0% 18%; --progress-fill: 0 0% 82%;
     /* Elevation: 1 = resting card / chip, 2 = popover / floating sheet */
     --elevation-1: inset 0 1px 0 hsl(0 0% 100% / 0.04), 0 1px 2px hsl(0 0% 0% / 0.40);
@@ -508,13 +508,13 @@
     --success: 175 50% 35%; --success-bg: 175 50% 94%;
     --warning: 35 80% 40%;  --warning-bg: 35 85% 92%;
     --danger:  350 65% 45%; --danger-bg:  350 70% 95%;
-    /* Memory UI — kind tokens (fg / tinted bg, fg≥4.5:1 on bg, checked by memory-tokens.test.ts) + progress. docs/design/memory-ui.md */
-    --memory-kind-fact: 214 42% 41%; --memory-kind-fact-bg: 214 40% 93%;
-    --memory-kind-preference: 330 42% 42%; --memory-kind-preference-bg: 330 40% 93%;
-    --memory-kind-episode: 42 42% 32%; --memory-kind-episode-bg: 42 40% 93%;
-    --memory-kind-lesson: 157 42% 30%; --memory-kind-lesson-bg: 157 40% 93%;
-    --memory-kind-entity: 255 42% 50%; --memory-kind-entity-bg: 255 40% 93%;
-    --memory-kind-procedure: 190 42% 33%; --memory-kind-procedure-bg: 190 40% 93%;
+    /* Memory UI — kind tokens (fg / tinted bg, fg≥4.5:1 on bg; hues ≥30° apart and ≥25° from success/warning/danger — checked by memory-tokens.test.ts) + progress. docs/design/memory-ui.md */
+    --memory-kind-fact: 231 42% 48%; --memory-kind-fact-bg: 231 40% 93%;
+    --memory-kind-preference: 314 42% 41%; --memory-kind-preference-bg: 314 40% 93%;
+    --memory-kind-episode: 74 42% 29%; --memory-kind-episode-bg: 74 40% 93%;
+    --memory-kind-lesson: 112 42% 31%; --memory-kind-lesson-bg: 112 40% 93%;
+    --memory-kind-entity: 266 42% 48%; --memory-kind-entity-bg: 266 40% 93%;
+    --memory-kind-procedure: 201 42% 36%; --memory-kind-procedure-bg: 201 40% 93%;
     --progress-track: 205 30% 88%; --progress-fill: 205 50% 42%;
     --focus-glow: 205 50% 50%;
     --focus-glow-bright: 205 70% 60%;
@@ -556,13 +556,13 @@
     --success: 175 45% 55%; --success-bg: 175 30% 18%;
     --warning: 35 75% 65%;  --warning-bg: 35 35% 18%;
     --danger:  350 60% 60%; --danger-bg:  350 35% 18%;
-    /* Memory UI — kind tokens (fg / tinted bg, fg≥4.5:1 on bg, checked by memory-tokens.test.ts) + progress. docs/design/memory-ui.md */
-    --memory-kind-fact: 214 45% 69%; --memory-kind-fact-bg: 214 28% 17%;
-    --memory-kind-preference: 330 45% 70%; --memory-kind-preference-bg: 330 28% 17%;
-    --memory-kind-episode: 42 45% 61%; --memory-kind-episode-bg: 42 28% 17%;
-    --memory-kind-lesson: 157 45% 58%; --memory-kind-lesson-bg: 157 28% 17%;
-    --memory-kind-entity: 256 45% 72%; --memory-kind-entity-bg: 256 28% 17%;
-    --memory-kind-procedure: 191 45% 62%; --memory-kind-procedure-bg: 191 28% 17%;
+    /* Memory UI — kind tokens (fg / tinted bg, fg≥4.5:1 on bg; hues ≥30° apart and ≥25° from success/warning/danger — checked by memory-tokens.test.ts) + progress. docs/design/memory-ui.md */
+    --memory-kind-fact: 231 45% 72%; --memory-kind-fact-bg: 231 28% 17%;
+    --memory-kind-preference: 314 45% 70%; --memory-kind-preference-bg: 314 28% 17%;
+    --memory-kind-episode: 74 45% 55%; --memory-kind-episode-bg: 74 28% 17%;
+    --memory-kind-lesson: 112 45% 59%; --memory-kind-lesson-bg: 112 28% 17%;
+    --memory-kind-entity: 266 45% 72%; --memory-kind-entity-bg: 266 28% 17%;
+    --memory-kind-procedure: 201 45% 66%; --memory-kind-procedure-bg: 201 28% 17%;
     --progress-track: 210 30% 20%; --progress-fill: 205 60% 62%;
     --focus-glow: 205 70% 58%;
     --focus-glow-bright: 205 85% 68%;
@@ -606,13 +606,13 @@
     --success: 145 60% 32%; --success-bg: 145 50% 92%;
     --warning: 35 85% 38%;  --warning-bg: 40 90% 92%;
     --danger:  0 70% 45%;   --danger-bg:  0 75% 95%;
-    /* Memory UI — kind tokens (fg / tinted bg, fg≥4.5:1 on bg, checked by memory-tokens.test.ts) + progress. docs/design/memory-ui.md */
-    --memory-kind-fact: 207 36% 38%; --memory-kind-fact-bg: 207 32% 93%;
-    --memory-kind-preference: 350 36% 43%; --memory-kind-preference-bg: 350 32% 93%;
-    --memory-kind-episode: 42 36% 33%; --memory-kind-episode-bg: 42 32% 93%;
-    --memory-kind-lesson: 149 36% 32%; --memory-kind-lesson-bg: 149 32% 93%;
-    --memory-kind-entity: 252 36% 49%; --memory-kind-entity-bg: 252 32% 93%;
-    --memory-kind-procedure: 183 36% 32%; --memory-kind-procedure-bg: 183 32% 93%;
+    /* Memory UI — kind tokens (fg / tinted bg, fg≥4.5:1 on bg; hues ≥30° apart and ≥25° from success/warning/danger — checked by memory-tokens.test.ts) + progress. docs/design/memory-ui.md */
+    --memory-kind-fact: 230 36% 47%; --memory-kind-fact-bg: 230 32% 93%;
+    --memory-kind-preference: 314 36% 42%; --memory-kind-preference-bg: 314 32% 93%;
+    --memory-kind-episode: 74 36% 30%; --memory-kind-episode-bg: 74 32% 93%;
+    --memory-kind-lesson: 112 36% 32%; --memory-kind-lesson-bg: 112 32% 93%;
+    --memory-kind-entity: 266 36% 47%; --memory-kind-entity-bg: 266 32% 93%;
+    --memory-kind-procedure: 196 36% 35%; --memory-kind-procedure-bg: 196 32% 93%;
     --progress-track: 140 15% 87%; --progress-fill: 150 35% 34%;
     --focus-glow: 150 35% 38%;
     --focus-glow-bright: 150 55% 48%;
@@ -654,13 +654,13 @@
     --success: 150 50% 60%; --success-bg: 150 30% 18%;
     --warning: 40 75% 60%;  --warning-bg: 40 35% 18%;
     --danger:  0 60% 60%;   --danger-bg:  0 35% 18%;
-    /* Memory UI — kind tokens (fg / tinted bg, fg≥4.5:1 on bg, checked by memory-tokens.test.ts) + progress. docs/design/memory-ui.md */
-    --memory-kind-fact: 207 38% 66%; --memory-kind-fact-bg: 207 22% 16%;
-    --memory-kind-preference: 350 38% 69%; --memory-kind-preference-bg: 350 22% 16%;
-    --memory-kind-episode: 42 38% 61%; --memory-kind-episode-bg: 42 22% 16%;
-    --memory-kind-lesson: 150 38% 58%; --memory-kind-lesson-bg: 150 22% 16%;
-    --memory-kind-entity: 252 38% 71%; --memory-kind-entity-bg: 252 22% 16%;
-    --memory-kind-procedure: 183 38% 59%; --memory-kind-procedure-bg: 183 22% 16%;
+    /* Memory UI — kind tokens (fg / tinted bg, fg≥4.5:1 on bg; hues ≥30° apart and ≥25° from success/warning/danger — checked by memory-tokens.test.ts) + progress. docs/design/memory-ui.md */
+    --memory-kind-fact: 230 38% 70%; --memory-kind-fact-bg: 230 22% 16%;
+    --memory-kind-preference: 314 38% 69%; --memory-kind-preference-bg: 314 22% 16%;
+    --memory-kind-episode: 74 38% 55%; --memory-kind-episode-bg: 74 22% 16%;
+    --memory-kind-lesson: 112 38% 59%; --memory-kind-lesson-bg: 112 22% 16%;
+    --memory-kind-entity: 266 38% 70%; --memory-kind-entity-bg: 266 22% 16%;
+    --memory-kind-procedure: 196 38% 63%; --memory-kind-procedure-bg: 196 22% 16%;
     --progress-track: 150 18% 19%; --progress-fill: 150 40% 55%;
     --focus-glow: 150 60% 52%;
     --focus-glow-bright: 150 75% 62%;
@@ -709,13 +709,13 @@
     --success: 145 50% 35%; --success-bg: 145 40% 93%;
     --warning: 35 80% 40%;  --warning-bg: 35 80% 92%;
     --danger:  0 65% 45%;   --danger-bg:  0 70% 95%;
-    /* Memory UI — kind tokens (fg / tinted bg, fg≥4.5:1 on bg, checked by memory-tokens.test.ts) + progress. docs/design/memory-ui.md */
-    --memory-kind-fact: 225 28% 42%; --memory-kind-fact-bg: 225 24% 91%;
-    --memory-kind-preference: 345 28% 41%; --memory-kind-preference-bg: 345 24% 91%;
-    --memory-kind-episode: 32 28% 35%; --memory-kind-episode-bg: 32 24% 91%;
-    --memory-kind-lesson: 140 28% 32%; --memory-kind-lesson-bg: 140 24% 91%;
-    --memory-kind-entity: 272 28% 43%; --memory-kind-entity-bg: 272 24% 91%;
-    --memory-kind-procedure: 178 28% 32%; --memory-kind-procedure-bg: 178 24% 91%;
+    /* Memory UI — kind tokens (fg / tinted bg, fg≥4.5:1 on bg; hues ≥30° apart and ≥25° from success/warning/danger — checked by memory-tokens.test.ts) + progress. docs/design/memory-ui.md */
+    --memory-kind-fact: 238 28% 45%; --memory-kind-fact-bg: 238 24% 91%;
+    --memory-kind-preference: 322 28% 40%; --memory-kind-preference-bg: 322 24% 91%;
+    --memory-kind-episode: 66 28% 31%; --memory-kind-episode-bg: 66 24% 91%;
+    --memory-kind-lesson: 104 28% 32%; --memory-kind-lesson-bg: 104 24% 91%;
+    --memory-kind-entity: 274 28% 42%; --memory-kind-entity-bg: 274 24% 91%;
+    --memory-kind-procedure: 196 28% 35%; --memory-kind-procedure-bg: 196 24% 91%;
     --progress-track: 40 6% 84%; --progress-fill: 18 22% 42%;
     --focus-glow: 185 60% 50%;
     --focus-glow-bright: 185 75% 60%;
@@ -757,13 +757,13 @@
     --success: 95 35% 35%;  --success-bg: 95 30% 92%;
     --warning: 30 65% 45%;  --warning-bg: 30 60% 90%;
     --danger:  10 60% 45%;  --danger-bg:  10 60% 94%;
-    /* Memory UI — kind tokens (fg / tinted bg, fg≥4.5:1 on bg, checked by memory-tokens.test.ts) + progress. docs/design/memory-ui.md */
-    --memory-kind-fact: 205 34% 36%; --memory-kind-fact-bg: 205 36% 91%;
-    --memory-kind-preference: 349 34% 41%; --memory-kind-preference-bg: 349 36% 91%;
-    --memory-kind-episode: 33 34% 34%; --memory-kind-episode-bg: 33 36% 91%;
-    --memory-kind-lesson: 140 34% 31%; --memory-kind-lesson-bg: 140 36% 91%;
-    --memory-kind-entity: 272 34% 43%; --memory-kind-entity-bg: 272 36% 91%;
-    --memory-kind-procedure: 178 34% 31%; --memory-kind-procedure-bg: 178 36% 91%;
+    /* Memory UI — kind tokens (fg / tinted bg, fg≥4.5:1 on bg; hues ≥30° apart and ≥25° from success/warning/danger — checked by memory-tokens.test.ts) + progress. docs/design/memory-ui.md */
+    --memory-kind-fact: 238 34% 47%; --memory-kind-fact-bg: 238 36% 91%;
+    --memory-kind-preference: 322 34% 40%; --memory-kind-preference-bg: 322 36% 91%;
+    --memory-kind-episode: 59 34% 30%; --memory-kind-episode-bg: 59 36% 91%;
+    --memory-kind-lesson: 146 34% 31%; --memory-kind-lesson-bg: 146 36% 91%;
+    --memory-kind-entity: 274 34% 43%; --memory-kind-entity-bg: 274 36% 91%;
+    --memory-kind-procedure: 196 34% 34%; --memory-kind-procedure-bg: 196 36% 91%;
     --progress-track: 44 25% 87%; --progress-fill: 205 28% 42%;
     --focus-glow: 205 55% 55%;
     --focus-glow-bright: 205 70% 65%;
@@ -805,13 +805,13 @@
     --success: 165 40% 55%; --success-bg: 165 30% 18%;
     --warning: 35 65% 60%;  --warning-bg: 35 35% 18%;
     --danger:  5 60% 60%;   --danger-bg:  5 35% 18%;
-    /* Memory UI — kind tokens (fg / tinted bg, fg≥4.5:1 on bg, checked by memory-tokens.test.ts) + progress. docs/design/memory-ui.md */
-    --memory-kind-fact: 209 34% 78%; --memory-kind-fact-bg: 209 20% 22%;
-    --memory-kind-preference: 330 34% 81%; --memory-kind-preference-bg: 330 20% 22%;
-    --memory-kind-episode: 42 34% 73%; --memory-kind-episode-bg: 42 20% 22%;
-    --memory-kind-lesson: 154 34% 72%; --memory-kind-lesson-bg: 154 20% 22%;
-    --memory-kind-entity: 252 34% 82%; --memory-kind-entity-bg: 252 20% 22%;
-    --memory-kind-procedure: 186 34% 73%; --memory-kind-procedure-bg: 186 20% 22%;
+    /* Memory UI — kind tokens (fg / tinted bg, fg≥4.5:1 on bg; hues ≥30° apart and ≥25° from success/warning/danger — checked by memory-tokens.test.ts) + progress. docs/design/memory-ui.md */
+    --memory-kind-fact: 230 34% 81%; --memory-kind-fact-bg: 230 20% 22%;
+    --memory-kind-preference: 314 34% 80%; --memory-kind-preference-bg: 314 20% 22%;
+    --memory-kind-episode: 74 34% 69%; --memory-kind-episode-bg: 74 20% 22%;
+    --memory-kind-lesson: 112 34% 72%; --memory-kind-lesson-bg: 112 20% 22%;
+    --memory-kind-entity: 266 34% 82%; --memory-kind-entity-bg: 266 20% 22%;
+    --memory-kind-procedure: 196 34% 75%; --memory-kind-procedure-bg: 196 20% 22%;
     --progress-track: 205 17% 22%; --progress-fill: 340 30% 66%;
     --focus-glow: 340 50% 65%;
     --focus-glow-bright: 340 65% 75%;
@@ -853,13 +853,13 @@
     --success: 142 45% 55%; --success-bg: 142 25% 14%;
     --warning: 40 70% 60%;  --warning-bg: 40 30% 14%;
     --danger:  0 60% 60%;   --danger-bg:  0 30% 14%;
-    /* Memory UI — kind tokens (fg / tinted bg, fg≥4.5:1 on bg, checked by memory-tokens.test.ts) + progress. docs/design/memory-ui.md */
-    --memory-kind-fact: 215 55% 73%; --memory-kind-fact-bg: 215 22% 13%;
-    --memory-kind-preference: 340 55% 75%; --memory-kind-preference-bg: 340 22% 13%;
-    --memory-kind-episode: 32 55% 66%; --memory-kind-episode-bg: 32 22% 13%;
-    --memory-kind-lesson: 150 55% 56%; --memory-kind-lesson-bg: 150 22% 13%;
-    --memory-kind-entity: 262 55% 77%; --memory-kind-entity-bg: 262 22% 13%;
-    --memory-kind-procedure: 188 55% 61%; --memory-kind-procedure-bg: 188 22% 13%;
+    /* Memory UI — kind tokens (fg / tinted bg, fg≥4.5:1 on bg; hues ≥30° apart and ≥25° from success/warning/danger — checked by memory-tokens.test.ts) + progress. docs/design/memory-ui.md */
+    --memory-kind-fact: 234 55% 77%; --memory-kind-fact-bg: 234 22% 13%;
+    --memory-kind-preference: 318 55% 74%; --memory-kind-preference-bg: 318 22% 13%;
+    --memory-kind-episode: 70 55% 50%; --memory-kind-episode-bg: 70 22% 13%;
+    --memory-kind-lesson: 108 55% 56%; --memory-kind-lesson-bg: 108 22% 13%;
+    --memory-kind-entity: 270 55% 76%; --memory-kind-entity-bg: 270 22% 13%;
+    --memory-kind-procedure: 200 55% 67%; --memory-kind-procedure-bg: 200 22% 13%;
     --progress-track: 235 7% 20%; --progress-fill: 43 55% 52%;
     --focus-glow: 43 70% 58%;
     --focus-glow-bright: 43 85% 68%;
@@ -903,14 +903,14 @@
     --success: 145 60% 55%; --success-bg: 145 30% 12%;
     --warning: 40 85% 60%;  --warning-bg: 40 35% 12%;
     --danger:  0 70% 60%;   --danger-bg:  0 35% 12%;
-    /* Memory UI — kind tokens (fg / tinted bg, fg≥4.5:1 on bg, checked by memory-tokens.test.ts) + progress. docs/design/memory-ui.md */
-    --memory-kind-fact: 205 55% 66%; --memory-kind-fact-bg: 205 26% 12%;
-    --memory-kind-preference: 346 55% 72%; --memory-kind-preference-bg: 346 26% 12%;
-    --memory-kind-episode: 33 55% 62%; --memory-kind-episode-bg: 33 26% 12%;
-    --memory-kind-lesson: 140 55% 50%; --memory-kind-lesson-bg: 140 26% 12%;
-    --memory-kind-entity: 272 55% 73%; --memory-kind-entity-bg: 272 26% 12%;
-    --memory-kind-procedure: 178 55% 49%; --memory-kind-procedure-bg: 178 26% 12%;
-    --progress-track: 270 4% 18%; --progress-fill: 350 80% 60%;
+    /* Memory UI — kind tokens (fg / tinted bg, fg≥4.5:1 on bg; hues ≥30° apart and ≥25° from success/warning/danger — checked by memory-tokens.test.ts) + progress. docs/design/memory-ui.md */
+    --memory-kind-fact: 238 55% 75%; --memory-kind-fact-bg: 238 26% 12%;
+    --memory-kind-preference: 322 55% 71%; --memory-kind-preference-bg: 322 26% 12%;
+    --memory-kind-episode: 67 55% 47%; --memory-kind-episode-bg: 67 26% 12%;
+    --memory-kind-lesson: 104 55% 50%; --memory-kind-lesson-bg: 104 26% 12%;
+    --memory-kind-entity: 274 55% 73%; --memory-kind-entity-bg: 274 26% 12%;
+    --memory-kind-procedure: 196 55% 61%; --memory-kind-procedure-bg: 196 26% 12%;
+    --progress-track: 270 4% 18%; --progress-fill: 40 45% 78%;
     --focus-glow: 44 100% 62%;
     --focus-glow-bright: 44 100% 72%;
   }
@@ -956,13 +956,13 @@
     --success: 145 45% 60%; --success-bg: 145 25% 18%;
     --warning: 35 70% 65%;  --warning-bg: 35 30% 18%;
     --danger:  0 60% 60%;   --danger-bg:  0 30% 18%;
-    /* Memory UI — kind tokens (fg / tinted bg, fg≥4.5:1 on bg, checked by memory-tokens.test.ts) + progress. docs/design/memory-ui.md */
-    --memory-kind-fact: 225 30% 71%; --memory-kind-fact-bg: 225 16% 18%;
-    --memory-kind-preference: 345 30% 71%; --memory-kind-preference-bg: 345 16% 18%;
-    --memory-kind-episode: 32 30% 67%; --memory-kind-episode-bg: 32 16% 18%;
-    --memory-kind-lesson: 140 30% 64%; --memory-kind-lesson-bg: 140 16% 18%;
-    --memory-kind-entity: 272 30% 71%; --memory-kind-entity-bg: 272 16% 18%;
-    --memory-kind-procedure: 178 30% 63%; --memory-kind-procedure-bg: 178 16% 18%;
+    /* Memory UI — kind tokens (fg / tinted bg, fg≥4.5:1 on bg; hues ≥30° apart and ≥25° from success/warning/danger — checked by memory-tokens.test.ts) + progress. docs/design/memory-ui.md */
+    --memory-kind-fact: 238 30% 72%; --memory-kind-fact-bg: 238 16% 18%;
+    --memory-kind-preference: 322 30% 70%; --memory-kind-preference-bg: 322 16% 18%;
+    --memory-kind-episode: 66 30% 61%; --memory-kind-episode-bg: 66 16% 18%;
+    --memory-kind-lesson: 104 30% 63%; --memory-kind-lesson-bg: 104 16% 18%;
+    --memory-kind-entity: 274 30% 71%; --memory-kind-entity-bg: 274 16% 18%;
+    --memory-kind-procedure: 196 30% 66%; --memory-kind-procedure-bg: 196 16% 18%;
     --progress-track: 260 6% 20%; --progress-fill: 15 30% 68%;
     --focus-glow: 30 75% 62%;
     --focus-glow-bright: 30 90% 72%;

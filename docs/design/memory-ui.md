@@ -53,9 +53,11 @@ Use `text-[11px]` … `text-[20px]` with `leading-*`; no other sizes (retire ad-
 |---|---|
 | 120 ms | hover / press, color & border changes |
 | 180 ms | enter of chips, rows, popovers (opacity 0→1 + `y: 4→0`) |
-| 240 ms | progress fill glide, panel/sheet enter, expand/collapse |
+| 240 ms | progress fill glide only |
 
-Ease-out (`[0.16, 1, 0.3, 1]` in `motion/react`, `ease-out` in CSS) for enters; exits
+State changes otherwise stay ≤ 200 ms (panel/sheet enter, expand/collapse use 180 ms);
+the 240 ms progress glide is the single exception, because it smooths bursty download
+events rather than reacting to a user action. Ease-out (`[0.16, 1, 0.3, 1]` in `motion/react`, `ease-out` in CSS) for enters; exits
 are ~70 % of the enter duration with ease-in. Animate `transform`/`opacity` only. Lists
 stagger 30 ms per item, max 8 items. Under reduced motion: no translate, no shimmer, no
 sweep — fades ≤120 ms or instant (`motion-safe:` / `motion-reduce:` variants;
@@ -74,8 +76,8 @@ sweep — fades ≤120 ms or instant (`motion-safe:` / `motion-reduce:` variants
   short cause ("索引失败：磁盘空间不足"), and a concrete action button (重试 / 打开设置).
   Keep the stale data visible underneath when there is any.
 - **Progress.** `ProgressBar` — 4 px hairline, `--progress-track` / `--progress-fill`.
-  Determinate glides 240 ms; indeterminate (unknown total) sweeps; label it for screen
-  readers ("下载记忆模型") and show the numbers as text next to it (`12.4 / 90 MB`).
+  Determinate glides 240 ms; indeterminate (unknown total) sweeps; it must be named
+  (`label` or `aria-labelledby`, enforced by the type) ("下载记忆模型") and show the numbers as text next to it (`12.4 / 90 MB`).
 - **Stats.** `StatPill` — muted label, toned value (`neutral | success | warning |
   danger` on the existing semantic tokens). A row of pills should read as data.
 
@@ -84,31 +86,43 @@ sweep — fades ≤120 ms or instant (`motion-safe:` / `motion-reduce:` variants
 Six kinds, each with an ink (`--memory-kind-<k>`) and a tinted surface
 (`--memory-kind-<k>-bg`), defined in `ui/src/styles/globals.css` for `:root`, `.dark`
 and all 10 named themes; mapped in `tailwind.config.js` as `bg-memory-<k>`,
-`text-memory-<k>`, `bg-memory-<k>-bg`, `border-memory-<k>/20`.
+`text-memory-<k>`, `bg-memory-<k>-bg`, `border-memory-<k>/20` (always `/20` for kind
+borders).
 
 | Kind | 中文 | Base hue | Rationale |
 |---|---|---|---|
-| fact | 事实 | 215 slate-blue | steady, neutral knowledge |
-| preference | 偏好 | 340 rose | personal, warm |
-| episode | 事件 | 32 ochre | time, lived moments |
-| lesson | 经验 | 150 sage | growth |
-| entity | 实体 | 262 violet | people, things — the "who" |
-| procedure | 技能 | 188 teal | doing, skills |
+| fact | 事实 | 234 slate-blue | steady, neutral knowledge |
+| preference | 偏好 | 318 orchid | personal, warm — but clear of danger red |
+| episode | 事件 | 70 sand / khaki | lived moments; clear of warning amber |
+| lesson | 经验 | 108 olive-leaf | growth; clear of success green |
+| entity | 实体 | 270 violet | people, things — the "who" |
+| procedure | 技能 | 200 teal-cyan | doing, skills |
+
+**Hue budget.** The semantic status colors own three zones: danger ≈ 350–10,
+warning ≈ 30–40, success ≈ 142–175 (warm-paper: 95). Kinds must stay ≥ 25° from each
+of them and ≥ 30° from each other (circular distance), so a 偏好 badge never reads as an
+error and an 事件 badge never reads as a warning next to a `StatPill`. Kinds live in the
+two free arcs — 60–117 (episode, lesson) and 200–325 (procedure, fact, entity,
+preference). warm-paper's success is olive (95), so there lesson moves to 146 and
+episode to 59. Per-theme minimums (pair gap / semantic gap): `:root` 34/34, `.dark`
+34/30, ocean 30/26, forest 34/33–34, slate 36/31, warm-paper 36/29, qingye 34/31,
+black 34/30, the-finals 36/27.
 
 Rules: **restrained chroma** (28–45 % saturation; 55 % only on the high-contrast black /
-the-finals themes) — premium means quiet. Each theme pulls the hues ≤10° toward its own
+the-finals themes) — premium means quiet. Each theme pulls the hues ≤4° toward its own
 hue (ocean → blue, forest/qingye → green, slate/warm-paper → earth, the-finals → warm)
 and sets its own saturation/lightness, so kinds harmonize instead of looking pasted on.
 Badge text is solved per theme for **≥ 4.5:1 on its `-bg` and on the theme card**
-(guarded by `ui/src/styles/memory-tokens.test.ts`, which also requires progress
-fill ≥ 3:1 on track). Color is never the only signal: badges always carry the label.
+(guarded by `ui/src/styles/memory-tokens.test.ts`, which also enforces the hue budget
+above and progress fill ≥ 3:1 on track). Progress fill is neutral or the theme's brand
+tone, never a status hue (the-finals uses warm cream, not its red). Color is never the only signal: badges always carry the label.
 Components never use raw palette classes (`blue-500` …) — only these tokens or the
 existing semantic ones (`success`, `warning`, `danger`, `muted`).
 
 ## Primitives (`ui/src/components/memory/primitives/`)
 
 `<KindBadge kind variant="label|dot" size="sm|md" />`,
-`<ProgressBar value={0..1} indeterminate? label? />`,
+`<ProgressBar value={0..1} indeterminate? label | aria-labelledby />` (a name is required),
 `<StatPill label value tone />`, `<MemorySkeleton className="h-3 w-24" />`,
 plus `MEMORY_KINDS` / `MEMORY_KIND_LABELS` / `MEMORY_KIND_CLASSES`.
 

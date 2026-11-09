@@ -74,6 +74,24 @@ describe('ProgressBar', () => {
   })
 })
 
+describe('ProgressBar accessible name', () => {
+  it('accepts aria-labelledby instead of label', () => {
+    render(
+      <>
+        <span id="cap">重建索引</span>
+        <ProgressBar value={0.5} aria-labelledby="cap" />
+      </>,
+    )
+    expect(screen.getByRole('progressbar', { name: '重建索引' })).toBeInTheDocument()
+  })
+
+  it('requires a name at the type level', () => {
+    // @ts-expect-error — neither label nor aria-labelledby
+    const el = <ProgressBar value={0.5} />
+    expect(el).toBeTruthy()
+  })
+})
+
 describe('StatPill', () => {
   it.each([
     ['neutral', 'text-foreground'],

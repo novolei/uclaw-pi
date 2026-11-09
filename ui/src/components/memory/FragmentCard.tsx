@@ -6,12 +6,12 @@ import type { FragmentItem } from '@/lib/tauri-bridge'
 // 碎片子类型 → 记忆 kind 色板（theme tokens，见 docs/design/memory-ui.md）
 // daily→fact, credential→entity, location→lesson, reminder→preference, inspiration→episode, bookmark→procedure
 export const SUBTYPE_COLORS: Record<string, { bg: string; border: string; text: string; dot: string }> = {
-  daily:       { bg: 'bg-memory-fact-bg', border: 'border-memory-fact/25', text: 'text-memory-fact', dot: 'bg-memory-fact' },
-  credential:  { bg: 'bg-memory-entity-bg', border: 'border-memory-entity/25', text: 'text-memory-entity', dot: 'bg-memory-entity' },
-  location:    { bg: 'bg-memory-lesson-bg', border: 'border-memory-lesson/25', text: 'text-memory-lesson', dot: 'bg-memory-lesson' },
-  reminder:    { bg: 'bg-memory-preference-bg', border: 'border-memory-preference/25', text: 'text-memory-preference', dot: 'bg-memory-preference' },
-  inspiration: { bg: 'bg-memory-episode-bg', border: 'border-memory-episode/25', text: 'text-memory-episode', dot: 'bg-memory-episode' },
-  bookmark:    { bg: 'bg-memory-procedure-bg', border: 'border-memory-procedure/25', text: 'text-memory-procedure', dot: 'bg-memory-procedure' },
+  daily:       { bg: 'bg-memory-fact-bg', border: 'border-memory-fact/20', text: 'text-memory-fact', dot: 'bg-memory-fact' },
+  credential:  { bg: 'bg-memory-entity-bg', border: 'border-memory-entity/20', text: 'text-memory-entity', dot: 'bg-memory-entity' },
+  location:    { bg: 'bg-memory-lesson-bg', border: 'border-memory-lesson/20', text: 'text-memory-lesson', dot: 'bg-memory-lesson' },
+  reminder:    { bg: 'bg-memory-preference-bg', border: 'border-memory-preference/20', text: 'text-memory-preference', dot: 'bg-memory-preference' },
+  inspiration: { bg: 'bg-memory-episode-bg', border: 'border-memory-episode/20', text: 'text-memory-episode', dot: 'bg-memory-episode' },
+  bookmark:    { bg: 'bg-memory-procedure-bg', border: 'border-memory-procedure/20', text: 'text-memory-procedure', dot: 'bg-memory-procedure' },
 }
 
 const DEFAULT_COLORS = SUBTYPE_COLORS.daily

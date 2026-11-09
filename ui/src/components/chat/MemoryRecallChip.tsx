@@ -78,7 +78,7 @@ export function MemoryRecallChip({
       <PopoverTrigger asChild>
         <span
           role="status"
-          className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] leading-tight bg-memory-entity-bg text-memory-entity border border-memory-entity/20 cursor-pointer hover:border-memory-entity/40 transition-colors animate-in fade-in duration-200"
+          className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] leading-tight bg-muted text-muted-foreground border border-border cursor-pointer hover:text-foreground hover:border-foreground/20 transition-colors animate-in fade-in duration-200"
         >
           <Brain className="size-3 shrink-0" />
           <span>
@@ -94,7 +94,7 @@ export function MemoryRecallChip({
       >
         <div className="p-3 border-b">
           <div className="flex items-center gap-2 mb-1">
-            <Sparkles className="size-4 text-memory-entity" />
+            <Sparkles className="size-4 text-muted-foreground" />
             <span className="text-sm font-semibold">记忆召回详情</span>
           </div>
           <p className="text-xs text-muted-foreground">
