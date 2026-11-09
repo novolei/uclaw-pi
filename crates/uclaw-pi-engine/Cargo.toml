@@ -16,10 +16,17 @@ description = "Engine Actor + ACL bridging the pi agent runtime to uClaw's Tauri
 license = "Apache-2.0"
 
 [dependencies]
-pi = { package = "pi_agent_rust", path = "../pi" }
+# default-features = false: drop pi's terminal front-end (`tui`/`ftui`), which
+# uClaw never uses. `bpe-tokens` keeps upstream's real BPE token counting for
+# compaction thresholds (default-on upstream since v0.3.0). `sqlite-sessions`
+# is required for pi's lib to compile (upstream doesn't gate every use); it is
+# the pure-Rust fsqlite now, so no `links` clash with uClaw's rusqlite. pi still
+# runs stateless (no_session) — uClaw owns persistence.
+pi = { package = "pi_agent_rust", path = "../pi", default-features = false, features = ["bpe-tokens", "sqlite-sessions"] }
 # Same runtime pi uses; the engine bootstraps a dedicated asupersync runtime on
-# its own OS thread (never tokio). Pinned =0.3.2 to match pi (shared types).
-asupersync = { version = "=0.3.2", default-features = false, features = ["tls-native-roots"] }
+# its own OS thread (never tokio). Must stay on the same minor as crates/pi
+# (shared types); pi upstream 6e19cb50 uses 0.5.
+asupersync = { version = "0.5.0", default-features = false, features = ["tls-native-roots"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # [R4] Tool trait is #[async_trait]; wrapped uClaw tools impl it.

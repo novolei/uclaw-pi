@@ -31,7 +31,7 @@ use crate::acl::{demux, Acl};
 use crate::approval::{make_approval_handler, ApprovalRegistry};
 use crate::events::{event, EventSink};
 use crate::tool_bridge::{tool_output_text, ToolRequestSink, ToolResultRegistry};
-use crate::tool_factory::UclawToolFactory;
+use crate::tool_factory::{UclawToolFactory, PI_BUILTIN_TOOLS};
 
 /// An API key string that never appears in `Debug` output (so it can ride inside
 /// a `#[derive(Debug)]` command without leaking into logs).
@@ -164,6 +164,13 @@ impl EngineConfig {
             session_dir: self.session_dir.clone(),
             no_session: self.no_session,
             working_directory: self.working_directory.clone(),
+            // Keep the F5 boundary explicit: pi contributes only its core
+            // file/shell tools; uClaw layers its own (ask_user, browser, MCP,
+            // skills, …) on top via `UclawToolFactory`. Since pi 0.3 the
+            // implicit default set grew to ~19 tools (ask, web_search, jobs,
+            // hub, lsp, debug, todo, …), several of which need pi's own host UI
+            // or overlap uClaw tools — so never fall through to it.
+            enabled_tools: Some(PI_BUILTIN_TOOLS.iter().map(|s| (*s).to_string()).collect()),
             ..Default::default()
         }
     }
@@ -469,7 +476,12 @@ async fn start_run(
     // Own the model name BEFORE the 'static spawn — capturing `model_config`
     // (a borrow) inside the async move would escape the function (E0521).
     let cost_model = model_config.model.clone().unwrap_or_default();
-    rt.spawn(async move {
+    // `spawn_local`: asupersync 0.5's `MutexGuard` is `!Send`, and this task
+    // holds the session guard across the prompt await. The engine runtime is
+    // `current_thread` and `start_run` runs inside its `block_on` root, so local
+    // spawning is allowed and every task already ran on this one thread anyway.
+    // Dropping the handle detaches the task, same as before.
+    let _ = rt.spawn_local(async move {
         // Shared so the run task can read the streamed-so-far text after the run
         // (to persist the partial reply on abort/error — see the Err arm below).
         let acl = Arc::new(StdMutex::new(Acl::new(conv_id.clone())));
