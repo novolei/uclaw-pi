@@ -3,14 +3,15 @@ import { cn, safeParseDate } from '@/lib/utils'
 import { Mic, Clipboard, Type, Clock } from 'lucide-react'
 import type { FragmentItem } from '@/lib/tauri-bridge'
 
-// 固定配色映射 (7.5 视觉线索增强)
+// 碎片子类型 → 记忆 kind 色板（theme tokens，见 docs/design/memory-ui.md）
+// daily→fact, credential→entity, location→lesson, reminder→preference, inspiration→episode, bookmark→procedure
 export const SUBTYPE_COLORS: Record<string, { bg: string; border: string; text: string; dot: string }> = {
-  daily:       { bg: 'bg-blue-50 dark:bg-blue-950/30',    border: 'border-blue-200 dark:border-blue-800',   text: 'text-blue-700 dark:text-blue-300', dot: 'bg-blue-500' },
-  credential:  { bg: 'bg-purple-50 dark:bg-purple-950/30',  border: 'border-purple-200 dark:border-purple-800', text: 'text-purple-700 dark:text-purple-300', dot: 'bg-purple-500' },
-  location:    { bg: 'bg-green-50 dark:bg-green-950/30',   border: 'border-green-200 dark:border-green-800',  text: 'text-green-700 dark:text-green-300', dot: 'bg-green-500' },
-  reminder:    { bg: 'bg-red-50 dark:bg-red-950/30',     border: 'border-red-200 dark:border-red-800',    text: 'text-red-700 dark:text-red-300', dot: 'bg-red-500' },
-  inspiration: { bg: 'bg-orange-50 dark:bg-orange-950/30',  border: 'border-orange-200 dark:border-orange-800', text: 'text-orange-700 dark:text-orange-300', dot: 'bg-orange-500' },
-  bookmark:    { bg: 'bg-cyan-50 dark:bg-cyan-950/30',    border: 'border-cyan-200 dark:border-cyan-800',   text: 'text-cyan-700 dark:text-cyan-300', dot: 'bg-cyan-500' },
+  daily:       { bg: 'bg-memory-fact-bg', border: 'border-memory-fact/25', text: 'text-memory-fact', dot: 'bg-memory-fact' },
+  credential:  { bg: 'bg-memory-entity-bg', border: 'border-memory-entity/25', text: 'text-memory-entity', dot: 'bg-memory-entity' },
+  location:    { bg: 'bg-memory-lesson-bg', border: 'border-memory-lesson/25', text: 'text-memory-lesson', dot: 'bg-memory-lesson' },
+  reminder:    { bg: 'bg-memory-preference-bg', border: 'border-memory-preference/25', text: 'text-memory-preference', dot: 'bg-memory-preference' },
+  inspiration: { bg: 'bg-memory-episode-bg', border: 'border-memory-episode/25', text: 'text-memory-episode', dot: 'bg-memory-episode' },
+  bookmark:    { bg: 'bg-memory-procedure-bg', border: 'border-memory-procedure/25', text: 'text-memory-procedure', dot: 'bg-memory-procedure' },
 }
 
 const DEFAULT_COLORS = SUBTYPE_COLORS.daily
@@ -112,7 +113,7 @@ export function FragmentCard({ fragment, onClick, compact = false }: FragmentCar
           
           {/* 复习状态 */}
           {fragment.reviewStatus && !fragment.reviewStatus.completed && (
-            <span className="inline-flex items-center gap-0.5 text-[11px] text-red-500">
+            <span className="inline-flex items-center gap-0.5 text-[11px] text-danger">
               <Clock className="size-2.5" />
               复习中
             </span>

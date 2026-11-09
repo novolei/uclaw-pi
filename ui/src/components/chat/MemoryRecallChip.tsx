@@ -23,12 +23,14 @@ interface MemoryRecallChipProps {
   className?: string
 }
 
+// Recall layers borrow the memory kind palette (docs/design/memory-ui.md):
+// Boot→lesson, Triggered→episode, Relevant→fact, Expanded→entity; Recent stays neutral.
 const LAYER_COLORS: Record<string, string> = {
-  Boot: 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20',
-  Triggered: 'bg-amber-500/10 text-amber-400 border-amber-500/20',
-  Relevant: 'bg-blue-500/10 text-blue-400 border-blue-500/20',
-  Expanded: 'bg-purple-500/10 text-purple-400 border-purple-500/20',
-  Recent: 'bg-zinc-500/10 text-zinc-400 border-zinc-500/20',
+  Boot: 'bg-memory-lesson-bg text-memory-lesson border-memory-lesson/20',
+  Triggered: 'bg-memory-episode-bg text-memory-episode border-memory-episode/20',
+  Relevant: 'bg-memory-fact-bg text-memory-fact border-memory-fact/20',
+  Expanded: 'bg-memory-entity-bg text-memory-entity border-memory-entity/20',
+  Recent: 'bg-muted text-muted-foreground border-border',
 }
 
 const KIND_LABELS: Record<string, string> = {
@@ -76,7 +78,7 @@ export function MemoryRecallChip({
       <PopoverTrigger asChild>
         <span
           role="status"
-          className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] leading-tight bg-purple-500/10 text-purple-600 dark:text-purple-400 border border-purple-500/20 cursor-pointer hover:bg-purple-500/20 transition-colors animate-in fade-in duration-200"
+          className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] leading-tight bg-memory-entity-bg text-memory-entity border border-memory-entity/20 cursor-pointer hover:border-memory-entity/40 transition-colors animate-in fade-in duration-200"
         >
           <Brain className="size-3 shrink-0" />
           <span>
@@ -92,7 +94,7 @@ export function MemoryRecallChip({
       >
         <div className="p-3 border-b">
           <div className="flex items-center gap-2 mb-1">
-            <Sparkles className="size-4 text-purple-400" />
+            <Sparkles className="size-4 text-memory-entity" />
             <span className="text-sm font-semibold">记忆召回详情</span>
           </div>
           <p className="text-xs text-muted-foreground">

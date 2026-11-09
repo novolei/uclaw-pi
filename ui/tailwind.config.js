@@ -66,6 +66,37 @@ export default {
           DEFAULT: 'hsl(var(--danger))',
           bg: 'hsl(var(--danger-bg))',
         },
+        // Memory UI kind tokens (docs/design/memory-ui.md). `bg-memory-fact` = the
+        // kind's ink (dots, bars); `bg-memory-fact-bg` = tinted badge surface;
+        // `text-memory-fact` = badge label (≥4.5:1 on its -bg in every theme).
+        'memory-fact': {
+          DEFAULT: 'hsl(var(--memory-kind-fact) / <alpha-value>)',
+          bg: 'hsl(var(--memory-kind-fact-bg) / <alpha-value>)',
+        },
+        'memory-preference': {
+          DEFAULT: 'hsl(var(--memory-kind-preference) / <alpha-value>)',
+          bg: 'hsl(var(--memory-kind-preference-bg) / <alpha-value>)',
+        },
+        'memory-episode': {
+          DEFAULT: 'hsl(var(--memory-kind-episode) / <alpha-value>)',
+          bg: 'hsl(var(--memory-kind-episode-bg) / <alpha-value>)',
+        },
+        'memory-lesson': {
+          DEFAULT: 'hsl(var(--memory-kind-lesson) / <alpha-value>)',
+          bg: 'hsl(var(--memory-kind-lesson-bg) / <alpha-value>)',
+        },
+        'memory-entity': {
+          DEFAULT: 'hsl(var(--memory-kind-entity) / <alpha-value>)',
+          bg: 'hsl(var(--memory-kind-entity-bg) / <alpha-value>)',
+        },
+        'memory-procedure': {
+          DEFAULT: 'hsl(var(--memory-kind-procedure) / <alpha-value>)',
+          bg: 'hsl(var(--memory-kind-procedure-bg) / <alpha-value>)',
+        },
+        progress: {
+          track: 'hsl(var(--progress-track) / <alpha-value>)',
+          fill: 'hsl(var(--progress-fill) / <alpha-value>)',
+        },
         // Fixed cross-theme scales — used by Dock/ConnectionIndicator; do not
         // change with theme switches unlike the CSS-variable tokens above.
         sage: {
@@ -111,6 +142,10 @@ export default {
         serif: ['var(--font-serif)', 'ui-serif', 'Georgia', 'serif'],
         mono: ['var(--font-mono)', 'ui-monospace', 'SFMono-Regular', 'Menlo', 'Monaco', 'Consolas', 'monospace'],
       },
+      boxShadow: {
+        'elevation-1': 'var(--elevation-1)',
+        'elevation-2': 'var(--elevation-2)',
+      },
       borderRadius: {
         lg: 'var(--radius)',
         md: 'calc(var(--radius) - 2px)',
@@ -129,11 +164,22 @@ export default {
           from: { transform: 'translateX(0)' },
           to: { transform: 'translateX(100%)' },
         },
+        // Memory UI: indeterminate progress sweep + skeleton shimmer.
+        'memory-indeterminate': {
+          from: { transform: 'translateX(-100%)' },
+          to: { transform: 'translateX(250%)' },
+        },
+        'memory-shimmer': {
+          from: { backgroundPosition: '200% 0' },
+          to: { backgroundPosition: '-200% 0' },
+        },
 
       },
       animation: {
         'in': 'slide-in-from-top 0.3s ease-out',
         'out': 'slide-out-to-right 0.2s ease-in',
+        'memory-indeterminate': 'memory-indeterminate 1.4s cubic-bezier(0.65, 0, 0.35, 1) infinite',
+        'memory-shimmer': 'memory-shimmer 1.6s linear infinite',
 
       },
     },
