@@ -994,6 +994,17 @@ export interface MemoryRecallItem {
   source: string
 }
 
+/** One MemoryCore hit in `agent:memory-recall` (see build_recall_event in memory_context.rs). */
+export interface MemoryCoreHit {
+  title: string
+  /** ≤120 chars */
+  snippet: string
+  source: 'graph' | 'chunk' | 'item' | string
+  /** 0..1 when scoreKind is "rerank"; an RRF fusion score otherwise (not a percentage). */
+  score: number
+  scoreKind: 'rerank' | 'rrf'
+}
+
 export interface MemoryRecallEvent {
   totalCandidates: number
   skillsCount: number
@@ -1003,6 +1014,10 @@ export interface MemoryRecallEvent {
   expandedCount: number
   recentCount: number
   items: MemoryRecallItem[]
+  /** MemoryCore top hits for this turn (relevance order). Absent on older backends. */
+  coreHits?: MemoryCoreHit[]
+  /** MemoryCore retrieval mode: keyword-only (FTS) or hybrid (FTS + local models). */
+  mode?: 'hybrid' | 'keyword'
   conversationId: string | null
   timestamp: string
 }

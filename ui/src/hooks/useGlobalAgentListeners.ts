@@ -931,6 +931,8 @@ function startAgentListeners(store: Store): void {
       console.info('[memory-recall] received', {
         total: payload.totalCandidates,
         skills: payload.skillsCount,
+        coreHits: payload.coreHits?.length ?? 0,
+        mode: payload.mode,
         conversationId: payload.conversationId,
       })
       store.set(memoryRecallEventAtom, (prev) => {

@@ -353,6 +353,62 @@ async function simulatePetChat(): Promise<null> {
   return null
 }
 
+/**
+ * Chat › 本轮参考的记忆 (opt-in: `?memoryRecall=hybrid|keyword`): the mock
+ * provides one workspace (agent tabs only render inside a workspace) and every
+ * `send_agent_message` emits one `agent:memory-recall` — 3 core hits (two
+ * rerank, one rrf; one chunk) plus a small graph recall — so the recall chip
+ * can be inspected without a backend. `keyword` also shows the keyword hint.
+ * The mock has no models, so it also emits once ~1.2 s after `create_agent_session`.
+ */
+export function parseMemoryRecallMockMode(search: string): 'hybrid' | 'keyword' | null {
+  const v = new URLSearchParams(search).get('memoryRecall')
+  return v === 'hybrid' || v === 'keyword' ? v : null
+}
+
+const MOCK_WORKSPACE = {
+  id: 'mock-workspace',
+  name: '演示工作区',
+  icon: '🧠',
+  createdAt: '2026-11-09T00:00:00Z',
+  updatedAt: '2026-11-09T00:00:00Z',
+}
+
+export function memoryRecallFixture(sessionId: string, mode: 'hybrid' | 'keyword') {
+  return {
+    totalCandidates: 2,
+    skillsCount: 0,
+    bootCount: 1,
+    triggeredCount: 0,
+    relevantCount: 1,
+    expandedCount: 0,
+    recentCount: 0,
+    items: [
+      { nodeId: 'mock-node-family', title: '家庭', kind: 'knowledge', source: 'graph' },
+      { nodeId: 'mock-node-style', title: '回答风格偏好', kind: 'user_profile', source: 'graph' },
+    ],
+    coreHits: [
+      { title: '家庭', snippet: '用户的儿子叫刘书维，今年上小学二年级，周末常去公园踢球。', source: 'graph', score: 0.86, scoreKind: 'rerank' },
+      { title: '上周讨论的旅行计划：十二月去', snippet: '上周讨论的旅行计划：十二月去京都，住在岚山附近，想避开周末人流，顺路看看金阁寺和伏见稻荷。', source: 'chunk', score: 0.41, scoreKind: 'rerank' },
+      { title: '常用工具', snippet: '写代码主要用 VS Code，终端用 iTerm2，偏好深色主题。', source: 'item', score: 0.0312, scoreKind: 'rrf' },
+    ],
+    mode,
+    conversationId: sessionId || null,
+    timestamp: new Date().toISOString(),
+  }
+}
+
+async function simulateMemoryRecall(
+  sessionId: string,
+  mode: 'hybrid' | 'keyword' | null,
+  delayMs = 300,
+): Promise<null> {
+  if (!mode) return null
+  await sleep(delayMs)
+  await emit('agent:memory-recall', memoryRecallFixture(sessionId, mode))
+  return null
+}
+
 export function shouldInstallDevTauriMock(): boolean {
   return import.meta.env.VITE_UCLAW_MOCK_TAURI === '1'
     && typeof window !== 'undefined'
@@ -365,8 +421,16 @@ export function createUclawMockIpcHandler(): MockHandler {
     parseMemoryCoreMockState(typeof window !== 'undefined' ? window.location.search : ''),
     (status: MemoryCoreStatus) => emit('memory-core:status', status),
   )
+  const memoryRecallMode = parseMemoryRecallMockMode(
+    typeof window !== 'undefined' ? window.location.search : '',
+  )
   return (cmd: string, payload?: InvokeArgs): unknown => {
     console.info('[uClaw mock Tauri IPC]', cmd, payload ?? {})
+
+    if (memoryRecallMode) {
+      if (cmd === 'list_spaces') return [MOCK_WORKSPACE]
+      if (cmd === 'get_active_workspace_id') return MOCK_WORKSPACE.id
+    }
 
     switch (cmd) {
       case 'get_settings':
@@ -384,6 +448,7 @@ export function createUclawMockIpcHandler(): MockHandler {
         return { userName: 'Mock User', avatar: '' }
       case 'list_conversations':
       case 'list_agent_sessions':
+      case 'get_agent_session_messages':
       case 'list_spaces':
       case 'list_notifications':
       case 'list_background_tasks':
@@ -485,6 +550,9 @@ export function createUclawMockIpcHandler(): MockHandler {
         // `updatedAt`/`createdAt` are ms — WelcomeView formats them (else "Invalid Date").
         const now = Date.now()
         const id = `mock-agent-${now}`
+        // The mock has no models, so a turn can't actually be sent — show the
+        // recall chip on the fresh session instead (opt-in, see above).
+        if (memoryRecallMode) void simulateMemoryRecall(id, memoryRecallMode, 1200)
         return { id, title: '新会话', archived: false, pinned: false, messageCount: 0, updatedAt: now, createdAt: now }
       }
       case 'create_conversation': {
@@ -519,6 +587,13 @@ export function createUclawMockIpcHandler(): MockHandler {
         return memoryCore.setModelsEnabled(Boolean((payload as { enabled?: boolean })?.enabled))
       case 'memory_core_retry_download':
         return memoryCore.retryDownload()
+
+      // ── Chat › memories used this turn ───────────────────────────────────────
+      case 'send_agent_message':
+        return simulateMemoryRecall(
+          String((payload as { input?: { sessionId?: string } })?.input?.sessionId ?? ''),
+          memoryRecallMode,
+        )
 
       // ── S4 desk-pet ──────────────────────────────────────────────────────────
       case 'list_pet_personas':

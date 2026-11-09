@@ -27,7 +27,7 @@ import { proactiveLearningEventsAtom, memoryRecallEventAtom, skillRecallsMapAtom
 import { agentDisplayNameForAtom } from '@/atoms/agent-display-name'
 import { stickyUserMessageEnabledAtom } from '@/atoms/ui-preferences'
 import { ProactiveLearningChip } from '@/components/chat/ProactiveLearningChip'
-import { MemoryRecallChip } from '@/components/chat/MemoryRecallChip'
+import { MemoryRecallChip, hasRecalledMemories } from '@/components/chat/MemoryRecallChip'
 import { SkillRecallChips } from './SkillRecallChips'
 import { ScrollPositionManager } from '@/hooks/useScrollPositionMemory'
 import { CompactingIndicator, CompactBoundaryDivider } from './CompactionIndicators'
@@ -191,7 +191,7 @@ export function AgentMessages({ sessionId, sessionModelId, messages, messagesLoa
         const hasAny =
           skillRecalls.length > 0 ||
           sessionProactiveEvents.length > 0 ||
-          (memoryRecallEvent != null && memoryRecallEvent.totalCandidates > 0)
+          hasRecalledMemories(memoryRecallEvent)
 
         if (!hasAny) return null
 
@@ -201,7 +201,7 @@ export function AgentMessages({ sessionId, sessionModelId, messages, messagesLoa
             {sessionProactiveEvents.slice(0, 3).map((ev) => (
               <ProactiveLearningChip key={ev.timestamp} event={ev} />
             ))}
-            {memoryRecallEvent != null && memoryRecallEvent.totalCandidates > 0 && (
+            {memoryRecallEvent != null && hasRecalledMemories(memoryRecallEvent) && (
               <MemoryRecallChip event={memoryRecallEvent} inline />
             )}
           </div>

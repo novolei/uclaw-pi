@@ -171,6 +171,32 @@ describe('dev tauri mock', () => {
     expect(done).toHaveBeenCalledTimes(1)
   })
 
+  it('emits a sample agent:memory-recall on send_agent_message when ?memoryRecall is set', async () => {
+    vi.stubEnv('VITE_UCLAW_MOCK_TAURI', '1')
+    window.history.replaceState({}, '', '/?memoryRecall=keyword')
+    installDevTauriMock()
+    window.history.replaceState({}, '', '/')
+
+    const recall = vi.fn()
+    const unlisten = await listen('agent:memory-recall', (e) => recall(e.payload))
+    await invoke('send_agent_message', { input: { sessionId: 's-mock', userMessage: 'hi' } })
+    await unlisten()
+
+    expect(recall).toHaveBeenCalledTimes(1)
+    const ev = recall.mock.calls[0][0]
+    expect(ev.conversationId).toBe('s-mock')
+    expect(ev.coreHits).toHaveLength(3)
+    expect(ev.coreHits.map((h: { scoreKind: string }) => h.scoreKind)).toContain('rrf')
+    expect(ev.coreHits.map((h: { source: string }) => h.source)).toContain('chunk')
+    expect(ev.mode).toBe('keyword')
+  })
+
+  it('keeps send_agent_message silent without ?memoryRecall', async () => {
+    const handler = createUclawMockIpcHandler()
+    await expect(await handler('send_agent_message', { input: { sessionId: 's' } })).toBeNull()
+    await expect(await handler('list_spaces')).toEqual([])
+  })
+
   it('mocks confirmed Browser Runtime execute IPC for browser-only validation', async () => {
     const handler = createUclawMockIpcHandler()
 
