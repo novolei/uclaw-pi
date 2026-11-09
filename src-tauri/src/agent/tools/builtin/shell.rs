@@ -989,8 +989,9 @@ mod tests {
             ApprovalRequirement::Never
         );
 
-        // Unknown command + daemon=true → still Always approval
-        let unknown_daemon = serde_json::json!({ "command": "python3 server.py", "daemon": true });
+        // Unknown command + daemon=true → still Always approval.
+        // (Not `python3 …`: python3 is in SAFE_COMMANDS, so it is auto-approved.)
+        let unknown_daemon = serde_json::json!({ "command": "./my-server --port 8080", "daemon": true });
         assert_eq!(
             tool.requires_approval(&unknown_daemon),
             ApprovalRequirement::Always
