@@ -205,6 +205,8 @@ impl MemoryCore {
             *g = None;
         }
         self.refresh_model_status();
+        // Pending/vector counts depend on the loaded embedder's model id.
+        self.refresh_index_status(false);
     }
 
     /// Load whichever models are on disk and not yet loaded. Idempotent.
