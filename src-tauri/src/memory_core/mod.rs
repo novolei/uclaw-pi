@@ -128,10 +128,16 @@ impl MemoryCore {
         // Vector (embed without lock; load vectors under lock; cosine without lock).
         let mut vec_ids: Vec<String> = Vec::new();
         if let Some(emb) = &embedder {
-            let qv = match emb.embed(&[query.to_string()]) {
-                Ok(v) => v.into_iter().next().unwrap_or_default(),
-                Err(e) => {
+            // Never queue behind a background backfill batch: if the embedder is busy,
+            // skip the vector arm for this query (BM25 + rerank still run).
+            let qv = match emb.try_embed(&[query.to_string()]) {
+                Some(Ok(v)) => v.into_iter().next().unwrap_or_default(),
+                Some(Err(e)) => {
                     tracing::warn!("memory_core: query embed failed, BM25 only: {e:#}");
+                    Vec::new()
+                }
+                None => {
+                    tracing::debug!("memory_core: embedder busy (backfill), skipping vector arm");
                     Vec::new()
                 }
             };

@@ -78,12 +78,30 @@ impl Embedder {
             return Ok(Vec::new());
         }
         let mut g = self.inner.lock().map_err(|_| anyhow!("embedder mutex poisoned"))?;
-        let mut out = g
-            .embed(texts, Some(BATCH_SIZE))
-            .map_err(|e| anyhow!("embed: {e}"))?;
-        out.iter_mut().for_each(|v| l2_normalize(v));
-        Ok(out)
+        run_embed(&mut g, texts)
     }
+
+    /// Like [`embed`](Self::embed) but never waits for the model: returns `None` when
+    /// another caller (e.g. background backfill) currently holds it. Used on the query
+    /// path so a search never queues behind a backfill batch.
+    pub fn try_embed(&self, texts: &[String]) -> Option<anyhow::Result<Vec<Vec<f32>>>> {
+        if texts.is_empty() {
+            return Some(Ok(Vec::new()));
+        }
+        match self.inner.try_lock() {
+            Ok(mut g) => Some(run_embed(&mut g, texts)),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+            Err(std::sync::TryLockError::Poisoned(_)) => Some(Err(anyhow!("embedder mutex poisoned"))),
+        }
+    }
+}
+
+fn run_embed(engine: &mut TextEmbedding, texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
+    let mut out = engine
+        .embed(texts, Some(BATCH_SIZE))
+        .map_err(|e| anyhow!("embed: {e}"))?;
+    out.iter_mut().for_each(|v| l2_normalize(v));
+    Ok(out)
 }
 
 pub struct Reranker {
@@ -195,6 +213,19 @@ mod tests {
         let irr = cosine(&v[0], &v[2]);
         eprintln!("related={rel} unrelated={irr}");
         assert!(rel > irr);
+    }
+
+    #[test]
+    #[ignore]
+    fn try_embed_is_none_while_busy() {
+        let e = Embedder::load(&root()).unwrap();
+        let texts = vec!["hello".to_string()];
+        {
+            let _busy = e.inner.lock().unwrap();
+            assert!(e.try_embed(&texts).is_none(), "must not wait for a held model");
+        }
+        let v = e.try_embed(&texts).expect("free model").unwrap();
+        assert_eq!(v[0].len(), e.dim());
     }
 
     #[test]

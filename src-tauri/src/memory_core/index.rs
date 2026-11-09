@@ -10,7 +10,10 @@ use super::embed::{pack, Embedder};
 use super::segment::segmented_text;
 
 const MAX_CONTENT_CHARS: usize = 2000;
-const EMBED_BATCH: usize = 16;
+/// Docs per backfill embed call. Small so the embedder mutex is released often:
+/// a query arriving mid-backfill skips its vector arm rather than wait (see
+/// `Embedder::try_embed`), so shorter batches mean fewer skipped vector arms.
+const EMBED_BATCH: usize = 4;
 
 #[derive(Debug, Clone)]
 pub struct SourceDoc {
@@ -202,8 +205,8 @@ pub fn embed_pending(db: &std::sync::Mutex<Connection>, embedder: &Embedder) -> 
 /// vector) whose doc_id is not in `docs` is deleted, so callers must pass all
 /// sources together. Docs whose content hash changed are rewritten (FTS refreshed,
 /// stale vector dropped). If `embedder` is given, every doc lacking a vector (or
-/// with one from a different model) is embedded in batches of 16, one transaction
-/// per batch.
+/// with one from a different model) is embedded in batches of `EMBED_BATCH`, one
+/// transaction per batch.
 ///
 /// NOTE: with `Some(embedder)` the caller's connection is used for the whole embedding
 /// loop. Long-lived callers sharing the app-wide DB mutex should pass `None` here and
@@ -381,7 +384,7 @@ mod tests {
         // Always-wrong-dim embedder: must terminate and store nothing.
         let n = embed_all_pending(&conn, "m", 4, |t| Ok(t.iter().map(|_| vec![0.0; 3]).collect())).unwrap();
         assert_eq!(n, 0);
-        // Correct-dim embedder drains all 20 across two batches.
+        // Correct-dim embedder drains all 20 across several batches.
         let n = embed_all_pending(&conn, "m", 4, |t| Ok(t.iter().map(|_| vec![0.5; 4]).collect())).unwrap();
         assert_eq!(n, 20);
     }
