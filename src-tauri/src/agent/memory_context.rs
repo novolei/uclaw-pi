@@ -51,23 +51,25 @@ pub struct LoadedMemoryContext {
     pub recall_event: Option<Value>,
 }
 
-/// Concatenate the three optional blocks in the canonical order
-/// (graph → session → browser). Returns `None` when nothing is present.
+/// Concatenate the optional blocks in the canonical order
+/// (adapter → graph → session → browser). Returns `None` when nothing is
+/// present. The adapter block is small (≤ limit × 200 chars) and
+/// query-matched, so it goes first: downstream truncation
+/// (`PiPromptContext::compose`'s recall cap) cuts from the tail, and a long
+/// graph block used to push it out on every turn.
 fn compose_memory_context(
     graph_block: Option<String>,
     session_block: Option<&str>,
     browser_block: Option<&str>,
     adapter_block: Option<&str>,
 ) -> Option<String> {
-    let mut out = graph_block.unwrap_or_default();
+    let mut out = adapter_block.map(str::to_string).unwrap_or_default();
+    out.push_str(&graph_block.unwrap_or_default());
     if let Some(s) = session_block {
         out.push_str(s);
     }
     if let Some(b) = browser_block {
         out.push_str(b);
-    }
-    if let Some(a) = adapter_block {
-        out.push_str(a);
     }
     if out.is_empty() {
         None
@@ -112,18 +114,21 @@ impl PiPromptContext {
             (self.recall, CAP_RECALL),
             (self.gbrain, CAP_GBRAIN),
         ];
+        // Caps and the total budget count CHARACTERS, not bytes: with byte
+        // counting a CJK block (3 bytes/char) got a third of its intended room.
         let mut kept: Vec<String> = Vec::new();
         let mut used = 0usize;
         for (block, cap) in dims {
             let Some(mut b) = block else { continue };
             if b.trim().is_empty() { continue; }
-            if b.len() > cap {
-                let mut n = cap;
-                while n > 0 && !b.is_char_boundary(n) { n -= 1; }
-                b.truncate(n);
+            let mut chars = b.chars().count();
+            if chars > cap {
+                let cut = b.char_indices().nth(cap).map_or(b.len(), |(i, _)| i);
+                b.truncate(cut);
+                chars = cap;
             }
-            if used + b.len() > total_budget { break; }
-            used += b.len();
+            if used + chars > total_budget { break; }
+            used += chars;
             kept.push(b);
         }
         if kept.is_empty() { None } else { Some(kept.join("\n\n")) }
@@ -321,7 +326,7 @@ mod tests {
     }
 
     #[test]
-    fn compose_appends_adapter_block_last() {
+    fn compose_puts_adapter_block_first() {
         let out = compose_memory_context(
             Some("<g>\n".into()),
             Some("<s>\n"),
@@ -329,7 +334,7 @@ mod tests {
             Some("<a>\n"),
         )
         .unwrap();
-        assert_eq!(out, "<g>\n<s>\n<b>\n<a>\n");
+        assert_eq!(out, "<a>\n<g>\n<s>\n<b>\n");
     }
 
     #[tokio::test]
@@ -399,13 +404,33 @@ mod tests {
     }
     #[test]
     fn pi_context_per_dim_cap_truncates_recall_on_char_boundary() {
-        // recall block far over CAP_RECALL must be truncated to <= cap, never
-        // splitting a UTF-8 codepoint.
-        let huge = "电".repeat(5000); // 3 bytes each = 15000 bytes > CAP_RECALL
+        // recall block far over CAP_RECALL must be truncated to <= cap chars,
+        // never splitting a UTF-8 codepoint.
+        let huge = "电".repeat(20_000);
         let out = PiPromptContext { recall: Some(huge), ..Default::default() }
             .compose(1_000_000);
         let s = out.unwrap();
-        assert!(s.len() <= 8_000, "recall capped to CAP_RECALL=8000, got {}", s.len());
+        assert_eq!(s.chars().count(), 8_000, "recall capped to CAP_RECALL=8000 chars");
         assert!(std::str::from_utf8(s.as_bytes()).is_ok(), "no broken codepoint");
+    }
+
+    #[test]
+    fn pi_context_caps_count_chars_not_bytes() {
+        // 5000 CJK chars = 15000 bytes: under the 8000-char cap, so kept whole.
+        // (Byte counting used to cut this to ~2,666 chars.)
+        let cjk = "电".repeat(5_000);
+        let s = PiPromptContext { recall: Some(cjk), ..Default::default() }
+            .compose(12_000)
+            .unwrap();
+        assert_eq!(s.chars().count(), 5_000);
+        // The total budget is in chars too: 1500 + 5000 CJK chars fit in 7000.
+        let s = PiPromptContext {
+            facts: Some("事".repeat(1_500)),
+            recall: Some("电".repeat(5_000)),
+            ..Default::default()
+        }
+        .compose(7_000)
+        .unwrap();
+        assert!(s.contains('电'), "recall must survive a char-denominated budget");
     }
 }
