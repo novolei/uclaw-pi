@@ -1,0 +1,51 @@
+import { describe, it, expect } from 'vitest'
+import { memoryCoreFixture, parseMemoryCoreMockState } from '@/lib/dev-memory-core-mock'
+import { formatBytes, formatSince } from '../components/memory/MemoryEngineCard'
+import {
+  acceptMemoryCoreStatus,
+  memoryCoreAttention,
+  memoryEngineState,
+} from './useMemoryCoreStatus'
+
+describe('useMemoryCoreStatus helpers', () => {
+  it('seq guard: events must be strictly newer; command responses may be equal', () => {
+    const a = memoryCoreFixture('ready', 5)
+    expect(acceptMemoryCoreStatus(null, a)).toBe(a)
+    expect(acceptMemoryCoreStatus(a, memoryCoreFixture('off', 4))).toBe(a)
+    expect(acceptMemoryCoreStatus(a, memoryCoreFixture('off', 5))).toBe(a)
+    const eq = memoryCoreFixture('off', 5)
+    expect(acceptMemoryCoreStatus(a, eq, true)).toBe(eq)
+    const newer = memoryCoreFixture('off', 6)
+    expect(acceptMemoryCoreStatus(a, newer)).toBe(newer)
+  })
+
+  it('derives the engine state and the nav attention', () => {
+    expect(memoryEngineState(memoryCoreFixture('ready'))).toBe('ready')
+    expect(memoryEngineState(memoryCoreFixture('off'))).toBe('off')
+    expect(memoryEngineState(memoryCoreFixture('failed'))).toBe('failed')
+    expect(memoryEngineState(memoryCoreFixture('downloading'))).toBe('downloading')
+    expect(memoryEngineState(memoryCoreFixture('loading'))).toBe('loading')
+    expect(memoryCoreAttention(null)).toBe('none')
+    expect(memoryCoreAttention(memoryCoreFixture('ready'))).toBe('none')
+    expect(memoryCoreAttention(memoryCoreFixture('loading'))).toBe('none') // phase done
+    expect(memoryCoreAttention(memoryCoreFixture('downloading'))).toBe('active')
+    expect(memoryCoreAttention(memoryCoreFixture('failed'))).toBe('failed')
+  })
+
+  it('formats bytes and relative sync time', () => {
+    expect(formatBytes(568_456_694)).toBe('568 MB')
+    expect(formatBytes(1_139_183_788)).toBe('1.14 GB')
+    const now = Date.parse('2026-11-09T10:00:00Z')
+    expect(formatSince(null, now)).toBe('尚未同步')
+    expect(formatSince('2026-11-09T09:59:30Z', now)).toBe('刚刚同步')
+    expect(formatSince('2026-11-09T09:57:00Z', now)).toBe('上次同步 3 分钟前')
+    expect(formatSince('2026-11-09T07:00:00Z', now)).toBe('上次同步 3 小时前')
+    expect(formatSince('2026-11-07T10:00:00Z', now)).toBe('上次同步 2 天前')
+  })
+
+  it('mock URL flag picks the state, defaulting to ready', () => {
+    expect(parseMemoryCoreMockState('?memoryCore=failed')).toBe('failed')
+    expect(parseMemoryCoreMockState('?memoryCore=nope')).toBe('ready')
+    expect(parseMemoryCoreMockState('')).toBe('ready')
+  })
+})

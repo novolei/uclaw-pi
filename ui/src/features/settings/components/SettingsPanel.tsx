@@ -22,6 +22,7 @@ import {
   SystemTab,
 } from '@/features/settings'
 import { SettingsBreadcrumb } from './SettingsBreadcrumb'
+import { memoryCoreAttention, useMemoryCoreStatus } from '../hooks/useMemoryCoreStatus'
 
 
 function SettingsContent({ tab }: { tab: SettingsTab }) {
@@ -65,12 +66,13 @@ export default function SettingsPanel() {
   const [hasUpdate] = useAtom(hasUpdateAtom)
   const modelStatus = useAtomValue(modelStatusAtom)
   const sttNeedsDownload = modelStatus.kind === 'not-downloaded'
+  const { status: memoryCoreStatus } = useMemoryCoreStatus()
 
   const TAB_LABEL: Record<SettingsTab, string> = {
     connectivity: '服务商与用量',
     intelligence: '智能',
     tools: '工具与能力',
-    memoryRecall: '记忆召回',
+    memoryRecall: '记忆',
     learnedProfile: '学到的偏好',
     imChannels: 'IM 渠道',
     general: '通用与外观',
@@ -100,6 +102,7 @@ export default function SettingsPanel() {
           onChange={setActiveTab}
           hasUpdate={hasUpdate}
           sttNeedsDownload={sttNeedsDownload}
+          memoryAttention={memoryCoreAttention(memoryCoreStatus)}
         />
 
         {/* Right content */}

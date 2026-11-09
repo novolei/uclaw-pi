@@ -10,7 +10,7 @@ export type SettingsTab =
   | 'connectivity'   // 服务商 + 用量
   | 'intelligence'   // 模型 + Agent + 提示词
   | 'tools'          // 工具 + 权限 + 已学技能
-  | 'memoryRecall'   // 记忆召回设置
+  | 'memoryRecall'   // 记忆（本地检索引擎 + 召回参数）；id 保持不变
   | 'learnedProfile' // openhuman facet store (Sprint 2.2)
   | 'imChannels'     // IM 渠道
   | 'general'        // 通用 + 外观

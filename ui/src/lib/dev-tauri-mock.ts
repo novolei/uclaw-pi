@@ -1,6 +1,8 @@
 import { clearMocks, mockConvertFileSrc, mockIPC, mockWindows } from '@tauri-apps/api/mocks'
 import type { InvokeArgs } from '@tauri-apps/api/core'
 import { emit } from '@tauri-apps/api/event'
+import type { MemoryCoreStatus } from './bridge/memory-core'
+import { createMemoryCoreMock, parseMemoryCoreMockState } from './dev-memory-core-mock'
 
 declare global {
   interface Window {
@@ -358,6 +360,11 @@ export function shouldInstallDevTauriMock(): boolean {
 }
 
 export function createUclawMockIpcHandler(): MockHandler {
+  // Settings › 记忆 engine: `?memoryCore=ready|downloading|failed|off|empty|loading`.
+  const memoryCore = createMemoryCoreMock(
+    parseMemoryCoreMockState(typeof window !== 'undefined' ? window.location.search : ''),
+    (status: MemoryCoreStatus) => emit('memory-core:status', status),
+  )
   return (cmd: string, payload?: InvokeArgs): unknown => {
     console.info('[uClaw mock Tauri IPC]', cmd, payload ?? {})
 
@@ -504,6 +511,14 @@ export function createUclawMockIpcHandler(): MockHandler {
       case 'assign_local_model_to_roles':
       case 'cancel_download':
         return null
+
+      // ── MemoryCore engine (Settings › 记忆) ──────────────────────────────────
+      case 'memory_core_get_status':
+        return memoryCore.getStatus()
+      case 'memory_core_set_models_enabled':
+        return memoryCore.setModelsEnabled(Boolean((payload as { enabled?: boolean })?.enabled))
+      case 'memory_core_retry_download':
+        return memoryCore.retryDownload()
 
       // ── S4 desk-pet ──────────────────────────────────────────────────────────
       case 'list_pet_personas':

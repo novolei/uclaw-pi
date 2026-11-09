@@ -32,7 +32,7 @@ const GROUPS: NavGroup[] = [
       { id: 'connectivity', label: '服务商与用量', icon: <Radio size={16} /> },
       { id: 'intelligence', label: '智能', icon: <Cpu size={16} /> },
       { id: 'tools', label: '工具与能力', icon: <Wrench size={16} /> },
-      { id: 'memoryRecall', label: '记忆召回', icon: <Brain size={16} /> },
+      { id: 'memoryRecall', label: '记忆', icon: <Brain size={16} /> },
       { id: 'learnedProfile', label: '学到的偏好', icon: <UserCircle2 size={16} /> },
       { id: 'imChannels', label: 'IM 渠道', icon: <MessageSquare size={16} /> },
     ],
@@ -62,6 +62,8 @@ interface SettingsNavProps {
   onChange: (id: SettingsTab) => void
   hasUpdate: boolean
   sttNeedsDownload: boolean
+  /** Memory models download state: dot while queued/downloading, danger dot when failed. */
+  memoryAttention?: 'none' | 'active' | 'failed'
 }
 
 export function SettingsNav({
@@ -69,6 +71,7 @@ export function SettingsNav({
   onChange,
   hasUpdate,
   sttNeedsDownload,
+  memoryAttention = 'none',
 }: SettingsNavProps): React.ReactElement {
   const [query, setQuery] = React.useState('')
   const q = query.trim().toLowerCase()
@@ -134,6 +137,17 @@ export function SettingsNav({
                       <span
                         data-update-dot
                         className="w-1.5 h-1.5 rounded-full bg-red-500"
+                      />
+                    )}
+                    {it.id === 'memoryRecall' && memoryAttention !== 'none' && (
+                      <span
+                        data-memory-dot
+                        aria-label={memoryAttention === 'failed' ? '模型下载失败' : '正在下载模型'}
+                        role="img"
+                        className={cn(
+                          'w-1.5 h-1.5 rounded-full',
+                          memoryAttention === 'failed' ? 'bg-danger' : 'bg-primary',
+                        )}
                       />
                     )}
                     {it.id === 'stt' && sttNeedsDownload && (

@@ -85,4 +85,38 @@ describe('SettingsNav', () => {
     const sttBtn = screen.getByText('输入（语音）').closest('button')
     expect(sttBtn?.querySelector('[data-stt-dot]')).not.toBeNull()
   })
+  it('labels the memory tab 记忆 and shows its attention dot (danger when failed)', () => {
+    const { rerender } = renderWithProviders(
+      <SettingsNav
+        active="connectivity"
+        onChange={() => {}}
+        hasUpdate={false}
+        sttNeedsDownload={false}
+        memoryAttention="none"
+      />,
+    )
+    const btn = () => screen.getByText('记忆').closest('button')
+    expect(screen.queryByText('记忆召回')).toBeNull()
+    expect(btn()?.querySelector('[data-memory-dot]')).toBeNull()
+    rerender(
+      <SettingsNav
+        active="connectivity"
+        onChange={() => {}}
+        hasUpdate={false}
+        sttNeedsDownload={false}
+        memoryAttention="active"
+      />,
+    )
+    expect(btn()?.querySelector('[data-memory-dot]')?.className).toContain('bg-primary')
+    rerender(
+      <SettingsNav
+        active="connectivity"
+        onChange={() => {}}
+        hasUpdate={false}
+        sttNeedsDownload={false}
+        memoryAttention="failed"
+      />,
+    )
+    expect(btn()?.querySelector('[data-memory-dot]')?.className).toContain('bg-danger')
+  })
 })
