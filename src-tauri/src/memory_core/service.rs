@@ -122,11 +122,26 @@ async fn load_models(core: &Arc<MemoryCore>) {
     }
 }
 
+/// Read the `memory_core_models_enabled` setting under a short DB lock
+/// (default on; a poisoned lock also falls back to on).
+fn models_enabled(core: &MemoryCore) -> bool {
+    use crate::services::settings_service::{DbSettings, SettingsService as _};
+    core.db().lock().map(|c| DbSettings.memory_core_models_enabled(&c)).unwrap_or(true)
+}
+
 /// Spawn the background tasks (called from a Tauri/Tokio async context).
 /// Model download/load runs in its own task; the sync loop never waits on it
 /// and embeds as soon as `core.embedder()` becomes available.
+///
+/// The `memory_core_models_enabled` setting is read once here: when off, no model
+/// is downloaded or loaded and the index stays BM25-only.
 pub fn spawn(core: Arc<MemoryCore>, chunks_db_path: PathBuf) {
-    tauri::async_runtime::spawn(model_task(core.clone()));
+    let models_on = models_enabled(&core);
+    if models_on {
+        tauri::async_runtime::spawn(model_task(core.clone()));
+    } else {
+        tracing::info!("MemoryCore models disabled by setting");
+    }
     tauri::async_runtime::spawn(async move {
         let chunks_db_path = Arc::new(chunks_db_path);
         // Warm up jieba once so the first sync doesn't pay for dictionary load mid-lock.
@@ -137,7 +152,8 @@ pub fn spawn(core: Arc<MemoryCore>, chunks_db_path: PathBuf) {
             cycle(&core, &chunks_db_path).await;
             tokio::time::sleep(SYNC_INTERVAL).await;
             // Models on disk but embedder missing (a load failed): retry at most every 30 min.
-            if core.embedder().is_none()
+            if models_on
+                && core.embedder().is_none()
                 && models::is_ready(core.models_root(), &BGE_M3_INT8)
                 && last_load_retry.elapsed() >= MODEL_RETRY
             {
@@ -186,6 +202,20 @@ mod tests {
 
     fn doc_count(core: &MemoryCore) -> i64 {
         core.db().lock().unwrap().query_row("SELECT COUNT(*) FROM memory_search_docs", [], |r| r.get(0)).unwrap()
+    }
+
+    #[test]
+    fn models_enabled_reads_setting_default_on() {
+        let core = core();
+        assert!(models_enabled(&core), "default on");
+        {
+            let c = core.db().lock().unwrap();
+            c.execute_batch("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);")
+                .unwrap();
+            use crate::services::settings_service::{DbSettings, SettingsService as _};
+            DbSettings.set_memory_core_models_enabled(&c, false).unwrap();
+        }
+        assert!(!models_enabled(&core));
     }
 
     #[test]
