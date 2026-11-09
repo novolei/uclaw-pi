@@ -151,4 +151,35 @@ describe('MemoryRecallChip', () => {
     expect(await screen.findByText('常用编辑器')).toBeInTheDocument()
     expect(screen.getByText('层级分布')).toBeInTheDocument()
   })
+
+  it('names the popover by its heading', async () => {
+    const user = userEvent.setup()
+    renderChip(makeEvent({ coreHits: CORE_HITS }))
+    await user.click(screen.getByRole('button', { name: /参考了 3 条记忆/ }))
+    expect(await screen.findByRole('dialog', { name: '本轮参考的记忆' })).toBeInTheDocument()
+  })
+
+  it('lists a graph item a core hit already shows only once, and the layers agree with the total', async () => {
+    const user = userEvent.setup()
+    renderChip(
+      makeEvent({
+        coreHits: CORE_HITS,
+        totalCandidates: 2,
+        bootCount: 1,
+        relevantCount: 1,
+        items: [
+          { nodeId: 'a', title: '家庭', kind: 'knowledge', source: 'graph' },
+          { nodeId: 'b', title: '常用编辑器', kind: 'knowledge', source: 'graph' },
+        ],
+      }),
+    )
+    await user.click(screen.getByRole('button', { name: /参考了 4 条记忆/ }))
+    expect(await screen.findByText('共 4 条')).toBeInTheDocument()
+    // 家庭 appears once (under 最相关), not again under 层级分布.
+    expect(screen.getAllByText('家庭')).toHaveLength(1)
+    expect(screen.getByText('常用编辑器')).toBeInTheDocument()
+    // 常驻 (家庭's layer) drops to 0 and is hidden; 相关 1 remains: 3 + 1 = 4.
+    expect(screen.queryByText('常驻')).toBeNull()
+    expect(screen.getByText('相关')).toBeInTheDocument()
+  })
 })

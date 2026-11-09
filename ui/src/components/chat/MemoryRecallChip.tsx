@@ -76,11 +76,15 @@ function coreHitsOf(event: MemoryRecallEvent): MemoryCoreHit[] {
  * minus graph items that a core `graph` hit already covers (matched by title —
  * the core index has no node id to match on).
  */
+function coreGraphTitlesOf(event: MemoryRecallEvent): Set<string> {
+  return new Set(
+    coreHitsOf(event).filter((h) => h.source === 'graph').map((h) => h.title.trim()),
+  )
+}
+
 export function countRecalledMemories(event: MemoryRecallEvent): number {
   const hits = coreHitsOf(event)
-  const coreGraphTitles = new Set(
-    hits.filter((h) => h.source === 'graph').map((h) => h.title.trim()),
-  )
+  const coreGraphTitles = coreGraphTitlesOf(event)
   const duplicates = event.items.filter((i) => coreGraphTitles.has(i.title.trim())).length
   return hits.length + Math.max(0, event.totalCandidates - duplicates)
 }
@@ -154,6 +158,7 @@ export function MemoryRecallChip({
   const setSettingsOpen = useSetAtom(settingsOpenAtom)
   const setSettingsTab = useSetAtom(settingsTabAtom)
   const coreListId = React.useId()
+  const headingId = React.useId()
   const contentRef = React.useRef<HTMLDivElement>(null)
 
   const total = countRecalledMemories(event)
@@ -161,16 +166,27 @@ export function MemoryRecallChip({
 
   const coreHits = coreHitsOf(event)
   const hasSkills = event.skillsCount > 0
-  const layers = (
-    [
-      { name: 'Boot', count: event.bootCount },
-      { name: 'Triggered', count: event.triggeredCount },
-      { name: 'Relevant', count: event.relevantCount },
-      { name: 'Expanded', count: event.expandedCount },
-      { name: 'Recent', count: event.recentCount },
-    ] as Array<{ name: LayerName; count: number }>
-  ).filter((l) => l.count > 0)
-  const graphItems = event.items.slice(0, 12)
+  // Graph items a core `graph` hit already shows are listed (and counted) once,
+  // under 最相关 — keep 层级分布 in step with the 共 N 条 total.
+  const coreGraphTitles = coreGraphTitlesOf(event)
+  const layerCounts: Record<LayerName, number> = {
+    Boot: event.bootCount,
+    Triggered: event.triggeredCount,
+    Relevant: event.relevantCount,
+    Expanded: event.expandedCount,
+    Recent: event.recentCount,
+  }
+  const graphEntries = event.items
+    .map((item, idx) => ({ item, layer: inferItemLayer(idx, event) }))
+    .filter(({ item, layer }) => {
+      if (!coreGraphTitles.has(item.title.trim())) return true
+      layerCounts[layer] = Math.max(0, layerCounts[layer] - 1)
+      return false
+    })
+  const layers = (Object.keys(layerCounts) as LayerName[])
+    .map((name) => ({ name, count: layerCounts[name] }))
+    .filter((l) => l.count > 0)
+  const graphItems = graphEntries.slice(0, 12)
   const hasGraph = layers.length > 0 || graphItems.length > 0
 
   const openMemorySettings = () => {
@@ -213,9 +229,11 @@ export function MemoryRecallChip({
       <PopoverContent
         side="top"
         align="start"
-        className="w-80 max-h-[min(28rem,var(--radix-popover-content-available-height))] overflow-y-auto scrollbar-thin rounded-lg p-0 shadow-elevation-2 duration-[180ms]"
+        aria-labelledby={headingId}
+        className="w-80 max-h-[min(28rem,var(--radix-popover-content-available-height))] overflow-y-auto scrollbar-thin rounded-lg p-0 shadow-elevation-2 duration-[180ms] motion-reduce:data-[state=closed]:animate-none motion-reduce:data-[state=open]:animate-none"
         // Focus the panel, not the settings link, so opening doesn't light a
-        // focus ring on it; Tab still reaches the link (Radix traps focus).
+        // focus ring on it. The popover is non-modal (Radix does not trap
+        // focus): Tab from the panel moves to the link inside it.
         onOpenAutoFocus={(e) => {
           e.preventDefault()
           contentRef.current?.focus()
@@ -224,7 +242,7 @@ export function MemoryRecallChip({
         tabIndex={-1}
       >
         <div className="px-4 pb-3 pt-3">
-          <p className="text-[13px] font-medium leading-5 text-foreground">本轮参考的记忆</p>
+          <p id={headingId} className="text-[13px] font-medium leading-5 text-foreground">本轮参考的记忆</p>
           <p className="text-[11px] leading-4 text-muted-foreground tabular-nums">
             共 {total} 条{hasSkills && `，含 ${event.skillsCount} 个学得技能`}
           </p>
@@ -260,8 +278,7 @@ export function MemoryRecallChip({
             )}
             {graphItems.length > 0 && (
               <ul className="mt-2 space-y-1.5">
-                {graphItems.map((item, idx) => {
-                  const layer = inferItemLayer(idx, event)
+                {graphItems.map(({ item, layer }, idx) => {
                   return (
                     <li key={item.nodeId || idx} className="min-w-0">
                       <p className="truncate text-[12px] leading-[18px] text-foreground">{item.title}</p>

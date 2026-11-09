@@ -186,7 +186,8 @@ describe('dev tauri mock', () => {
     const ev = recall.mock.calls[0][0]
     expect(ev.conversationId).toBe('s-mock')
     expect(ev.coreHits).toHaveLength(3)
-    expect(ev.coreHits.map((h: { scoreKind: string }) => h.scoreKind)).toContain('rrf')
+    // Keyword mode has no reranker: every core hit is RRF-scored.
+    expect(ev.coreHits.map((h: { scoreKind: string }) => h.scoreKind)).toEqual(['rrf', 'rrf', 'rrf'])
     expect(ev.coreHits.map((h: { source: string }) => h.source)).toContain('chunk')
     expect(ev.mode).toBe('keyword')
   })

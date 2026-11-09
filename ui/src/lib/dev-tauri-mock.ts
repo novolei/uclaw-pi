@@ -375,6 +375,9 @@ const MOCK_WORKSPACE = {
 }
 
 export function memoryRecallFixture(sessionId: string, mode: 'hybrid' | 'keyword') {
+  // Keyword mode has no reranker loaded, so every core hit is RRF-scored.
+  const scored = (rerank: number, rrf: number) =>
+    mode === 'hybrid' ? { score: rerank, scoreKind: 'rerank' } : { score: rrf, scoreKind: 'rrf' }
   return {
     totalCandidates: 2,
     skillsCount: 0,
@@ -388,8 +391,8 @@ export function memoryRecallFixture(sessionId: string, mode: 'hybrid' | 'keyword
       { nodeId: 'mock-node-style', title: '回答风格偏好', kind: 'user_profile', source: 'graph' },
     ],
     coreHits: [
-      { title: '家庭', snippet: '用户的儿子叫刘书维，今年上小学二年级，周末常去公园踢球。', source: 'graph', score: 0.86, scoreKind: 'rerank' },
-      { title: '上周讨论的旅行计划：十二月去', snippet: '上周讨论的旅行计划：十二月去京都，住在岚山附近，想避开周末人流，顺路看看金阁寺和伏见稻荷。', source: 'chunk', score: 0.41, scoreKind: 'rerank' },
+      { title: '家庭', snippet: '用户的儿子叫刘书维，今年上小学二年级，周末常去公园踢球。', source: 'graph', ...scored(0.86, 0.0328) },
+      { title: '上周讨论的旅行计划：十二月去', snippet: '上周讨论的旅行计划：十二月去京都，住在岚山附近，想避开周末人流，顺路看看金阁寺和伏见稻荷。', source: 'chunk', ...scored(0.41, 0.032) },
       { title: '常用工具', snippet: '写代码主要用 VS Code，终端用 iTerm2，偏好深色主题。', source: 'item', score: 0.0312, scoreKind: 'rrf' },
     ],
     mode,
