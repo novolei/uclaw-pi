@@ -147,6 +147,15 @@ describe('MemoryEngineCard', () => {
     expect(screen.queryByText(/首次开启会下载/)).toBeNull()
   })
 
+  it('mode pill explanation is reachable by keyboard and screen readers', async () => {
+    await renderState('ready')
+    const pill = screen.getByText('混合检索').closest('[data-tone]') as HTMLElement
+    expect(pill).toHaveAttribute('tabindex', '0')
+    expect(pill).toHaveAccessibleDescription('关键词 + 语义向量，再经精排')
+    act(() => pill.focus())
+    expect(await screen.findByRole('tooltip')).toHaveTextContent('关键词 + 语义向量，再经精排')
+  })
+
   it('off: keyword-only explanation and the first-download size', async () => {
     await renderState('off')
     expect(screen.getByRole('switch', { name: '使用本地检索模型' })).not.toBeChecked()

@@ -15,6 +15,7 @@ import {
 import { cn } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible'
+import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import { MemorySkeleton, ProgressBar, StatPill } from '@/components/memory/primitives'
 import {
   MEMORY_MODELS,
@@ -330,6 +331,33 @@ function LoadingModelsBody() {
   )
 }
 
+/**
+ * The header's mode pill. Its one-line explanation is a Radix tooltip on a
+ * focusable trigger (keyboard: Tab to it), and is also wired as the pill's
+ * accessible description so screen readers get it without the tooltip.
+ */
+function ModePill({ hybrid }: { hybrid: boolean }) {
+  const hint = hybrid ? '关键词 + 语义向量，再经精排' : '全文关键词检索'
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <StatPill
+          label="模式"
+          value={hybrid ? '混合检索' : '仅关键词'}
+          tone={hybrid ? 'success' : 'neutral'}
+          tabIndex={0}
+          aria-describedby="memory-engine-mode-hint"
+          className="mt-0.5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+        />
+      </TooltipTrigger>
+      <TooltipContent side="bottom">{hint}</TooltipContent>
+      <span id="memory-engine-mode-hint" className="sr-only">
+        {hint}
+      </span>
+    </Tooltip>
+  )
+}
+
 // ── index section ───────────────────────────────────────────────────────────
 
 function IndexSection({ status }: { status: MemoryCoreStatus }) {
@@ -478,13 +506,7 @@ export function MemoryEngineCard(): React.ReactElement {
           </p>
         </div>
         {status && (
-          <StatPill
-            label="模式"
-            value={hybrid ? '混合检索' : '仅关键词'}
-            tone={hybrid ? 'success' : 'neutral'}
-            className="mt-0.5"
-            title={hybrid ? '关键词 + 语义向量，再经精排' : '全文关键词检索'}
-          />
+          <ModePill hybrid={hybrid} />
         )}
       </header>
 

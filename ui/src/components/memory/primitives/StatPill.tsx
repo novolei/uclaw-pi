@@ -19,18 +19,17 @@ const TONE: Record<StatTone, { root: string; value: string }> = {
 /**
  * StatPill — a quiet label/value pair ("记忆 1,204", "待索引 3").
  * The value carries the tone; the label stays muted so a row of pills
- * reads as data, not as a row of alerts.
+ * reads as data, not as a row of alerts. Forwards its ref (usable as a
+ * Radix `asChild` trigger, e.g. a tooltip).
  */
-export function StatPill({
-  label,
-  value,
-  tone = 'neutral',
-  className,
-  ...props
-}: StatPillProps): React.ReactElement {
+export const StatPill = React.forwardRef<HTMLSpanElement, StatPillProps>(function StatPill(
+  { label, value, tone = 'neutral', className, ...props },
+  ref,
+): React.ReactElement {
   const t = TONE[tone]
   return (
     <span
+      ref={ref}
       data-tone={tone}
       className={cn(
         'inline-flex h-6 shrink-0 items-baseline gap-1.5 whitespace-nowrap rounded-full border px-2.5 text-[12px] leading-6',
@@ -43,4 +42,4 @@ export function StatPill({
       <span className={cn('font-medium tabular-nums', t.value)}>{value}</span>
     </span>
   )
-}
+})
