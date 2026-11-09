@@ -109,7 +109,7 @@ memvid（只支持英文）、rig/swiftide（没有记忆层）、各个 Rust me
 
 ## 6. 需要你拍板的点
 
-1. **gbrain**：是否整体退役？你如果在 gbrain 里手动浏览或编辑过页面，需要先导入。
+1. ~~gbrain~~ **已定（2026-11-09）**：先导入、再退役。P2 把 gbrain 全部页面导入统一存储（保留出处），之后启动不再拉起 Bun，`mcp__gbrain__*` 工具由 `memory_search` / `memory_write` 取代；浏览改用 Markdown 导出。
 2. ~~本地模型体积~~ **已定（2026-11-09）**：首次使用下载约 1.2GB（bge-m3 + bge-reranker-v2-m3）可以接受。
 3. **后台整理用哪个模型**：本地 MiniCPM（免费、慢、质量一般），还是云端便宜模型（每天有 token 预算）？
 4. ~~P0 快修~~ **已完成**：结果见 `docs/eval/2026-11-09-memory-recall-baseline.md`「After P0」一节。
