@@ -250,12 +250,17 @@ pub fn sync(
                indexed_at = excluded.indexed_at",
             params![d.doc_id, d.source, d.source_id, d.title, d.content, hash, d.updated_at],
         )?;
-        tx.execute("DELETE FROM memory_search_fts WHERE doc_id = ?1", [&d.doc_id])?;
+        // doc_id is UNINDEXED in the FTS table, so this DELETE is a full scan: only
+        // pay for it when the doc already exists (a changed doc), never for new docs,
+        // or the first build of N docs is O(N^2) under the app-wide DB mutex.
+        if existing.contains_key(&d.doc_id) {
+            tx.execute("DELETE FROM memory_search_fts WHERE doc_id = ?1", [&d.doc_id])?;
+            tx.execute("DELETE FROM memory_search_vectors WHERE doc_id = ?1", [&d.doc_id])?;
+        }
         tx.execute(
             "INSERT INTO memory_search_fts (doc_id, segmented) VALUES (?1, ?2)",
             params![d.doc_id, seg],
         )?;
-        tx.execute("DELETE FROM memory_search_vectors WHERE doc_id = ?1", [&d.doc_id])?;
         stats.upserted += 1;
     }
     tx.commit()?;
@@ -299,8 +304,13 @@ mod tests {
         assert_eq!(sync(&conn, &docs, None).unwrap().upserted, 2);
         assert_eq!(sync(&conn, &docs, None).unwrap().upserted, 0);
 
+        store_vectors(&conn, "m", 1, &[("graph:b".into(), String::new())], &[vec![1.0]]).unwrap();
         docs[1].content = "在做混合检索".into();
         assert_eq!(sync(&conn, &docs, None).unwrap().upserted, 1);
+        assert_eq!(pending_batch(&conn, "m", 16).unwrap().len(), 2, "stale vector of changed doc dropped");
+        // A changed doc is rewritten, not duplicated, in the FTS table.
+        assert_eq!(fts_count(&conn, "graph:b"), 1);
+        assert_eq!(fts_count(&conn, "graph:a"), 1);
 
         let hit: String = conn
             .query_row(
