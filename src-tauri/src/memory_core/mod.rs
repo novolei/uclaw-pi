@@ -31,6 +31,7 @@ impl Default for MemoryCoreConfig {
 }
 
 #[derive(Debug, Clone)]
+/// `score` is a sigmoid probability in 0..1 when the reranker ran, otherwise the RRF score.
 pub struct MemoryHit {
     pub doc_id: String,
     pub source: String,
@@ -118,7 +119,13 @@ impl MemoryCore {
         // Vector (embed without lock; load vectors under lock; cosine without lock).
         let mut vec_ids: Vec<String> = Vec::new();
         if let Some(emb) = &embedder {
-            let qv = emb.embed(&[query.to_string()])?.into_iter().next().unwrap_or_default();
+            let qv = match emb.embed(&[query.to_string()]) {
+                Ok(v) => v.into_iter().next().unwrap_or_default(),
+                Err(e) => {
+                    tracing::warn!("memory_core: query embed failed, BM25 only: {e:#}");
+                    Vec::new()
+                }
+            };
             if !qv.is_empty() {
                 let rows: Vec<(String, Vec<u8>)> = {
                     let conn = self.db.lock().map_err(|_| anyhow::anyhow!("memory db lock poisoned"))?;
@@ -173,28 +180,50 @@ impl MemoryCore {
         }
 
         if let Some(rr) = reranker {
-            hits.truncate(cfg.rerank_top_n);
-            let texts: Vec<String> = hits
-                .iter()
-                .map(|h| if h.title.is_empty() { h.content.clone() } else { format!("{}\n{}", h.title, h.content) })
-                .collect();
-            let ranked = rr.rerank(query, &texts)?;
-            let mut out = Vec::new();
-            for (i, logit) in ranked {
-                let p = search::sigmoid(logit);
-                if p < cfg.min_rerank_score {
-                    continue;
-                }
-                if let Some(h) = hits.get(i) {
-                    let mut h = h.clone();
-                    h.score = p;
-                    out.push(h);
-                }
-            }
-            hits = out;
+            hits = self.apply_rerank(query, hits, |q, t| rr.rerank(q, t));
         }
         hits.truncate(limit);
         Ok(hits)
+    }
+
+    /// Rerank `hits`; on rerank error keep the fused order (scores stay RRF).
+    fn apply_rerank<F>(&self, query: &str, mut hits: Vec<MemoryHit>, rerank: F) -> Vec<MemoryHit>
+    where
+        F: FnOnce(&str, &[String]) -> anyhow::Result<Vec<(usize, f32)>>,
+    {
+        let cfg = &self.config;
+        hits.truncate(cfg.rerank_top_n);
+        let texts: Vec<String> = hits
+            .iter()
+            .map(|h| if h.title.is_empty() { h.content.clone() } else { format!("{}\n{}", h.title, h.content) })
+            .collect();
+        let ranked = match rerank(query, &texts) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!("memory_core: rerank failed, keeping RRF order: {e:#}");
+                return hits;
+            }
+        };
+        let candidates = ranked.len();
+        let mut out = Vec::new();
+        for (i, logit) in ranked {
+            let p = search::sigmoid(logit);
+            if p < cfg.min_rerank_score {
+                continue;
+            }
+            if let Some(h) = hits.get(i) {
+                let mut h = h.clone();
+                h.score = p;
+                out.push(h);
+            }
+        }
+        if out.is_empty() && candidates > 0 {
+            tracing::debug!(
+                "memory_core: rerank threshold {} dropped all {candidates} candidates",
+                cfg.min_rerank_score
+            );
+        }
+        out
     }
 
     pub fn render_block(hits: &[MemoryHit]) -> Option<String> {
@@ -316,5 +345,27 @@ mod tests {
             }
             assert!(hits[0].content.contains(want), "{q}: {:?}", hits.first());
         }
+    }
+
+    #[test]
+    fn rerank_error_keeps_rrf_order() {
+        let core = core_with(&[]);
+        let hits = vec![hit("", "first"), hit("", "second")];
+        let out = core.apply_rerank("q", hits, |_, _| Err(anyhow::anyhow!("boom")));
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].content, "first");
+        assert_eq!(out[0].score, 1.0);
+    }
+
+    #[test]
+    fn rerank_reorders_and_thresholds() {
+        let core = core_with(&[]);
+        let hits = vec![hit("", "a"), hit("", "b"), hit("", "c")];
+        let out = core.apply_rerank("q", hits, |_, _| Ok(vec![(2, 2.0), (0, -1.0), (1, -11.0)]));
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].content, "c");
+        assert!(out[0].score > 0.8 && out[0].score < 1.0);
+        let none = core.apply_rerank("q", vec![hit("", "a")], |_, _| Ok(vec![(0, -11.0)]));
+        assert!(none.is_empty());
     }
 }

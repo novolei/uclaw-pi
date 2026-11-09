@@ -109,6 +109,77 @@ fn content_hash(title: &str, content: &str) -> String {
     h.finalize().iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// Next docs (at most `max`, capped to EMBED_BATCH) lacking a vector for `model_id`.
+fn pending_batch(conn: &Connection, model_id: &str, max: usize) -> rusqlite::Result<Vec<(String, String)>> {
+    let n = max.min(EMBED_BATCH) as i64;
+    let mut stmt = conn.prepare(
+        "SELECT d.doc_id, d.title || char(10) || d.content
+         FROM memory_search_docs d
+         LEFT JOIN memory_search_vectors v ON v.doc_id = d.doc_id
+         WHERE v.doc_id IS NULL OR v.model_id != ?1
+         ORDER BY d.doc_id LIMIT ?2",
+    )?;
+    let rows = stmt.query_map(params![model_id, n], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    rows.collect()
+}
+
+/// Embed a batch (no DB access) and write the vectors in one transaction.
+/// Returns the number stored; docs with a wrong-dim vector are skipped.
+fn embed_and_store(conn: &Connection, emb: &Embedder, batch: &[(String, String)]) -> anyhow::Result<usize> {
+    let texts: Vec<String> = batch.iter().map(|(_, t)| t.clone()).collect();
+    let vecs = emb.embed(&texts)?;
+    store_vectors(conn, emb.model_id(), emb.dim(), batch, &vecs)
+}
+
+fn store_vectors(
+    conn: &Connection,
+    model_id: &str,
+    dim: usize,
+    batch: &[(String, String)],
+    vecs: &[Vec<f32>],
+) -> anyhow::Result<usize> {
+    let mut n = 0;
+    let tx = conn.unchecked_transaction()?;
+    for ((doc_id, _), v) in batch.iter().zip(vecs.iter()) {
+        if v.len() != dim {
+            tracing::warn!("embedding dim mismatch for {doc_id}: {} != {}", v.len(), dim);
+            continue;
+        }
+        tx.execute(
+            "INSERT OR REPLACE INTO memory_search_vectors (doc_id, model_id, dim, embedding)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![doc_id, model_id, dim as i64, pack(v)],
+        )?;
+        n += 1;
+    }
+    tx.commit()?;
+    Ok(n)
+}
+
+/// Embed every doc lacking a vector, holding the DB lock only for the short select and
+/// write steps (never while embedding). Returns the number embedded.
+pub fn embed_pending(db: &std::sync::Mutex<Connection>, embedder: &Embedder) -> anyhow::Result<usize> {
+    let mut total = 0;
+    loop {
+        let batch = {
+            let conn = db.lock().map_err(|_| anyhow::anyhow!("memory db lock poisoned"))?;
+            pending_batch(&conn, embedder.model_id(), EMBED_BATCH)?
+        };
+        if batch.is_empty() {
+            return Ok(total);
+        }
+        let texts: Vec<String> = batch.iter().map(|(_, t)| t.clone()).collect();
+        let vecs = embedder.embed(&texts)?;
+        let conn = db.lock().map_err(|_| anyhow::anyhow!("memory db lock poisoned"))?;
+        let n = store_vectors(&conn, embedder.model_id(), embedder.dim(), &batch, &vecs)?;
+        total += n;
+        if n == 0 {
+            // Nothing stored (e.g. persistent dim mismatch): stop rather than spin.
+            return Ok(total);
+        }
+    }
+}
+
 /// Bring the index in line with `docs`.
 ///
 /// `docs` is treated as the COMPLETE corpus: every indexed doc (docs row, FTS row,
@@ -117,6 +188,10 @@ fn content_hash(title: &str, content: &str) -> String {
 /// stale vector dropped). If `embedder` is given, every doc lacking a vector (or
 /// with one from a different model) is embedded in batches of 16, one transaction
 /// per batch.
+///
+/// NOTE: with `Some(embedder)` the caller's connection is used for the whole embedding
+/// loop. Long-lived callers sharing the app-wide DB mutex should pass `None` here and
+/// then call [`embed_pending`], which releases the lock while embedding.
 pub fn sync(
     conn: &Connection,
     docs: &[SourceDoc],
@@ -167,34 +242,12 @@ pub fn sync(
     tx.commit()?;
 
     if let Some(emb) = embedder {
-        let pending: Vec<(String, String)> = {
-            let mut stmt = conn.prepare(
-                "SELECT d.doc_id, d.title || char(10) || d.content
-                 FROM memory_search_docs d
-                 LEFT JOIN memory_search_vectors v ON v.doc_id = d.doc_id
-                 WHERE v.doc_id IS NULL OR v.model_id != ?1
-                 ORDER BY d.doc_id",
-            )?;
-            let rows = stmt.query_map([emb.model_id()], |r| Ok((r.get(0)?, r.get(1)?)))?;
-            rows.collect::<rusqlite::Result<_>>()?
-        };
-        for batch in pending.chunks(EMBED_BATCH) {
-            let texts: Vec<String> = batch.iter().map(|(_, t)| t.clone()).collect();
-            let vecs = emb.embed(&texts)?;
-            let tx = conn.unchecked_transaction()?;
-            for ((doc_id, _), v) in batch.iter().zip(vecs.iter()) {
-                if v.len() != emb.dim() {
-                    tracing::warn!("embedding dim mismatch for {doc_id}: {} != {}", v.len(), emb.dim());
-                    continue;
-                }
-                tx.execute(
-                    "INSERT OR REPLACE INTO memory_search_vectors (doc_id, model_id, dim, embedding)
-                     VALUES (?1, ?2, ?3, ?4)",
-                    params![doc_id, emb.model_id(), emb.dim() as i64, pack(v)],
-                )?;
-                stats.embedded += 1;
+        loop {
+            let batch = pending_batch(conn, emb.model_id(), usize::MAX)?;
+            if batch.is_empty() {
+                break;
             }
-            tx.commit()?;
+            stats.embedded += embed_and_store(conn, emb, &batch)?;
         }
     }
     Ok(stats)
@@ -308,5 +361,40 @@ mod tests {
             .unwrap();
         assert_eq!((n, dim), (3, 1024));
         assert_eq!(sync(&conn, &docs, Some(&emb)).unwrap().embedded, 0);
+    }
+
+    #[test]
+    fn pending_and_store_helpers_without_model() {
+        let conn = db();
+        let docs = vec![doc("a", "t", "x"), doc("b", "", "y")];
+        sync(&conn, &docs, None).unwrap();
+        let batch = pending_batch(&conn, "m1", 16).unwrap();
+        assert_eq!(batch.len(), 2);
+        assert_eq!(batch[1].1, "\ny");
+        // wrong-dim vector is skipped, right-dim stored
+        let n = store_vectors(&conn, "m1", 2, &batch, &[vec![1.0, 2.0], vec![1.0]]).unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(pending_batch(&conn, "m1", 16).unwrap().len(), 1);
+        // a different model id makes everything pending again
+        assert_eq!(pending_batch(&conn, "m2", 16).unwrap().len(), 2);
+        // batch cap
+        assert_eq!(pending_batch(&conn, "m2", 1).unwrap().len(), 1);
+    }
+
+    #[test]
+    #[ignore]
+    fn embed_pending_with_real_model() {
+        let Ok(root) = std::env::var("UCLAW_TEST_MODELS") else {
+            eprintln!("UCLAW_TEST_MODELS unset; skipping");
+            return;
+        };
+        let emb = Embedder::load(std::path::Path::new(&root)).unwrap();
+        let conn = db();
+        let docs = vec![doc("a", "家庭", "用户的儿子叫刘书维"), doc("b", "工作", "在做记忆检索"), doc("c", "", "hello world")];
+        sync(&conn, &docs, None).unwrap();
+        let db = std::sync::Mutex::new(conn);
+        assert_eq!(embed_pending(&db, &emb).unwrap(), 3);
+        assert_eq!(embed_pending(&db, &emb).unwrap(), 0);
+        assert!(db.try_lock().is_ok(), "lock must be free after return");
     }
 }
