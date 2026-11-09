@@ -2411,6 +2411,33 @@ const SQL_V60: &str = r#"
     ALTER TABLE memory_versions ADD COLUMN updated_at TEXT;
 "#;
 
+// ─── V61 — memory search index (P1 hybrid retrieval) ───
+// Derived, rebuildable index over memory sources (graph nodes, chunks):
+// - memory_search_docs: one row per indexed source; doc_id is "<source>:<source_id>".
+//   content_hash (sha256 of title+"\n"+content) lets the indexer skip unchanged docs.
+// - memory_search_fts: FTS5 over pre-segmented text (jieba output, space-joined),
+//   unicode61 tokenizer so segmented CJK tokens match exactly.
+// - memory_search_vectors: embedding BLOBs keyed by doc_id, tagged with model_id + dim.
+// All statements are IF NOT EXISTS — replay-safe.
+const SQL_V61: &str = r#"
+    CREATE TABLE IF NOT EXISTS memory_search_docs (
+      doc_id TEXT PRIMARY KEY,
+      source TEXT NOT NULL,
+      source_id TEXT NOT NULL,
+      title TEXT NOT NULL DEFAULT '',
+      content TEXT NOT NULL,
+      content_hash TEXT NOT NULL,
+      source_updated_at TEXT,
+      indexed_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE VIRTUAL TABLE IF NOT EXISTS memory_search_fts USING fts5(
+      doc_id UNINDEXED, segmented, tokenize = 'unicode61 remove_diacritics 2'
+    );
+    CREATE TABLE IF NOT EXISTS memory_search_vectors (
+      doc_id TEXT PRIMARY KEY, model_id TEXT NOT NULL, dim INTEGER NOT NULL, embedding BLOB NOT NULL
+    );
+"#;
+
 /// Test/dev helper: run the full migration stack on a fresh connection.
 ///
 /// The `_target` parameter is currently ignored. All migrations are
@@ -2892,6 +2919,13 @@ pub fn run(conn: &rusqlite::Connection) -> Result<(), rusqlite::Error> {
             tracing::debug!("V60 stmt skipped (likely already applied): {} :: {}", e, stmt);
         }
     }
+    // V61: memory search index (P1 hybrid retrieval) — docs + FTS5 + vectors. IF NOT EXISTS throughout.
+    tracing::debug!("Running migration V61: memory search index tables");
+    for stmt in SQL_V61.split(';').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        if let Err(e) = conn.execute(stmt, []) {
+            tracing::debug!("V61 stmt skipped (likely already applied): {} :: {}", e, stmt);
+        }
+    }
     tracing::info!("Database migrations complete");
     Ok(())
 }
@@ -2960,6 +2994,40 @@ mod tests {
             [],
         )
         .expect("memory_versions update of updated_at must succeed");
+    }
+
+    #[test]
+    fn v61_memory_search_index_tables_exist_and_fts_matches_segmented_text() {
+        let conn = Connection::open_in_memory().unwrap();
+        super::run(&conn).expect("first run");
+        super::run(&conn).expect("second run must not error (idempotent)");
+
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name IN (
+                    'memory_search_docs',
+                    'memory_search_fts',
+                    'memory_search_vectors'
+                )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 3, "V61 must create all three memory search tables");
+
+        conn.execute(
+            "INSERT INTO memory_search_fts (doc_id, segmented) VALUES ('graph:x', '用户 的 儿子 叫 刘书维')",
+            [],
+        )
+        .expect("memory_search_fts insert");
+        let doc_id: String = conn
+            .query_row(
+                "SELECT doc_id FROM memory_search_fts WHERE memory_search_fts MATCH '\"儿子\"'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("FTS MATCH on segmented token must return the row");
+        assert_eq!(doc_id, "graph:x");
     }
 
     #[test]

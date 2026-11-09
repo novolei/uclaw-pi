@@ -1,11 +1,24 @@
 use ndarray::{Array2, Axis};
 use ort::{
+    environment::Environment,
     logging::LogLevel,
     session::{builder::GraphOptimizationLevel, Session},
     value::{Tensor, TensorRef, Value},
 };
 use std::path::Path;
 use tracing::info;
+
+/// ort rc.15 要求显式 Environment；进程内共享一个（fastembed 亦复用 ort 全局环境）。
+fn ort_env() -> anyhow::Result<&'static Environment> {
+    static ENV: std::sync::OnceLock<Environment> = std::sync::OnceLock::new();
+    if let Some(e) = ENV.get() {
+        return Ok(e);
+    }
+    let env = ort::init()
+        .build()
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    Ok(ENV.get_or_init(|| env))
+}
 
 /// 将首输出张量解析为 f32（兼容 float32 与 float16 模型）
 fn extract_logits_as_f32(value: &Value) -> anyhow::Result<ndarray::ArrayD<f32>> {
@@ -30,7 +43,7 @@ impl OnnxInference {
     pub fn new(model_path: &Path) -> anyhow::Result<Self> {
         info!("🧠 加载 ONNX 模型: {:?}", model_path);
 
-        let session = Session::builder()
+        let session = Session::builder(ort_env()?)
             .map_err(|e| anyhow::anyhow!(e.to_string()))?
             .with_log_level(LogLevel::Warning)
             .map_err(|e| anyhow::anyhow!(e.to_string()))?

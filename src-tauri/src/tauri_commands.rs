@@ -1596,6 +1596,7 @@ pub async fn send_message(
                     query: &input.content,
                     browser_ctx: build_browser_task_memory_context(&state, &input.content),
                     adapter_recall,
+                    core: Some(Arc::clone(&state.memory_core)),
                 },
             )
             .await;
@@ -2116,6 +2117,7 @@ pub async fn send_message(
                 query: &input.content,
                 browser_ctx: build_browser_task_memory_context(&state, &input.content),
                 adapter_recall,
+                core: Some(Arc::clone(&state.memory_core)),
             },
         )
         .await;
@@ -5079,6 +5081,7 @@ pub async fn send_agent_message(
                 .map(|g| g.clone())
                 .unwrap_or_else(|| "legacy_kv".to_string());
             let recall_ctx_cache_for_bg = Arc::clone(&state.recall_ctx_cache);
+            let memory_core_for_recall = Arc::clone(&state.memory_core);
 
             tokio::spawn(async move {
                 let recall_engine = crate::memory_graph::recall::MemoryRecallEngine::new(
@@ -5108,6 +5111,7 @@ pub async fn send_agent_message(
                         query: &user_msg_for_recall,
                         browser_ctx: browser_task_memory_ctx,
                         adapter_recall,
+                        core: Some(Arc::clone(&memory_core_for_recall)),
                     },
                 )
                 .await;
@@ -6168,6 +6172,7 @@ pub async fn send_agent_message(
         let state_db_for_browser = Arc::clone(&state.db);
         let workspace_root_for_browser = state.workspace_root.clone();
         let memory_adapters_for_recall = Arc::clone(&state.memory_adapters);
+        let memory_core_for_recall = Arc::clone(&state.memory_core);
         let default_backend_for_recall = state
             .default_memory_backend
             .read()
@@ -6217,6 +6222,7 @@ pub async fn send_agent_message(
                     query: &user_msg_for_recall,
                     browser_ctx: browser_task_memory_ctx,
                     adapter_recall,
+                    core: Some(Arc::clone(&memory_core_for_recall)),
                 },
             )
             .await;

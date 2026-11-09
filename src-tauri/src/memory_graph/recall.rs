@@ -499,12 +499,15 @@ impl MemoryRecallEngine {
     /// Format a recall plan as injectable system-prompt text.
     ///
     /// `token_budget` is the approximate maximum number of tokens the
-    /// output may occupy.  The formatter applies progressive truncation:
-    ///  1. Shorten per-item content snippets (200 → 120 → 80 chars)
-    ///  2. Drop lower-priority sections entirely (recent → expanded →
-    ///     relevant → triggered → boot)
-    ///  3. Within the Learned Skills section (highest priority), truncate
-    ///     individual SOP fields
+    /// output may occupy.  Sections render query-dependent first:
+    /// Triggered → Relevant → Expanded → Boot → Learned Skills → Recent, so a
+    /// downstream cut from the tail drops query-independent context, never
+    /// the answer. Within that:
+    ///  1. Each section has a share of the budget; unused share cascades to
+    ///     the next section; snippets shorten (200 → 120 → 60 chars) as the
+    ///     section budget shrinks.
+    ///  2. Learned skills matched by this query get their SOP (progressively
+    ///     truncated); boot-only skills render as a one-line index.
     /// Pass 0 to disable the limit (full output, backward-compatible).
     pub fn format_recall_for_prompt(plan: &MemoryRecallPlan, token_budget: usize) -> String {
         // Note: the emit-detection logic below is duplicated by
@@ -558,7 +561,6 @@ impl MemoryRecallEngine {
         };
 
         // ── Token budget tracking ──
-        let mut used = 0usize;
         let budget = token_budget;
         let budget_enabled = budget > 0;
 
@@ -607,88 +609,10 @@ impl MemoryRecallEngine {
         let format_section_header = |header: &str| -> String { header.to_string() };
 
 
-        // ── Learned Skills section (top priority) ──
-        if !learned_skills.is_empty() {
-            let header_lines = [
-                "## Learned Skills (已学技能)\n",
-                "以下是你已学会的技能 SOP。**强制规则**：\n",
-                " 1. 任务开始前先判断本次请求是否匹配下列任一技能的「适用场景」。\n",
-                " 2. 如匹配，**必须**在你的响应开头以引用块形式声明：\n",
-                "   `> 应用技能：<技能名> — <一句话说明为何匹配>`\n",
-                "   然后严格按该技能的「SOP 步骤」执行，不要绕过 / 简化 / 自创流程。\n",
-                " 3. 如不匹配任何技能，无需声明，正常回复即可。\n",
-                " 这一规则用于积累\"技能是否真正被使用\"的反馈数据，请配合执行。\n\n",
-            ];
-            let header: String = header_lines.iter().map(|s| *s).collect();
-            out.push_str(&header);
-            if budget_enabled {
-                used += estimate_tokens(&header);
-            }
-        
-            // Determine how much budget remains per skill (on average).
-            let skills_count = learned_skills.len();
-            let rem = if budget_enabled && used < budget {
-                (budget - used) / skills_count.max(1)
-            } else {
-                usize::MAX
-            };
-        
-            // Progressive truncation levels for SOP fields based on remaining
-            // budget per skill:
-            //   > 600 tokens/skill → full SOP
-            //   400-600 → truncate steps to first 3, drop pitfalls
-            //   200-400 → title + context only
-            //   < 200   → title + context truncated to 80 chars
-            for c in &learned_skills {
-                let meta = c.metadata.as_ref().unwrap(); // safe: checked above
-                let context = meta.get("context").and_then(|v| v.as_str()).unwrap_or("");
-                let principles = meta.get("principles").and_then(|v| v.as_str()).unwrap_or("");
-                let steps = meta.get("steps").and_then(|v| v.as_str()).unwrap_or("");
-                let pitfalls = meta.get("pitfalls").and_then(|v| v.as_str()).unwrap_or("");
-        
-                out.push_str(&format!("### {}\n", c.title));
-        
-                let ctx_max = if rem >= 400 { 200 } else { 80 };
-                if !context.is_empty() {
-                    let ctx_text = budgeted_snippet(context, ctx_max);
-                    out.push_str(&format!("**适用场景**: {}\n", ctx_text));
-                }
-        
-                if rem >= 200 && !principles.is_empty() {
-                    let p_text = budgeted_snippet(principles, 150);
-                    out.push_str(&format!("**核心原则**: {}\n", p_text));
-                }
-        
-                if rem >= 400 && !steps.is_empty() {
-                    out.push_str("**SOP 步骤**:\n");
-                    let step_lines: Vec<&str> = steps.lines()
-                        .filter(|l| !l.trim().is_empty())
-                        .collect();
-                    let step_limit = if rem >= 600 { step_lines.len() } else { step_lines.len().min(3) };
-                    for line in step_lines.iter().take(step_limit) {
-                        let step_text = budgeted_snippet(line, 120);
-                        out.push_str(&format!("{}\n", step_text));
-                    }
-                    if step_limit < step_lines.len() {
-                        out.push_str(&format!("  _(... 共 {} 步，已省略)_\n", step_lines.len() - step_limit));
-                    }
-                }
-        
-                if rem >= 400 && !pitfalls.is_empty() {
-                    let pf_text = budgeted_snippet(pitfalls, 150);
-                    out.push_str(&format!("**注意事项**: {}\n", pf_text));
-                }
-        
-                out.push('\n');
-        
-                if budget_enabled {
-                    used = estimate_tokens(&out);
-                }
-            }
-        }
-
         // ── Normal sections (filtering out learned/disabled skills) ──
-        // Section priority: Boot > Triggered > Relevant > Expanded > Recent.
+        // Section order: Triggered > Relevant > Expanded > Boot > Learned Skills >
+        // Recent — query-dependent memory first, so a downstream cut (e.g. the pi
+        // recall cap) removes the query-independent tail, not the answer.
         // Use TokenBudgetAllocation for per-section budget management and
         // CrossLayerDedup for cross-layer deduplication with score merging.
 
@@ -701,9 +625,9 @@ impl MemoryRecallEngine {
         let expanded_normal: Vec<&MemoryRecallCandidate> =
             plan.expanded.iter().filter(|c| should_render_normal(*c)).collect();
 
-        // Initialize per-section budget allocation from remaining tokens
-        let remaining_budget = if budget_enabled { budget.saturating_sub(used) } else { 0 };
-        let mut allocation = TokenBudgetAllocation::from_total(remaining_budget);
+        // Per-section budget allocation over the whole budget (learned skills
+        // render later and take what is left).
+        let mut allocation = TokenBudgetAllocation::from_total(if budget_enabled { budget } else { 0 });
 
         // CrossLayerDedup: register all candidates for multi-source bonus tracking
         let mut dedup = CrossLayerDedup::new();
@@ -725,32 +649,6 @@ impl MemoryRecallEngine {
             if !budget_enabled { return 200; }
             if section_budget > 800 { 200 } else if section_budget > 400 { 120 } else { 60 }
         };
-
-        // ── Boot ──
-        if !boot_normal.is_empty() {
-            let section_budget = allocation.budget_for("boot");
-            let snippet_max = snippet_max_for_budget(section_budget);
-            let mut section_out = format_section_header("## Boot Memories (启动记忆)\n");
-            for c in &boot_normal {
-                if budget_enabled && estimate_tokens(&section_out) >= section_budget {
-                    break;
-                }
-                section_out.push_str(&format!(
-                    "- [{}] {}: {}\n",
-                    capitalize_kind(&c.kind),
-                    c.title,
-                    budgeted_snippet(&c.content, snippet_max),
-                ));
-            }
-            section_out.push('\n');
-            let section_tokens = estimate_tokens(&section_out);
-            if budget_enabled {
-                allocation.cascade_unused("boot", section_tokens);
-            }
-            out.push_str(&section_out);
-        } else if budget_enabled {
-            allocation.cascade_unused("boot", 0);
-        }
 
         // ── Triggered ──
         if !triggered_normal.is_empty() {
@@ -839,6 +737,142 @@ impl MemoryRecallEngine {
             out.push_str(&section_out);
         } else if budget_enabled {
             allocation.cascade_unused("expanded", 0);
+        }
+
+        // ── Boot ──
+        if !boot_normal.is_empty() {
+            let section_budget = allocation.budget_for("boot");
+            let snippet_max = snippet_max_for_budget(section_budget);
+            let mut section_out = format_section_header("## Boot Memories (启动记忆)\n");
+            for c in &boot_normal {
+                if budget_enabled && estimate_tokens(&section_out) >= section_budget {
+                    break;
+                }
+                section_out.push_str(&format!(
+                    "- [{}] {}: {}\n",
+                    capitalize_kind(&c.kind),
+                    c.title,
+                    budgeted_snippet(&c.content, snippet_max),
+                ));
+            }
+            section_out.push('\n');
+            let section_tokens = estimate_tokens(&section_out);
+            if budget_enabled {
+                allocation.cascade_unused("boot", section_tokens);
+            }
+            out.push_str(&section_out);
+        } else if budget_enabled {
+            allocation.cascade_unused("boot", 0);
+        }
+
+        // ── Learned Skills ── (after the query-dependent sections and boot).
+        // Skills matched by THIS query (triggered/relevant/expanded layers) get
+        // their SOP. Boot-only skills (top-N by usage, injected every turn
+        // regardless of the question) become a one-line index, so they no
+        // longer crowd query-relevant memory out of a truncated block.
+        if !learned_skills.is_empty() {
+            let query_ids: HashSet<&str> = plan
+                .triggered
+                .iter()
+                .chain(plan.relevant.iter())
+                .chain(plan.expanded.iter())
+                .map(|c| c.node_id.as_str())
+                .collect();
+            let (matched, indexed): (Vec<&MemoryRecallCandidate>, Vec<&MemoryRecallCandidate>) =
+                learned_skills
+                    .iter()
+                    .copied()
+                    .partition(|c| query_ids.contains(c.node_id.as_str()));
+
+            let header_lines = [
+                "## Learned Skills (已学技能)\n",
+                "以下是你已学会的技能 SOP。**强制规则**：\n",
+                " 1. 任务开始前先判断本次请求是否匹配下列任一技能的「适用场景」。\n",
+                " 2. 如匹配，**必须**在你的响应开头以引用块形式声明：\n",
+                "   `> 应用技能：<技能名> — <一句话说明为何匹配>`\n",
+                "   然后严格按该技能的「SOP 步骤」执行，不要绕过 / 简化 / 自创流程。\n",
+                " 3. 如不匹配任何技能，无需声明，正常回复即可。\n",
+                " 这一规则用于积累\"技能是否真正被使用\"的反馈数据，请配合执行。\n\n",
+            ];
+            let header: String = header_lines.iter().map(|s| *s).collect();
+            out.push_str(&header);
+
+            // Per-skill budget for the matched SOPs (0 once over budget).
+            let used_now = if budget_enabled { estimate_tokens(&out) } else { 0 };
+            let rem = if !budget_enabled {
+                usize::MAX
+            } else {
+                budget.saturating_sub(used_now) / matched.len().max(1)
+            };
+
+            // Progressive truncation levels for SOP fields based on remaining
+            // budget per skill:
+            //   > 600 tokens/skill → full SOP
+            //   400-600 → truncate steps to first 3, drop pitfalls
+            //   200-400 → title + context only
+            //   < 200   → title + context truncated to 80 chars
+            for c in &matched {
+                let meta = c.metadata.as_ref().unwrap(); // safe: checked above
+                let context = meta.get("context").and_then(|v| v.as_str()).unwrap_or("");
+                let principles = meta.get("principles").and_then(|v| v.as_str()).unwrap_or("");
+                let steps = meta.get("steps").and_then(|v| v.as_str()).unwrap_or("");
+                let pitfalls = meta.get("pitfalls").and_then(|v| v.as_str()).unwrap_or("");
+
+                out.push_str(&format!("### {}\n", c.title));
+
+                let ctx_max = if rem >= 400 { 200 } else { 80 };
+                if !context.is_empty() {
+                    let ctx_text = budgeted_snippet(context, ctx_max);
+                    out.push_str(&format!("**适用场景**: {}\n", ctx_text));
+                }
+
+                if rem >= 200 && !principles.is_empty() {
+                    let p_text = budgeted_snippet(principles, 150);
+                    out.push_str(&format!("**核心原则**: {}\n", p_text));
+                }
+
+                if rem >= 400 && !steps.is_empty() {
+                    out.push_str("**SOP 步骤**:\n");
+                    let step_lines: Vec<&str> = steps.lines()
+                        .filter(|l| !l.trim().is_empty())
+                        .collect();
+                    let step_limit = if rem >= 600 { step_lines.len() } else { step_lines.len().min(3) };
+                    for line in step_lines.iter().take(step_limit) {
+                        let step_text = budgeted_snippet(line, 120);
+                        out.push_str(&format!("{}\n", step_text));
+                    }
+                    if step_limit < step_lines.len() {
+                        out.push_str(&format!("  _(... 共 {} 步，已省略)_\n", step_lines.len() - step_limit));
+                    }
+                }
+
+                if rem >= 400 && !pitfalls.is_empty() {
+                    let pf_text = budgeted_snippet(pitfalls, 150);
+                    out.push_str(&format!("**注意事项**: {}\n", pf_text));
+                }
+
+                out.push('\n');
+            }
+
+            // Index-only skills: name + one-line scope. Always rendered (they
+            // are short), so collect_emitted_skill_ids stays in sync.
+            if !indexed.is_empty() {
+                out.push_str("其他已学技能（如匹配，用 skill_search / load_skill 查看完整步骤）：\n");
+                for c in &indexed {
+                    let context = c
+                        .metadata
+                        .as_ref()
+                        .and_then(|m| m.get("context"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    if context.is_empty() {
+                        out.push_str(&format!("- {}\n", c.title));
+                    } else {
+                        out.push_str(&format!("- {} — {}\n", c.title, budgeted_snippet(context, 80)));
+                    }
+                }
+                out.push('\n');
+            }
         }
 
         // ── Recent ── (lowest priority, receives cascaded surplus)
@@ -1743,34 +1777,31 @@ struct TokenBudgetAllocation {
 }
 
 impl TokenBudgetAllocation {
+    /// Shares follow the render order (triggered → relevant → expanded →
+    /// boot → recent). ~10% is left unallocated for the learned-skills index.
     fn from_total(total: usize) -> Self {
         Self {
-            boot: (total as f32 * 0.30) as usize,
             triggered: (total as f32 * 0.20) as usize,
-            relevant: (total as f32 * 0.25) as usize,
-            expanded: (total as f32 * 0.15) as usize,
-            recent: (total as f32 * 0.10) as usize,
+            relevant: (total as f32 * 0.35) as usize,
+            expanded: (total as f32 * 0.10) as usize,
+            boot: (total as f32 * 0.20) as usize,
+            recent: (total as f32 * 0.05) as usize,
         }
     }
 
-    /// 流转未用配额到下一层
+    /// 流转未用配额到下一层 (in render order: query-dependent layers first).
     fn cascade_unused(&mut self, layer: &str, used: usize) {
         let surplus = match layer {
-            "boot" => self.boot.saturating_sub(used),
             "triggered" => self.triggered.saturating_sub(used),
             "relevant" => self.relevant.saturating_sub(used),
             "expanded" => self.expanded.saturating_sub(used),
+            "boot" => self.boot.saturating_sub(used),
             _ => return,
         };
         if surplus == 0 {
             return;
         }
         match layer {
-            "boot" => {
-                let per = surplus / 2;
-                self.triggered += per;
-                self.relevant += surplus - per;
-            }
             "triggered" => {
                 let per = surplus / 2;
                 self.relevant += per;
@@ -1779,9 +1810,12 @@ impl TokenBudgetAllocation {
             "relevant" => {
                 let per = surplus / 2;
                 self.expanded += per;
-                self.recent += surplus - per;
+                self.boot += surplus - per;
             }
             "expanded" => {
+                self.boot += surplus;
+            }
+            "boot" => {
                 self.recent += surplus;
             }
             _ => {}
@@ -1956,6 +1990,58 @@ mod recall_helpers_tests {
         plan.relevant.push(skill_candidate("d", true, true)); // included
         let ids = collect_emitted_skill_ids(&plan);
         assert_eq!(ids, vec!["a".to_string(), "d".to_string()]);
+    }
+
+    fn fact(node_id: &str, title: &str, content: &str) -> MemoryRecallCandidate {
+        MemoryRecallCandidate {
+            node_id: node_id.into(),
+            title: title.into(),
+            content: content.into(),
+            kind: MemoryNodeKind::UserProfile,
+            source: "relevant".into(),
+            reason: "r".into(),
+            score: Some(0.5),
+            fts_rank: None,
+            vector_rank: None,
+            matched_keywords: vec![],
+            metadata: None,
+        }
+    }
+
+    fn sop_skill(node_id: &str, title: &str) -> MemoryRecallCandidate {
+        let mut c = skill_candidate(node_id, true, true);
+        c.title = title.into();
+        c.metadata = Some(serde_json::json!({
+            "enabled": true,
+            "skill_type": "learned",
+            "context": "某个场景",
+            "steps": "1. 第一步\n2. 第二步",
+        }));
+        c
+    }
+
+    #[test]
+    fn format_puts_query_memory_first_and_indexes_boot_skills() {
+        let mut plan = empty_plan();
+        plan.boot.push(fact("b1", "boot-fact", "用户是产品经理"));
+        plan.boot.push(sop_skill("s-boot", "boot-only-skill"));
+        plan.relevant.push(fact("r1", "son", "用户的儿子叫刘书维"));
+        plan.relevant.push(sop_skill("s-q", "query-skill"));
+
+        let out = MemoryRecallEngine::format_recall_for_prompt(&plan, 5000);
+
+        let rel = out.find("## Relevant Memories").expect("relevant section");
+        let boot = out.find("## Boot Memories").expect("boot section");
+        let skills = out.find("## Learned Skills").expect("skills section");
+        assert!(rel < boot && boot < skills, "query memory first, then boot, then skills:\n{out}");
+        assert!(out.contains("刘书维"));
+        // Query-matched skill keeps its SOP; boot-only skill is a one-line index.
+        assert!(out.contains("### query-skill"), "{out}");
+        assert!(out.contains("**SOP 步骤**"), "{out}");
+        assert!(!out.contains("### boot-only-skill"), "{out}");
+        assert!(out.contains("- boot-only-skill — 某个场景"), "{out}");
+        // Every learned skill is still rendered, so usage accounting stays in sync.
+        assert_eq!(collect_emitted_skill_ids(&plan).len(), 2);
     }
 
     #[test]

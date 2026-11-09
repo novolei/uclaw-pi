@@ -32,6 +32,12 @@ pub trait SettingsService {
     /// Store (or clear) the skillsmp.com API key. OPTIONAL — it only raises the
     /// rate limit (search works anonymously). Whitespace-trimmed; empty ⇒ deleted.
     fn set_skillsmp_api_key(&self, conn: &Connection, key: &str) -> rusqlite::Result<()>;
+    /// Whether MemoryCore may download (~1.2 GB) and load (~1.5–3 GB resident) its
+    /// embedding + rerank models (default: ON when unset; "false"/"0" = off). When off,
+    /// MemoryCore runs BM25-only. Read once at service start (takes effect on restart).
+    fn memory_core_models_enabled(&self, conn: &Connection) -> bool;
+    /// Persist the MemoryCore model enablement flag (takes effect on next restart).
+    fn set_memory_core_models_enabled(&self, conn: &Connection, enabled: bool) -> rusqlite::Result<()>;
 }
 
 /// The SQLite-backed implementation (the only one in production).
@@ -69,6 +75,24 @@ impl SettingsService for DbSettings {
     fn set_pi_engine_enabled(&self, conn: &Connection, enabled: bool) -> rusqlite::Result<()> {
         conn.execute(
             "INSERT OR REPLACE INTO settings (key, value) VALUES ('pi_engine_enabled', ?1)",
+            [if enabled { "true" } else { "false" }],
+        )?;
+        Ok(())
+    }
+
+    fn memory_core_models_enabled(&self, conn: &Connection) -> bool {
+        conn.query_row(
+            "SELECT value FROM settings WHERE key = 'memory_core_models_enabled'",
+            [],
+            |r| r.get::<_, String>(0),
+        )
+        .ok()
+        .is_none_or(|v| !(v == "false" || v == "0"))
+    }
+
+    fn set_memory_core_models_enabled(&self, conn: &Connection, enabled: bool) -> rusqlite::Result<()> {
+        conn.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES ('memory_core_models_enabled', ?1)",
             [if enabled { "true" } else { "false" }],
         )?;
         Ok(())
@@ -140,6 +164,22 @@ mod tests {
         assert!(DbSettings.http_api_enabled(&c));
         DbSettings.set_http_api_enabled(&c, false).unwrap();
         assert!(!DbSettings.http_api_enabled(&c));
+    }
+
+    #[test]
+    fn memory_core_models_flag_defaults_on_and_round_trips() {
+        let c = conn();
+        assert!(DbSettings.memory_core_models_enabled(&c), "default must be on");
+        DbSettings.set_memory_core_models_enabled(&c, false).unwrap();
+        assert!(!DbSettings.memory_core_models_enabled(&c));
+        DbSettings.set_memory_core_models_enabled(&c, true).unwrap();
+        assert!(DbSettings.memory_core_models_enabled(&c));
+        c.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('memory_core_models_enabled', '0')", [])
+            .unwrap();
+        assert!(!DbSettings.memory_core_models_enabled(&c), "\"0\" = off");
+        // No settings table at all (e.g. a bare test DB) → default on.
+        let bare = Connection::open_in_memory().unwrap();
+        assert!(DbSettings.memory_core_models_enabled(&bare));
     }
 
     #[test]

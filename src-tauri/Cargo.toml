@@ -62,7 +62,11 @@ lettre = { version = "0.11", default-features = false, features = ["smtp-transpo
 # onnxruntime tarball 并静态链接进 binary。运行时零 dlopen / 零 ORT_DYLIB_PATH /
 # 零版本号维护。首次 build 多 ~30s + 最终 binary 多 ~30MB，换永远不再为
 # onnxruntime 版本对应关系 panic（详见 PR #156 的事故说明）。
-ort = { version = "=2.0.0-rc.12", features = ["ndarray", "half"] }
+ort = { version = "=2.0.0-rc.15", features = ["ndarray", "half"] }
+# Memory P1 hybrid retrieval: bge-m3 embeddings + reranker via local ONNX (UserDefined*).
+# hf-hub intentionally off; models are downloaded by our own downloader.
+fastembed = { version = "=7.6.1", default-features = false, features = ["ort-download-binaries-rustls-tls"] }
+jieba-rs = "0.11"
 realfft = "3"
 # Bumped 0.16 → 0.17 to match ort 2.0.0-rc.12's ndarray integration (S1
 # mistralrs added → ort bumped rc.10→rc.12 → ndarray 0.17). STT-only usage.
@@ -217,6 +221,10 @@ mockito = "0.32"
 [[example]]
 name = "echo_plugin"
 path = "examples/echo_plugin/main.rs"
+
+[[example]]
+name = "memory_recall_eval"
+path = "examples/memory_recall_eval/main.rs"
 
 [features]
 default = []
