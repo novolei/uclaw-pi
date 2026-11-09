@@ -96,12 +96,15 @@ the pi-context table reflects P1. It runs `db::migrations::run` on the **snapsho
 only, then indexes graph + chunk docs once per run (942 docs). Debug build, Apple
 Silicon, real models from `~/.uclaw-pi/models/memory`.
 
-| | baseline | after P0 | after P1 (final, `rerank_top_n=6`) |
-|---|---|---|---|
-| best ranked hit@5 (all) | 13.5% (graph_plan) | 13.5% | **70.3%** (`memory_core`) |
-| fact present in composed pi context | 32.4% | 37.8% | **86.5%** (zh 85.2%, en 90.0%) |
-| pi-context hit / stored | ~34% | ~40% | **91.4%** |
-| hit carried by the query-dependent recall block | 4 | 6 | 29 / 37 (78.4%) |
+| | baseline | after P0 | after P1 (final, `rerank_top_n=6`) | after review fixes (1 s core timeout) |
+|---|---|---|---|---|
+| best ranked hit@5 (all) | 13.5% (graph_plan) | 13.5% | **70.3%** (`memory_core`) | 67.6% |
+| fact present in composed pi context | 32.4% | 37.8% | **86.5%** (zh 85.2%, en 90.0%) | 64.9% (zh 66.7%, en 60.0%) |
+| pi-context hit / stored | ~34% | ~40% | **91.4%** | 68.6% |
+| hit carried by the query-dependent recall block | 4 | 6 | 29 / 37 (78.4%) | 19 / 37 (51.4%) |
+
+The last column is a re-run after the final-review fixes; read
+*Re-run after the final-review fixes* below before comparing it with the P1 column.
 
 ### memory_core ranked recall — final defaults (`rerank_top_n=6`, `min_rerank_score=0.05`, `limit=6`)
 
@@ -216,3 +219,39 @@ all, so the ceiling is 94.6%. Many misses are still saved in the prompt by the
 cheaper first stage so `rerank_top_n` can return to ~12–20 within the latency
 budget (shorter reranker inputs alone were tried and rejected, see the rerank
 experiment above).
+
+### Re-run after the final-review fixes
+
+One run with the shipped defaults after the final-review fixes (943 docs: the live
+snapshot gained one doc since the P1 runs; the app was running during the run).
+
+| group | n | hit@1 | hit@3 | hit@5 | hit@10 | MRR | p50 ms |
+|---|---|---|---|---|---|---|---|
+| all | 37 | 45.9% | 62.2% | 67.6% | 67.6% | 0.548 | 848 |
+| zh | 27 | 48.1% | 66.7% | 66.7% | 66.7% | 0.568 | 835 |
+| en | 10 | 40.0% | 50.0% | 70.0% | 70.0% | 0.495 | 1396 |
+| cat=skill | 6 | 66.7% | 83.3% | 83.3% | 83.3% | 0.750 | 2259 |
+
+pi context: 64.9% hit, 68.6% hit / stored, recall block 51.4%.
+
+**Why the pi-context numbers fell.** `load_context` now waits at most 1000 ms
+(`CORE_SEARCH_TIMEOUT`) for the MemoryCore search and drops only that block on
+timeout. Before this fix the harness waited for every search however long it took,
+so the P1 column overstated what the app delivers: in the app, the pi path's 1500 ms
+recall deadline dropped the whole memory block whenever the search was slower than
+that. In this run 15 of 37 queries lost the core block (13 at the 1 s cap, mostly en
+and skill questions whose search took 1.1–3.2 s). 9 of them had the answer in the
+core top 6. So the remaining gap is search latency, not ranking.
+
+**Why the ranked numbers moved (−2.7 pts hit@5, p50 697 → 848 ms).** Likely a
+harness artifact, not a ranking change. A timed-out search is detached, not aborted,
+so it keeps the reranker and CPU busy while the next query's ranked search runs.
+With the embedder busy, that query also skips its vector arm (`Embedder::try_embed`).
+The corpus also gained one doc, and the app was competing for CPU. The 32-token FTS
+cap and the 256-char model-query cap have no effect on these short questions.
+
+Against the gate, this run fails `hit@5 >= 70%` (67.6%) and `p50 < 800 ms` (848 ms)
+and passes zh hit@5 (66.7% >= 65%) and pi hit / stored (68.6% >= 60%). The fix is
+the same next lever as above: a faster reranker or cheaper first stage. Raising
+`CORE_SEARCH_TIMEOUT` toward the 1500 ms pi deadline would win back part of the
+pi-context hits, but leaves less margin for the other recall blocks.
