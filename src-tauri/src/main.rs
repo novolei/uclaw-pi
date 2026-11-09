@@ -324,6 +324,7 @@ fn main() {
                     uclaw_core::memory_core::service::spawn(
                         memory_core,
                         data_dir.join("bucket_seal").join("chunks.db"),
+                        None,
                     );
                     tracing::info!("[Stage 3] MemoryCore service started");
                     // Snapshot config at boot — services read their flags once at startup.

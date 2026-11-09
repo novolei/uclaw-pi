@@ -7,6 +7,7 @@ pub mod embed;
 pub mod index;
 pub mod search;
 pub mod service;
+pub mod status;
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
@@ -14,6 +15,10 @@ use std::sync::{Arc, Mutex, RwLock};
 use rusqlite::Connection;
 
 use embed::{Embedder, Reranker};
+use status::{MemoryCoreStatus, RetrievalMode, StatusNotifier};
+
+/// Minimum gap between progress-driven status notifications.
+const PROGRESS_THROTTLE: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// Max chars of the query fed to the embedder and the reranker, so a long pasted
 /// message neither dominates the cross-encoder input nor slows the query embed.
@@ -59,6 +64,9 @@ pub struct MemoryCore {
     /// same model twice (each load briefly costs ~1.2 GB extra peak memory).
     load_lock: Mutex<()>,
     config: MemoryCoreConfig,
+    status: RwLock<MemoryCoreStatus>,
+    notifier: Mutex<Option<StatusNotifier>>,
+    last_progress_notify: Mutex<Option<std::time::Instant>>,
 }
 
 impl MemoryCore {
@@ -70,6 +78,9 @@ impl MemoryCore {
             reranker: RwLock::new(None),
             load_lock: Mutex::new(()),
             config,
+            status: RwLock::new(MemoryCoreStatus::default()),
+            notifier: Mutex::new(None),
+            last_progress_notify: Mutex::new(None),
         }
     }
 
@@ -83,6 +94,84 @@ impl MemoryCore {
 
     pub fn config(&self) -> &MemoryCoreConfig {
         &self.config
+    }
+
+    /// Snapshot of the observable engine status.
+    pub fn status(&self) -> MemoryCoreStatus {
+        self.status.read().map(|g| g.clone()).unwrap_or_default()
+    }
+
+    pub fn set_notifier(&self, n: Option<StatusNotifier>) {
+        if let Ok(mut g) = self.notifier.lock() {
+            *g = n;
+        }
+    }
+
+    /// Apply `f` to the status. If anything (other than `seq`) changed, bump `seq`,
+    /// store, and invoke the notifier (outside the lock). Returns whether it changed.
+    pub fn update_status(&self, f: impl FnOnce(&mut MemoryCoreStatus)) -> bool {
+        let new = {
+            let Ok(mut g) = self.status.write() else { return false };
+            let mut next = g.clone();
+            f(&mut next);
+            next.seq = g.seq;
+            if next == *g {
+                return false;
+            }
+            next.seq += 1;
+            *g = next.clone();
+            next
+        };
+        let notifier = self.notifier.lock().ok().and_then(|g| g.clone());
+        if let Some(n) = notifier {
+            n(&new);
+        }
+        true
+    }
+
+    /// Like `update_status` but dropped entirely when a progress update was applied
+    /// less than 250 ms ago (for download progress ticks).
+    pub fn update_status_progress(&self, f: impl FnOnce(&mut MemoryCoreStatus)) -> bool {
+        {
+            let Ok(mut last) = self.last_progress_notify.lock() else { return false };
+            let now = std::time::Instant::now();
+            if last.is_some_and(|t| now.duration_since(t) < PROGRESS_THROTTLE) {
+                return false;
+            }
+            *last = Some(now);
+        }
+        self.update_status(f)
+    }
+
+    /// Sync `embedderLoaded` / `rerankerLoaded` / `mode` with what is actually loaded.
+    pub fn refresh_model_status(&self) {
+        let e = self.embedder().is_some();
+        let r = self.reranker.read().map(|g| g.is_some()).unwrap_or(false);
+        self.update_status(|s| {
+            s.embedder_loaded = e;
+            s.reranker_loaded = r;
+            s.mode = if e { RetrievalMode::Hybrid } else { RetrievalMode::Keyword };
+        });
+    }
+
+    /// Recompute index counts (short DB lock). `synced` stamps `last_sync_at` now.
+    pub fn refresh_index_status(&self, synced: bool) {
+        let model_id = self.embedder().map(|e| e.model_id());
+        let counts = match self.db.lock() {
+            Ok(c) => status::index_counts(&c, model_id),
+            Err(_) => return,
+        };
+        match counts {
+            Ok(c) => {
+                self.update_status(|s| {
+                    let last = s.index.last_sync_at.take();
+                    s.index = c;
+                    s.index.last_sync_at =
+                        if synced { Some(chrono::Utc::now().to_rfc3339()) } else { last };
+                });
+            }
+            Err(e) => tracing::warn!("memory_core: index counts failed: {e}"),
+        }
     }
 
     /// Load whichever models are on disk and not yet loaded. Idempotent.
@@ -111,6 +200,7 @@ impl MemoryCore {
                 Err(e) => tracing::warn!("memory_core: reranker load failed: {e:#}"),
             }
         }
+        self.refresh_model_status();
         self.embedder().is_some()
     }
 

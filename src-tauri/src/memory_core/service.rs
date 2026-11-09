@@ -14,6 +14,9 @@ use rusqlite::{Connection, OpenFlags};
 use super::index::{self, SyncStats};
 use super::models::{self, BGE_M3_INT8, BGE_RERANKER_V2_M3_INT8};
 use super::segment::segment;
+use super::status::{
+    DownloadPhase, DownloadStatus, StatusNotifier, BGE_M3_ONNX_BYTES, TOTAL_DOWNLOAD_BYTES,
+};
 use super::MemoryCore;
 
 const SYNC_INTERVAL: Duration = Duration::from_secs(60);
@@ -71,6 +74,7 @@ async fn cycle(core: &Arc<MemoryCore>, chunks_db_path: &Arc<PathBuf>) {
     .await;
     match res {
         Ok(Ok(Some((s, embedded)))) => {
+            core.refresh_index_status(true);
             if s.upserted + s.removed + embedded > 0 {
                 tracing::info!(
                     "memory_core: sync upserted={} removed={} embedded={}",
@@ -86,14 +90,71 @@ async fn cycle(core: &Arc<MemoryCore>, chunks_db_path: &Arc<PathBuf>) {
     }
 }
 
+fn download_status(
+    phase: DownloadPhase,
+    model: &str,
+    file: &str,
+    source: Option<String>,
+    downloaded: u64,
+    error: Option<String>,
+) -> DownloadStatus {
+    DownloadStatus {
+        phase,
+        model: model.to_string(),
+        file: file.to_string(),
+        source,
+        downloaded_bytes: downloaded.min(TOTAL_DOWNLOAD_BYTES),
+        total_bytes: TOTAL_DOWNLOAD_BYTES,
+        error,
+    }
+}
+
 async fn ensure_models(core: &Arc<MemoryCore>, client: &reqwest::Client) -> bool {
     let root = core.models_root().to_path_buf();
-    for spec in [&BGE_M3_INT8, &BGE_RERANKER_V2_M3_INT8] {
-        if let Err(e) = models::ensure_model(client, &root, spec).await {
+    // Bytes of onnx files already accounted for (done specs); small files are ignored.
+    let mut base = 0u64;
+    for (spec, onnx_bytes) in [
+        (&BGE_M3_INT8, BGE_M3_ONNX_BYTES),
+        (&BGE_RERANKER_V2_M3_INT8, super::status::RERANKER_ONNX_BYTES),
+    ] {
+        if models::is_ready(&root, spec) {
+            base += onnx_bytes;
+            continue; // nothing to download: no download phase at all
+        }
+        let file0 = spec.files.first().map(|f| f.path).unwrap_or("");
+        core.update_status(|s| {
+            s.download = Some(download_status(DownloadPhase::Queued, spec.id, file0, None, base, None));
+        });
+        let c = core.clone();
+        let on_progress = move |t: models::ProgressTick| {
+            // The onnx file is first in the manifest, so for other files it is complete.
+            let downloaded = if t.file.ends_with(".onnx") { base + t.downloaded } else { base + onnx_bytes };
+            let d = download_status(
+                DownloadPhase::Downloading,
+                spec.id,
+                &t.file,
+                Some(t.source_host),
+                downloaded,
+                None,
+            );
+            c.update_status_progress(|s| s.download = Some(d));
+        };
+        if let Err(e) = models::ensure_model(client, &root, spec, &on_progress).await {
             tracing::warn!("memory_core: model {} unavailable: {e:#}", spec.id);
+            let d = download_status(DownloadPhase::Failed, spec.id, file0, None, base, Some(format!("{e:#}")));
+            core.update_status(|s| s.download = Some(d));
             return false;
         }
+        base += onnx_bytes;
     }
+    // Only reached with a download in flight or everything already on disk.
+    core.update_status(|s| {
+        if let Some(d) = s.download.as_mut() {
+            d.phase = DownloadPhase::Done;
+            d.downloaded_bytes = d.total_bytes;
+            d.error = None;
+        }
+    });
     true
 }
 
@@ -115,7 +176,10 @@ async fn model_task(core: Arc<MemoryCore>) {
 
 async fn load_models(core: &Arc<MemoryCore>) {
     let c = core.clone();
-    match tokio::task::spawn_blocking(move || c.try_load_models()).await {
+    let res = tokio::task::spawn_blocking(move || c.try_load_models()).await;
+    // Download (if any) is finished either way; clear it from the status.
+    core.update_status(|s| s.download = None);
+    match res {
         Ok(true) => tracing::info!("memory_core: models loaded"),
         Ok(false) => tracing::warn!("memory_core: model load did not produce an embedder"),
         Err(e) => tracing::warn!("memory_core: model load task failed: {e}"),
@@ -135,8 +199,11 @@ fn models_enabled(core: &MemoryCore) -> bool {
 ///
 /// The `memory_core_models_enabled` setting is read once here: when off, no model
 /// is downloaded or loaded and the index stays BM25-only.
-pub fn spawn(core: Arc<MemoryCore>, chunks_db_path: PathBuf) {
+pub fn spawn(core: Arc<MemoryCore>, chunks_db_path: PathBuf, notifier: Option<StatusNotifier>) {
+    core.set_notifier(notifier);
     let models_on = models_enabled(&core);
+    core.update_status(|s| s.models_enabled = models_on);
+    core.refresh_index_status(false);
     if models_on {
         tauri::async_runtime::spawn(model_task(core.clone()));
     } else {

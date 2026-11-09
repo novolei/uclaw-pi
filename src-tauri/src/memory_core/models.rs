@@ -88,12 +88,29 @@ fn validate_download(
     Ok(())
 }
 
+/// Progress of the file currently downloading.
+#[derive(Clone, Debug)]
+pub struct ProgressTick {
+    pub file: String,
+    pub source_host: String,
+    pub downloaded: u64,
+    pub total_for_file: u64,
+}
+
+pub type OnProgress<'a> = &'a (dyn Fn(ProgressTick) + Send + Sync);
+
+fn host_of(url: &str) -> String {
+    url.split("://").nth(1).and_then(|r| r.split('/').next()).unwrap_or(url).to_string()
+}
+
 /// Download one URL to `part`, returning bytes written (validated).
+/// `on_progress` fires on headers, at most every 250 ms, and at completion.
 async fn fetch_to(
     client: &reqwest::Client,
     url: &str,
     file_name: &str,
     part: &Path,
+    on_progress: OnProgress<'_>,
 ) -> anyhow::Result<u64> {
     use futures_util::StreamExt;
     use tokio::io::AsyncWriteExt;
@@ -109,6 +126,14 @@ async fn fetch_to(
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
     let expected_len = resp.content_length();
+    let tick = |downloaded: u64| ProgressTick {
+        file: file_name.to_string(),
+        source_host: host_of(url),
+        downloaded,
+        total_for_file: expected_len.unwrap_or(0),
+    };
+    on_progress(tick(0));
+    let mut last_tick = std::time::Instant::now();
     let mut file = tokio::fs::File::create(part).await?;
     let mut stream = resp.bytes_stream();
     let mut total = 0u64;
@@ -126,6 +151,10 @@ async fn fetch_to(
                 }
                 total += chunk.len() as u64;
                 file.write_all(&chunk).await?;
+                if last_tick.elapsed() >= std::time::Duration::from_millis(250) {
+                    last_tick = std::time::Instant::now();
+                    on_progress(tick(total));
+                }
             }
             None => break,
         }
@@ -133,6 +162,7 @@ async fn fetch_to(
     file.flush().await?;
     file.sync_all().await?;
     validate_download(file_name, content_type.as_deref(), expected_len, total, first_byte)?;
+    on_progress(tick(total));
     Ok(total)
 }
 
@@ -160,6 +190,7 @@ pub async fn ensure_model(
     client: &reqwest::Client,
     models_root: &Path,
     spec: &ModelSpec,
+    on_progress: OnProgress<'_>,
 ) -> anyhow::Result<PathBuf> {
     // Process-wide per-spec guard so concurrent callers don't clobber `.part`.
     let lock = spec_lock(spec.id);
@@ -177,7 +208,7 @@ pub async fn ensure_model(
         let mut last_err = anyhow::anyhow!("no sources");
         let mut done = false;
         for url in source_urls(spec, f.path) {
-            let res = fetch_to(client, &url, f.path, &part).await.and_then(|n| {
+            let res = fetch_to(client, &url, f.path, &part, on_progress).await.and_then(|n| {
                 if n >= f.min_bytes {
                     Ok(n)
                 } else {
@@ -284,7 +315,7 @@ mod tests {
             .connect_timeout(std::time::Duration::from_secs(15))
             .build()
             .unwrap();
-        let dir = ensure_model(&client, t.path(), &spec).await.unwrap();
+        let dir = ensure_model(&client, t.path(), &spec, &|_| {}).await.unwrap();
         assert!(is_ready(t.path(), &spec));
         assert!(dir.join("tokenizer.json").exists());
     }
@@ -302,7 +333,7 @@ mod tests {
             .build()
             .unwrap();
         for spec in [&BGE_M3_INT8, &BGE_RERANKER_V2_M3_INT8] {
-            ensure_model(&client, &root, spec).await.unwrap();
+            ensure_model(&client, &root, spec, &|_| {}).await.unwrap();
             assert!(is_ready(&root, spec), "{} not ready", spec.id);
         }
     }
