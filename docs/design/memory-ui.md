@@ -168,4 +168,3 @@ the same folder. Mock states: `ready`, `downloading`, `failed`, `off`, `offondis
 `empty`, `loading`, `loadfailed`. The keyword-chip shots for warm-paper / qingye predate
 the neutral hint copy (本轮按关键词检索；本地检索模型就绪后可按意思找回 · 打开记忆设置); the
 light/dark ones are current.
-
