@@ -52,11 +52,17 @@ pub enum Error {
 
     /// SQLite errors
     #[error("SQLite error: {0}")]
-    Sqlite(#[from] Box<sqlmodel_core::Error>),
+    Sqlite(#[from] Box<fsqlite::FrankenError>),
 
     /// User aborted operation
     #[error("Operation aborted")]
     Aborted,
+
+    /// A model request was refused before transmission by the session budget.
+    #[error(
+        "Cost cap reached: this session spent ${spent:.4} of its ${cap:.4} cap (--max-cost / session.maxCost); the next model request was not sent"
+    )]
+    CostCap { spent: f64, cap: f64 },
 
     /// API errors (generic)
     #[error("API error: {0}")]
@@ -163,6 +169,11 @@ pub struct AuthDiagnostic {
 }
 
 impl Error {
+    /// Stable flattened-message marker for terminal session-persistence
+    /// failures. Callers that retry, rotate credentials, or fail over MUST
+    /// treat any error carrying this prefix as final (bd-8188r).
+    pub const SESSION_PERSISTENCE_PREFIX: &'static str = "[SESSION_PERSISTENCE_FAILED] ";
+
     /// Create a configuration error.
     pub fn config(message: impl Into<String>) -> Self {
         Self::Config(message.into())
@@ -171,6 +182,28 @@ impl Error {
     /// Create a session error.
     pub fn session(message: impl Into<String>) -> Self {
         Self::Session(message.into())
+    }
+
+    /// Create a session persistence failure with a stable classification marker.
+    ///
+    /// RPC callers use this marker to surface the durability failure without
+    /// retrying a provider turn whose tools or other side effects may already
+    /// have completed.
+    pub fn session_persistence(message: impl Into<String>) -> Self {
+        Self::Session(format!(
+            "{}{}",
+            Self::SESSION_PERSISTENCE_PREFIX,
+            message.into()
+        ))
+    }
+
+    /// Whether this error represents a failed session persistence boundary.
+    #[must_use]
+    pub fn is_session_persistence(&self) -> bool {
+        matches!(
+            self,
+            Self::Session(message) if message.starts_with(Self::SESSION_PERSISTENCE_PREFIX)
+        )
     }
 
     /// Create a provider error.
@@ -209,6 +242,60 @@ impl Error {
         Self::Api(message.into())
     }
 
+    /// Build the user-facing error for an I/O failure that terminated a
+    /// streaming (SSE) response read.
+    ///
+    /// Retryability is decided here — at the source — from the *typed*
+    /// [`std::io::ErrorKind`], because this is the last place the kind is
+    /// available: the caller immediately flattens the returned error into a
+    /// message string (`AssistantMessage::error_message`) that the retry loop
+    /// consults. For a transient connection drop (reset/abort/EOF/broken
+    /// pipe/timeout) a canonical `transient connection drop` marker is appended
+    /// so the drop is re-driven regardless of the dependency's (rustls/hyper)
+    /// prose, which changes phrasing between versions (pi_agent_rust#118).
+    pub fn sse(err: &std::io::Error) -> Self {
+        let base = format!("SSE error: {err}");
+        if io_kind_is_transient(err.kind()) {
+            Self::Api(format!("{base} (transient connection drop)"))
+        } else {
+            Self::Api(base)
+        }
+    }
+
+    /// Whether this error is a transient transport failure that is safe to
+    /// retry, classified from the *typed* error rather than its flattened
+    /// message string.
+    ///
+    /// Walks the [`std::error::Error::source`] chain (and, for
+    /// [`std::io::Error`] links, the [`std::io::Error::get_ref`] chain, which
+    /// `source` deliberately skips) looking for an [`std::io::Error`] whose
+    /// [`std::io::ErrorKind`] denotes a connection drop. This catches typed
+    /// I/O failures (e.g. an `UnexpectedEof` mid-body that propagates as
+    /// [`Error::Io`]) without depending on any substring match. Message-only
+    /// transient cases (dependency prose with no typed cause) are handled by
+    /// [`is_retryable_error`] as a documented fallback.
+    #[must_use]
+    pub fn is_transient(&self) -> bool {
+        // Direct io::Error link (get_ref walk covers io-wrapping-io).
+        if let Self::Io(io_err) = self
+            && io_error_chain_is_transient(io_err)
+        {
+            return true;
+        }
+        // Generic source chain: any link that is (or wraps) a transient
+        // io::Error makes this retryable.
+        let mut source = std::error::Error::source(self);
+        while let Some(cause) = source {
+            if let Some(io_err) = cause.downcast_ref::<std::io::Error>()
+                && io_error_chain_is_transient(io_err)
+            {
+                return true;
+            }
+            source = cause.source();
+        }
+        false
+    }
+
     /// Map this error to a hostcall taxonomy code.
     ///
     /// The hostcall ABI requires every error to be one of:
@@ -217,7 +304,7 @@ impl Error {
         match self {
             Self::Validation(_) => "invalid_request",
             Self::Io(_) | Self::Session(_) | Self::SessionNotFound { .. } | Self::Sqlite(_) => "io",
-            Self::Auth(_) => "denied",
+            Self::Auth(_) | Self::CostCap { .. } => "denied",
             Self::Aborted => "timeout",
             Self::Json(_)
             | Self::Extension(_)
@@ -243,6 +330,7 @@ impl Error {
             Self::Json(_) => "json",
             Self::Sqlite(_) => "sqlite",
             Self::Aborted => "runtime",
+            Self::CostCap { .. } => "cost_cap",
             Self::Api(_) => "api",
         }
     }
@@ -310,6 +398,14 @@ impl Error {
                     "details",
                     "Operation cancelled by user or runtime.".to_string(),
                 )],
+            ),
+            Self::CostCap { spent, cap } => build_hints(
+                "Session model-spend cap reached; the next request was not sent.",
+                vec![
+                    "Raise --max-cost / session.maxCost explicitly to continue this session."
+                        .to_string(),
+                ],
+                vec![("spent", spent.to_string()), ("cap", cap.to_string())],
             ),
             Self::Api(message) => build_hints(
                 "API request failed.",
@@ -419,6 +515,8 @@ fn classify_auth_diagnostic(provider: Option<&str>, message: &str) -> Option<Aut
             "api key is required",
             "you didn't provide an api key",
             "no api key provided",
+            // pi's own startup wording (`StartupError::MissingApiKey`, gh #217).
+            "no api key found",
             "missing bearer",
             "authorization header missing",
         ],
@@ -859,10 +957,17 @@ fn io_hints(err: &std::io::Error) -> ErrorHints {
     }
 }
 
-fn sqlite_hints(err: &sqlmodel_core::Error) -> ErrorHints {
+fn sqlite_hints(err: &fsqlite::FrankenError) -> ErrorHints {
     let details = err.to_string();
-    let lower = details.to_lowercase();
-    if contains_any(&lower, &["database is locked", "busy"]) {
+    if matches!(
+        err,
+        fsqlite::FrankenError::DatabaseLocked { .. }
+            | fsqlite::FrankenError::Busy
+            | fsqlite::FrankenError::BusyRecovery
+            | fsqlite::FrankenError::BusySnapshot { .. }
+            | fsqlite::FrankenError::LockFailed { .. }
+            | fsqlite::FrankenError::MultiProcessContractViolation { .. }
+    ) {
         return build_hints(
             "SQLite database is locked.",
             vec![
@@ -909,8 +1014,8 @@ impl From<serde_json::Error> for Error {
     }
 }
 
-impl From<sqlmodel_core::Error> for Error {
-    fn from(value: sqlmodel_core::Error) -> Self {
+impl From<fsqlite::FrankenError> for Error {
+    fn from(value: fsqlite::FrankenError) -> Self {
         Self::Sqlite(Box::new(value))
     }
 }
@@ -951,10 +1056,10 @@ pub fn is_context_overflow(
     context_window: Option<u32>,
 ) -> bool {
     // Silent overflow: usage exceeds context window.
-    if let (Some(input_tokens), Some(window)) = (usage_input_tokens, context_window) {
-        if input_tokens > u64::from(window) {
-            return true;
-        }
+    if let (Some(input_tokens), Some(window)) = (usage_input_tokens, context_window)
+        && input_tokens > u64::from(window)
+    {
+        return true;
     }
 
     let lower = error_message.to_lowercase();
@@ -986,12 +1091,56 @@ pub fn is_context_overflow(
 
 // ─── Retryable error classification ─────────────────────────────────────
 
-/// Check whether an error is retryable (transient). Matches pi-mono's
-/// `_isRetryableError()` logic:
+/// Whether an [`std::io::ErrorKind`] denotes a *transient* transport failure.
+///
+/// A transient failure is a connection that dropped mid-request and is worth
+/// retrying with a fresh connection, as opposed to a terminal error (refused,
+/// DNS, cert, ...). These are the kinds a dropped/half-open TLS or TCP
+/// connection surfaces: the peer reset/aborted the socket, the pipe broke, the
+/// read hit an unexpected EOF (rustls also reports a `close_notify`-less close
+/// as `UnexpectedEof`), the socket was reported not-connected, or the
+/// operation timed out.
+#[must_use]
+pub const fn io_kind_is_transient(kind: std::io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::UnexpectedEof
+            | std::io::ErrorKind::NotConnected
+            | std::io::ErrorKind::TimedOut
+    )
+}
+
+/// Walk an [`std::io::Error`] and its inner `get_ref` chain (which
+/// `Error::source` intentionally skips for io-wrapping-io) checking for a
+/// transient [`std::io::ErrorKind`].
+fn io_error_chain_is_transient(err: &std::io::Error) -> bool {
+    let mut current = Some(err);
+    while let Some(io_err) = current {
+        if io_kind_is_transient(io_err.kind()) {
+            return true;
+        }
+        current = io_err
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<std::io::Error>());
+    }
+    false
+}
+
+/// Check whether an error is retryable (transient) from its flattened message
+/// string.
+///
+/// This is the **fallback** classifier for errors that only exist as
+/// prose (dependency messages with no typed cause); typed errors should be
+/// classified with [`Error::is_transient`] first — see pi_agent_rust#118.
+/// Matches pi-mono's `_isRetryableError()` logic:
 ///
 /// 1. Error message must be non-empty.
 /// 2. Must NOT be context overflow (those need compaction, not retry).
-/// 3. Must match a retryable pattern (rate limit, server error, etc.).
+/// 3. Must match a retryable pattern (rate limit, server error, transient
+///    connection drop, etc.).
 pub fn is_retryable_error(
     error_message: &str,
     usage_input_tokens: Option<u64>,
@@ -1010,12 +1159,261 @@ pub fn is_retryable_error(
 
     let re = RETRYABLE_RE.get_or_init(|| {
         regex::Regex::new(
-            r"overloaded|rate.?limit|too many requests|429|500|502|503|504|service.?unavailable|server error|internal error|connection.?error|connection.?refused|other side closed|fetch failed|upstream.?connect|reset before headers|terminated|retry delay",
+            r"overloaded|rate.?limit|too many requests|429|500|502|503|504|service.?unavailable|server error|internal error|connection.?error|connection.?refused|connection.?reset|connection.?aborted|connection.?closed|connection.?dropped|other side closed|closed before headers|closed before message|close_notify|broken pipe|unexpected eof|unexpected end of file|transient connection|fetch failed|upstream.?connect|reset before headers|terminated|retry delay",
         )
         .expect("retryable regex")
     });
 
     re.is_match(&lower)
+}
+
+static HTTP_STATUS_RE: OnceLock<regex::Regex> = OnceLock::new();
+
+/// Coarse category of a provider request failure (#209).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderErrorKind {
+    /// 503/529, "overloaded", "service unavailable".
+    Overloaded,
+    /// 429, "rate limit", "too many requests".
+    RateLimited,
+    /// Any other 5xx or "server error"/"internal error".
+    ServerError,
+    /// 401/403 or credential wording.
+    Authentication,
+    /// Prompt exceeds the context window; needs compaction, not a retry.
+    ContextOverflow,
+    /// 408/504 or timeout wording.
+    Timeout,
+    /// Connection-level failures (refused/reset/EOF/DNS/TLS).
+    Network,
+    /// The turn was cancelled locally.
+    Aborted,
+    /// Anything unclassified.
+    Other,
+}
+
+impl ProviderErrorKind {
+    /// Short human label used in turn-end error cards.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Overloaded => "service unavailable / overloaded",
+            Self::RateLimited => "rate limited",
+            Self::ServerError => "server error",
+            Self::Authentication => "authentication failed",
+            Self::ContextOverflow => "context window exceeded",
+            Self::Timeout => "timed out",
+            Self::Network => "connection failed",
+            Self::Aborted => "aborted",
+            Self::Other => "request failed",
+        }
+    }
+}
+
+/// Why a provider request ended the turn (#209).
+///
+/// Distilled from the flattened error text so every surface (interactive
+/// cards, JSON/RPC consumers) reports the same provider / HTTP status /
+/// retryability facts instead of a raw payload dump.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderErrorSummary {
+    /// Provider display name, when known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    /// HTTP status code parsed from the error text, when present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub http_status: Option<u16>,
+    /// Coarse failure category.
+    pub kind: ProviderErrorKind,
+    /// Whether the same request is worth re-issuing unchanged.
+    pub retryable: bool,
+}
+
+/// Longest tail of the raw provider message reproduced on a turn-end card.
+/// Provider bodies can be multi-kilobyte JSON; the card needs the headline,
+/// not the payload.
+const PROVIDER_ERROR_DETAIL_MAX_CHARS: usize = 600;
+
+impl ProviderErrorSummary {
+    /// Classify a flattened provider error message.
+    ///
+    /// `provider` is the provider the request went to; when it is `None` the
+    /// `Provider error: <name>: ...` prefix produced by [`Error::Provider`] is
+    /// used instead, if present.
+    #[must_use]
+    pub fn from_error_text(provider: Option<&str>, message: &str) -> Self {
+        let provider = provider
+            .map(str::to_string)
+            .filter(|name| !name.is_empty())
+            .or_else(|| provider_from_prefixed_message(message).map(str::to_string));
+        let http_status = parse_http_status(message);
+        let lower = message.to_ascii_lowercase();
+        let kind = classify_provider_error(http_status, &lower, message);
+        let retryable = match kind {
+            ProviderErrorKind::Authentication
+            | ProviderErrorKind::ContextOverflow
+            | ProviderErrorKind::Aborted => false,
+            ProviderErrorKind::Overloaded
+            | ProviderErrorKind::RateLimited
+            | ProviderErrorKind::ServerError
+            | ProviderErrorKind::Timeout
+            | ProviderErrorKind::Network => true,
+            ProviderErrorKind::Other => is_retryable_error(message, None, None),
+        };
+        Self {
+            provider,
+            http_status,
+            kind,
+            retryable,
+        }
+    }
+
+    /// One-line headline: `DeepSeek: HTTP 503 (service unavailable / overloaded)`.
+    #[must_use]
+    pub fn headline(&self) -> String {
+        let provider = self.provider.as_deref().unwrap_or("Provider");
+        let label = self.kind.label();
+        self.http_status.map_or_else(
+            || format!("Provider error: {provider}: {label}"),
+            |status| format!("Provider error: {provider}: HTTP {status} ({label})"),
+        )
+    }
+
+    /// One-line retry status. `attempts` is `(made, budget)` when a caller ran
+    /// an auto-retry loop; `None` when the turn was not auto-retried.
+    #[must_use]
+    pub fn retry_note(&self, attempts: Option<(u32, u32)>) -> String {
+        match (attempts, self.retryable) {
+            (Some((made, budget)), _) if made > 0 => {
+                format!("auto-retried {made}/{budget} before giving up")
+            }
+            (_, true) => String::from(
+                "transient; not auto-retried this turn — resend the prompt once the provider recovers",
+            ),
+            (_, false) => match self.kind {
+                ProviderErrorKind::ContextOverflow => {
+                    String::from("not retryable — compact the context (/compact) and resend")
+                }
+                ProviderErrorKind::Authentication => {
+                    String::from("not retryable — check the provider credentials and resend")
+                }
+                _ => String::from("not retryable as-is"),
+            },
+        }
+    }
+
+    /// Full turn-end card: headline, retry status, and a bounded copy of the
+    /// raw provider message. `raw` may carry the `Provider error: <name>:`
+    /// prefix; it is stripped so the card does not repeat the headline.
+    #[must_use]
+    pub fn turn_end_card(&self, raw: &str, attempts: Option<(u32, u32)>) -> String {
+        let mut card = self.headline();
+        card.push('\n');
+        card.push_str("The turn ended without a reply: ");
+        card.push_str(&self.retry_note(attempts));
+        card.push('.');
+        let detail = strip_provider_prefix(raw).trim();
+        if !detail.is_empty() {
+            card.push('\n');
+            card.push_str("Detail: ");
+            let mut chars = detail.chars();
+            let bounded: String = chars
+                .by_ref()
+                .take(PROVIDER_ERROR_DETAIL_MAX_CHARS)
+                .collect();
+            card.push_str(&bounded);
+            if chars.next().is_some() {
+                card.push('…');
+            }
+        }
+        card
+    }
+}
+
+/// Provider name from a `Provider error: <name>: <message>` string.
+fn provider_from_prefixed_message(message: &str) -> Option<&str> {
+    let rest = message.strip_prefix("Provider error: ")?;
+    let (name, _) = rest.split_once(": ")?;
+    (!name.is_empty()).then_some(name)
+}
+
+/// Drop the `Provider error: <name>: ` prefix (when present) from `message`.
+fn strip_provider_prefix(message: &str) -> &str {
+    message
+        .strip_prefix("Provider error: ")
+        .and_then(|rest| rest.split_once(": ").map(|(_, tail)| tail))
+        .unwrap_or(message)
+}
+
+/// First `HTTP <code>` / `status <code>` marker in the message. Providers
+/// format transport failures as `<Name> API error (HTTP <status>): <body>`,
+/// so the first marker is the response status rather than a number quoted
+/// inside the body.
+fn parse_http_status(message: &str) -> Option<u16> {
+    let re = HTTP_STATUS_RE.get_or_init(|| {
+        regex::Regex::new(r"(?i)\b(?:http|status(?:\s+code)?)\s*[:=]?\s*([1-5]\d{2})\b")
+            .expect("http status regex")
+    });
+    re.captures(message)
+        .and_then(|caps| caps.get(1))
+        .and_then(|code| code.as_str().parse::<u16>().ok())
+}
+
+fn classify_provider_error(
+    http_status: Option<u16>,
+    lower: &str,
+    original: &str,
+) -> ProviderErrorKind {
+    if original == "Aborted" || lower.starts_with("operation aborted") {
+        return ProviderErrorKind::Aborted;
+    }
+    if is_context_overflow(original, None, None) {
+        return ProviderErrorKind::ContextOverflow;
+    }
+    if let Some(status) = http_status {
+        let by_status = match status {
+            401 | 403 => Some(ProviderErrorKind::Authentication),
+            408 | 504 => Some(ProviderErrorKind::Timeout),
+            429 => Some(ProviderErrorKind::RateLimited),
+            503 | 529 => Some(ProviderErrorKind::Overloaded),
+            500..=599 => Some(ProviderErrorKind::ServerError),
+            _ => None,
+        };
+        if let Some(kind) = by_status {
+            return kind;
+        }
+    }
+    if lower.contains("overloaded") || lower.contains("service unavailable") {
+        ProviderErrorKind::Overloaded
+    } else if lower.contains("rate limit")
+        || lower.contains("rate_limit")
+        || lower.contains("too many requests")
+    {
+        ProviderErrorKind::RateLimited
+    } else if lower.contains("unauthorized")
+        || lower.contains("invalid api key")
+        || lower.contains("authentication")
+        || lower.contains("forbidden")
+        || lower.contains("permission denied")
+    {
+        ProviderErrorKind::Authentication
+    } else if lower.contains("timed out") || lower.contains("timeout") {
+        ProviderErrorKind::Timeout
+    } else if lower.contains("server error") || lower.contains("internal error") {
+        ProviderErrorKind::ServerError
+    } else if lower.contains("connection")
+        || lower.contains("network")
+        || lower.contains("dns")
+        || lower.contains("tls")
+        || lower.contains("broken pipe")
+        || lower.contains("unexpected eof")
+        || lower.contains("other side closed")
+    {
+        ProviderErrorKind::Network
+    } else {
+        ProviderErrorKind::Other
+    }
 }
 
 #[cfg(test)]
@@ -1042,6 +1440,16 @@ mod tests {
     fn error_session_constructor() {
         let err = Error::session("session corrupted");
         assert!(matches!(err, Error::Session(ref msg) if msg == "session corrupted"));
+        assert!(!err.is_session_persistence());
+    }
+
+    #[test]
+    fn error_session_persistence_has_stable_non_transport_classification() {
+        let err = Error::session_persistence("connection reset while saving");
+        assert!(err.is_session_persistence());
+        assert!(!err.is_transient());
+        assert_eq!(err.category_code(), "session");
+        assert_eq!(err.hostcall_error_code(), "io");
     }
 
     #[test]
@@ -2480,6 +2888,121 @@ mod tests {
         assert!(is_retryable_error("Service Unavailable", None, None));
     }
 
+    // ─── pi_agent_rust#118: typed transient classification ──────────────
+
+    #[test]
+    fn transient_io_kinds_classified_from_type() {
+        for kind in [
+            std::io::ErrorKind::ConnectionReset,
+            std::io::ErrorKind::ConnectionAborted,
+            std::io::ErrorKind::BrokenPipe,
+            std::io::ErrorKind::UnexpectedEof,
+            std::io::ErrorKind::NotConnected,
+            std::io::ErrorKind::TimedOut,
+        ] {
+            assert!(io_kind_is_transient(kind), "{kind:?} should be transient");
+        }
+        for kind in [
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::NotFound,
+            std::io::ErrorKind::InvalidData,
+            std::io::ErrorKind::AlreadyExists,
+        ] {
+            assert!(
+                !io_kind_is_transient(kind),
+                "{kind:?} should NOT be transient"
+            );
+        }
+    }
+
+    #[test]
+    fn typed_io_error_is_transient_without_string_match() {
+        // Classified purely from the io::ErrorKind — the message contains no
+        // retryable keyword, so a substring matcher would miss it.
+        let reset = Error::Io(Box::new(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "opaque cause with no keywords",
+        )));
+        assert!(reset.is_transient());
+        assert!(!is_retryable_error(&reset.to_string(), None, None));
+
+        // Non-transient io kind is not retried.
+        let denied = Error::Io(Box::new(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "denied",
+        )));
+        assert!(!denied.is_transient());
+
+        // Non-io variants have no transient io cause.
+        assert!(!Error::auth("invalid key").is_transient());
+        assert!(!Error::api("400 bad request").is_transient());
+    }
+
+    #[test]
+    fn is_transient_walks_wrapped_io_error() {
+        // io::Error wrapping another io::Error (reachable only via get_ref,
+        // which Error::source deliberately skips).
+        let inner = std::io::Error::new(std::io::ErrorKind::BrokenPipe, "broken");
+        let outer = Error::Io(Box::new(std::io::Error::other(inner)));
+        assert!(outer.is_transient());
+    }
+
+    /// End-to-end: a mid-stream transient connection drop travels the REAL path
+    /// a provider takes. A typed `io::Error` is wrapped by `Error::sse` at the
+    /// source (the last place the kind is known), then flattened to a message
+    /// string exactly as `agent.rs` does via `AssistantMessage::error_message`,
+    /// and must be classified retryable by the string classifier the retry loop
+    /// consults for `StopReason::Error` turns.
+    #[test]
+    fn sse_transient_drop_retryable_end_to_end() {
+        // rustls reports a close_notify-less close as UnexpectedEof.
+        let io_err = std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "tls connection closed without close_notify",
+        );
+        let flattened = Error::sse(&io_err).to_string();
+        assert!(
+            is_retryable_error(&flattened, None, None),
+            "flattened transient SSE error should be retryable: {flattened}"
+        );
+
+        // A non-transient SSE failure (malformed body) is NOT retried.
+        let fatal = Error::sse(&std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid utf-8 in event",
+        ));
+        assert!(!is_retryable_error(&fatal.to_string(), None, None));
+    }
+
+    /// The two exact strings reported in pi_agent_rust#118 are now retryable,
+    /// both with the source-stamped canonical marker and as raw prose (the
+    /// documented text fallback for dependency messages).
+    #[test]
+    fn issue_118_reported_strings_retryable() {
+        assert!(is_retryable_error(
+            "API error: HTTP connection closed before headers (transient connection drop)",
+            None,
+            None,
+        ));
+        assert!(is_retryable_error(
+            "API error: SSE error: tls connection closed without close_notify \
+             (transient connection drop)",
+            None,
+            None,
+        ));
+        // Raw dependency phrasings, no marker (prose-only fallback path).
+        assert!(is_retryable_error(
+            "HTTP connection closed before headers",
+            None,
+            None,
+        ));
+        assert!(is_retryable_error(
+            "tls connection closed without close_notify",
+            None,
+            None,
+        ));
+    }
+
     mod proptest_error {
         use super::*;
         use proptest::prelude::*;
@@ -2655,6 +3178,139 @@ mod tests {
                 assert_eq!(Error::extension(&msg).category_code(), "extension");
                 assert_eq!(Error::api(&msg).category_code(), "api");
             }
+        }
+    }
+
+    // ─── Provider error summary (#209) ───────────────────────────────
+
+    mod provider_error_summary {
+        use super::*;
+
+        const DEEPSEEK_503: &str = "Provider error: DeepSeek: OpenAI API error (HTTP 503): \
+{\"error\":{\"code\":\"service_unavailable_error\",\"message\":\"Server Overloaded\"}}";
+
+        #[test]
+        fn http_503_is_overloaded_and_retryable() {
+            let summary = ProviderErrorSummary::from_error_text(None, DEEPSEEK_503);
+            assert_eq!(summary.provider.as_deref(), Some("DeepSeek"));
+            assert_eq!(summary.http_status, Some(503));
+            assert_eq!(summary.kind, ProviderErrorKind::Overloaded);
+            assert!(summary.retryable);
+            assert_eq!(
+                summary.headline(),
+                "Provider error: DeepSeek: HTTP 503 (service unavailable / overloaded)"
+            );
+        }
+
+        #[test]
+        fn explicit_provider_wins_over_prefix() {
+            let summary = ProviderErrorSummary::from_error_text(Some("openai"), DEEPSEEK_503);
+            assert_eq!(summary.provider.as_deref(), Some("openai"));
+        }
+
+        #[test]
+        fn status_in_body_does_not_shadow_transport_status() {
+            let text = "Anthropic API error (HTTP 429): {\"detail\":\"see HTTP 200 docs\"}";
+            let summary = ProviderErrorSummary::from_error_text(Some("anthropic"), text);
+            assert_eq!(summary.http_status, Some(429));
+            assert_eq!(summary.kind, ProviderErrorKind::RateLimited);
+            assert!(summary.retryable);
+        }
+
+        #[test]
+        fn auth_failures_are_not_retryable() {
+            let summary = ProviderErrorSummary::from_error_text(
+                Some("openai"),
+                "OpenAI API error (HTTP 401): invalid api key",
+            );
+            assert_eq!(summary.kind, ProviderErrorKind::Authentication);
+            assert!(!summary.retryable);
+            assert!(summary.retry_note(None).contains("credentials"));
+        }
+
+        #[test]
+        fn context_overflow_is_not_retryable_even_with_5xx_wording() {
+            let summary = ProviderErrorSummary::from_error_text(
+                Some("anthropic"),
+                "HTTP 400: prompt is too long: 250000 tokens > 200000 maximum",
+            );
+            assert_eq!(summary.kind, ProviderErrorKind::ContextOverflow);
+            assert!(!summary.retryable);
+            assert!(summary.retry_note(None).contains("/compact"));
+        }
+
+        #[test]
+        fn connection_drop_without_status_is_network() {
+            let summary =
+                ProviderErrorSummary::from_error_text(Some("gemini"), "connection reset by peer");
+            assert_eq!(summary.http_status, None);
+            assert_eq!(summary.kind, ProviderErrorKind::Network);
+            assert!(summary.retryable);
+            assert_eq!(
+                summary.headline(),
+                "Provider error: gemini: connection failed"
+            );
+        }
+
+        #[test]
+        fn unknown_text_falls_back_to_other() {
+            let summary = ProviderErrorSummary::from_error_text(None, "something odd happened");
+            assert_eq!(summary.provider, None);
+            assert_eq!(summary.kind, ProviderErrorKind::Other);
+            assert!(!summary.retryable);
+            assert_eq!(
+                summary.headline(),
+                "Provider error: Provider: request failed"
+            );
+        }
+
+        #[test]
+        fn retry_note_reports_exhausted_budget() {
+            let summary = ProviderErrorSummary::from_error_text(None, DEEPSEEK_503);
+            assert_eq!(
+                summary.retry_note(Some((3, 3))),
+                "auto-retried 3/3 before giving up"
+            );
+            assert!(
+                summary
+                    .retry_note(Some((0, 3)))
+                    .contains("not auto-retried")
+            );
+        }
+
+        #[test]
+        fn card_strips_prefix_and_bounds_detail() {
+            let summary = ProviderErrorSummary::from_error_text(None, DEEPSEEK_503);
+            let card = summary.turn_end_card(DEEPSEEK_503, None);
+            let mut lines = card.lines();
+            assert_eq!(
+                lines.next(),
+                Some("Provider error: DeepSeek: HTTP 503 (service unavailable / overloaded)")
+            );
+            assert!(
+                lines
+                    .next()
+                    .is_some_and(|l| l.starts_with("The turn ended without a reply: "))
+            );
+            let detail = lines.next().expect("detail line");
+            assert!(detail.starts_with("Detail: OpenAI API error (HTTP 503)"));
+            assert!(!detail.contains("Provider error: DeepSeek"));
+
+            let long = format!("OpenAI API error (HTTP 503): {}", "x".repeat(2000));
+            let card = summary.turn_end_card(&long, None);
+            let detail = card.lines().last().expect("detail line");
+            assert!(detail.ends_with('…'));
+            assert!(detail.chars().count() < 700);
+        }
+
+        #[test]
+        fn summary_serializes_camel_case() {
+            let summary = ProviderErrorSummary::from_error_text(None, DEEPSEEK_503);
+            let value = serde_json::to_value(&summary).expect("serialize");
+            assert_eq!(value["provider"], "DeepSeek");
+            assert_eq!(value["httpStatus"], 503);
+            assert_eq!(value["kind"], "overloaded");
+            assert_eq!(value["retryable"], true);
         }
     }
 }

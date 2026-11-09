@@ -1,6 +1,4 @@
-use crate::model::{
-    ContentBlock, ImageContent, Message as ModelMessage, TextContent, Usage, UserContent,
-};
+use crate::model::{ContentBlock, Message as ModelMessage, Usage, UserContent};
 use crate::models::ModelEntry;
 use crate::session::{Session, SessionEntry, SessionMessage, bash_execution_to_text};
 use serde_json::{Value, json};
@@ -42,10 +40,17 @@ pub(super) fn content_blocks_to_text(blocks: &[ContentBlock]) -> String {
         match block {
             ContentBlock::Text(text_block) => push_line(&mut output, &text_block.text),
             ContentBlock::Image(image) => {
-                let rendered =
-                    crate::terminal_images::render_inline(&image.data, &image.mime_type, 72);
-                push_line(&mut output, &rendered);
+                // Conversation content is wrapped and sanitized as ordinary
+                // text later. Keep terminal control sequences out of that path;
+                // structured image blocks remain available to model input.
+                push_line(
+                    &mut output,
+                    &crate::terminal_images::placeholder(&image.mime_type, None, None),
+                );
             }
+            // Media blocks are never rendered inline; the sanitized
+            // placeholder is the whole terminal surface (gh #212).
+            ContentBlock::Media(media) => push_line(&mut output, &media.placeholder()),
             ContentBlock::Thinking(thinking_block) => {
                 push_line(&mut output, &thinking_block.thinking);
             }
@@ -59,35 +64,6 @@ pub(super) fn content_blocks_to_text(blocks: &[ContentBlock]) -> String {
     output
 }
 
-pub(super) fn split_content_blocks_for_input(
-    blocks: &[ContentBlock],
-) -> (String, Vec<ImageContent>) {
-    let mut text = String::new();
-    let mut images = Vec::new();
-    for block in blocks {
-        match block {
-            ContentBlock::Text(text_block) => push_line(&mut text, &text_block.text),
-            ContentBlock::Image(image) => images.push(image.clone()),
-            _ => {}
-        }
-    }
-    (text, images)
-}
-
-pub(super) fn build_content_blocks_for_input(
-    text: &str,
-    images: &[ImageContent],
-) -> Vec<ContentBlock> {
-    let mut content = Vec::new();
-    if !text.trim().is_empty() {
-        content.push(ContentBlock::Text(TextContent::new(text.to_string())));
-    }
-    for image in images {
-        content.push(ContentBlock::Image(image.clone()));
-    }
-    content
-}
-
 pub(super) fn tool_content_blocks_to_text(blocks: &[ContentBlock], show_images: bool) -> String {
     let mut output = String::new();
     let mut hidden_images = 0usize;
@@ -97,13 +73,15 @@ pub(super) fn tool_content_blocks_to_text(blocks: &[ContentBlock], show_images: 
             ContentBlock::Text(text_block) => push_line(&mut output, &text_block.text),
             ContentBlock::Image(image) => {
                 if show_images {
-                    let rendered =
-                        crate::terminal_images::render_inline(&image.data, &image.mime_type, 72);
-                    push_line(&mut output, &rendered);
+                    push_line(
+                        &mut output,
+                        &crate::terminal_images::placeholder(&image.mime_type, None, None),
+                    );
                 } else {
                     hidden_images = hidden_images.saturating_add(1);
                 }
             }
+            ContentBlock::Media(media) => push_line(&mut output, &media.placeholder()),
             ContentBlock::Thinking(thinking_block) => {
                 push_line(&mut output, &thinking_block.thinking);
             }
@@ -154,6 +132,22 @@ pub fn conversation_from_session(session: &Session) -> (Vec<ConversationMessage>
                 is_error,
                 ..
             } => {
+                // Only a committed, successful write can become user-facing
+                // prose. Requested arguments and provisional tool updates do
+                // not establish that an interim reply was accepted.
+                if tool_name == "write"
+                    && !is_error
+                    && let Some(text) = details
+                        .as_ref()
+                        .and_then(crate::tools::interim_response_text_from_details)
+                {
+                    messages.push(ConversationMessage::new(
+                        MessageRole::Assistant,
+                        super::tool_render::sanitize_terminal_text(text).into_owned(),
+                        None,
+                    ));
+                    continue;
+                }
                 let (mut text, _) = assistant_content_to_text(content);
                 if let Some(diff) = details
                     .as_ref()
@@ -261,6 +255,60 @@ mod tests {
     };
     use std::collections::HashMap;
 
+    #[test]
+    fn accepted_interim_replies_replay_in_order_and_failures_stay_tools() {
+        let mut session = Session::in_memory();
+        session.append_message(SessionMessage::Assistant {
+            message: AssistantMessage {
+                content: vec![ContentBlock::Text(TextContent::new("Before the tool."))],
+                ..Default::default()
+            },
+        });
+        for (id, tool_name, is_error, text) in [
+            (
+                "first",
+                "write",
+                false,
+                "\u{1b}[31m## First update\u{1b}[0m",
+            ),
+            ("denied", "write", true, "must not become a reply"),
+            ("other", "read", false, "must remain a tool result"),
+            ("second", "write", false, "## Second update"),
+        ] {
+            let result = SessionMessage::ToolResult {
+                tool_call_id: id.to_string(),
+                tool_name: tool_name.to_string(),
+                content: vec![ContentBlock::Text(TextContent::new("Tool acknowledgment"))],
+                details: Some(json!({"schema": "pi.interim_response.v1", "text": text})),
+                is_error,
+                timestamp: Some(1),
+            };
+            // Exercise the persisted representation used by a resumed session.
+            let restored = serde_json::from_str(&serde_json::to_string(&result).unwrap()).unwrap();
+            session.append_message(restored);
+        }
+        let (messages, _) = conversation_from_session(&session);
+        let replies: Vec<_> = messages
+            .iter()
+            .filter(|message| message.role == MessageRole::Assistant)
+            .map(|message| message.content.as_str())
+            .collect();
+        assert_eq!(
+            replies,
+            ["Before the tool.", "## First update", "## Second update"]
+        );
+        assert_eq!(messages[2].role, MessageRole::Tool);
+        assert!(messages[2].content.contains("Tool error (write)"));
+        assert_eq!(messages[3].role, MessageRole::Tool);
+        let (reloaded, _) = conversation_from_session(&session);
+        assert_eq!(reloaded.len(), messages.len());
+        assert!(
+            reloaded
+                .iter()
+                .all(|message| !message.content.contains("must not"))
+        );
+    }
+
     // ── user_content_to_text ────────────────────────────────────────────
 
     #[test]
@@ -278,6 +326,17 @@ mod tests {
         let result = user_content_to_text(&content);
         assert!(result.contains("first"));
         assert!(result.contains("second"));
+    }
+
+    #[test]
+    fn user_content_image_is_a_control_free_placeholder() {
+        let content = UserContent::Blocks(vec![ContentBlock::Image(ImageContent {
+            data: "ignored-invalid-base64".to_string(),
+            mime_type: "image/png\x1b[2J\u{202e}evil".to_string(),
+        })]);
+        let result = user_content_to_text(&content);
+        assert_eq!(result, "[image: image/png]");
+        assert!(!result.chars().any(char::is_control));
     }
 
     // ── assistant_content_to_text ───────────────────────────────────────
@@ -332,69 +391,6 @@ mod tests {
         assert_eq!(text, "done");
     }
 
-    // ── split_content_blocks_for_input ──────────────────────────────────
-
-    #[test]
-    fn split_content_separates_text_and_images() {
-        let blocks = vec![
-            ContentBlock::Text(TextContent::new("prompt".to_string())),
-            ContentBlock::Image(ImageContent {
-                data: "base64data".to_string(),
-                mime_type: "image/png".to_string(),
-            }),
-        ];
-        let (text, images) = split_content_blocks_for_input(&blocks);
-        assert!(text.contains("prompt"));
-        assert_eq!(images.len(), 1);
-        assert_eq!(images[0].mime_type, "image/png");
-    }
-
-    #[test]
-    fn split_content_ignores_thinking_and_tool_calls() {
-        let blocks = vec![
-            ContentBlock::Thinking(ThinkingContent {
-                thinking: "ignored".to_string(),
-                thinking_signature: None,
-            }),
-            ContentBlock::ToolCall(ToolCall {
-                id: "tc_1".to_string(),
-                name: "bash".to_string(),
-                arguments: serde_json::json!({}),
-                thought_signature: None,
-            }),
-        ];
-        let (text, images) = split_content_blocks_for_input(&blocks);
-        assert!(text.is_empty());
-        assert!(images.is_empty());
-    }
-
-    // ── build_content_blocks_for_input ──────────────────────────────────
-
-    #[test]
-    fn build_content_text_only() {
-        let blocks = build_content_blocks_for_input("hello", &[]);
-        assert_eq!(blocks.len(), 1);
-        assert!(matches!(&blocks[0], ContentBlock::Text(t) if t.text == "hello"));
-    }
-
-    #[test]
-    fn build_content_empty_text_omitted() {
-        let blocks = build_content_blocks_for_input("  ", &[]);
-        assert!(blocks.is_empty());
-    }
-
-    #[test]
-    fn build_content_text_and_images() {
-        let images = vec![ImageContent {
-            data: "abc".to_string(),
-            mime_type: "image/jpeg".to_string(),
-        }];
-        let blocks = build_content_blocks_for_input("prompt", &images);
-        assert_eq!(blocks.len(), 2);
-        assert!(matches!(&blocks[0], ContentBlock::Text(_)));
-        assert!(matches!(&blocks[1], ContentBlock::Image(_)));
-    }
-
     // ── tool_content_blocks_to_text ─────────────────────────────────────
 
     #[test]
@@ -418,6 +414,17 @@ mod tests {
         ];
         let result = tool_content_blocks_to_text(&blocks, false);
         assert!(result.contains("[2 image(s) hidden]"));
+    }
+
+    #[test]
+    fn tool_content_shown_image_is_a_control_free_placeholder() {
+        let blocks = vec![ContentBlock::Image(ImageContent {
+            data: "ignored-invalid-base64".to_string(),
+            mime_type: "image/jpeg\x07\x1b[2J".to_string(),
+        })];
+        let result = tool_content_blocks_to_text(&blocks, true);
+        assert_eq!(result, "[image: image/jpeg]");
+        assert!(!result.chars().any(char::is_control));
     }
 
     #[test]
@@ -482,6 +489,7 @@ mod tests {
                 reasoning: true,
                 input: vec![InputType::Text],
                 cost: ModelCost {
+                    audio: None,
                     input: 0.03,
                     output: 0.06,
                     cache_read: 0.0,
@@ -520,6 +528,7 @@ mod tests {
                 reasoning: false,
                 input: vec![InputType::Text],
                 cost: ModelCost {
+                    audio: None,
                     input: 0.0,
                     output: 0.0,
                     cache_read: 0.0,
@@ -556,6 +565,7 @@ mod tests {
                 model: "gpt-4o-mini".to_string(),
                 usage: Usage::default(),
                 stop_reason: StopReason::Stop,
+                stop_details: None,
                 error_message: None,
                 timestamp: 0,
             }),

@@ -76,6 +76,7 @@ impl AutocompleteCatalog {
         let mut skills = resources
             .skills()
             .iter()
+            .filter(|skill| skill.user_invocable)
             .map(|skill| NamedEntry {
                 name: skill.name.clone(),
                 description: Some(skill.description.clone()).filter(|d| !d.trim().is_empty()),
@@ -96,6 +97,9 @@ impl AutocompleteCatalog {
 #[derive(Debug)]
 pub struct AutocompleteProvider {
     cwd: PathBuf,
+    /// Session workspace roots (bd-cv653.3.12): when set, @-file
+    /// suggestions span the primary root plus every additional root.
+    workspace: Option<crate::workspace::WorkspaceHandle>,
     home_dir_override: Option<PathBuf>,
     catalog: AutocompleteCatalog,
     file_cache: FileCache,
@@ -107,11 +111,18 @@ impl AutocompleteProvider {
     pub const fn new(cwd: PathBuf, catalog: AutocompleteCatalog) -> Self {
         Self {
             cwd,
+            workspace: None,
             home_dir_override: None,
             catalog,
             file_cache: FileCache::new(),
             max_items: 50,
         }
+    }
+
+    /// Attach the session workspace root handle (bd-cv653.3.12).
+    pub fn set_workspace(&mut self, workspace: crate::workspace::WorkspaceHandle) {
+        self.file_cache.invalidate();
+        self.workspace = Some(workspace);
     }
 
     pub fn set_catalog(&mut self, catalog: AutocompleteCatalog) {
@@ -132,7 +143,11 @@ impl AutocompleteProvider {
     }
 
     pub(crate) fn refresh_background(&mut self) {
-        self.file_cache.refresh_if_needed(&self.cwd);
+        let roots = self.workspace.as_ref().map_or_else(
+            || vec![self.cwd.clone()],
+            |w| w.snapshot_or(&self.cwd).all(),
+        );
+        self.file_cache.refresh_if_needed(&self.cwd, &roots);
     }
 
     /// Return suggestions for the given editor state.
@@ -149,11 +164,31 @@ impl AutocompleteProvider {
         if let Some(token) = model_argument_token(text, cursor) {
             return self.suggest_model_argument(&token);
         }
+        if let Some(token) = template_argument_token(text, cursor) {
+            return self.suggest_template_argument(&token);
+        }
         let segment = token_at_cursor(text, cursor);
 
         if segment.text.starts_with('/') {
             let path_response = self.suggest_path(&segment);
             if should_prefer_absolute_path_completion(segment.text, &path_response) {
+                // A bare `/name` fragment is ambiguous between a slash command
+                // and an absolute path (e.g. `/t` → `/tree` vs `/tmp`). Only
+                // surrender the token to path completion when no slash command
+                // prefix-matches the fragment; otherwise the command menu
+                // vanishes for common 1-2 character prefixes.
+                if is_unambiguous_path_token(segment.text) {
+                    return path_response;
+                }
+                let slash_response = self.suggest_slash(&segment);
+                let query = segment.text.trim_start_matches('/');
+                let has_prefix_command = slash_response
+                    .items
+                    .iter()
+                    .any(|item| item.insert.trim_start_matches('/').starts_with(query));
+                if has_prefix_command {
+                    return slash_response;
+                }
                 return path_response;
             }
             return self.suggest_slash(&segment);
@@ -182,13 +217,15 @@ impl AutocompleteProvider {
         if is_absolute_like(&normalized) {
             return Some(normalized);
         }
-
-        self.file_cache.refresh_if_needed(&self.cwd);
+        let roots = self.workspace.as_ref().map_or_else(
+            || vec![self.cwd.clone()],
+            |w| w.snapshot_or(&self.cwd).all(),
+        );
+        self.file_cache.refresh_if_needed(&self.cwd, &roots);
         let stripped = normalized.strip_prefix("./").unwrap_or(&normalized);
         if self.file_cache.files.iter().any(|path| path == stripped) {
             return Some(stripped.to_string());
         }
-
         None
     }
 
@@ -279,6 +316,30 @@ impl AutocompleteProvider {
             }
         }
 
+        // Skills (`/skill:<name>`) — listed here too so skills are
+        // discoverable from a bare `/` or partial prefix, not only after the
+        // user already knows to type the literal `/skill:` prefix.
+        if self.catalog.enable_skill_commands {
+            for skill in &self.catalog.skills {
+                let full = format!("skill:{}", skill.name);
+                if let Some((is_prefix, score)) = fuzzy_match_score(&full, query) {
+                    let label = format!("/{full}");
+                    items.push(ScoredItem {
+                        is_prefix,
+                        score,
+                        kind_rank: kind_rank(AutocompleteItemKind::Skill),
+                        label: label.clone(),
+                        item: AutocompleteItem {
+                            kind: AutocompleteItemKind::Skill,
+                            label: label.clone(),
+                            insert: label,
+                            description: skill.description.clone(),
+                        },
+                    });
+                }
+            }
+        }
+
         // Prompt templates.
         for template in &self.catalog.prompt_templates {
             if let Some((is_prefix, score)) = fuzzy_match_score(&template.name, query) {
@@ -313,7 +374,11 @@ impl AutocompleteProvider {
 
     fn suggest_file_ref(&mut self, token: &TokenAtCursor<'_>) -> AutocompleteResponse {
         let query = token.text.strip_prefix('@').unwrap_or(token.text);
-        self.file_cache.refresh_if_needed(&self.cwd);
+        let roots = self.workspace.as_ref().map_or_else(
+            || vec![self.cwd.clone()],
+            |w| w.snapshot_or(&self.cwd).all(),
+        );
+        self.file_cache.refresh_if_needed(&self.cwd, &roots);
 
         let mut items = self
             .file_cache
@@ -462,6 +527,42 @@ impl AutocompleteProvider {
         }
     }
 
+    fn suggest_template_argument(&self, token: &TokenAtCursor<'_>) -> AutocompleteResponse {
+        let query = token.text.trim();
+        let mut items = self
+            .catalog
+            .prompt_templates
+            .iter()
+            .filter_map(|template| {
+                let (is_prefix, score) = fuzzy_match_score(&template.name, query)?;
+                Some(ScoredItem {
+                    is_prefix,
+                    score,
+                    kind_rank: kind_rank(AutocompleteItemKind::PromptTemplate),
+                    label: template.name.clone(),
+                    item: AutocompleteItem {
+                        kind: AutocompleteItemKind::PromptTemplate,
+                        label: template.name.clone(),
+                        insert: template.name.clone(),
+                        description: template.description.clone(),
+                    },
+                })
+            })
+            .collect::<Vec<_>>();
+
+        sort_scored_items(&mut items);
+        let items = items
+            .into_iter()
+            .take(self.max_items)
+            .map(|s| s.item)
+            .collect();
+
+        AutocompleteResponse {
+            replace: token.range.clone(),
+            items,
+        }
+    }
+
     fn suggest_auth_provider_argument(&self, token: &TokenAtCursor<'_>) -> AutocompleteResponse {
         let query = token.text.trim();
         let mut items = Vec::new();
@@ -547,7 +648,7 @@ impl FileCache {
         self.updating = false;
     }
 
-    fn refresh_if_needed(&mut self, cwd: &Path) {
+    fn refresh_if_needed(&mut self, cwd: &Path, extra_roots: &[PathBuf]) {
         // Poll for completed updates
         if let Some(rx) = &self.update_rx {
             match rx.try_recv() {
@@ -572,11 +673,12 @@ impl FileCache {
             self.updating = true;
             self.last_update_request = Some(now);
             let cwd_buf = cwd.to_path_buf();
+            let roots_buf = extra_roots.to_vec();
             let (tx, rx) = std::sync::mpsc::channel();
             self.update_rx = Some(rx);
 
             std::thread::spawn(move || {
-                let files = collect_project_files(&cwd_buf);
+                let files = collect_project_files_multi(&cwd_buf, &roots_buf);
                 let _ = tx.send(files);
             });
         }
@@ -591,6 +693,23 @@ fn collect_project_files(cwd: &Path) -> Vec<String> {
         |bin| run_fd_list_files(bin, cwd).unwrap_or_else(|| walk_project_files(cwd)),
     );
 
+    if files.len() > MAX_FILE_CACHE_ENTRIES {
+        files.truncate(MAX_FILE_CACHE_ENTRIES);
+    }
+    files
+}
+
+/// Multi-root @-index (bd-cv653.3.12): the primary root keeps bare relative
+/// paths (single-root sessions stay byte-identical); each additional root's
+/// files are listed as `<root>/<rel>` so same-named files cannot collide in
+/// suggestion labels.
+fn collect_project_files_multi(primary: &Path, roots: &[PathBuf]) -> Vec<String> {
+    let mut files = collect_project_files(primary);
+    for root in roots.iter().skip(1) {
+        for file in collect_project_files(root) {
+            files.push(format!("{}/{file}", root.display()));
+        }
+    }
     if files.len() > MAX_FILE_CACHE_ENTRIES {
         files.truncate(MAX_FILE_CACHE_ENTRIES);
     }
@@ -693,6 +812,9 @@ struct BuiltinSlashCommand {
     description: &'static str,
 }
 
+// A flat static data table of built-in slash commands; not splittable into a
+// cohesive helper, so allow the line count rather than fragment the table.
+#[allow(clippy::too_many_lines)]
 const fn builtin_slash_commands() -> &'static [BuiltinSlashCommand] {
     &[
         BuiltinSlashCommand {
@@ -717,7 +839,11 @@ const fn builtin_slash_commands() -> &'static [BuiltinSlashCommand] {
         },
         BuiltinSlashCommand {
             name: "thinking",
-            description: "Set thinking level (off/minimal/low/medium/high/xhigh)",
+            description: "Set thinking level (off/minimal/low/medium/high/xhigh/max)",
+        },
+        BuiltinSlashCommand {
+            name: "fast",
+            description: "Show or change the model's serving tier",
         },
         BuiltinSlashCommand {
             name: "scoped-models",
@@ -741,7 +867,7 @@ const fn builtin_slash_commands() -> &'static [BuiltinSlashCommand] {
         },
         BuiltinSlashCommand {
             name: "settings",
-            description: "Show current settings summary",
+            description: "Edit and save session preferences",
         },
         BuiltinSlashCommand {
             name: "theme",
@@ -789,7 +915,103 @@ const fn builtin_slash_commands() -> &'static [BuiltinSlashCommand] {
         },
         BuiltinSlashCommand {
             name: "share",
-            description: "Export to a temp HTML file and show path",
+            description: "Share the session as a GitHub Gist",
+        },
+        BuiltinSlashCommand {
+            name: "mcp",
+            description: "Show MCP server status (Model Context Protocol)",
+        },
+        BuiltinSlashCommand {
+            name: "template",
+            description: "Expand a prompt template by name",
+        },
+        BuiltinSlashCommand {
+            name: "plan",
+            description: "Enter or manage read-only plan mode",
+        },
+        BuiltinSlashCommand {
+            name: "goal",
+            description: "Manage goals (FrankenTUI only; /goal status)",
+        },
+        BuiltinSlashCommand {
+            name: "prewalk",
+            description: "Hand off to @smol after planning and the first edit",
+        },
+        BuiltinSlashCommand {
+            name: "advisor",
+            description: "Second-model turn review (advisor)",
+        },
+        BuiltinSlashCommand {
+            name: "checkpoint",
+            description: "Mark a session restore point",
+        },
+        BuiltinSlashCommand {
+            name: "rewind",
+            description: "Collapse back to a checkpoint with a report",
+        },
+        BuiltinSlashCommand {
+            name: "fresh",
+            description: "Reset provider cache and stream bookkeeping",
+        },
+        BuiltinSlashCommand {
+            name: "retry",
+            description: "Re-queue the last user turn",
+        },
+        BuiltinSlashCommand {
+            name: "undo",
+            description: "Revert the last recorded file mutation",
+        },
+        BuiltinSlashCommand {
+            name: "redo",
+            description: "Replay an undone file mutation",
+        },
+        BuiltinSlashCommand {
+            name: "usage",
+            description: "Show provider credit/quota usage",
+        },
+        BuiltinSlashCommand {
+            name: "approval",
+            description: "Show or change the tool approval mode",
+        },
+        BuiltinSlashCommand {
+            name: "handoff",
+            description: "Emit a handoff document for the next agent",
+        },
+        BuiltinSlashCommand {
+            name: "rules",
+            description: "Show or manage stream rules",
+        },
+        BuiltinSlashCommand {
+            name: "btw",
+            description: "Ask an ephemeral side question on the smol role",
+        },
+        BuiltinSlashCommand {
+            name: "tan",
+            description: "Run tangential work in a background task-role child",
+        },
+        BuiltinSlashCommand {
+            name: "omfg",
+            description: "File a grievance and inject a stream rule",
+        },
+        BuiltinSlashCommand {
+            name: "commit",
+            description: "Dependency-ordered atomic commit splitting",
+        },
+        BuiltinSlashCommand {
+            name: "review",
+            description: "Review the current changes",
+        },
+        BuiltinSlashCommand {
+            name: "add-dir",
+            description: "Add a directory to the workspace roots",
+        },
+        BuiltinSlashCommand {
+            name: "remove-dir",
+            description: "Remove a directory from the workspace roots",
+        },
+        BuiltinSlashCommand {
+            name: "crash",
+            description: "List recorded crash bundles",
         },
     ]
 }
@@ -895,10 +1117,10 @@ fn is_path_like(text: &str) -> bool {
 
 fn expand_tilde(text: &str) -> String {
     let text = text.trim();
-    if let Some(rest) = text.strip_prefix("~/") {
-        if let Some(home) = dirs::home_dir() {
-            return home.join(rest).display().to_string();
-        }
+    if let Some(rest) = text.strip_prefix("~/")
+        && let Some(home) = dirs::home_dir()
+    {
+        return home.join(rest).display().to_string();
     }
     text.to_string()
 }
@@ -1041,6 +1263,10 @@ fn auth_provider_argument_token(text: &str, cursor: usize) -> Option<TokenAtCurs
     slash_first_argument_token(text, cursor, &["/login", "/logout"])
 }
 
+fn template_argument_token(text: &str, cursor: usize) -> Option<TokenAtCursor<'_>> {
+    slash_first_argument_token(text, cursor, &["/template"])
+}
+
 fn should_prefer_absolute_path_completion(
     token_text: &str,
     path_response: &AutocompleteResponse,
@@ -1054,7 +1280,7 @@ fn should_prefer_absolute_path_completion(
         return false;
     }
 
-    if token_text.starts_with("/.") || token_text[1..].contains('/') {
+    if is_unambiguous_path_token(token_text) {
         return true;
     }
 
@@ -1064,11 +1290,18 @@ fn should_prefer_absolute_path_completion(
         .any(|item| item.insert.starts_with(token_text))
 }
 
+/// True when a `/`-prefixed token can only mean a filesystem path: it starts
+/// a dotfile segment (`/.`) or already contains a second path separator.
+fn is_unambiguous_path_token(token_text: &str) -> bool {
+    let token_text = token_text.trim();
+    token_text.starts_with("/.") || token_text.get(1..).is_some_and(|rest| rest.contains('/'))
+}
+
 fn clamp_cursor(text: &str, cursor: usize) -> usize {
     clamp_to_char_boundary(text, cursor.min(text.len()))
 }
 
-fn clamp_to_char_boundary(text: &str, mut idx: usize) -> usize {
+const fn clamp_to_char_boundary(text: &str, mut idx: usize) -> usize {
     while idx > 0 && !text.is_char_boundary(idx) {
         idx -= 1;
     }
@@ -1110,6 +1343,71 @@ mod tests {
             resp.items.iter().any(|item| item.insert == "/review"
                 && item.kind == AutocompleteItemKind::PromptTemplate)
         );
+    }
+
+    #[test]
+    fn template_command_suggests_template_name_argument() {
+        let catalog = AutocompleteCatalog {
+            prompt_templates: vec![
+                NamedEntry {
+                    name: "tc-plan".to_string(),
+                    description: Some("Planning template".to_string()),
+                },
+                NamedEntry {
+                    name: "tc-explain".to_string(),
+                    description: None,
+                },
+            ],
+            skills: Vec::new(),
+            extension_commands: Vec::new(),
+            enable_skill_commands: false,
+        };
+        let mut provider = AutocompleteProvider::new(PathBuf::from("."), catalog);
+        let text = "/template tc-";
+        let resp = provider.suggest(text, text.len());
+        assert!(
+            resp.items.iter().any(|item| item.insert == "tc-plan"
+                && item.kind == AutocompleteItemKind::PromptTemplate),
+            "expected tc-plan suggestion, got: {:?}",
+            resp.items
+        );
+        assert!(resp.items.iter().any(|item| item.insert == "tc-explain"));
+    }
+
+    #[test]
+    fn template_argument_completion_ignores_later_arguments() {
+        let catalog = AutocompleteCatalog {
+            prompt_templates: vec![NamedEntry {
+                name: "tc-plan".to_string(),
+                description: None,
+            }],
+            skills: Vec::new(),
+            extension_commands: Vec::new(),
+            enable_skill_commands: false,
+        };
+        let mut provider = AutocompleteProvider::new(PathBuf::from("."), catalog);
+        let text = "/template tc-plan extra";
+        let resp = provider.suggest(text, text.len());
+        assert!(
+            !resp
+                .items
+                .iter()
+                .any(|item| item.kind == AutocompleteItemKind::PromptTemplate),
+            "later arguments must not trigger template-name completion"
+        );
+    }
+
+    #[test]
+    fn builtin_slash_commands_contains_template() {
+        let cmds = builtin_slash_commands();
+        assert!(cmds.iter().any(|c| c.name == "template"));
+    }
+
+    #[test]
+    fn builtin_slash_commands_contains_side_channel_commands() {
+        let cmds = builtin_slash_commands();
+        assert!(cmds.iter().any(|c| c.name == "btw"));
+        assert!(cmds.iter().any(|c| c.name == "tan"));
     }
 
     #[test]
@@ -1401,6 +1699,91 @@ mod tests {
             resp.items
                 .iter()
                 .any(|item| item.insert.starts_with("/tmp"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn short_slash_prefix_shows_commands_not_root_paths() {
+        // Regression: `/t` used to vanish into `/tmp` path completion,
+        // hiding /tree, /theme, /thinking, /template at the 2-char stage.
+        let mut provider =
+            AutocompleteProvider::new(PathBuf::from("."), AutocompleteCatalog::default());
+        for (input, expected) in [("/t", "/tree"), ("/e", "/exit"), ("/h", "/help")] {
+            let resp = provider.suggest(input, input.len());
+            assert!(
+                resp.items.iter().any(|item| item.insert == expected),
+                "expected {expected} for input {input}, got: {:?}",
+                resp.items
+            );
+            assert!(
+                resp.items
+                    .iter()
+                    .all(|item| item.kind != AutocompleteItemKind::Path),
+                "slash-command menu for {input} must not be path items"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn multi_segment_slash_token_still_prefers_paths() {
+        let mut provider =
+            AutocompleteProvider::new(PathBuf::from("."), AutocompleteCatalog::default());
+        let input = "/usr/";
+        let resp = provider.suggest(input, input.len());
+        assert!(
+            resp.items
+                .iter()
+                .all(|item| item.kind == AutocompleteItemKind::Path),
+            "multi-segment absolute tokens must stay path completions"
+        );
+    }
+
+    #[test]
+    fn skills_discoverable_from_bare_slash_prefix() {
+        // Regression: skills only appeared after typing the literal
+        // `/skill:` prefix, which made the feature look nonexistent.
+        let catalog = AutocompleteCatalog {
+            prompt_templates: Vec::new(),
+            skills: vec![NamedEntry {
+                name: "rustfmt".to_string(),
+                description: Some("Format Rust code".to_string()),
+            }],
+            extension_commands: Vec::new(),
+            enable_skill_commands: true,
+        };
+        let mut provider = AutocompleteProvider::new(PathBuf::from("."), catalog);
+        for input in ["/sk", "/skill"] {
+            let resp = provider.suggest(input, input.len());
+            assert!(
+                resp.items.iter().any(|item| item.insert == "/skill:rustfmt"
+                    && item.kind == AutocompleteItemKind::Skill),
+                "expected /skill:rustfmt suggestion for {input}, got: {:?}",
+                resp.items
+            );
+        }
+    }
+
+    #[test]
+    fn skills_hidden_from_bare_slash_when_disabled() {
+        let catalog = AutocompleteCatalog {
+            prompt_templates: Vec::new(),
+            skills: vec![NamedEntry {
+                name: "rustfmt".to_string(),
+                description: None,
+            }],
+            extension_commands: Vec::new(),
+            enable_skill_commands: false,
+        };
+        let mut provider = AutocompleteProvider::new(PathBuf::from("."), catalog);
+        let resp = provider.suggest("/sk", "/sk".len());
+        assert!(
+            !resp
+                .items
+                .iter()
+                .any(|item| item.kind == AutocompleteItemKind::Skill),
+            "skills must not appear when skill commands are disabled"
         );
     }
 
@@ -1923,6 +2306,39 @@ mod tests {
         names.sort_unstable();
         names.dedup();
         assert_eq!(names.len(), orig_len, "Duplicate slash command names found");
+    }
+
+    #[test]
+    fn every_offered_completion_is_a_command_that_runs() {
+        // A completion the parser rejects hands the user a command that does
+        // nothing when they press enter.
+        let mut dead = Vec::new();
+        for cmd in builtin_slash_commands() {
+            let typed = format!("/{}", cmd.name);
+            if crate::interactive::SlashCommand::parse(&typed).is_none() {
+                dead.push(typed);
+            }
+        }
+        assert!(dead.is_empty(), "offered but the parser rejects: {dead:?}");
+    }
+
+    #[test]
+    fn every_command_the_parser_knows_is_offered() {
+        // The gap this closes: `/add-dir`, `/remove-dir` and `/crash` all
+        // worked and none of them could be completed, so the only way to find
+        // them was to read the source or already know they existed.
+        use crate::interactive::SlashCommand;
+        let offered: std::collections::HashSet<&str> =
+            builtin_slash_commands().iter().map(|c| c.name).collect();
+        let missing: Vec<&str> = SlashCommand::ALL
+            .iter()
+            .map(|cmd| cmd.canonical())
+            .filter(|name| !offered.contains(name.trim_start_matches('/')))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "the parser accepts these and nothing offers them: {missing:?}"
+        );
     }
 
     // ── set_max_items ────────────────────────────────────────────────

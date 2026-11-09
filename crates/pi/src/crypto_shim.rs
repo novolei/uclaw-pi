@@ -100,7 +100,7 @@ fn register_hmac_hostcall(global: &rquickjs::Object<'_>) -> rquickjs::Result<()>
              data: rquickjs::TypedArray<'_, u8>,
              encoding: String|
              -> rquickjs::Result<String> {
-                use hmac::Mac;
+                use hmac::{KeyInit, Mac};
                 let key_bytes = key
                     .as_bytes()
                     .ok_or_else(|| rquickjs::Error::new_from_js("buffer", "Detached key buffer"))?;
@@ -406,7 +406,9 @@ fn register_scrypt_hostcall(global: &rquickjs::Object<'_>) -> rquickjs::Result<(
                 let salt_bytes = salt
                     .as_bytes()
                     .ok_or_else(|| rquickjs::Error::new_from_js("buffer", "Detached buffer"))?;
-                let params = ScryptParams::new(log_n, r, p, keylen).map_err(|_| {
+                // scrypt 0.12: `Params::new` no longer takes the output length;
+                // the raw `scrypt()` call derives it from the output slice.
+                let params = ScryptParams::new(log_n, r, p).map_err(|_| {
                     rquickjs::Error::new_from_js("number", "invalid scrypt params")
                 })?;
                 let mut out = vec![0u8; keylen];
@@ -621,10 +623,10 @@ fn hex_decode(hex: &str) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(hex.len() / 2);
     let mut chars = hex.chars();
     while let (Some(hi), Some(lo)) = (chars.next(), chars.next()) {
-        if let (Some(h), Some(l)) = (hi.to_digit(16), lo.to_digit(16)) {
-            if let Ok(byte) = u8::try_from(h * 16 + l) {
-                bytes.push(byte);
-            }
+        if let (Some(h), Some(l)) = (hi.to_digit(16), lo.to_digit(16))
+            && let Ok(byte) = u8::try_from(h * 16 + l)
+        {
+            bytes.push(byte);
         }
     }
     bytes
@@ -637,10 +639,11 @@ fn ed25519_public_key_from_spki(der: &[u8]) -> rquickjs::Result<&[u8]> {
     if der.len() == 32 {
         return Ok(der);
     }
-    if der.len() == ED25519_SPKI_PREFIX.len() + 32 && der.starts_with(ED25519_SPKI_PREFIX) {
-        if let Some(raw) = der.get(ED25519_SPKI_PREFIX.len()..) {
-            return Ok(raw);
-        }
+    if der.len() == ED25519_SPKI_PREFIX.len() + 32
+        && der.starts_with(ED25519_SPKI_PREFIX)
+        && let Some(raw) = der.get(ED25519_SPKI_PREFIX.len()..)
+    {
+        return Ok(raw);
     }
     Err(rquickjs::Error::new_from_js(
         "key",
@@ -1444,7 +1447,7 @@ mod tests {
 
     #[test]
     fn hmac_sha256_secret_hello() {
-        use hmac::Mac;
+        use hmac::{KeyInit, Mac};
         let mut mac =
             hmac::Hmac::<Sha256>::new_from_slice(b"secret").expect("create HMAC with test key");
         mac.update(b"hello");
@@ -1459,7 +1462,7 @@ mod tests {
 
     #[test]
     fn hmac_sha1_key_data() {
-        use hmac::Mac;
+        use hmac::{KeyInit, Mac};
         let mut mac =
             hmac::Hmac::<sha1::Sha1>::new_from_slice(b"key").expect("create HMAC with test key");
         mac.update(b"data");

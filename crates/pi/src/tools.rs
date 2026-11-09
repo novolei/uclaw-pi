@@ -1,6 +1,6 @@
 //! Built-in tool implementations.
 //!
-//! Pi provides 8 built-in tools: read, bash, edit, write, grep, find, ls, hashline_edit.
+//! Pi provides built-in file, shell, search, editing, and subagent delegation tools.
 //!
 //! Tools are exposed to the model via JSON Schema (see [`crate::provider::ToolDef`]) and executed
 //! locally by the agent loop. Each tool returns structured [`ContentBlock`] output suitable for
@@ -10,7 +10,12 @@ use crate::agent_cx::AgentCx;
 use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::extensions::{safe_canonicalize, strip_unc_prefix};
-use crate::model::{ContentBlock, ImageContent, TextContent};
+use crate::model::{ContentBlock, ImageContent, MediaContent, TextContent};
+use crate::platform::{
+    EffectiveModeAccessContext, UNIX_ACCESS_READ, UNIX_ACCESS_SEARCH, UNIX_ACCESS_WRITE,
+    ensure_effective_mode_access,
+};
+use crate::workspace::{WorkspaceHandle, ensure_canonical_path_allowed};
 use asupersync::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadBuf, SeekFrom};
 use asupersync::time::{sleep, wall_now};
 use async_trait::async_trait;
@@ -23,11 +28,42 @@ use std::fmt::Write as _;
 use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{Mutex, OnceLock, mpsc};
+use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use unicode_normalization::UnicodeNormalization;
 use uuid::Uuid;
+
+pub(crate) mod bash_session;
+mod client_files;
+mod client_terminals;
+mod interim_response;
+mod structured_json;
+mod structured_sqlite;
+pub use client_files::{TextFileClient, TextFileClientScope};
+pub use client_terminals::{TerminalClient, TerminalClientScope, TerminalCommand};
+pub use interim_response::interim_response_text;
+pub(crate) use interim_response::{interim_response_text_from_details, is_interim_response_path};
+
+/// Run an internal, resource-bounded data query before normal Pi startup.
+/// The worker receives admitted bytes and never loads project configuration,
+/// extensions, credentials, or another agent session.
+#[doc(hidden)]
+pub fn run_structured_read_worker_if_requested() -> Option<i32> {
+    let mut args = std::env::args_os().skip(1);
+    let mode = args.next()?;
+    let worker: fn() -> i32 = if mode == "--internal-json-query" {
+        structured_json::run_json_worker
+    } else if mode == "--internal-sqlite-query" {
+        structured_sqlite::run_sqlite_worker
+    } else {
+        return None;
+    };
+    if args.next().is_some() {
+        return Some(2);
+    }
+    Some(worker())
+}
 
 // ============================================================================
 // Tool Trait
@@ -154,6 +190,148 @@ impl ToolEffects {
     }
 }
 
+/// Non-secret identity of the model currently serving the owning agent.
+///
+/// Keep provider and model separate: model identifiers can contain slashes,
+/// and child processes must not reinterpret them as a provider-qualified spec.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolModelSelection {
+    pub provider: String,
+    pub model: String,
+}
+
+/// Live model affinity shared by one registry and its delegating tools.
+///
+/// The host publishes changes only when it installs a provider. A delegation
+/// captures [`Self::current`] once so queued children and retries retain the
+/// model selected for that request. Credentials are never stored here.
+#[derive(Clone, Default)]
+pub struct ToolModelScope {
+    current: Arc<Mutex<Option<ToolModelSelection>>>,
+}
+
+impl ToolModelScope {
+    /// Capture the active model, or `None` for an unattached tool registry.
+    #[must_use]
+    pub fn current(&self) -> Option<ToolModelSelection> {
+        self.current
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    pub(crate) fn set(&self, provider: &str, model: &str) {
+        let selection =
+            (!provider.trim().is_empty() && !model.trim().is_empty()).then(|| ToolModelSelection {
+                provider: provider.to_string(),
+                model: model.to_string(),
+            });
+        *self
+            .current
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = selection;
+    }
+}
+
+/// Public model identity and limits available for an approved sampling request.
+/// Credentials, conversation history and provider handles stay in the Agent.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolSamplingModel {
+    pub provider: String,
+    pub model: String,
+    pub session_id: String,
+    pub max_tokens: Option<u32>,
+    pub temperature: Option<f32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolSamplingRole {
+    User,
+    Assistant,
+}
+
+#[derive(Debug, Clone)]
+pub struct ToolSamplingMessage {
+    pub role: ToolSamplingRole,
+    pub text: String,
+}
+
+/// An isolated, reviewed prompt. No Agent transcript or tools are inherited.
+#[derive(Debug, Clone)]
+pub struct ToolSamplingRequest {
+    pub system_prompt: Option<String>,
+    pub messages: Vec<ToolSamplingMessage>,
+    pub max_tokens: u32,
+    pub temperature: Option<f32>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ToolSamplingResult {
+    pub text: String,
+    pub stop_reason: crate::model::StopReason,
+}
+
+/// Borrowed authority to call tools or sample through the owning Agent.
+///
+/// Implementations must enforce the live registry, approval, plan, cancellation
+/// and privacy policies. A tool receives this only for the current invocation;
+/// it must never retain it in an interpreter, registry snapshot or background
+/// task. Standalone tools do not acquire this authority implicitly.
+#[async_trait]
+pub trait ToolInvocationHost: Send + Sync {
+    /// `expected_session` is captured by the native caller before admission,
+    /// never supplied by guest code or resolved afresh at the first tool call.
+    async fn call_tool(
+        &self,
+        call: crate::model::ToolCall,
+        expected_session: &str,
+    ) -> Result<ToolOutput>;
+
+    /// Capture non-secret model affinity before presenting a sampling review.
+    /// Standalone or custom hosts must explicitly opt into this capability.
+    fn sampling_model(&self) -> Result<ToolSamplingModel> {
+        Err(Error::tool(
+            "mcp",
+            "sampling is unavailable for this caller",
+        ))
+    }
+
+    /// Recheck live session ownership after a user review can have suspended.
+    /// Hosts with a mutable session resolver must validate it here as well.
+    async fn check_sampling_session(&self, expected_session: &str) -> Result<()> {
+        if self.sampling_model()?.session_id != expected_session {
+            return Err(Error::tool("mcp", "sampling session changed"));
+        }
+        Ok(())
+    }
+
+    /// Execute only the already reviewed prompt under the original session,
+    /// cancellation owner and cost account. The caller owns consent, privacy
+    /// projection and reply review; this method never publishes to a server.
+    async fn sample(
+        &self,
+        _request: ToolSamplingRequest,
+        _expected_session: &str,
+    ) -> Result<ToolSamplingResult> {
+        Err(Error::tool(
+            "mcp",
+            "sampling is unavailable for this caller",
+        ))
+    }
+}
+
+/// Authority borrowed for one native invocation.
+///
+/// A background-capable tool may ask for an owned privacy projection, but
+/// cannot retain this context or use it to extend the lifetime of Agent
+/// tool-call authority.
+pub struct ToolInvocationContext<'a> {
+    pub protect: &'a (dyn for<'p, 's> Fn(&'p [&'s str]) -> Result<Vec<String>> + Send + Sync),
+    pub host: Option<&'a dyn ToolInvocationHost>,
+    pub snapshot_privacy:
+        &'a (dyn Fn() -> crate::text_completion::AuxiliaryPrivacySnapshot + Send + Sync),
+}
+
 /// A tool that can be executed by the agent.
 #[async_trait]
 pub trait Tool: Send + Sync {
@@ -169,6 +347,18 @@ pub trait Tool: Send + Sync {
     /// Get the tool parameters as JSON Schema.
     fn parameters(&self) -> serde_json::Value;
 
+    /// Host-only planning/mutation evidence from this tool's raw successful
+    /// execution. Ordinary, extension and MCP tools cannot opt in by naming
+    /// themselves after a native tool or returning similar-looking details.
+    #[doc(hidden)]
+    fn prewalk_evidence(
+        &self,
+        _input: &serde_json::Value,
+        _output: &ToolOutput,
+    ) -> crate::prewalk::ToolEvidence {
+        crate::prewalk::ToolEvidence::default()
+    }
+
     /// Execute the tool.
     ///
     /// Tools may call `on_update` to stream incremental results (e.g. while a long-running `bash`
@@ -181,6 +371,92 @@ pub trait Tool: Send + Sync {
         on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
     ) -> Result<ToolOutput>;
 
+    /// Native filesystem authority available to imported tool factories.
+    /// A same-named extension or MCP tool cannot acquire this by registration.
+    #[doc(hidden)]
+    fn builtin_factory_context(&self) -> Option<(&Path, &WorkspaceHandle)> {
+        None
+    }
+
+    /// Delegate an imported factory to the admitted native implementation.
+    /// Relative paths are rebased, but the tool's configured cwd and live
+    /// workspace remain authoritative for access checks and root revocation.
+    #[doc(hidden)]
+    async fn execute_from_factory(
+        &self,
+        tool_call_id: &str,
+        input: serde_json::Value,
+        cwd: Option<&str>,
+        options: &serde_json::Value,
+        on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+    ) -> Result<ToolOutput> {
+        let Some((configured_cwd, workspace)) = self.builtin_factory_context() else {
+            return Err(Error::validation(format!(
+                "Tool '{}' is not an admitted native factory target",
+                self.name()
+            )));
+        };
+        validate_builtin_factory_options(self.name(), options, &[])?;
+        let input =
+            rebase_builtin_factory_input(self.name(), input, cwd, configured_cwd, workspace)?;
+        self.execute(tool_call_id, input, on_update).await
+    }
+
+    /// Execute with this invocation's live auxiliary-provider privacy policy.
+    /// Tools making a second model request use `protect` on complete source
+    /// fields before formatting or truncation. Ordinary tools retain their
+    /// normal execution path and do not capture session state in the registry.
+    ///
+    /// `protect` names its lifetimes with `for<'a, 'b>` because `#[async_trait]`
+    /// replaces elided lifetimes inside `Fn(..)` with method lifetimes, which
+    /// would make the callback accept only one caller-chosen borrow.
+    async fn execute_with_auxiliary_privacy(
+        &self,
+        tool_call_id: &str,
+        input: serde_json::Value,
+        on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+        protect: &(dyn for<'a, 'b> Fn(&'a [&'b str]) -> Result<Vec<String>> + Send + Sync),
+    ) -> Result<ToolOutput> {
+        let _ = protect;
+        self.execute(tool_call_id, input, on_update).await
+    }
+
+    /// Execute with an invocation-scoped host for policy-checked tool re-entry.
+    /// Ordinary tools keep their existing privacy-aware execution path. Eval
+    /// borrows the host while servicing its kernel's tool requests; the kernel
+    /// receives only serialized results, never a host or credential handle.
+    async fn execute_with_host(
+        &self,
+        tool_call_id: &str,
+        input: serde_json::Value,
+        on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+        protect: &(dyn for<'a, 'b> Fn(&'a [&'b str]) -> Result<Vec<String>> + Send + Sync),
+        host: &dyn ToolInvocationHost,
+    ) -> Result<ToolOutput> {
+        let _ = host;
+        self.execute_with_auxiliary_privacy(tool_call_id, input, on_update, protect)
+            .await
+    }
+
+    /// Execute with the current Agent's scoped authority and a lazy privacy
+    /// snapshot for explicitly backgrounded work. The default preserves the
+    /// existing host/auxiliary dispatch without cloning the secrets vault.
+    async fn execute_with_invocation(
+        &self,
+        tool_call_id: &str,
+        input: serde_json::Value,
+        on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+        context: ToolInvocationContext<'_>,
+    ) -> Result<ToolOutput> {
+        if let Some(host) = context.host {
+            self.execute_with_host(tool_call_id, input, on_update, context.protect, host)
+                .await
+        } else {
+            self.execute_with_auxiliary_privacy(tool_call_id, input, on_update, context.protect)
+                .await
+        }
+    }
+
     /// Declare the coarse side effects used by the agent scheduler.
     ///
     /// Defaults to local write effects so undeclared tools are serialized fail-closed.
@@ -188,6 +464,58 @@ pub trait Tool: Send + Sync {
     fn effects(&self) -> ToolEffects {
         ToolEffects::write()
     }
+
+    /// Declare the effects of this invocation for execution and approval gates.
+    ///
+    /// Input-aware tools may narrow their coarse declaration only for branches
+    /// that cannot perform the stronger effects. Malformed inputs must retain
+    /// a conservative declaration. Ordinary tools keep their existing effects.
+    #[must_use]
+    fn effects_for_input(&self, _input: &serde_json::Value) -> ToolEffects {
+        self.effects()
+    }
+
+    /// Attach the owning registry's live background-job session scope.
+    /// Non-job tools intentionally ignore it.
+    fn bind_job_session_scope(&mut self, _scope: crate::jobs::JobSessionScope) {}
+
+    /// Attach the owning registry's live provider/model identity.
+    /// Tools that do not delegate model work intentionally ignore it.
+    fn bind_model_scope(&mut self, _scope: ToolModelScope) {}
+
+    /// Attach the session-tree spend budget to tools that make model calls.
+    fn bind_cost_scope(&mut self, _scope: crate::cost::CostScope) {}
+
+    /// Attach session credentials to native media adapters without exposing keys to tool input.
+    fn bind_media_auth_scope(&mut self, _scope: crate::media_tools::MediaAuthScope) {}
+
+    /// Attach the owning host's editor filesystem without changing tool policy.
+    fn bind_text_file_client_scope(&mut self, _scope: TextFileClientScope) {}
+
+    /// Attach an editor terminal backend without changing approval or mediation.
+    fn bind_terminal_client_scope(&mut self, _scope: TerminalClientScope) {}
+
+    /// Where the tool comes from. Extension-registered tools answer
+    /// [`ToolOrigin::Extension`] so `setActiveTools` can shelve and restore
+    /// them without touching built-in or MCP tools.
+    fn origin(&self) -> ToolOrigin {
+        ToolOrigin::BuiltIn
+    }
+
+    /// Exact owner of a mounted MCP wrapper. Names alone cannot establish
+    /// ownership: an extension or caller may deliberately use the same name.
+    fn mcp_manager(&self) -> Option<&Arc<crate::mcp::McpManager>> {
+        None
+    }
+}
+
+/// Provenance of a registered tool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolOrigin {
+    /// Built-in, MCP, plan, or other host-provided tools.
+    BuiltIn,
+    /// Registered by an extension (JS, native, or WASM wrapper).
+    Extension,
 }
 
 /// Tool execution output.
@@ -231,6 +559,9 @@ pub const DEFAULT_GREP_LIMIT: usize = 100;
 
 /// Default find result limit.
 pub const DEFAULT_FIND_LIMIT: usize = 1000;
+
+/// Hard cap for complete find scans before newest-first selection.
+pub const FIND_SCAN_HARD_LIMIT: usize = 20_000;
 
 /// Default ls result limit.
 pub const DEFAULT_LS_LIMIT: usize = 500;
@@ -796,6 +1127,164 @@ impl HeadTruncatingLineWriter {
     }
 }
 
+fn push_escaped_utf8_for_line_output(escaped: &mut String, text: &str) {
+    for character in text.chars() {
+        match character {
+            '\\' => escaped.push_str("\\\\"),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            character if character.is_control() => escaped.extend(character.escape_unicode()),
+            character => escaped.push(character),
+        }
+    }
+}
+
+fn escape_bytes_for_line_output(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+
+    let mut escaped = String::with_capacity(bytes.len());
+    let mut remaining = bytes;
+    while !remaining.is_empty() {
+        match std::str::from_utf8(remaining) {
+            Ok(valid) => {
+                push_escaped_utf8_for_line_output(&mut escaped, valid);
+                break;
+            }
+            Err(error) => {
+                let valid_up_to = error.valid_up_to();
+                if valid_up_to > 0 {
+                    // SAFETY: `Utf8Error::valid_up_to` identifies a valid UTF-8 prefix.
+                    let valid = std::str::from_utf8(&remaining[..valid_up_to])
+                        .expect("valid_up_to must delimit valid UTF-8");
+                    push_escaped_utf8_for_line_output(&mut escaped, valid);
+                }
+
+                let invalid_len = error
+                    .error_len()
+                    .unwrap_or_else(|| remaining.len().saturating_sub(valid_up_to));
+                for &byte in &remaining[valid_up_to..valid_up_to + invalid_len] {
+                    escaped.push_str("\\x");
+                    escaped.push(char::from(HEX[usize::from(byte >> 4)]));
+                    escaped.push(char::from(HEX[usize::from(byte & 0x0f)]));
+                }
+                remaining = &remaining[valid_up_to + invalid_len..];
+            }
+        }
+    }
+    escaped
+}
+
+fn path_for_line_output(path: &Path) -> String {
+    // Each arm is the function tail on its own platform; only one is ever
+    // compiled, so none of them needs an explicit `return`.
+    #[cfg(windows)]
+    {
+        let rendered = path.to_string_lossy().replace('\\', "/");
+        escape_bytes_for_line_output(rendered.as_bytes())
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+        escape_bytes_for_line_output(path.as_os_str().as_bytes())
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    escape_bytes_for_line_output(path.to_string_lossy().as_bytes())
+}
+
+fn compare_paths_for_line_output(a: &Path, b: &Path) -> Ordering {
+    let a_rendered = path_for_line_output(a);
+    let b_rendered = path_for_line_output(b);
+    a_rendered
+        .to_lowercase()
+        .cmp(&b_rendered.to_lowercase())
+        .then_with(|| a_rendered.cmp(&b_rendered))
+}
+
+fn strip_ansi_sequences(bytes: &[u8]) -> Vec<u8> {
+    fn skip_csi(bytes: &[u8], mut index: usize) -> usize {
+        while index < bytes.len() {
+            let byte = bytes[index];
+            index += 1;
+            if (0x40..=0x7e).contains(&byte) {
+                break;
+            }
+        }
+        index
+    }
+
+    fn skip_string_sequence(bytes: &[u8], mut index: usize, osc: bool) -> usize {
+        while index < bytes.len() {
+            if osc && bytes[index] == 0x07 {
+                return index + 1;
+            }
+            if bytes[index] == 0x1b && bytes.get(index + 1) == Some(&b'\\') {
+                return index + 2;
+            }
+            index += 1;
+        }
+        index
+    }
+
+    let mut sanitized = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            0x1b => {
+                index += 1;
+                match bytes.get(index).copied() {
+                    Some(b'[') => index = skip_csi(bytes, index + 1),
+                    Some(b']') => index = skip_string_sequence(bytes, index + 1, true),
+                    Some(b'P' | b'X' | b'^' | b'_') => {
+                        index = skip_string_sequence(bytes, index + 1, false);
+                    }
+                    Some(_) => index += 1,
+                    None => {}
+                }
+            }
+            0x9b => index = skip_csi(bytes, index + 1),
+            0x90 | 0x98 | 0x9e | 0x9f => {
+                index = skip_string_sequence(bytes, index + 1, false);
+            }
+            0x9d => index = skip_string_sequence(bytes, index + 1, true),
+            byte => {
+                sanitized.push(byte);
+                index += 1;
+            }
+        }
+    }
+    sanitized
+}
+
+fn diagnostic_for_line_output(bytes: &[u8], truncated: bool) -> String {
+    let sanitized = strip_ansi_sequences(bytes);
+    let Some(first) = sanitized
+        .iter()
+        .position(|byte| !byte.is_ascii_whitespace())
+    else {
+        return if truncated {
+            "... [stderr truncated] ...".to_string()
+        } else {
+            String::new()
+        };
+    };
+    let last = sanitized
+        .iter()
+        .rposition(|byte| !byte.is_ascii_whitespace())
+        .expect("a non-whitespace byte exists");
+    let mut rendered = escape_bytes_for_line_output(&sanitized[first..=last]);
+    if truncated {
+        rendered.push_str(" ... [stderr truncated] ...");
+    }
+    rendered
+}
+
+fn error_for_line_output(error: &impl std::fmt::Display) -> String {
+    diagnostic_for_line_output(error.to_string().as_bytes(), false)
+}
+
 fn utf8_prefix_len(s: &str, max_bytes: usize) -> usize {
     let mut valid_bytes = max_bytes.min(s.len());
     while valid_bytes > 0 && !s.is_char_boundary(valid_bytes) {
@@ -1144,7 +1633,7 @@ fn write_artifact_file_if_absent(path: &Path, bytes: &[u8]) -> std::io::Result<(
     {
         Ok(mut file) => {
             file.write_all(bytes)?;
-            file.sync_all()?;
+            tolerate_fsync_refusal(file.sync_all(), "artifact file", path)?;
             Ok(())
         }
         Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
@@ -1181,7 +1670,7 @@ fn write_text_tool_output_artifact_at_root(
     }
     let redacted = redact_tool_output_artifact_bytes(bytes)?;
     let bytes = redacted.bytes.as_slice();
-    let sha256 = format!("{:x}", sha2::Sha256::digest(bytes));
+    let sha256 = crate::package_manager::hex_encode(&sha2::Sha256::digest(bytes));
     let (scope_dir, session_id) = tool_output_artifact_scope_dir(root, tool_call_id);
     std::fs::create_dir_all(&scope_dir)?;
 
@@ -1249,7 +1738,7 @@ fn copy_text_tool_output_artifact_from_path_at_root(
     let redacted = redact_tool_output_artifact_bytes(&source_bytes)?;
     let bytes = redacted.bytes.as_slice();
 
-    let sha256 = format!("{:x}", sha2::Sha256::digest(bytes));
+    let sha256 = crate::package_manager::hex_encode(&sha2::Sha256::digest(bytes));
     let (scope_dir, session_id) = tool_output_artifact_scope_dir(root, tool_call_id);
     std::fs::create_dir_all(&scope_dir)?;
     let id = format!("tool-artifact-{}", &sha256[..16]);
@@ -1291,10 +1780,32 @@ fn append_tool_output_artifact_notice(output_text: &mut String, artifact: &ToolO
 }
 
 fn append_artifact_source_line(full_text: &mut String, line: &str) {
+    // Artifact redaction refuses inputs above this size. Stop retaining bytes
+    // as soon as we cross that boundary instead of allowing a streaming grep
+    // with a caller-supplied huge limit to grow memory without bound. The one
+    // extra byte keeps the persistence path honest: it reports that the full
+    // artifact exceeded its redaction limit.
+    let capture_limit = TOOL_OUTPUT_ARTIFACT_REDACTION_MAX_BYTES_USIZE.saturating_add(1);
+    if full_text.len() >= capture_limit {
+        return;
+    }
     if !full_text.is_empty() {
         full_text.push('\n');
     }
-    full_text.push_str(line);
+    let remaining = capture_limit.saturating_sub(full_text.len());
+    if line.len() <= remaining {
+        full_text.push_str(line);
+        return;
+    }
+
+    let mut prefix_len = remaining;
+    while prefix_len > 0 && !line.is_char_boundary(prefix_len) {
+        prefix_len -= 1;
+    }
+    full_text.push_str(&line[..prefix_len]);
+    while full_text.len() <= TOOL_OUTPUT_ARTIFACT_REDACTION_MAX_BYTES_USIZE {
+        full_text.push('!');
+    }
 }
 
 fn record_tool_output_artifact_error(
@@ -1496,6 +2007,299 @@ const TOOL_OUTPUT_CACHE_MAX_ENTRY_BYTES: usize = DEFAULT_MAX_BYTES + 64 * 1024;
 const TOOL_OUTPUT_CACHE_MAX_FINGERPRINT_FILES: usize = 2048;
 const TOOL_OUTPUT_CACHE_MAX_FINGERPRINT_BYTES: u64 = 8 * 1024 * 1024;
 const TOOL_OUTPUT_CACHE_MAX_FILE_HASH_BYTES: u64 = 2 * 1024 * 1024;
+const GREP_CONTEXT_MAX_FILE_BYTES: u64 = 10 * 1024 * 1024;
+const GREP_CONTEXT_MAX_LINES: usize = 200_000;
+const RECURSIVE_SCAN_IGNORE_CONTROL_MAX_BYTES: u64 = 8 * 1024 * 1024;
+
+#[cfg(unix)]
+fn opened_file_matches_metadata_snapshot(
+    expected: &std::fs::Metadata,
+    opened: &std::fs::Metadata,
+) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+
+    expected.dev() == opened.dev() && expected.ino() == opened.ino()
+}
+
+#[cfg(windows)]
+fn opened_file_matches_metadata_snapshot(
+    expected: &std::fs::Metadata,
+    opened: &std::fs::Metadata,
+) -> bool {
+    use std::os::windows::fs::MetadataExt as _;
+
+    expected.creation_time() == opened.creation_time()
+        && expected.file_size() == opened.file_size()
+        && expected.last_write_time() == opened.last_write_time()
+}
+
+#[cfg(not(any(unix, windows)))]
+fn opened_file_matches_metadata_snapshot(
+    _expected: &std::fs::Metadata,
+    _opened: &std::fs::Metadata,
+) -> bool {
+    true
+}
+
+fn open_regular_file_for_capped_read(path: &Path) -> std::io::Result<std::fs::File> {
+    // Resolve an intentional terminal symlink once, then refuse a second
+    // terminal link swap while opening the resolved target. NONBLOCK keeps a
+    // concurrent regular-file-to-FIFO swap from hanging the agent.
+    let resolved_path = std::fs::canonicalize(path)?;
+    let expected_metadata = std::fs::metadata(&resolved_path)?;
+    if !expected_metadata.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{} is not a regular file", path.display()),
+        ));
+    }
+
+    #[cfg(unix)]
+    ensure_ancestors_searchable_sync(&resolved_path)?;
+
+    #[cfg(unix)]
+    let file = {
+        let descriptor = rustix::fs::open(
+            &resolved_path,
+            rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::CLOEXEC
+                | rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::NONBLOCK,
+            rustix::fs::Mode::empty(),
+        )
+        .map_err(std::io::Error::from)?;
+        std::fs::File::from(descriptor)
+    };
+
+    #[cfg(windows)]
+    let file = {
+        use std::os::windows::fs::OpenOptionsExt as _;
+
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(&resolved_path)?
+    };
+
+    #[cfg(not(any(unix, windows)))]
+    let file = std::fs::File::open(&resolved_path)?;
+
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{} is not a regular file", path.display()),
+        ));
+    }
+    if !opened_file_matches_metadata_snapshot(&expected_metadata, &metadata) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{} changed while opening", path.display()),
+        ));
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "{} changed to a reparse point while opening",
+                    path.display()
+                ),
+            ));
+        }
+    }
+    ensure_effective_mode_access(
+        &metadata,
+        &resolved_path,
+        UNIX_ACCESS_READ,
+        "bounded file reading",
+    )?;
+    Ok(file)
+}
+
+fn open_regular_file_within_roots_with<F>(
+    path: &Path,
+    allowed_roots: &[PathBuf],
+    before_open: F,
+) -> std::io::Result<std::fs::File>
+where
+    F: FnOnce(),
+{
+    let lexical_path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let canonical_path = strip_unc_prefix(std::fs::canonicalize(&lexical_path)?);
+    let within_allowed_root = allowed_roots.iter().any(|root| {
+        std::fs::canonicalize(root)
+            .map(strip_unc_prefix)
+            .is_ok_and(|canonical_root| canonical_path.starts_with(canonical_root))
+    });
+    if !within_allowed_root {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "refusing to read outside the allowed roots: {}",
+                lexical_path.display()
+            ),
+        ));
+    }
+
+    let access_context = EffectiveModeAccessContext::current()?;
+    #[cfg(unix)]
+    {
+        ensure_ancestors_searchable_with_context_sync(&lexical_path, &access_context)?;
+        ensure_ancestors_searchable_with_context_sync(&canonical_path, &access_context)?;
+    }
+
+    let expected_metadata = std::fs::metadata(&canonical_path)?;
+    if !expected_metadata.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{} is not a regular file", lexical_path.display()),
+        ));
+    }
+    access_context.ensure(
+        &expected_metadata,
+        &canonical_path,
+        UNIX_ACCESS_READ,
+        "scoped file reading",
+    )?;
+
+    before_open();
+
+    #[cfg(unix)]
+    let file = {
+        let descriptor = rustix::fs::open(
+            &lexical_path,
+            rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::CLOEXEC
+                | rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::NONBLOCK,
+            rustix::fs::Mode::empty(),
+        )
+        .map_err(std::io::Error::from)?;
+        std::fs::File::from(descriptor)
+    };
+
+    #[cfg(windows)]
+    let file = {
+        use std::os::windows::fs::OpenOptionsExt as _;
+
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(&lexical_path)?
+    };
+
+    #[cfg(not(any(unix, windows)))]
+    let file = std::fs::File::open(&lexical_path)?;
+
+    let opened_metadata = file.metadata()?;
+    if !opened_metadata.is_file()
+        || !opened_file_matches_metadata_snapshot(&expected_metadata, &opened_metadata)
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("{} changed while opening", lexical_path.display()),
+        ));
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+        if opened_metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "{} changed to a reparse point while opening",
+                    lexical_path.display()
+                ),
+            ));
+        }
+    }
+    access_context.ensure(
+        &opened_metadata,
+        &lexical_path,
+        UNIX_ACCESS_READ,
+        "scoped file reading",
+    )?;
+    Ok(file)
+}
+
+fn open_scoped_regular_file_for_read_with<F>(
+    path: &Path,
+    cwd: &Path,
+    before_open: F,
+) -> std::io::Result<std::fs::File>
+where
+    F: FnOnce(),
+{
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    };
+    open_regular_file_within_roots_with(&path, &[cwd.to_path_buf()], before_open)
+}
+
+fn read_scoped_file_capped_sync(
+    path: &Path,
+    cwd: &Path,
+    max_bytes: u64,
+) -> std::io::Result<Vec<u8>> {
+    let file = open_scoped_regular_file_for_read_with(path, cwd, || {})?;
+    let mut contents = Vec::new();
+    file.take(max_bytes.saturating_add(1))
+        .read_to_end(&mut contents)?;
+    if u64::try_from(contents.len()).unwrap_or(u64::MAX) > max_bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{} exceeds {max_bytes} bytes", path.display()),
+        ));
+    }
+    Ok(contents)
+}
+
+fn read_file_capped_within_roots_sync(
+    path: &Path,
+    allowed_roots: &[PathBuf],
+    max_bytes: u64,
+) -> std::io::Result<Vec<u8>> {
+    let file = open_regular_file_within_roots_with(path, allowed_roots, || {})?;
+    let mut contents = Vec::new();
+    file.take(max_bytes.saturating_add(1))
+        .read_to_end(&mut contents)?;
+    if u64::try_from(contents.len()).unwrap_or(u64::MAX) > max_bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{} exceeds {max_bytes} bytes", path.display()),
+        ));
+    }
+    Ok(contents)
+}
+
+fn read_file_capped_sync(path: &Path, max_bytes: u64) -> std::io::Result<Vec<u8>> {
+    let file = open_regular_file_for_capped_read(path)?;
+    let mut contents = Vec::new();
+    file.take(max_bytes.saturating_add(1))
+        .read_to_end(&mut contents)?;
+    if u64::try_from(contents.len()).unwrap_or(u64::MAX) > max_bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{} exceeds {max_bytes} bytes", path.display()),
+        ));
+    }
+    Ok(contents)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ToolCacheDependency {
@@ -1701,6 +2505,76 @@ fn stable_cache_dependency_for_path(
     (before_deps == after_deps.as_slice()).then_some(after_deps)
 }
 
+fn cache_dependencies_for_scan(
+    path: &Path,
+    cwd: &Path,
+    mode: ToolCacheFingerprintMode,
+    recursive_access: Option<RecursiveScanAccess>,
+) -> Option<Vec<ToolCacheDependency>> {
+    let mut dependencies = cache_dependency_for_path(path, mode)?;
+    if let Some(access) = recursive_access {
+        dependencies.extend(ignore_control_cache_dependencies(path, cwd, access)?);
+    }
+    Some(dependencies)
+}
+
+fn stable_cache_dependencies_for_scan(
+    path: &Path,
+    cwd: &Path,
+    mode: ToolCacheFingerprintMode,
+    recursive_access: Option<RecursiveScanAccess>,
+    before_deps: Option<&[ToolCacheDependency]>,
+) -> Option<Vec<ToolCacheDependency>> {
+    let before_deps = before_deps?;
+    let after_deps = cache_dependencies_for_scan(path, cwd, mode, recursive_access)?;
+    (before_deps == after_deps.as_slice()).then_some(after_deps)
+}
+
+fn cache_dependencies_for_scoped_scan(
+    root: &ScopedScanRoot,
+    cwd_root: &ScopedScanRoot,
+    mode: ToolCacheFingerprintMode,
+    recursive_access: Option<RecursiveScanAccess>,
+) -> Option<Vec<ToolCacheDependency>> {
+    let io_path = root.io_path();
+    let fingerprint = match mode {
+        // File roots are read via the bare descriptor path; `io_path()` is
+        // only traversable for directory roots.
+        ToolCacheFingerprintMode::FileContent => fingerprint_file_content(&root.file_read_path())?,
+        ToolCacheFingerprintMode::DirectoryImmediate => fingerprint_directory_immediate(&io_path)?,
+        ToolCacheFingerprintMode::DirectoryRecursive => fingerprint_directory_recursive(&io_path)?,
+    };
+    let mut dependencies = vec![ToolCacheDependency {
+        path: root.logical_path().to_path_buf(),
+        fingerprint,
+    }];
+    if let Some(access) = recursive_access {
+        let cwd_io_path = cwd_root.io_path();
+        let mut controls = ignore_control_cache_dependencies(&io_path, &cwd_io_path, access)?;
+        for control in &mut controls {
+            if let Ok(relative) = control.path.strip_prefix(&io_path) {
+                control.path = root.logical_path().join(relative);
+            } else if let Ok(relative) = control.path.strip_prefix(&cwd_io_path) {
+                control.path = cwd_root.logical_path().join(relative);
+            }
+        }
+        dependencies.extend(controls);
+    }
+    Some(dependencies)
+}
+
+fn stable_cache_dependencies_for_scoped_scan(
+    root: &ScopedScanRoot,
+    cwd_root: &ScopedScanRoot,
+    mode: ToolCacheFingerprintMode,
+    recursive_access: Option<RecursiveScanAccess>,
+    before_deps: Option<&[ToolCacheDependency]>,
+) -> Option<Vec<ToolCacheDependency>> {
+    let before_deps = before_deps?;
+    let after_deps = cache_dependencies_for_scoped_scan(root, cwd_root, mode, recursive_access)?;
+    (before_deps == after_deps.as_slice()).then_some(after_deps)
+}
+
 fn cacheable_tool_output_weight(output: &ToolOutput) -> Option<usize> {
     let mut weight = output
         .details
@@ -1717,6 +2591,7 @@ fn cacheable_tool_output_weight(output: &ToolOutput) -> Option<usize> {
                 }
             }
             ContentBlock::Image(_)
+            | ContentBlock::Media(_)
             | ContentBlock::Thinking(_)
             | ContentBlock::RedactedThinking(_)
             | ContentBlock::ToolCall(_) => return None,
@@ -1742,24 +2617,188 @@ fn cache_dependency_for_path(
     }])
 }
 
+fn cache_dependency_for_open_file(
+    path: &Path,
+    file: &std::fs::File,
+) -> Option<Vec<ToolCacheDependency>> {
+    Some(vec![ToolCacheDependency {
+        path: path.to_path_buf(),
+        fingerprint: fingerprint_open_file_content(file)?,
+    }])
+}
+
+fn stable_cache_dependency_for_open_file(
+    path: &Path,
+    file: Option<&std::fs::File>,
+    before_deps: Option<&[ToolCacheDependency]>,
+) -> Option<Vec<ToolCacheDependency>> {
+    let file = file?;
+    let before_deps = before_deps?;
+    let after_deps = cache_dependency_for_open_file(path, file)?;
+    (before_deps == after_deps.as_slice()).then_some(after_deps)
+}
+
 fn fingerprint_file_content(path: &Path) -> Option<[u8; 32]> {
-    let metadata = std::fs::symlink_metadata(path).ok()?;
-    if !metadata.is_file() || metadata.len() > TOOL_OUTPUT_CACHE_MAX_FILE_HASH_BYTES {
+    ensure_ancestors_searchable_sync(path).ok()?;
+    let file = open_regular_file_for_capped_read(path).ok()?;
+    fingerprint_open_file_content(&file)
+}
+
+fn fingerprint_open_file_content(file: &std::fs::File) -> Option<[u8; 32]> {
+    let before = file.metadata().ok()?;
+    if !before.is_file() || before.len() > TOOL_OUTPUT_CACHE_MAX_FILE_HASH_BYTES {
         return None;
     }
 
-    let bytes = std::fs::read(path).ok()?;
+    let bytes = read_open_file_capped_at(file, TOOL_OUTPUT_CACHE_MAX_FILE_HASH_BYTES).ok()?;
+    if u64::try_from(bytes.len()).ok()? != before.len() {
+        return None;
+    }
+    let after = file.metadata().ok()?;
+    if !cache_fingerprint_metadata_stable(&before, &after) {
+        return None;
+    }
+
     let mut hasher = sha2::Sha256::new();
-    update_fingerprint_metadata(&mut hasher, Path::new(""), &metadata);
+    update_fingerprint_metadata(&mut hasher, Path::new(""), &before);
     hasher.update(sha2::Sha256::digest(&bytes));
     Some(hasher.finalize().into())
 }
 
+fn cache_fingerprint_metadata_stable(
+    before: &std::fs::Metadata,
+    after: &std::fs::Metadata,
+) -> bool {
+    opened_file_matches_metadata_snapshot(before, after)
+        && before.is_file() == after.is_file()
+        && before.is_dir() == after.is_dir()
+        && before.file_type().is_symlink() == after.file_type().is_symlink()
+        && before.len() == after.len()
+        && before.modified().ok() == after.modified().ok()
+}
+
+fn read_open_file_capped_at(file: &std::fs::File, max_bytes: u64) -> std::io::Result<Vec<u8>> {
+    let max_len = usize::try_from(max_bytes)
+        .map_err(|_| std::io::Error::other("cache fingerprint limit exceeds usize"))?;
+    let read_limit = max_len
+        .checked_add(1)
+        .ok_or_else(|| std::io::Error::other("cache fingerprint limit overflow"))?;
+    let initial_capacity = file
+        .metadata()
+        .ok()
+        .and_then(|metadata| usize::try_from(metadata.len()).ok())
+        .unwrap_or(0)
+        .min(read_limit);
+    let mut contents = Vec::with_capacity(initial_capacity);
+    let mut buffer = vec![0_u8; 64 * 1024];
+    let mut offset = 0_u64;
+
+    while contents.len() < read_limit {
+        let remaining = read_limit - contents.len();
+        let chunk_len = remaining.min(buffer.len());
+        let read = loop {
+            match positioned_file_read(file, &mut buffer[..chunk_len], offset) {
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                result => break result?,
+            }
+        };
+        if read == 0 {
+            break;
+        }
+        contents.extend_from_slice(&buffer[..read]);
+        offset = offset
+            .checked_add(u64::try_from(read).unwrap_or(u64::MAX))
+            .ok_or_else(|| std::io::Error::other("cache fingerprint offset overflow"))?;
+    }
+
+    if contents.len() > max_len {
+        return Err(std::io::Error::other(
+            "file exceeds cache fingerprint limit",
+        ));
+    }
+    Ok(contents)
+}
+
+#[cfg(unix)]
+fn positioned_file_read(
+    file: &std::fs::File,
+    buffer: &mut [u8],
+    offset: u64,
+) -> std::io::Result<usize> {
+    std::os::unix::fs::FileExt::read_at(file, buffer, offset)
+}
+
+/// Restore `resume` as the handle's position after a positioned read that
+/// moved it, and fold the two fallible steps into one result.
+///
+/// A failure to restore is reported even when the read itself succeeded: the
+/// cursor is then at an unknown offset, and callers that share it would read
+/// from the wrong place rather than fail. The read's own error wins when both
+/// fail, because it is the more informative one.
+#[cfg(not(unix))]
+fn restore_file_position(
+    file: &std::fs::File,
+    resume: u64,
+    read: std::io::Result<usize>,
+) -> std::io::Result<usize> {
+    // `Seek` is implemented for `&File`, so seeking needs `&mut &File` and
+    // never `&mut File`; the handle itself stays shared.
+    let mut handle: &std::fs::File = file;
+    let restored = std::io::Seek::seek(&mut handle, std::io::SeekFrom::Start(resume));
+    match (read, restored) {
+        (Ok(read), Ok(_)) => Ok(read),
+        (Err(error), _) | (Ok(_), Err(error)) => Err(error),
+    }
+}
+
+// `seek_read` sets the cursor to the end of the read, unlike the Unix `read_at`
+// above, which never touches it. Callers treat this function as cursor-neutral
+// on every platform, and at least one of them fingerprints through a
+// `try_clone()` that shares its cursor with the handle doing the real read
+// (`ReadTool::execute`). Leaving the cursor at EOF there made `read` return an
+// empty file with no error for every file on Windows (bd-kgkrq, GH #182), so
+// put the position back where we found it.
+#[cfg(windows)]
+fn positioned_file_read(
+    file: &std::fs::File,
+    buffer: &mut [u8],
+    offset: u64,
+) -> std::io::Result<usize> {
+    let mut handle: &std::fs::File = file;
+    let resume = std::io::Seek::stream_position(&mut handle)?;
+    let read = std::os::windows::fs::FileExt::seek_read(file, buffer, offset);
+    restore_file_position(file, resume, read)
+}
+
+// `try_clone` shares the OS file position with the original handle, so seeking
+// the clone moves the caller's cursor exactly as `seek_read` does above. Same
+// contract, same restore.
+#[cfg(not(any(unix, windows)))]
+fn positioned_file_read(
+    file: &std::fs::File,
+    buffer: &mut [u8],
+    offset: u64,
+) -> std::io::Result<usize> {
+    let mut handle: &std::fs::File = file;
+    let resume = std::io::Seek::stream_position(&mut handle)?;
+    let read = std::io::Seek::seek(&mut handle, std::io::SeekFrom::Start(offset))
+        .and_then(|_| handle.read(buffer));
+    restore_file_position(file, resume, read)
+}
+
 fn fingerprint_directory_immediate(path: &Path) -> Option<[u8; 32]> {
-    let metadata = std::fs::symlink_metadata(path).ok()?;
+    let metadata = std::fs::metadata(path).ok()?;
     if !metadata.is_dir() {
         return None;
     }
+    ensure_ancestors_searchable_sync(path).ok()?;
+    ensure_effective_mode_access(
+        &metadata,
+        path,
+        UNIX_ACCESS_READ | UNIX_ACCESS_SEARCH,
+        "cache directory scanning",
+    )
+    .ok()?;
 
     let mut entries = std::fs::read_dir(path)
         .ok()?
@@ -1787,13 +2826,21 @@ fn fingerprint_directory_immediate(path: &Path) -> Option<[u8; 32]> {
 }
 
 fn fingerprint_directory_recursive(path: &Path) -> Option<[u8; 32]> {
-    let metadata = std::fs::symlink_metadata(path).ok()?;
+    let metadata = std::fs::metadata(path).ok()?;
     if metadata.is_file() {
         return fingerprint_file_content(path);
     }
     if !metadata.is_dir() {
         return None;
     }
+    ensure_ancestors_searchable_sync(path).ok()?;
+    ensure_effective_mode_access(
+        &metadata,
+        path,
+        UNIX_ACCESS_READ | UNIX_ACCESS_SEARCH,
+        "cache directory scanning",
+    )
+    .ok()?;
 
     let mut budget = FingerprintBudget::default();
     let mut hasher = sha2::Sha256::new();
@@ -1814,6 +2861,14 @@ fn fingerprint_tree(
     budget: &mut FingerprintBudget,
     hasher: &mut sha2::Sha256,
 ) -> Option<()> {
+    let dir_metadata = std::fs::metadata(dir).ok()?;
+    ensure_effective_mode_access(
+        &dir_metadata,
+        dir,
+        UNIX_ACCESS_READ | UNIX_ACCESS_SEARCH,
+        "cache directory scanning",
+    )
+    .ok()?;
     let mut entries = std::fs::read_dir(dir)
         .ok()?
         .collect::<std::result::Result<Vec<_>, _>>()
@@ -1839,11 +2894,19 @@ fn fingerprint_tree(
             if metadata.len() > TOOL_OUTPUT_CACHE_MAX_FILE_HASH_BYTES {
                 return None;
             }
+            ensure_effective_mode_access(
+                &metadata,
+                &entry_path,
+                UNIX_ACCESS_READ,
+                "cache file reading",
+            )
+            .ok()?;
             budget.bytes = budget.bytes.saturating_add(metadata.len());
             if budget.bytes > TOOL_OUTPUT_CACHE_MAX_FINGERPRINT_BYTES {
                 return None;
             }
-            let bytes = std::fs::read(&entry_path).ok()?;
+            let bytes =
+                read_file_capped_sync(&entry_path, TOOL_OUTPUT_CACHE_MAX_FILE_HASH_BYTES).ok()?;
             hasher.update(sha2::Sha256::digest(&bytes));
         }
     }
@@ -1958,11 +3021,26 @@ fn expand_path(file_path: &str) -> String {
             .to_string_lossy()
             .to_string();
     }
-    if let Some(rest) = normalized.strip_prefix("~/") {
+    if let Some(rest) = home_relative_rest(&normalized, cfg!(windows)) {
         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("~"));
         return home.join(rest).to_string_lossy().to_string();
     }
     normalized
+}
+
+/// The remainder of `path` after a leading `~` home marker, or `None`.
+///
+/// `~/` is a home marker everywhere. `~\` is one only where backslash is a
+/// path separator (Windows, where models naturally write `~\Documents\x`);
+/// on Unix `~\x` is a legal relative file name and must stay literal.
+fn home_relative_rest(path: &str, backslash_separates: bool) -> Option<&str> {
+    path.strip_prefix("~/").or_else(|| {
+        if backslash_separates {
+            path.strip_prefix("~\\")
+        } else {
+            None
+        }
+    })
 }
 
 /// Resolve a path relative to `cwd`. Handles `~` expansion and absolute paths.
@@ -2051,17 +3129,1391 @@ pub(crate) fn resolve_read_path(file_path: &str, cwd: &Path) -> PathBuf {
     resolved
 }
 
-fn enforce_cwd_scope(path: &Path, cwd: &Path, action: &str) -> Result<PathBuf> {
+fn enforce_cwd_scope(
+    path: &Path,
+    cwd: &Path,
+    action: &str,
+    workspace: &WorkspaceHandle,
+) -> Result<PathBuf> {
     let canonical_path = crate::extensions::safe_canonicalize(path);
     let canonical_cwd = crate::extensions::safe_canonicalize(cwd);
+    let roots = workspace.snapshot_or(cwd);
+    if roots.additional().is_empty() {
+        // Single-root sessions keep the legacy decision and message verbatim.
+        if !canonical_path.starts_with(&canonical_cwd) {
+            return Err(Error::validation(format!(
+                "Cannot {action} outside the working directory (resolved: {}, cwd: {})",
+                path_for_line_output(&canonical_path),
+                path_for_line_output(&canonical_cwd)
+            )));
+        }
+        return Ok(canonical_path);
+    }
+    ensure_canonical_path_allowed(&canonical_path, &roots.all(), action)?;
+    Ok(canonical_path)
+}
+
+struct ScopedScanRoot {
+    logical_path: PathBuf,
+    #[cfg(unix)]
+    handle: std::fs::File,
+    #[cfg(windows)]
+    _component_guards: Vec<std::fs::File>,
+}
+
+impl ScopedScanRoot {
+    fn logical_path(&self) -> &Path {
+        &self.logical_path
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn io_path(&self) -> PathBuf {
+        use std::os::fd::AsRawFd as _;
+
+        let descriptor = self.handle.as_raw_fd();
+        PathBuf::from("/proc/self/fd")
+            .join(descriptor.to_string())
+            .join(".")
+    }
+
+    // macOS/BSD `/dev/fd/N` entries support only re-open (dup) semantics:
+    // traversing through them as directories fails (`/dev/fd/N/.` -> ENOENT,
+    // readdir -> ENOTDIR), so fd-relative path IO is procfs-only. Fall back
+    // to the canonicalized logical path, as Windows does; the pinned handle
+    // still guards identity and liveness of the scan root.
+    #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+    fn io_path(&self) -> PathBuf {
+        self.logical_path.clone()
+    }
+
+    #[cfg(windows)]
+    fn io_path(&self) -> PathBuf {
+        self.logical_path.clone()
+    }
+
+    // `&self` kept (despite being unused on this cfg) so both platform variants
+    // share one method signature at every call site.
+    #[allow(clippy::unused_self)]
+    #[cfg(unix)]
+    fn child_operand(&self) -> PathBuf {
+        PathBuf::from(".")
+    }
+
+    #[allow(clippy::unused_self)]
+    #[cfg(windows)]
+    fn child_operand(&self) -> PathBuf {
+        PathBuf::from(".")
+    }
+
+    /// Whether the pinned root is a regular file rather than a directory.
+    fn is_file_root(&self) -> bool {
+        #[cfg(unix)]
+        {
+            self.handle.metadata().is_ok_and(|m| m.is_file())
+        }
+        #[cfg(windows)]
+        {
+            std::fs::metadata(&self.logical_path).is_ok_and(|m| m.is_file())
+        }
+    }
+
+    /// Path for reading the pinned root's bytes when it is a regular file.
+    ///
+    /// `io_path()` appends `/.` for directory traversal, which never resolves
+    /// for a file descriptor. The bare `/proc/self/fd/N` form does not work
+    /// either: procfs descriptor entries are magic symlinks, and every scoped
+    /// read helper opens results with `O_NOFOLLOW`. Downstream readers verify
+    /// descriptor identity against this path themselves, so the logical path
+    /// is the correct read handle on every platform.
+    fn file_read_path(&self) -> PathBuf {
+        self.logical_path.clone()
+    }
+
+    /// Scanner operand for a pinned regular-file root. Children cannot chdir
+    /// into a file, so Unix children read the pinned descriptor from stdin
+    /// (`-`), while Windows children receive the logical path.
+    #[allow(clippy::unused_self)]
+    #[cfg(unix)]
+    fn file_child_operand(&self) -> PathBuf {
+        PathBuf::from("-")
+    }
+
+    #[cfg(windows)]
+    fn file_child_operand(&self) -> PathBuf {
+        self.logical_path.clone()
+    }
+
+    /// Path by which a child can access this root after its handle is installed
+    /// as stdin. Scanner children run with their pinned scan root as cwd, so
+    /// stdin remains available for the independently pinned workspace root.
+    // `&self` kept (despite being unused on this cfg) so both platform variants
+    // share one method signature at every call site.
+    #[allow(clippy::unused_self)]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn inherited_child_operand(&self) -> PathBuf {
+        PathBuf::from("/proc/self/fd/0").join(".")
+    }
+
+    // See io_path(): /dev/fd nodes cannot be traversed on macOS/BSD, so a
+    // child reaches the independently pinned workspace root by its logical
+    // path while the inherited stdin descriptor keeps the root alive.
+    #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+    fn inherited_child_operand(&self) -> PathBuf {
+        self.logical_path.clone()
+    }
+
+    #[cfg(windows)]
+    fn inherited_child_operand(&self) -> PathBuf {
+        self.logical_path.clone()
+    }
+
+    #[cfg(unix)]
+    fn child_stdin(&self) -> std::io::Result<Stdio> {
+        Ok(Stdio::from(self.handle.try_clone()?))
+    }
+
+    // Mirrors the Unix arm, which clones a real handle off `self` and can fail.
+    #[cfg(windows)]
+    #[allow(clippy::unnecessary_wraps, clippy::unused_self)]
+    fn child_stdin(&self) -> std::io::Result<Stdio> {
+        Ok(Stdio::null())
+    }
+
+    fn map_child_output(&self, child_path: &Path) -> std::io::Result<ScopedScanOutputPath> {
+        // A regular-file root has exactly one possible result: the root
+        // itself. Unix scanners read it from stdin (reporting `<stdin>`),
+        // so their reported path never resolves against the root anyway.
+        if self.is_file_root() {
+            return Ok(ScopedScanOutputPath {
+                read_path: self.file_read_path(),
+                logical_path: self.logical_path.clone(),
+                relative: PathBuf::new(),
+            });
+        }
+
+        #[cfg(unix)]
+        let relative = if child_path.is_absolute() {
+            child_path
+                .strip_prefix(self.io_path())
+                .or_else(|_| child_path.strip_prefix(&self.logical_path))
+                .map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "scanner returned a path outside its pinned root",
+                    )
+                })?
+                .to_path_buf()
+        } else {
+            child_path.to_path_buf()
+        };
+
+        #[cfg(windows)]
+        let relative = if child_path.is_absolute() {
+            strip_unc_prefix(child_path.to_path_buf())
+                .strip_prefix(strip_unc_prefix(self.logical_path.clone()))
+                .map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "scanner returned a path outside its pinned root",
+                    )
+                })?
+                .to_path_buf()
+        } else {
+            child_path.to_path_buf()
+        };
+
+        let relative = normalize_scanner_relative_path(&relative)?;
+        Ok(ScopedScanOutputPath {
+            read_path: self.io_path().join(&relative),
+            logical_path: self.logical_path.join(&relative),
+            relative,
+        })
+    }
+}
+
+struct ScopedScanOutputPath {
+    read_path: PathBuf,
+    logical_path: PathBuf,
+    relative: PathBuf,
+}
+
+fn normalize_scanner_relative_path(path: &Path) -> std::io::Result<PathBuf> {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::Normal(name) => normalized.push(name),
+            _ => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "scanner returned a non-relative path component",
+                ));
+            }
+        }
+    }
+    Ok(normalized)
+}
+
+async fn open_scoped_scan_root(
+    path: &Path,
+    cwd: &Path,
+    allow_file: bool,
+    after_open: Option<Arc<dyn Fn() + Send + Sync>>,
+) -> std::io::Result<ScopedScanRoot> {
+    let path = path.to_path_buf();
+    let cwd = cwd.to_path_buf();
+    asupersync::runtime::spawn_blocking_io(move || {
+        open_scoped_scan_root_sync(&path, &cwd, allow_file, || {
+            if let Some(after_open) = after_open {
+                after_open();
+            }
+        })
+    })
+    .await
+}
+
+#[cfg(unix)]
+fn open_scoped_scan_root_sync<F>(
+    path: &Path,
+    cwd: &Path,
+    allow_file: bool,
+    after_open: F,
+) -> std::io::Result<ScopedScanRoot>
+where
+    F: FnOnce(),
+{
+    let canonical_cwd = std::fs::canonicalize(cwd)?;
+    let canonical_path = std::fs::canonicalize(path)?;
     if !canonical_path.starts_with(&canonical_cwd) {
-        return Err(Error::validation(format!(
-            "Cannot {action} outside the working directory (resolved: {}, cwd: {})",
-            canonical_path.display(),
-            canonical_cwd.display()
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "scan root escaped the working directory before it could be pinned",
+        ));
+    }
+    ensure_ancestors_searchable_sync(&canonical_path)?;
+    let expected = std::fs::symlink_metadata(&canonical_path)?;
+    if expected.file_type().is_symlink() || !(expected.is_dir() || allow_file && expected.is_file())
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "scan root is not an allowed directory or regular file",
+        ));
+    }
+
+    let mut flags = rustix::fs::OFlags::RDONLY
+        | rustix::fs::OFlags::CLOEXEC
+        | rustix::fs::OFlags::NOFOLLOW
+        | rustix::fs::OFlags::NONBLOCK;
+    if expected.is_dir() {
+        flags |= rustix::fs::OFlags::DIRECTORY;
+    }
+    let descriptor = rustix::fs::open(&canonical_path, flags, rustix::fs::Mode::empty())
+        .map_err(std::io::Error::from)?;
+    let handle = std::fs::File::from(descriptor);
+    let opened = handle.metadata()?;
+    if !opened_file_matches_metadata_snapshot(&expected, &opened)
+        || !(opened.is_dir() || allow_file && opened.is_file())
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "scan root changed while it was being pinned",
+        ));
+    }
+    let required_access = if opened.is_dir() {
+        UNIX_ACCESS_READ | UNIX_ACCESS_SEARCH
+    } else {
+        UNIX_ACCESS_READ
+    };
+    ensure_effective_mode_access(&opened, &canonical_path, required_access, "scoped scanning")?;
+    after_open();
+    Ok(ScopedScanRoot {
+        logical_path: canonical_path,
+        handle,
+    })
+}
+
+#[cfg(windows)]
+fn open_scoped_scan_root_sync<F>(
+    path: &Path,
+    cwd: &Path,
+    allow_file: bool,
+    after_open: F,
+) -> std::io::Result<ScopedScanRoot>
+where
+    F: FnOnce(),
+{
+    use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
+    use std::path::Component;
+
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const FILE_SHARE_READ: u32 = 0x0000_0001;
+    const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+
+    let canonical_cwd = strip_unc_prefix(std::fs::canonicalize(cwd)?);
+    let canonical_path = strip_unc_prefix(std::fs::canonicalize(path)?);
+    if !canonical_path.starts_with(&canonical_cwd) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "scan root escaped the working directory before it could be pinned",
+        ));
+    }
+
+    let components = canonical_path.components().collect::<Vec<_>>();
+    let mut current = PathBuf::new();
+    let mut guards = Vec::new();
+    for (index, component) in components.iter().enumerate() {
+        match component {
+            Component::Prefix(prefix) => {
+                current.push(prefix.as_os_str());
+                continue;
+            }
+            Component::RootDir => {
+                current.push(component.as_os_str());
+                continue;
+            }
+            Component::CurDir => continue,
+            Component::ParentDir => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "scan roots must not contain parent components",
+                ));
+            }
+            Component::Normal(name) => current.push(name),
+        }
+
+        let is_final = index + 1 == components.len();
+        let expected = std::fs::symlink_metadata(&current)?;
+        let expected_type_allowed = if is_final {
+            expected.is_dir() || allow_file && expected.is_file()
+        } else {
+            expected.is_dir()
+        };
+        if !expected_type_allowed || expected.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "scan root traverses a non-directory or Windows reparse point",
+            ));
+        }
+        let handle = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(&current)?;
+        let opened = handle.metadata()?;
+        if opened.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+            || opened.creation_time() != expected.creation_time()
+            || opened.is_dir() != expected.is_dir()
+            || opened.is_file() != expected.is_file()
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "scan path component changed while it was being pinned",
+            ));
+        }
+        guards.push(handle);
+    }
+    if guards.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "scan root did not contain an openable path component",
+        ));
+    }
+    after_open();
+    Ok(ScopedScanRoot {
+        logical_path: canonical_path,
+        _component_guards: guards,
+    })
+}
+
+#[cfg(not(any(unix, windows)))]
+fn open_scoped_scan_root_sync<F>(
+    _path: &Path,
+    _cwd: &Path,
+    _allow_file: bool,
+    _after_open: F,
+) -> std::io::Result<ScopedScanRoot>
+where
+    F: FnOnce(),
+{
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "scoped scanner root pinning is unsupported on this platform",
+    ))
+}
+
+async fn std_metadata_async(path: &Path) -> std::io::Result<std::fs::Metadata> {
+    let path = path.to_path_buf();
+    asupersync::runtime::spawn_blocking_io(move || std::fs::metadata(path)).await
+}
+
+fn ensure_ancestors_searchable_with_context_sync(
+    path: &Path,
+    access_context: &EffectiveModeAccessContext,
+) -> std::io::Result<()> {
+    for directory in path.ancestors().skip(1) {
+        if directory.as_os_str().is_empty() {
+            continue;
+        }
+        let metadata = std::fs::metadata(directory)?;
+        if !metadata.is_dir() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotADirectory,
+                format!("Not a directory: {}", directory.display()),
+            ));
+        }
+        access_context.ensure(
+            &metadata,
+            directory,
+            UNIX_ACCESS_SEARCH,
+            "directory traversal",
+        )?;
+    }
+    Ok(())
+}
+
+fn ensure_ancestors_searchable_sync(path: &Path) -> std::io::Result<()> {
+    let access_context = EffectiveModeAccessContext::current()?;
+    ensure_ancestors_searchable_with_context_sync(path, &access_context)
+}
+
+/// Backend for the `grep`/`find` tools (bd-cv653.1.5).
+///
+/// `Inproc` (default) searches with the same engines ripgrep is built from
+/// (`ignore` walker + `grep-searcher`/`globset`), linked into the process so
+/// no `rg`/`fd` binaries are required. `External` shells out to `rg`/`fd`
+/// exactly as before — kept as a debugging escape hatch via the
+/// `search_backend` setting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum SearchBackend {
+    #[default]
+    Inproc,
+    External,
+}
+
+pub(crate) fn search_backend_from_config(config: Option<&Config>) -> SearchBackend {
+    match config
+        .and_then(|config| config.search_backend.as_deref())
+        .map(str::trim)
+    {
+        Some("external") => SearchBackend::External,
+        Some("inproc" | "") | None => SearchBackend::Inproc,
+        Some(other) => {
+            tracing::warn!(
+                "unknown search_backend setting '{other}' (expected 'inproc' or 'external'); using inproc"
+            );
+            SearchBackend::Inproc
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecursiveScanAccess {
+    DirectoriesOnly,
+    ReadableFiles,
+}
+
+impl RecursiveScanAccess {
+    const fn custom_ignore_filename(self) -> &'static str {
+        match self {
+            Self::DirectoriesOnly => ".fdignore",
+            Self::ReadableFiles => ".rgignore",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct RecursiveScanDenial {
+    path: PathBuf,
+    kind: std::io::ErrorKind,
+    message: String,
+}
+
+fn ensure_ignore_control_readable_sync(
+    path: &Path,
+    access_context: &EffectiveModeAccessContext,
+    operation: &str,
+) -> std::io::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => {}
+        Err(err)
+            if matches!(
+                err.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            return Ok(());
+        }
+        Err(err) => return Err(err),
+    }
+    ensure_ancestors_searchable_with_context_sync(path, access_context)?;
+    let target = std::fs::canonicalize(path)?;
+    ensure_ancestors_searchable_with_context_sync(&target, access_context)?;
+    let metadata = std::fs::metadata(path)?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("ignore control is not a regular file: {}", path.display()),
+        ));
+    }
+    if metadata.len() > RECURSIVE_SCAN_IGNORE_CONTROL_MAX_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "ignore control {} exceeds {} bytes",
+                path.display(),
+                RECURSIVE_SCAN_IGNORE_CONTROL_MAX_BYTES
+            ),
+        ));
+    }
+    access_context.ensure(&metadata, path, UNIX_ACCESS_READ, operation)
+}
+
+#[derive(Debug, Clone)]
+struct GitGlobalConfigLocations {
+    home_dir: Option<PathBuf>,
+    xdg_config_home: Option<PathBuf>,
+}
+
+impl GitGlobalConfigLocations {
+    fn current() -> Self {
+        #[allow(deprecated)]
+        let home_dir = std::env::home_dir();
+        let xdg_config_home = std::env::var_os("XDG_CONFIG_HOME")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| home_dir.as_ref().map(|home| home.join(".config")));
+        Self {
+            home_dir,
+            xdg_config_home,
+        }
+    }
+}
+
+fn fd_global_ignore_path() -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        // fd uses etcetera's Windows base strategy, which resolves to the
+        // roaming application-data directory rather than XDG_CONFIG_HOME.
+        dirs::config_dir().map(|root| root.join("fd").join("ignore"))
+    }
+
+    #[cfg(not(windows))]
+    {
+        // fd deliberately uses the XDG strategy on both Unix and macOS. The
+        // `dirs` crate instead returns `~/Library/Application Support` on
+        // macOS, so using `dirs::config_dir` here would validate and cache a
+        // different file from the one the child process actually consumes.
+        fd_global_ignore_path_from_locations(&GitGlobalConfigLocations::current())
+    }
+}
+
+#[cfg(not(windows))]
+fn fd_global_ignore_path_from_locations(locations: &GitGlobalConfigLocations) -> Option<PathBuf> {
+    locations
+        .xdg_config_home
+        .as_ref()
+        .map(|root| root.join("fd").join("ignore"))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GitGlobalIgnoreControls {
+    consumed_config_paths: Vec<PathBuf>,
+    ignore_path: Option<PathBuf>,
+}
+
+// Keep in-process config discovery bounded and aligned with the largest file
+// the tool-output cache can fingerprint. The external ignore crate reads these
+// configs without a cap, but doing that in the long-lived agent process would
+// let an oversized user-controlled config exhaust memory before rg/fd starts.
+const GIT_GLOBAL_CONFIG_MAX_BYTES: u64 = TOOL_OUTPUT_CACHE_MAX_FILE_HASH_BYTES;
+const GIT_GLOBAL_IGNORE_PATH_MAX_BYTES: usize = 2 * 1024 * 1024;
+
+fn parse_gitconfig_excludes_path(
+    data: &[u8],
+    home_dir: Option<&Path>,
+) -> std::io::Result<Option<PathBuf>> {
+    static RE: OnceLock<regex::bytes::Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        regex::bytes::Regex::new(r#"(?im-u)^\s*excludesfile\s*=\s*"?\s*(\S+?)\s*"?\s*$"#)
+            .expect("valid git excludesFile regex")
+    });
+    let Some(candidate) = re
+        .captures(data)
+        .and_then(|captures| captures.get(1))
+        .and_then(|capture| std::str::from_utf8(capture.as_bytes()).ok())
+    else {
+        return Ok(None);
+    };
+    let home = home_dir.map(Path::to_string_lossy);
+    // ignore 0.4.25 deliberately replaces every `~`, not only a leading one.
+    // Preserve that behavior while bounding its potential allocation growth.
+    let tilde_count = candidate.bytes().filter(|byte| *byte == b'~').count();
+    let expanded_len = home.as_ref().map_or(Some(candidate.len()), |home| {
+        candidate
+            .len()
+            .checked_sub(tilde_count)?
+            .checked_add(tilde_count.checked_mul(home.len())?)
+    });
+    if expanded_len.is_none_or(|len| len > GIT_GLOBAL_IGNORE_PATH_MAX_BYTES) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "expanded git global ignore path exceeds {GIT_GLOBAL_IGNORE_PATH_MAX_BYTES} bytes"
+            ),
+        ));
+    }
+    let expanded = home.map_or_else(
+        || candidate.to_string(),
+        |home| candidate.replace('~', &home),
+    );
+    Ok(Some(PathBuf::from(expanded)))
+}
+
+fn read_checked_ignore_control_if_present(
+    path: &Path,
+    access_context: &EffectiveModeAccessContext,
+    operation: &str,
+) -> std::io::Result<Option<Vec<u8>>> {
+    match std::fs::symlink_metadata(path) {
+        Err(err)
+            if matches!(
+                err.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            return Ok(None);
+        }
+        Err(err) => return Err(err),
+        Ok(_) => {}
+    }
+    ensure_ignore_control_readable_sync(path, access_context, operation)?;
+    read_file_capped_sync(path, GIT_GLOBAL_CONFIG_MAX_BYTES).map(Some)
+}
+
+fn resolve_git_global_ignore_controls(
+    locations: &GitGlobalConfigLocations,
+    access_context: &EffectiveModeAccessContext,
+    operation: &str,
+) -> std::io::Result<GitGlobalIgnoreControls> {
+    let mut consumed_config_paths = Vec::with_capacity(2);
+
+    if let Some(home_dir) = &locations.home_dir {
+        let home_config = home_dir.join(".gitconfig");
+        consumed_config_paths.push(home_config.clone());
+        if let Some(contents) =
+            read_checked_ignore_control_if_present(&home_config, access_context, operation)?
+            && let Some(ignore_path) =
+                parse_gitconfig_excludes_path(&contents, locations.home_dir.as_deref())?
+        {
+            return Ok(GitGlobalIgnoreControls {
+                consumed_config_paths,
+                ignore_path: Some(ignore_path),
+            });
+        }
+    }
+
+    if let Some(xdg_config_home) = &locations.xdg_config_home {
+        let xdg_config = xdg_config_home.join("git").join("config");
+        consumed_config_paths.push(xdg_config.clone());
+        if let Some(contents) =
+            read_checked_ignore_control_if_present(&xdg_config, access_context, operation)?
+            && let Some(ignore_path) =
+                parse_gitconfig_excludes_path(&contents, locations.home_dir.as_deref())?
+        {
+            return Ok(GitGlobalIgnoreControls {
+                consumed_config_paths,
+                ignore_path: Some(ignore_path),
+            });
+        }
+    }
+
+    Ok(GitGlobalIgnoreControls {
+        consumed_config_paths,
+        ignore_path: locations
+            .xdg_config_home
+            .as_ref()
+            .map(|root| root.join("git").join("ignore")),
+    })
+}
+
+fn ignore_control_path_from_command_cwd(path: PathBuf, cwd: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path
+    } else {
+        cwd.join(path)
+    }
+}
+
+fn ensure_directory_ignore_controls_access_sync(
+    directory: &Path,
+    operation: &str,
+    access: RecursiveScanAccess,
+    access_context: &EffectiveModeAccessContext,
+) -> std::io::Result<()> {
+    for filename in [".gitignore", ".ignore", access.custom_ignore_filename()] {
+        ensure_ignore_control_readable_sync(&directory.join(filename), access_context, operation)?;
+    }
+    // With --no-require-git, rg/fd probe this conventional path even outside
+    // a repository. A linked worktree uses a regular `.git` file, in which
+    // case `.git/info/exclude` is simply absent (ENOTDIR), not a scan error.
+    ensure_ignore_control_readable_sync(
+        &directory.join(".git").join("info").join("exclude"),
+        access_context,
+        operation,
+    )
+}
+
+fn ensure_recursive_ignore_controls_access_sync(
+    path: &Path,
+    cwd: &Path,
+    operation: &str,
+    access: RecursiveScanAccess,
+    access_context: &EffectiveModeAccessContext,
+) -> std::io::Result<Option<PathBuf>> {
+    let mut directory = if path.is_dir() {
+        Some(path)
+    } else {
+        path.parent()
+    };
+    while let Some(current) = directory {
+        ensure_directory_ignore_controls_access_sync(current, operation, access, access_context)?;
+        directory = current.parent();
+    }
+
+    let global_controls = resolve_git_global_ignore_controls(
+        &GitGlobalConfigLocations::current(),
+        access_context,
+        operation,
+    )?;
+    let global_ignore = global_controls
+        .ignore_path
+        .map(|path| ignore_control_path_from_command_cwd(path, cwd));
+    if let Some(global_ignore) = global_ignore.as_deref() {
+        ensure_ignore_control_readable_sync(global_ignore, access_context, operation)?;
+    }
+    if access == RecursiveScanAccess::DirectoriesOnly
+        && let Some(global_ignore) = fd_global_ignore_path()
+    {
+        ensure_ignore_control_readable_sync(&global_ignore, access_context, operation)?;
+    }
+    Ok(global_ignore)
+}
+
+fn recursive_scan_ignore_control_paths(
+    path: &Path,
+    cwd: &Path,
+    access: RecursiveScanAccess,
+) -> Vec<PathBuf> {
+    let mut paths = std::collections::BTreeSet::new();
+    let mut directory = if path.is_dir() {
+        Some(path)
+    } else {
+        path.parent()
+    };
+    while let Some(current) = directory {
+        for filename in [".gitignore", ".ignore", access.custom_ignore_filename()] {
+            paths.insert(current.join(filename));
+        }
+        paths.insert(current.join(".git").join("info").join("exclude"));
+        directory = current.parent();
+    }
+
+    // These are passed explicitly to rg/fd. Keep the lexical cwd spelling as
+    // a dependency too: it can be a symlink even though `path` is canonical.
+    paths.insert(cwd.join(".gitignore"));
+    paths.insert(path.join(".gitignore"));
+
+    if access == RecursiveScanAccess::DirectoriesOnly
+        && let Some(global_ignore) = fd_global_ignore_path()
+    {
+        paths.insert(global_ignore);
+    }
+
+    paths.into_iter().collect()
+}
+
+fn ignore_control_cache_dependency(
+    path: PathBuf,
+    access_context: &EffectiveModeAccessContext,
+    budget: &mut FingerprintBudget,
+) -> Option<ToolCacheDependency> {
+    budget.entries = budget.entries.saturating_add(1);
+    if budget.entries > TOOL_OUTPUT_CACHE_MAX_FINGERPRINT_FILES {
+        return None;
+    }
+
+    let mut hasher = sha2::Sha256::new();
+    match std::fs::symlink_metadata(&path) {
+        Err(err)
+            if matches!(
+                err.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            hasher.update(b"missing");
+        }
+        Err(_) => return None,
+        Ok(_) => {
+            ensure_ignore_control_readable_sync(
+                &path,
+                access_context,
+                "cache ignore-control reading",
+            )
+            .ok()?;
+            let metadata = std::fs::metadata(&path).ok()?;
+            if !metadata.is_file() || metadata.len() > TOOL_OUTPUT_CACHE_MAX_FILE_HASH_BYTES {
+                return None;
+            }
+            budget.bytes = budget.bytes.saturating_add(metadata.len());
+            if budget.bytes > TOOL_OUTPUT_CACHE_MAX_FINGERPRINT_BYTES {
+                return None;
+            }
+            let bytes = read_file_capped_sync(&path, TOOL_OUTPUT_CACHE_MAX_FILE_HASH_BYTES).ok()?;
+            hasher.update(b"file");
+            update_fingerprint_metadata(&mut hasher, Path::new(""), &metadata);
+            hasher.update(sha2::Sha256::digest(&bytes));
+        }
+    }
+
+    Some(ToolCacheDependency {
+        path,
+        fingerprint: hasher.finalize().into(),
+    })
+}
+
+fn ignore_control_cache_dependencies(
+    path: &Path,
+    cwd: &Path,
+    access: RecursiveScanAccess,
+) -> Option<Vec<ToolCacheDependency>> {
+    let access_context = EffectiveModeAccessContext::current().ok()?;
+    let mut budget = FingerprintBudget::default();
+    let mut control_paths = recursive_scan_ignore_control_paths(path, cwd, access)
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>();
+    let global_controls = resolve_git_global_ignore_controls(
+        &GitGlobalConfigLocations::current(),
+        &access_context,
+        "cache global-git-config reading",
+    )
+    .ok()?;
+    control_paths.extend(global_controls.consumed_config_paths);
+    if let Some(global_ignore) = global_controls.ignore_path {
+        control_paths.insert(ignore_control_path_from_command_cwd(global_ignore, cwd));
+    }
+    control_paths
+        .into_iter()
+        .map(|path| ignore_control_cache_dependency(path, &access_context, &mut budget))
+        .collect()
+}
+
+fn recursive_scan_walk_builder(
+    path: &Path,
+    cwd: &Path,
+    access: RecursiveScanAccess,
+    glob: Option<&str>,
+    global_git_ignore: Option<&Path>,
+    include_workspace_ignore: bool,
+) -> std::io::Result<ignore::WalkBuilder> {
+    let mut builder = ignore::WalkBuilder::new(path);
+    builder
+        .current_dir(cwd)
+        .hidden(false)
+        .parents(true)
+        .ignore(true)
+        .git_ignore(true)
+        // `ignore` resolves a relative core.excludesFile against the process
+        // cwd before `current_dir` takes effect. External rg/fd run in `cwd`,
+        // so load the already mode-checked, cwd-resolved file explicitly.
+        .git_global(false)
+        .git_exclude(true)
+        .require_git(false)
+        .follow_links(false);
+    builder.add_custom_ignore_filename(access.custom_ignore_filename());
+    if let Some(global_ignore) = global_git_ignore
+        && global_ignore.is_file()
+        && let Some(err) = builder.add_ignore(global_ignore)
+    {
+        return Err(std::io::Error::other(format!(
+            "failed to load git global ignore file {}: {err}",
+            global_ignore.display()
         )));
     }
-    Ok(canonical_path)
+    if access == RecursiveScanAccess::DirectoriesOnly
+        && let Some(global_ignore) = fd_global_ignore_path()
+        && global_ignore.is_file()
+        && let Some(err) = builder.add_ignore(&global_ignore)
+    {
+        return Err(std::io::Error::other(format!(
+            "failed to load fd global ignore file {}: {err}",
+            global_ignore.display()
+        )));
+    }
+
+    // The external commands pass these two files via --ignore-file in
+    // addition to native discovery. Explicit ignore files are interpreted
+    // relative to the command cwd, which can exclude a different (larger)
+    // surface than the same file discovered natively below `path`.
+    // Sibling workspace roots use their own controls, without inheriting
+    // the primary workspace's explicit ignore file.
+    let workspace_gitignore = cwd.join(".gitignore");
+    if include_workspace_ignore
+        && workspace_gitignore.exists()
+        && let Some(err) = builder.add_ignore(&workspace_gitignore)
+    {
+        return Err(std::io::Error::other(format!(
+            "failed to load explicit ignore file {}: {err}",
+            workspace_gitignore.display()
+        )));
+    }
+    let root_gitignore = path.join(".gitignore");
+    if root_gitignore != workspace_gitignore
+        && root_gitignore.exists()
+        && let Some(err) = builder.add_ignore(&root_gitignore)
+    {
+        return Err(std::io::Error::other(format!(
+            "failed to load explicit ignore file {}: {err}",
+            root_gitignore.display()
+        )));
+    }
+    if let Some(glob) = glob {
+        // rg evaluates --glob relative to its process cwd, even when the
+        // explicit search root is absolute. Rooting this at `path` reverses
+        // the result for slash-containing globs (for example `src/a/*.rs`).
+        let mut overrides = ignore::overrides::OverrideBuilder::new(cwd);
+        overrides.add(glob).map_err(|err| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, err.to_string())
+        })?;
+        builder.overrides(overrides.build().map_err(|err| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, err.to_string())
+        })?);
+    }
+    Ok(builder)
+}
+
+/// Resolve the git global ignore file for an in-process scan, mirroring how
+/// the external scanners (and the cache-dependency tracker) consume it.
+fn resolved_global_git_ignore_for_scan(cwd: &Path) -> std::io::Result<Option<PathBuf>> {
+    let access_context = EffectiveModeAccessContext::current()?;
+    let controls = resolve_git_global_ignore_controls(
+        &GitGlobalConfigLocations::current(),
+        &access_context,
+        "in-process scan global-git-config reading",
+    )?;
+    Ok(controls
+        .ignore_path
+        .map(|path| ignore_control_path_from_command_cwd(path, cwd)))
+}
+
+/// In-process `find` backend (bd-cv653.1.5): walk the pinned scan root with
+/// the same ignore surface the external `fd` invocation consumed and collect
+/// scan-root-relative matches for the shared result pipeline.
+///
+/// Filename-shaped patterns (no `/`) match the entry name, path-shaped
+/// patterns match the scan-root-relative path — the same split the external
+/// backend implements via `--full-path` plus the host-side Override filter.
+fn find_inproc_scan_sync(
+    scan_root: &Path,
+    operation_cwd: &Path,
+    pattern: &str,
+    path_shaped: bool,
+    scan_limit: usize,
+    cancelled: &std::sync::atomic::AtomicBool,
+) -> std::io::Result<Vec<PathBuf>> {
+    let filename_matcher = if path_shaped {
+        None
+    } else {
+        Some(
+            globset::Glob::new(pattern)
+                .map_err(|err| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidInput, err.to_string())
+                })?
+                .compile_matcher(),
+        )
+    };
+    let path_matcher = if path_shaped {
+        let mut builder = ignore::overrides::OverrideBuilder::new(scan_root);
+        builder.add(pattern).map_err(|err| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, err.to_string())
+        })?;
+        Some(builder.build().map_err(|err| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, err.to_string())
+        })?)
+    } else {
+        None
+    };
+
+    let global_git_ignore = resolved_global_git_ignore_for_scan(operation_cwd)?;
+    let builder = recursive_scan_walk_builder(
+        scan_root,
+        operation_cwd,
+        RecursiveScanAccess::DirectoriesOnly,
+        None,
+        global_git_ignore.as_deref(),
+        true,
+    )?;
+
+    let mut results = Vec::new();
+    for entry in builder.build() {
+        if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "scan cancelled",
+            ));
+        }
+        let entry = match entry {
+            Ok(entry) => entry,
+            // fd reports unreadable entries on stderr and keeps walking;
+            // the permission preflight already failed closed on anything
+            // the effective mode model forbids.
+            Err(err) => {
+                tracing::debug!("in-process find skipped an unreadable entry: {err}");
+                continue;
+            }
+        };
+        let path = entry.path();
+        if path == scan_root {
+            continue;
+        }
+        let Ok(relative) = path.strip_prefix(scan_root) else {
+            continue;
+        };
+        let is_dir = entry
+            .file_type()
+            .is_some_and(|file_type| file_type.is_dir());
+        let matched = filename_matcher.as_ref().map_or_else(
+            || {
+                path_matcher
+                    .as_ref()
+                    .is_some_and(|matcher| matcher.matched(path, is_dir).is_whitelist())
+            },
+            |matcher| {
+                path.file_name()
+                    .is_some_and(|name| matcher.is_match(Path::new(name)))
+            },
+        );
+        if matched {
+            results.push(relative.to_path_buf());
+            if results.len() >= scan_limit {
+                break;
+            }
+        }
+    }
+    Ok(results)
+}
+
+/// Validate every visible filesystem object a recursive search could visit.
+///
+/// The `ignore` walker mirrors the external scanners' hidden-file, ignore-file,
+/// parent-ignore, and no-symlink-following behavior. A grep glob is installed as
+/// an override so files excluded by that glob do not cause false denials. Find
+/// validates directories plus the ignore-control files that fd must read;
+/// enumerating any other regular-file name does not require content access.
+/// The entire visible tree is checked:
+/// an output limit cannot prove which candidates an external scanner will open
+/// before it reaches that limit.
+#[cfg(test)]
+fn ensure_recursive_scan_access_sync(
+    path: &Path,
+    cwd: &Path,
+    operation: &str,
+    access: RecursiveScanAccess,
+    glob: Option<&str>,
+) -> std::io::Result<()> {
+    ensure_recursive_scan_access_filtered_sync(path, cwd, operation, access, glob, None, true)
+}
+
+fn ensure_recursive_scan_access_filtered_sync(
+    path: &Path,
+    cwd: &Path,
+    operation: &str,
+    access: RecursiveScanAccess,
+    glob: Option<&str>,
+    exclusions: Option<Arc<GrepExclusions>>,
+    include_workspace_ignore: bool,
+) -> std::io::Result<()> {
+    let access_context = EffectiveModeAccessContext::current()?;
+    ensure_ancestors_searchable_with_context_sync(path, &access_context)?;
+    let global_git_ignore = ensure_recursive_ignore_controls_access_sync(
+        path,
+        cwd,
+        operation,
+        access,
+        &access_context,
+    )?;
+
+    let root_metadata = std::fs::metadata(path)?;
+    if root_metadata.is_file() {
+        return if access == RecursiveScanAccess::ReadableFiles {
+            access_context.ensure(&root_metadata, path, UNIX_ACCESS_READ, operation)
+        } else {
+            Ok(())
+        };
+    }
+    if !root_metadata.is_dir() {
+        return Ok(());
+    }
+    access_context.ensure(
+        &root_metadata,
+        path,
+        UNIX_ACCESS_READ | UNIX_ACCESS_SEARCH,
+        operation,
+    )?;
+
+    let denied = std::sync::Arc::new(std::sync::Mutex::new(None::<RecursiveScanDenial>));
+    let denied_from_filter = std::sync::Arc::clone(&denied);
+    let operation_owned = operation.to_string();
+
+    let mut builder = recursive_scan_walk_builder(
+        path,
+        cwd,
+        access,
+        glob,
+        global_git_ignore.as_deref(),
+        include_workspace_ignore,
+    )?;
+
+    let exclusion_root = path.to_path_buf();
+    builder.filter_entry(move |entry| {
+        if exclusions.as_ref().is_some_and(|exclusions| {
+            entry
+                .path()
+                .strip_prefix(&exclusion_root)
+                .is_ok_and(|relative| exclusions.excludes(relative))
+        }) {
+            return false;
+        }
+        if entry.path_is_symlink() {
+            return true;
+        }
+        let Some(file_type) = entry.file_type() else {
+            return true;
+        };
+        let required = if file_type.is_dir() {
+            UNIX_ACCESS_READ | UNIX_ACCESS_SEARCH
+        } else if file_type.is_file() && access == RecursiveScanAccess::ReadableFiles {
+            UNIX_ACCESS_READ
+        } else {
+            return true;
+        };
+
+        let result = std::fs::symlink_metadata(entry.path()).and_then(|metadata| {
+            access_context
+                .ensure(&metadata, entry.path(), required, &operation_owned)
+                .and_then(|()| {
+                    if file_type.is_dir() {
+                        // Ignore controls are loaded before the walker yields
+                        // their directory contents. Validate them here so a
+                        // positive rg glob cannot hide a consumed control file
+                        // from the permission filter.
+                        ensure_directory_ignore_controls_access_sync(
+                            entry.path(),
+                            &operation_owned,
+                            access,
+                            &access_context,
+                        )
+                    } else {
+                        Ok(())
+                    }
+                })
+        });
+        if let Err(err) = result {
+            let mut slot = denied_from_filter
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if slot.is_none() {
+                *slot = Some(RecursiveScanDenial {
+                    path: entry.path().to_path_buf(),
+                    kind: err.kind(),
+                    message: err.to_string(),
+                });
+            }
+            drop(slot);
+            return false;
+        }
+        true
+    });
+
+    finish_recursive_scan_access_walk(builder.build(), denied.as_ref(), operation)
+}
+
+fn finish_recursive_scan_access_walk(
+    mut walker: ignore::Walk,
+    denied: &std::sync::Mutex<Option<RecursiveScanDenial>>,
+    operation: &str,
+) -> std::io::Result<()> {
+    loop {
+        let next = walker.next();
+        let denial = denied
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(denial) = denial {
+            tracing::debug!(
+                denied_path = %denial.path.display(),
+                operation,
+                error = %denial.message,
+                "recursive scan denied a descendant"
+            );
+            return Err(std::io::Error::new(
+                denial.kind,
+                format!("{}: {}", denial.path.display(), denial.message),
+            ));
+        }
+
+        match next {
+            None => break,
+            Some(Ok(entry)) => {
+                if let Some(err) = entry.error()
+                    && err
+                        .io_error()
+                        .is_some_and(|io_err| io_err.kind() == std::io::ErrorKind::PermissionDenied)
+                {
+                    tracing::debug!(
+                        denied_path = %entry.path().display(),
+                        operation,
+                        error = %err,
+                        "recursive scan could not read an ignore control file"
+                    );
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        format!("{}: {err}", entry.path().display()),
+                    ));
+                }
+            }
+            Some(Err(err)) => {
+                let kind = err
+                    .io_error()
+                    .map_or(std::io::ErrorKind::Other, std::io::Error::kind);
+                tracing::debug!(operation, error = %err, "recursive scan walk failed");
+                return Err(std::io::Error::new(kind, err.to_string()));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn ensure_recursive_scan_access(
+    path: &Path,
+    cwd: &Path,
+    operation: &'static str,
+    access: RecursiveScanAccess,
+    glob: Option<String>,
+    exclusions: Option<Arc<GrepExclusions>>,
+    include_workspace_ignore: bool,
+) -> std::io::Result<()> {
+    let path = path.to_path_buf();
+    let cwd = cwd.to_path_buf();
+    asupersync::runtime::spawn_blocking_io(move || {
+        ensure_recursive_scan_access_filtered_sync(
+            &path,
+            &cwd,
+            operation,
+            access,
+            glob.as_deref(),
+            exclusions,
+            include_workspace_ignore,
+        )
+    })
+    .await
+}
+
+/// Require directory-search access on every existing ancestor of `path`.
+///
+/// `metadata(path)` succeeds for UID 0 even when an ancestor has mode `000`.
+/// Checking the traversal chain keeps privileged and unprivileged tool
+/// behavior aligned before the real operation performs its identity-specific
+/// checks.
+async fn ensure_ancestors_searchable(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        let path = path.to_path_buf();
+        asupersync::runtime::spawn_blocking_io(move || ensure_ancestors_searchable_sync(&path))
+            .await?;
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+
+    Ok(())
+}
+
+/// Preserve traversal checks for both the user-supplied spelling and the
+/// canonical path used for scope enforcement. Canonicalization otherwise
+/// erases a mode-denied lexical parent of a terminal symlink under UID 0.
+async fn ensure_scan_path_ancestors_searchable(
+    lexical_path: &Path,
+    canonical_path: &Path,
+) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        let lexical_path = lexical_path.to_path_buf();
+        let canonical_path = canonical_path.to_path_buf();
+        asupersync::runtime::spawn_blocking_io(move || {
+            let access_context = EffectiveModeAccessContext::current()?;
+            ensure_ancestors_searchable_with_context_sync(&lexical_path, &access_context)?;
+            ensure_ancestors_searchable_with_context_sync(&canonical_path, &access_context)
+        })
+        .await?;
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = (lexical_path, canonical_path);
+    }
+
+    Ok(())
+}
+
+/// Require read, write, and search access on the nearest existing parent directory.
+///
+/// This check happens before `create_dir_all`, preventing a privileged process
+/// from creating missing descendants beneath an explicitly non-writable
+/// ancestor. Newly-created parents are covered by their normal creation mode;
+/// read access is required because the durable atomic-write path opens and
+/// synchronizes the parent directory after rename. The eventual create/rename
+/// syscall is still the final authority.
+async fn ensure_parent_allows_creation(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        let mut candidate = path.parent();
+        while let Some(directory) = candidate {
+            match std_metadata_async(directory).await {
+                Ok(metadata) => {
+                    if !metadata.is_dir() {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::NotADirectory,
+                            format!("Not a directory: {}", directory.display()),
+                        ));
+                    }
+                    ensure_effective_mode_access(
+                        &metadata,
+                        directory,
+                        UNIX_ACCESS_READ | UNIX_ACCESS_WRITE | UNIX_ACCESS_SEARCH,
+                        "durable file creation",
+                    )?;
+                    return ensure_ancestors_searchable(directory).await;
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    candidate = directory.parent();
+                }
+                Err(err) => return Err(err),
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+
+    Ok(())
 }
 
 /// Same scoping contract as `enforce_cwd_scope`, but also accepts paths under
@@ -2079,31 +4531,43 @@ fn enforce_cwd_scope(path: &Path, cwd: &Path, action: &str) -> Result<PathBuf> {
 /// symlinks before the prefix check, so e.g. `~/.pi/agent/skills/foo/SKILL.md`
 /// pointing at `/etc/passwd` resolves to `/etc/passwd` and fails the prefix
 /// test against both cwd and agent dir.
-fn enforce_read_scope_with_roots(path: &Path, cwd: &Path, agent_dir: &Path) -> Result<PathBuf> {
+pub(crate) fn enforce_read_scope_with_roots(
+    path: &Path,
+    cwd: &Path,
+    agent_dir: &Path,
+    workspace: &WorkspaceHandle,
+) -> Result<PathBuf> {
     let canonical_path = crate::extensions::safe_canonicalize(path);
     let canonical_cwd = crate::extensions::safe_canonicalize(cwd);
-    if canonical_path.starts_with(&canonical_cwd) {
-        return Ok(canonical_path);
-    }
-
     let canonical_agent = crate::extensions::safe_canonicalize(agent_dir);
-    if canonical_path.starts_with(&canonical_agent) {
-        return Ok(canonical_path);
+    let roots = workspace.snapshot_or(cwd);
+    if roots.additional().is_empty() {
+        // Single-root sessions keep the legacy decision and message verbatim.
+        if canonical_path.starts_with(&canonical_cwd)
+            || canonical_path.starts_with(&canonical_agent)
+        {
+            return Ok(canonical_path);
+        }
+        return Err(Error::validation(format!(
+            "Cannot read outside the working directory or agent dir \
+             (resolved: {}, cwd: {}, agent dir: {})",
+            canonical_path.display(),
+            canonical_cwd.display(),
+            canonical_agent.display(),
+        )));
     }
 
-    Err(Error::validation(format!(
-        "Cannot read outside the working directory or agent dir \
-         (resolved: {}, cwd: {}, agent dir: {})",
-        canonical_path.display(),
-        canonical_cwd.display(),
-        canonical_agent.display(),
-    )))
+    // Multi-root: cwd + additional roots + agent dir (read broadening, #71).
+    let mut all_roots = roots.all();
+    all_roots.push(canonical_agent);
+    ensure_canonical_path_allowed(&canonical_path, &all_roots, "read")?;
+    Ok(canonical_path)
 }
 
 /// Convenience wrapper that pulls the agent dir from the active config.
-fn enforce_read_scope(path: &Path, cwd: &Path) -> Result<PathBuf> {
+fn enforce_read_scope(path: &Path, cwd: &Path, workspace: &WorkspaceHandle) -> Result<PathBuf> {
     let agent_dir = crate::config::Config::global_dir();
-    enforce_read_scope_with_roots(path, cwd, &agent_dir)
+    enforce_read_scope_with_roots(path, cwd, &agent_dir, workspace)
 }
 
 // ============================================================================
@@ -2114,7 +4578,8 @@ fn enforce_read_scope(path: &Path, cwd: &Path) -> Result<PathBuf> {
 #[derive(Debug, Clone, Default)]
 pub struct ProcessedFiles {
     pub text: String,
-    pub images: Vec<ImageContent>,
+    /// Image and media blocks in the order of their source file arguments.
+    pub attachments: Vec<ContentBlock>,
 }
 
 fn normalize_dot_segments(path: &Path) -> PathBuf {
@@ -2163,17 +4628,602 @@ pub fn fuzz_normalize_dot_segments(path: &Path) -> PathBuf {
     normalize_dot_segments(path)
 }
 
-#[cfg(unix)]
+/// Returns `true` when an `fsync`/`fdatasync` durability barrier was *refused*
+/// by the filesystem rather than reflecting a real write failure.
+///
+/// The bytes are already handed to the kernel by the preceding `write(2)`;
+/// `fsync` only asks the filesystem to make them durable. Some filesystems —
+/// notably virtiofs / FUSE bind mounts (Docker Desktop for macOS) and various
+/// network filesystems — do not implement `fsync` on a given descriptor and
+/// report it with `EBADF`, `EINVAL`, or an "unsupported" error even though the
+/// `write(2)` and the subsequent atomic `rename(2)` already landed the data
+/// correctly. Failing the whole write tool in that case is wrong: the file is
+/// complete and correct on disk. We downgrade these specific refusals to a
+/// warning. Genuine I/O failures (`EIO`, `ENOSPC`, `EDQUOT`, …) still
+/// propagate. See issue #136.
+fn is_fsync_refused(err: &std::io::Error) -> bool {
+    // EBADF = 9 and EINVAL = 22 on both Linux and macOS. `ErrorKind::Unsupported`
+    // captures ENOTSUP/EOPNOTSUPP/ENOSYS portably without a `libc` dependency
+    // (this crate is `#![forbid(unsafe_code)]`).
+    matches!(err.raw_os_error(), Some(9 | 22)) || err.kind() == std::io::ErrorKind::Unsupported
+}
+
+/// Runs a durability `fsync` (`result`), treating a filesystem *refusal* (see
+/// [`is_fsync_refused`]) as a non-fatal warning while still propagating real
+/// I/O errors. `what` and `path` are used only for the diagnostic log line.
+fn tolerate_fsync_refusal(
+    result: std::io::Result<()>,
+    what: &str,
+    path: &Path,
+) -> std::io::Result<()> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(err) if is_fsync_refused(&err) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %err,
+                "{what} fsync refused by filesystem (non-POSIX durability semantics); \
+                 data already written, continuing without a durability barrier"
+            );
+            Ok(())
+        }
+        Err(err) => Err(err),
+    }
+}
+
+#[cfg(all(unix, any(target_os = "espidf", target_os = "redox")))]
 fn sync_parent_dir(path: &Path) -> std::io::Result<()> {
     let Some(parent) = path.parent() else {
         return Ok(());
     };
-    std::fs::File::open(parent)?.sync_all()
+    let parent = if parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        parent
+    };
+    // Directory fsync is a pure durability nicety (it makes the rename durable);
+    // on filesystems that refuse it the rename is still visible, so tolerate a
+    // refusal rather than failing the write. See issue #136.
+    tolerate_fsync_refusal(
+        std::fs::File::open(parent).and_then(|dir| dir.sync_all()),
+        "parent directory",
+        parent,
+    )
 }
 
+// Mirrors the Unix arm's fallible signature, which really can fail.
 #[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps, clippy::missing_const_for_fn)]
 fn sync_parent_dir(_path: &Path) -> std::io::Result<()> {
     Ok(())
+}
+
+fn set_atomic_replacement_permissions(
+    temp_file: &tempfile::NamedTempFile,
+    original_permissions: Option<std::fs::Permissions>,
+) -> std::io::Result<()> {
+    if let Some(permissions) = original_permissions {
+        temp_file.as_file().set_permissions(permissions)?;
+    } else {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            temp_file
+                .as_file()
+                .set_permissions(std::fs::Permissions::from_mode(0o644))?;
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AtomicContentExpectation {
+    len: u64,
+    sha256: [u8; 32],
+}
+
+impl AtomicContentExpectation {
+    fn from_bytes(bytes: &[u8]) -> Self {
+        Self {
+            len: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+            sha256: sha2::Sha256::digest(bytes).into(),
+        }
+    }
+}
+
+fn ensure_atomic_source_unchanged(
+    mut source: std::fs::File,
+    expectation: AtomicContentExpectation,
+) -> std::io::Result<()> {
+    let metadata = source.metadata()?;
+    if !metadata.is_file() || metadata.len() != expectation.len {
+        return Err(std::io::Error::other(
+            "file changed since it was read; re-read it and retry the edit",
+        ));
+    }
+
+    let mut hasher = sha2::Sha256::new();
+    let mut total = 0_u64;
+    let mut buffer = vec![0_u8; 64 * 1024];
+    loop {
+        let read = source.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        total = total.saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
+        if total > expectation.len {
+            return Err(std::io::Error::other(
+                "file changed since it was read; re-read it and retry the edit",
+            ));
+        }
+        hasher.update(&buffer[..read]);
+    }
+
+    let actual_sha256: [u8; 32] = hasher.finalize().into();
+    if total != expectation.len || actual_sha256 != expectation.sha256 {
+        return Err(std::io::Error::other(
+            "file changed since it was read; re-read it and retry the edit",
+        ));
+    }
+    Ok(())
+}
+
+/// Verifies that the directory entry `target_name` under the pinned
+/// `parent_file` descriptor is a regular file whose content is exactly
+/// `contents`.
+///
+/// Used as the post-rename fallback for filesystems (virtiofs/FUSE) that do
+/// not preserve inode identity across `rename(2)`, where the dev/ino
+/// comparison against the temp-file descriptor can no longer prove that the
+/// persisted entry is the file we just wrote (issue #193). Opening through
+/// the pinned parent descriptor with `NOFOLLOW` keeps the check immune to
+/// parent-directory swaps and symlink redirection.
+#[cfg(all(unix, not(any(target_os = "espidf", target_os = "redox"))))]
+fn verify_persisted_entry_content(
+    parent_file: &std::fs::File,
+    target_name: &OsStr,
+    contents: &[u8],
+) -> std::io::Result<()> {
+    let descriptor = rustix::fs::openat(
+        parent_file,
+        target_name,
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::CLOEXEC
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::NONBLOCK,
+        rustix::fs::Mode::empty(),
+    )
+    .map_err(std::io::Error::from)?;
+    let file = std::fs::File::from(descriptor);
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::other(
+            "persisted entry is not a regular file",
+        ));
+    }
+    ensure_atomic_source_unchanged(file, AtomicContentExpectation::from_bytes(contents)).map_err(
+        |_| std::io::Error::other("persisted entry content does not match the bytes just written"),
+    )
+}
+
+/// Normalize a raw `rustix` stat identity to platform-independent widths.
+///
+/// The libc stat field types differ per target (`st_dev` is `i32` and
+/// `st_mode` is `u16` on macOS, `u64`/`u32` on Linux), while the comparisons
+/// below mix them with `std::os::unix::fs::MetadataExt` values (`u64`) and
+/// `Permissions::from_mode` (`u32`). Widening every field once here keeps the
+/// identity checks compiling identically on every unix target.
+#[cfg(all(unix, not(any(target_os = "espidf", target_os = "redox"))))]
+#[allow(
+    clippy::cast_lossless,
+    clippy::cast_sign_loss,
+    clippy::unnecessary_cast
+)]
+const fn stat_replacement_identity(metadata: &rustix::fs::Stat) -> (u64, u64, u32) {
+    (
+        metadata.st_dev as u64,
+        metadata.st_ino as u64,
+        metadata.st_mode as u32,
+    )
+}
+
+// Keep the descriptor-pinned validation, write, rename, durability, and
+// identity-checked cleanup sequence together: splitting this security-critical
+// transaction across helpers would make its ordering invariants harder to audit.
+#[allow(clippy::too_many_lines)]
+/// `allowed_roots` is the workspace's canonical root set (primary cwd plus
+/// any `/add-dir` roots); the replacement parent must live under one of
+/// them. A single-root caller passes `&[cwd]`.
+fn atomic_replace_file_with<F>(
+    target: &Path,
+    allowed_roots: &[PathBuf],
+    contents: &[u8],
+    expected_source: Option<AtomicContentExpectation>,
+    before_persist: F,
+) -> std::io::Result<()>
+where
+    F: FnOnce(),
+{
+    let parent = target.parent().unwrap_or_else(|| Path::new("."));
+
+    #[cfg(all(unix, not(any(target_os = "espidf", target_os = "redox"))))]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let canonical_parent = std::fs::canonicalize(parent)?;
+        if !atomic_parent_within_roots(&canonical_parent, allowed_roots) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "atomic replacement parent escaped the working directory: {}",
+                    parent.display()
+                ),
+            ));
+        }
+
+        let access_context = EffectiveModeAccessContext::current()?;
+        ensure_ancestors_searchable_with_context_sync(parent, &access_context)?;
+        ensure_ancestors_searchable_with_context_sync(&canonical_parent, &access_context)?;
+        let expected_parent_metadata = std::fs::metadata(&canonical_parent)?;
+        if !expected_parent_metadata.is_dir() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotADirectory,
+                format!("Not a directory: {}", parent.display()),
+            ));
+        }
+        access_context.ensure(
+            &expected_parent_metadata,
+            &canonical_parent,
+            UNIX_ACCESS_READ | UNIX_ACCESS_WRITE | UNIX_ACCESS_SEARCH,
+            "atomic file replacement",
+        )?;
+
+        let parent_descriptor = rustix::fs::open(
+            parent,
+            rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::CLOEXEC
+                | rustix::fs::OFlags::DIRECTORY
+                | rustix::fs::OFlags::NOFOLLOW,
+            rustix::fs::Mode::empty(),
+        )
+        .map_err(std::io::Error::from)?;
+        let parent_file = std::fs::File::from(parent_descriptor);
+        let opened_parent_metadata = parent_file.metadata()?;
+        if !opened_file_matches_metadata_snapshot(
+            &expected_parent_metadata,
+            &opened_parent_metadata,
+        ) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!("{} changed while opening", parent.display()),
+            ));
+        }
+        access_context.ensure(
+            &opened_parent_metadata,
+            parent,
+            UNIX_ACCESS_READ | UNIX_ACCESS_WRITE | UNIX_ACCESS_SEARCH,
+            "atomic file replacement",
+        )?;
+
+        let target_name = target
+            .file_name()
+            .ok_or_else(|| std::io::Error::other("replacement target has no basename"))?;
+        let expected_target_identity = match rustix::fs::statat(
+            &parent_file,
+            target_name,
+            rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+        ) {
+            Ok(metadata)
+                if rustix::fs::FileType::from_raw_mode(metadata.st_mode)
+                    == rustix::fs::FileType::RegularFile =>
+            {
+                Some(stat_replacement_identity(&metadata))
+            }
+            Ok(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("{} is not a regular file", target.display()),
+                ));
+            }
+            Err(err) if err == rustix::io::Errno::NOENT => None,
+            Err(err) => return Err(std::io::Error::from(err)),
+        };
+        let original_permissions = expected_target_identity.map(|(_, _, mode)| {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            std::fs::Permissions::from_mode(mode)
+        });
+
+        // The pathname stored by `NamedTempFile` is not descriptor-relative.
+        // Disable its Drop cleanup from construction so a concurrent parent
+        // rename cannot redirect cleanup into an attacker-controlled directory.
+        // Errors below clean up only after re-validating the entry through the
+        // pinned parent descriptor.
+        let mut temp_file = tempfile::Builder::new()
+            .disable_cleanup(true)
+            .tempfile_in(parent)?;
+        let temp_name = temp_file
+            .path()
+            .file_name()
+            .ok_or_else(|| std::io::Error::other("temporary file has no basename"))?
+            .to_os_string();
+        let temp_descriptor_metadata = rustix::fs::fstat(temp_file.as_file())?;
+        let temp_entry_metadata = rustix::fs::statat(
+            &parent_file,
+            &temp_name,
+            rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+        )?;
+        if temp_descriptor_metadata.st_dev != temp_entry_metadata.st_dev
+            || temp_descriptor_metadata.st_ino != temp_entry_metadata.st_ino
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "temporary file was created outside the pinned parent directory",
+            ));
+        }
+
+        let replacement_result = (|| {
+            temp_file.as_file_mut().write_all(contents)?;
+            set_atomic_replacement_permissions(&temp_file, original_permissions)?;
+            tolerate_fsync_refusal(temp_file.as_file_mut().sync_all(), "temp file", target)?;
+
+            before_persist();
+
+            // A descriptor-relative rename is safe even if this check races,
+            // but fail before mutation when a deterministic parent swap is
+            // already visible. The post-rename check reports narrower races.
+            let current_parent_metadata = std::fs::metadata(parent)?;
+            if current_parent_metadata.dev() != opened_parent_metadata.dev()
+                || current_parent_metadata.ino() != opened_parent_metadata.ino()
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!("{} changed before atomic replacement", parent.display()),
+                ));
+            }
+
+            let current_target_identity = match rustix::fs::statat(
+                &parent_file,
+                target_name,
+                rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+            ) {
+                Ok(metadata)
+                    if rustix::fs::FileType::from_raw_mode(metadata.st_mode)
+                        == rustix::fs::FileType::RegularFile =>
+                {
+                    Some(stat_replacement_identity(&metadata))
+                }
+                Ok(_) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "atomic replacement target changed to a non-regular file",
+                    ));
+                }
+                Err(err) if err == rustix::io::Errno::NOENT => None,
+                Err(err) => return Err(std::io::Error::from(err)),
+            };
+            if current_target_identity != expected_target_identity {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "atomic replacement target changed before rename",
+                ));
+            }
+
+            if let Some(expectation) = expected_source {
+                let Some((expected_dev, expected_ino, _)) = expected_target_identity else {
+                    return Err(std::io::Error::other(
+                        "file changed since it was read; re-read it and retry the edit",
+                    ));
+                };
+                let source_descriptor = rustix::fs::openat(
+                    &parent_file,
+                    target_name,
+                    rustix::fs::OFlags::RDONLY
+                        | rustix::fs::OFlags::CLOEXEC
+                        | rustix::fs::OFlags::NOFOLLOW
+                        | rustix::fs::OFlags::NONBLOCK,
+                    rustix::fs::Mode::empty(),
+                )
+                .map_err(std::io::Error::from)?;
+                let source_file = std::fs::File::from(source_descriptor);
+                let source_metadata = source_file.metadata()?;
+                if !source_metadata.is_file()
+                    || source_metadata.dev() != expected_dev
+                    || source_metadata.ino() != expected_ino
+                {
+                    return Err(std::io::Error::other(
+                        "file changed since it was read; re-read it and retry the edit",
+                    ));
+                }
+                access_context.ensure(
+                    &source_metadata,
+                    target,
+                    UNIX_ACCESS_READ,
+                    "optimistic edit validation",
+                )?;
+                ensure_atomic_source_unchanged(source_file, expectation)?;
+
+                // Re-check the directory entry after hashing. This keeps a
+                // rename/replacement concurrent with the digest read from
+                // being overwritten by the final descriptor-relative rename.
+                let after_digest = rustix::fs::statat(
+                    &parent_file,
+                    target_name,
+                    rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+                )?;
+                let after_identity = stat_replacement_identity(&after_digest);
+                if after_identity.0 != expected_dev
+                    || after_identity.1 != expected_ino
+                    || Some(after_identity) != expected_target_identity
+                {
+                    return Err(std::io::Error::other(
+                        "file changed since it was read; re-read it and retry the edit",
+                    ));
+                }
+            }
+
+            rustix::fs::renameat(&parent_file, &temp_name, &parent_file, target_name)?;
+
+            let persisted_entry_metadata = rustix::fs::statat(
+                &parent_file,
+                target_name,
+                rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+            )?;
+            if temp_descriptor_metadata.st_dev != persisted_entry_metadata.st_dev
+                || temp_descriptor_metadata.st_ino != persisted_entry_metadata.st_ino
+            {
+                // On virtiofs/FUSE the filesystem assigns a fresh inode during
+                // `rename(2)`, so this descriptor-vs-entry identity comparison
+                // reports a mismatch even though the rename landed our bytes
+                // correctly (issue #193; kernel-backed filesystems like ext4
+                // and overlayfs keep the inode stable). Fall back to verifying
+                // the persisted entry's *content* through the pinned parent
+                // descriptor: identical bytes mean the rename result is ours
+                // regardless of inode identity, while a genuine post-rename
+                // swap still fails because the attacker's content differs (or
+                // is byte-identical to what we just wrote, which is harmless).
+                verify_persisted_entry_content(&parent_file, target_name, contents).map_err(
+                    |verify_error| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::PermissionDenied,
+                            format!(
+                                "atomic replacement target changed immediately after rename \
+                                 (content verification also failed: {verify_error})"
+                            ),
+                        )
+                    },
+                )?;
+                tracing::warn!(
+                    path = %target.display(),
+                    "atomic replacement inode identity not preserved across rename \
+                     (virtiofs/FUSE semantics); persisted content verified by hash instead"
+                );
+            }
+            tolerate_fsync_refusal(parent_file.sync_all(), "parent directory", parent)?;
+
+            let current_parent_metadata = std::fs::metadata(parent)?;
+            if current_parent_metadata.dev() != opened_parent_metadata.dev()
+                || current_parent_metadata.ino() != opened_parent_metadata.ino()
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!("{} changed during atomic replacement", parent.display()),
+                ));
+            }
+            Ok(())
+        })();
+
+        if replacement_result.is_err()
+            && let Ok(current_temp_entry) = rustix::fs::statat(
+                &parent_file,
+                &temp_name,
+                rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+            )
+            && current_temp_entry.st_dev == temp_descriptor_metadata.st_dev
+            && current_temp_entry.st_ino == temp_descriptor_metadata.st_ino
+        {
+            // Only unlink the exact temporary inode we created. An attacker
+            // that replaced the name cannot make cleanup delete their entry.
+            let _ = rustix::fs::unlinkat(&parent_file, &temp_name, rustix::fs::AtFlags::empty());
+        }
+
+        replacement_result
+    }
+
+    #[cfg(not(all(unix, not(any(target_os = "espidf", target_os = "redox")))))]
+    {
+        let original_permissions = std::fs::metadata(target)
+            .ok()
+            .filter(std::fs::Metadata::is_file)
+            .map(|metadata| metadata.permissions());
+        let canonical_parent = strip_unc_prefix(std::fs::canonicalize(parent)?);
+        if !atomic_parent_within_roots(&canonical_parent, allowed_roots) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "atomic replacement parent escaped the working directory: {}",
+                    parent.display()
+                ),
+            ));
+        }
+
+        let mut temp_file = tempfile::NamedTempFile::new_in(parent)?;
+        let canonical_temp_parent = temp_file
+            .path()
+            .parent()
+            .and_then(|temp_parent| std::fs::canonicalize(temp_parent).ok())
+            .map(strip_unc_prefix)
+            .ok_or_else(|| std::io::Error::other("failed to resolve temporary-file parent"))?;
+        if canonical_temp_parent != canonical_parent {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "temporary file was created outside the validated parent directory",
+            ));
+        }
+
+        temp_file.as_file_mut().write_all(contents)?;
+        set_atomic_replacement_permissions(&temp_file, original_permissions)?;
+        tolerate_fsync_refusal(temp_file.as_file_mut().sync_all(), "temp file", target)?;
+
+        before_persist();
+
+        let parent_before_persist = strip_unc_prefix(std::fs::canonicalize(parent)?);
+        if parent_before_persist != canonical_parent {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!("{} changed before atomic replacement", parent.display()),
+            ));
+        }
+        if let Some(expectation) = expected_source {
+            let source = open_regular_file_within_roots_with(target, allowed_roots, || {})?;
+            ensure_atomic_source_unchanged(source, expectation)?;
+
+            let parent_after_digest = strip_unc_prefix(std::fs::canonicalize(parent)?);
+            if parent_after_digest != canonical_parent {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!("{} changed before atomic replacement", parent.display()),
+                ));
+            }
+        }
+        temp_file.persist(target).map_err(|error| error.error)?;
+        sync_parent_dir(target)
+    }
+}
+
+/// Containment for the atomic-replacement parent against the canonical
+/// workspace roots. Each root is canonicalized here so a caller passing a
+/// raw cwd (symlinked `/var` → `/private/var` on macOS) still matches.
+fn atomic_parent_within_roots(canonical_parent: &Path, allowed_roots: &[PathBuf]) -> bool {
+    allowed_roots.iter().any(|root| {
+        let canonical_root =
+            std::fs::canonicalize(root).map_or_else(|_| root.clone(), strip_unc_prefix);
+        canonical_parent.starts_with(&canonical_root)
+    })
+}
+
+fn atomic_replace_file(
+    target: &Path,
+    allowed_roots: &[PathBuf],
+    contents: &[u8],
+) -> std::io::Result<()> {
+    atomic_replace_file_with(target, allowed_roots, contents, None, || {})
+}
+
+fn atomic_replace_file_if_unchanged(
+    target: &Path,
+    allowed_roots: &[PathBuf],
+    contents: &[u8],
+    expected_source: AtomicContentExpectation,
+) -> std::io::Result<()> {
+    atomic_replace_file_with(
+        target,
+        allowed_roots,
+        contents,
+        Some(expected_source),
+        || {},
+    )
 }
 
 fn escape_file_tag_attribute(value: &str) -> String {
@@ -2197,12 +5247,23 @@ fn escaped_file_tag_name(path: &Path) -> String {
     escape_file_tag_attribute(&path.display().to_string())
 }
 
+/// The window git sniffs for binary content.
+const BINARY_SNIFF_BYTES: usize = 8192;
+
+/// A NUL byte, or bytes that are not UTF-8, in the first 8 KiB. A multibyte
+/// character cut off at the window edge is still text.
+fn looks_binary(bytes: &[u8]) -> bool {
+    let header = bytes.get(..BINARY_SNIFF_BYTES).unwrap_or(bytes);
+    header.contains(&0)
+        || std::str::from_utf8(header).is_err_and(|error| error.error_len().is_some())
+}
+
 fn append_file_notice_block(out: &mut String, path: &Path, notice: &str) {
     let path_str = escaped_file_tag_name(path);
     let _ = writeln!(out, "<file name=\"{path_str}\">\n{notice}\n</file>");
 }
 
-fn append_image_file_ref(out: &mut String, path: &Path, note: Option<&str>) {
+fn append_attachment_file_ref(out: &mut String, path: &Path, note: Option<&str>) {
     let path_str = escaped_file_tag_name(path);
     match note {
         Some(text) => {
@@ -2274,10 +5335,10 @@ fn maybe_append_image_argument(
 
     let base64_data =
         base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &resized.bytes);
-    out.images.push(ImageContent {
+    out.attachments.push(ContentBlock::Image(ImageContent {
         data: base64_data,
         mime_type: resized.mime_type.to_string(),
-    });
+    }));
 
     let note = if resized.resized {
         if let (Some(ow), Some(oh), Some(w), Some(h)) = (
@@ -2302,28 +5363,53 @@ fn maybe_append_image_argument(
     } else {
         None
     };
-    append_image_file_ref(&mut out.text, absolute_path, note.as_deref());
+    append_attachment_file_ref(&mut out.text, absolute_path, note.as_deref());
     Ok(true)
 }
 
-/// Process `@file` arguments into a single text prefix and image attachments.
+fn append_media_argument(
+    out: &mut ProcessedFiles,
+    absolute_path: &Path,
+    bytes: &[u8],
+    mime_type: &str,
+) {
+    let data = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes);
+    let name = absolute_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(crate::model::sanitize_media_name);
+    out.attachments.push(ContentBlock::Media(MediaContent {
+        data,
+        mime_type: mime_type.to_string(),
+        name,
+    }));
+    let note = format!(
+        "[Media: {mime_type}, {}]",
+        crate::model::format_media_size(bytes.len() as u64)
+    );
+    append_attachment_file_ref(&mut out.text, absolute_path, Some(&note));
+}
+
+/// Process `@file` arguments into a single text prefix and ordered attachments.
 ///
-/// Matches the legacy TypeScript behavior:
 /// - Resolves paths (including `~` expansion + macOS screenshot variants)
 /// - Skips empty files
 /// - For images: attaches image blocks and appends `<file name="...">...</file>` references
+/// - For supported video/audio extensions: attaches the unchanged bytes as media,
+///   bounded by the default inline media byte cap
 /// - For text: embeds the file contents inside `<file>` tags
 pub fn process_file_arguments(
     file_args: &[String],
     cwd: &Path,
     auto_resize_images: bool,
+    workspace: &crate::workspace::WorkspaceHandle,
 ) -> Result<ProcessedFiles> {
     let mut out = ProcessedFiles::default();
 
     for file_arg in file_args {
         let resolved = resolve_read_path(file_arg, cwd);
         let absolute_path = normalize_dot_segments(&resolved);
-        let absolute_path = enforce_read_scope(&absolute_path, cwd)?;
+        let absolute_path = enforce_read_scope(&absolute_path, cwd, workspace)?;
 
         let meta = std::fs::metadata(&absolute_path).map_err(|e| {
             Error::tool(
@@ -2331,6 +5417,15 @@ pub fn process_file_arguments(
                 format!("Cannot access file {}: {e}", absolute_path.display()),
             )
         })?;
+        ensure_ancestors_searchable_sync(&absolute_path)
+            .map_err(|err| Error::tool("read", err.to_string()))?;
+        let required_access = if meta.is_dir() {
+            UNIX_ACCESS_READ | UNIX_ACCESS_SEARCH
+        } else {
+            UNIX_ACCESS_READ
+        };
+        ensure_effective_mode_access(&meta, &absolute_path, required_access, "@file reading")
+            .map_err(|err| Error::tool("read", err.to_string()))?;
         if meta.is_dir() {
             append_file_notice_block(
                 &mut out.text,
@@ -2344,31 +5439,60 @@ pub fn process_file_arguments(
             continue;
         }
 
-        if meta.len() > READ_TOOL_MAX_BYTES {
+        let media_mime_type = absolute_path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .and_then(crate::media_tools::media_mime_type_for_extension);
+        let max_bytes = if media_mime_type.is_some() {
+            crate::media_tools::DEFAULT_MEDIA_MAX_BYTES
+        } else {
+            READ_TOOL_MAX_BYTES
+        };
+        if meta.len() > max_bytes {
             append_file_notice_block(
                 &mut out.text,
                 &absolute_path,
                 &format!(
                     "[File is too large ({} bytes). Max allowed is {} bytes.]",
                     meta.len(),
-                    READ_TOOL_MAX_BYTES
+                    max_bytes
                 ),
             );
             continue;
         }
 
-        let bytes = std::fs::read(&absolute_path).map_err(|e| {
+        // Snapshot immediately before the confined open so additions and
+        // revocations on shared workspace handles apply to the actual read.
+        let mut allowed_roots = workspace.snapshot_or(cwd).all();
+        allowed_roots.push(Config::global_dir());
+        let bytes = read_file_capped_within_roots_sync(&absolute_path, &allowed_roots, max_bytes)
+            .map_err(|e| {
             Error::tool(
                 "read",
                 format!("Could not read file {}: {e}", absolute_path.display()),
             )
         })?;
+        if bytes.is_empty() {
+            continue;
+        }
 
         if maybe_append_image_argument(&mut out, &absolute_path, &bytes, auto_resize_images)? {
             continue;
         }
 
-        append_text_file_block(&mut out.text, &absolute_path, &bytes);
+        if let Some(mime_type) = media_mime_type {
+            append_media_argument(&mut out, &absolute_path, &bytes, mime_type);
+        } else if looks_binary(&bytes) {
+            // Decoded as text it would be up to a megabyte of replacement
+            // characters. OMP skips binary mentions the same way.
+            append_file_notice_block(
+                &mut out.text,
+                &absolute_path,
+                &format!("[Binary file ({} bytes), not included.]", bytes.len()), // ubs:ignore[rust.perf.string-alloc-in-loop] -- once per binary @file argument
+            );
+        } else {
+            append_text_file_block(&mut out.text, &absolute_path, &bytes);
+        }
     }
 
     Ok(out)
@@ -2638,64 +5762,1049 @@ pub(crate) fn resize_image_if_needed(
 // Tool Registry
 // ============================================================================
 
+/// Retained exposure rules for tools mounted after the built-in registry exists.
+/// Dynamic tools keep their existing essential default unless configured.
+#[derive(Clone, Default)]
+struct ToolLoadPolicy {
+    modes: std::collections::HashMap<String, crate::xdev::LoadMode>,
+    selected: std::collections::HashSet<String>,
+    dispatcher_cwd: Option<PathBuf>,
+}
+
+impl ToolLoadPolicy {
+    fn new(enabled: &[&str], cwd: Option<&Path>, config: Option<&Config>) -> Self {
+        let modes = config
+            .and_then(|config| config.tools.as_ref())
+            .and_then(|tools| tools.load_mode.as_ref())
+            .into_iter()
+            .flatten()
+            .filter_map(|(name, mode)| {
+                crate::xdev::LoadMode::from_name(mode).map(|mode| (name.clone(), mode))
+            })
+            .collect();
+        Self {
+            modes,
+            selected: enabled.iter().map(|name| (*name).to_string()).collect(),
+            dispatcher_cwd: cwd
+                .filter(|_| crate::xdev::tier_for("xdev", config) != crate::xdev::LoadMode::Off)
+                .map(Path::to_path_buf),
+        }
+    }
+
+    fn admits(&self, name: &str) -> bool {
+        self.selected.contains(name) || self.modes.get(name) != Some(&crate::xdev::LoadMode::Off)
+    }
+}
+
 /// Registry of enabled tools for a Pi run.
 ///
 /// The registry is constructed from configuration (enabled tool names + settings) and is used for:
 /// - Looking up a tool implementation by name during tool-call execution.
 /// - Enumerating tool schemas when building provider requests.
 pub struct ToolRegistry {
-    tools: Vec<Box<dyn Tool>>,
+    tools: Vec<Arc<dyn Tool>>,
+    /// Initially admitted native implementations, retained independently of
+    /// same-named extension wrappers. Factories never construct disabled tools.
+    factory_tools: Vec<Arc<dyn Tool>>,
+    /// Extension tools shelved by `setActiveTools`; restored when a later
+    /// call names them again.
+    inactive: Vec<Arc<dyn Tool>>,
+    /// Shared by bash/jobs/hub and rebound by [`crate::agent::AgentSession`]
+    /// to the live session handle.
+    job_session_scope: crate::jobs::JobSessionScope,
+    /// Shared by delegating tools and updated on every host provider switch.
+    model_scope: ToolModelScope,
+    cost_scope: crate::cost::CostScope,
+    media_auth_scope: crate::media_tools::MediaAuthScope,
+    text_file_client_scope: TextFileClientScope,
+    terminal_client_scope: TerminalClientScope,
+    /// Discoverable-tier tool names (bd-cv653.1.6): excluded from the provider
+    /// schema until promoted via `xdev promote`. Everything not in this set
+    /// is in the schema (essential tier).
+    discoverable: std::collections::HashSet<String>,
+    load_policy: Arc<ToolLoadPolicy>,
+    /// Exact ownership prevents catalog refresh from replacing an extension or
+    /// host tool that happens to use the dispatcher's name.
+    generated_dispatcher: Option<Arc<crate::xdev::XdevTool>>,
+    /// Session undo recorder shared with write/edit/hashline_edit
+    /// (bd-cv653.3.13); the interactive host reads it back for /undo //redo.
+    mutation_recorder: Option<Arc<crate::undo::FileMutationRecorder>>,
+    /// Host-owned picker surface shared by permission-gated built-ins and the
+    /// optional model-facing ask tool. This exists even when `ask` is not in
+    /// the model schema: host authorization must not disappear merely because
+    /// the model cannot ask arbitrary questions.
+    host_ask: crate::ask::AskTool,
+    /// Invocation policy retained when extension/MCP mounts publish a snapshot.
+    /// Set only when the host explicitly disables its built-in tool set.
+    builtins_disabled: bool,
+    /// Back-pointer to the [`SharedToolRegistry`] this snapshot belongs to,
+    /// so a hostcall holding only a snapshot can publish an update.
+    shared: Option<std::sync::Weak<SharedToolRegistryInner>>,
+}
+
+/// How the memory-bank tools are turned on, quoted in the `--tools` warning.
+const MEMORY_BANK_HOW: &str = "set memory.backend to \"local\" or \"cass\" in settings.json";
+
+/// The requested tool names pi does not provide at all.
+///
+/// A name pi DOES provide but does not select through `--tools` is not one of
+/// these; see [`unselectable_tool_names`]. Calling both a typo and a real tool
+/// "not a tool pi provides" was wrong about seven shipped tools.
+///
+/// Order and duplicates follow the request, so the warning reads back what the
+/// user typed.
+#[must_use]
+pub fn unknown_tool_names(requested: &[&str]) -> Vec<String> {
+    requested
+        .iter()
+        .filter(|name| {
+            !ToolRegistry::KNOWN_TOOL_NAMES.contains(*name)
+                && !ToolRegistry::TOOLS_NOT_SELECTED_BY_FLAG
+                    .iter()
+                    .any(|(name_, _)| name_ == *name)
+        })
+        .map(|name| (*name).to_string())
+        .collect()
+}
+
+/// Requested names whose construction depends on a separate activation path,
+/// paired with the setting or prerequisite that supplies them.
+///
+/// Naming one does not enable its backend, but can override a configured
+/// load-mode exclusion once that backend supplies the tool. Explain both
+/// prerequisites and overrides instead of treating the name as a typo.
+#[must_use]
+pub fn unselectable_tool_names(requested: &[&str]) -> Vec<(String, &'static str)> {
+    requested
+        .iter()
+        .filter_map(|name| {
+            ToolRegistry::TOOLS_NOT_SELECTED_BY_FLAG
+                .iter()
+                .find(|(name_, _)| name_ == name)
+                .map(|(_, how)| ((*name).to_string(), *how))
+        })
+        .collect()
+}
+
+fn retained_factory_tools(tools: &[Arc<dyn Tool>]) -> Vec<Arc<dyn Tool>> {
+    tools
+        .iter()
+        .filter(|tool| {
+            tool.origin() == ToolOrigin::BuiltIn
+                && matches!(
+                    tool.name(),
+                    "read" | "write" | "edit" | "bash" | "grep" | "find" | "ls"
+                )
+        })
+        .cloned()
+        .collect()
+}
+
+fn validate_builtin_factory_options(
+    name: &str,
+    options: &serde_json::Value,
+    allowed: &[&str],
+) -> Result<()> {
+    let Some(options) = options.as_object() else {
+        return Err(Error::validation(format!(
+            "{name} factory options must be an object"
+        )));
+    };
+    if let Some(key) = options.keys().find(|key| !allowed.contains(&key.as_str())) {
+        return Err(Error::validation(format!(
+            "{name} factory option '{key}' is not supported by the native host"
+        )));
+    }
+    Ok(())
+}
+
+fn builtin_factory_cwd(
+    name: &str,
+    requested: Option<&str>,
+    configured: &Path,
+    workspace: &WorkspaceHandle,
+) -> Result<PathBuf> {
+    let Some(requested) = requested else {
+        return Ok(configured.to_path_buf());
+    };
+    if requested.is_empty() || requested.contains('\0') {
+        return Err(Error::validation("Factory cwd must be a non-empty path"));
+    }
+    let path = resolve_path(requested, configured);
+    let canonical = std::fs::canonicalize(&path).map_err(|error| {
+        Error::validation(format!("Cannot resolve {name} factory cwd: {error}"))
+    })?;
+    enforce_cwd_scope(&canonical, configured, name, workspace)?;
+    if !canonical.is_dir() {
+        return Err(Error::validation("Factory cwd must be a directory"));
+    }
+    Ok(canonical)
+}
+
+fn rebase_builtin_factory_input(
+    name: &str,
+    mut input: serde_json::Value,
+    cwd: Option<&str>,
+    configured: &Path,
+    workspace: &WorkspaceHandle,
+) -> Result<serde_json::Value> {
+    // The native tool already resolves its default cwd. Rebasing here would
+    // apply a relative configured cwd twice (project/project/file).
+    if cwd.is_none() {
+        return Ok(input);
+    }
+    let cwd = builtin_factory_cwd(name, cwd, configured, workspace)?;
+    let Some(params) = input.as_object_mut() else {
+        return Err(Error::validation("Tool input must be an object"));
+    };
+    let path = match params.get("path") {
+        Some(serde_json::Value::String(path)) => path.as_str(),
+        None if matches!(name, "grep" | "find" | "ls") => ".",
+        // Preserve the native tool's required-field and type errors.
+        _ => return Ok(input),
+    };
+    // Native resource URLs and remote selectors keep their own routing. Local
+    // relative paths, including archive/document selectors, use the factory cwd.
+    if !crate::url_router::has_scheme(path) {
+        let path = resolve_to_cwd(path, &cwd);
+        let path = path
+            .to_str()
+            .ok_or_else(|| Error::validation("Factory path cannot be represented as UTF-8"))?;
+        params.insert(
+            "path".to_string(),
+            serde_json::Value::String(path.to_string()),
+        );
+    }
+    Ok(input)
 }
 
 impl ToolRegistry {
     /// Create a new registry with the specified tools enabled.
     pub fn new(enabled: &[&str], cwd: &Path, config: Option<&Config>) -> Self {
+        Self::with_mutation_recorder(enabled, cwd, config, None, None)
+    }
+
+    /// Construct an empty built-in set while retaining the host's picker policy.
+    /// Extensions and MCP tools may still be mounted afterward.
+    pub fn without_builtins(config: Option<&Config>) -> Self {
+        let mut registry = Self::from_tools(Vec::new());
+        registry.builtins_disabled = true;
+        registry.load_policy = Arc::new(ToolLoadPolicy::new(&[], None, config));
+        registry.host_ask = crate::ask::AskTool::new(crate::ask::AskPolicy::from_config(
+            config.and_then(|config| config.ask_policy.as_deref()),
+        ));
+        registry
+    }
+
+    /// Whether this invocation explicitly disabled host-provided built-in tools.
+    /// Extension and MCP mounts do not change this policy.
+    #[must_use]
+    pub const fn builtins_disabled(&self) -> bool {
+        self.builtins_disabled
+    }
+
+    /// The undo recorder attached at construction, if any.
+    #[must_use]
+    pub fn mutation_recorder(&self) -> Option<Arc<crate::undo::FileMutationRecorder>> {
+        self.mutation_recorder.clone()
+    }
+
+    /// Every name `--tools` will honour.
+    ///
+    /// The match in [`Self::with_builtin_tool_policy`] ends in `_ => {}`, so a
+    /// name it does not know is dropped without a word: `pi --tools
+    /// completely_made_up` starts an agent with no tools at all and says
+    /// nothing, and `--tools read,bsah,edit` quietly hands the model two tools
+    /// instead of three. This list is what [`unknown_tool_names`] measures a
+    /// request against.
+    ///
+    /// Keep it in step with that match. `tool_registry_builds_every_listed_name`
+    /// fails if a name here builds nothing, which is the direction that would
+    /// promise a tool pi cannot deliver. The reverse direction — a tool pi
+    /// registers that no list mentions — used to cost a spurious "not a tool pi
+    /// provides" warning; it is now covered by
+    /// [`Self::TOOLS_NOT_SELECTED_BY_FLAG`] and
+    /// `every_registerable_tool_is_named_in_one_of_the_two_lists`.
+    pub const KNOWN_TOOL_NAMES: &'static [&'static str] = &[
+        // Built here, one arm each.
+        "ast_edit",
+        "ast_grep",
+        "bash",
+        "browser",
+        "computer",
+        "current_time",
+        "debug",
+        "edit",
+        "eval",
+        "find",
+        "generate_image",
+        "github",
+        "grep",
+        "hashline_edit",
+        "hub",
+        "inspect_image",
+        "jobs",
+        "ls",
+        "lsp",
+        "read",
+        "read_media",
+        "security_scan",
+        "subagent",
+        "tts",
+        "web_search",
+        "write",
+        // Host-coupled: joined after construction by main.rs / sdk.rs.
+        "ask",
+        "todo",
+        "submit_plan",
+    ];
+
+    /// Tools constructed outside the `--tools` match, and their prerequisites.
+    ///
+    /// Naming one does not enable its backend. Explicit names can still
+    /// override configured load-mode exclusions for automatically added tools.
+    /// Before this list existed, `--tools xdev` was answered with "xdev is not
+    /// a tool pi provides", which is false about the dispatcher the entire
+    /// discoverable tier hangs off.
+    ///
+    /// The second field is the whole message a user needs to actually get the
+    /// tool, so keep it specific enough to act on.
+    pub const TOOLS_NOT_SELECTED_BY_FLAG: &'static [(&'static str, &'static str)] = &[
+        (
+            "xdev",
+            "the dispatcher appears whenever any discoverable-tier tool is enabled \
+             (ast_grep, ast_edit, lsp, debug, or the memory bank)",
+        ),
+        (
+            "manage_skill",
+            "available by default; tools.loadMode.manage_skill=off disables implicit access, \
+             and an explicit --tools name overrides that restriction",
+        ),
+        ("retain", MEMORY_BANK_HOW),
+        ("recall", MEMORY_BANK_HOW),
+        ("reflect", MEMORY_BANK_HOW),
+        ("memory_edit", MEMORY_BANK_HOW),
+        ("learn", MEMORY_BANK_HOW),
+    ];
+
+    /// Like [`ToolRegistry::new`] but attaches a session undo recorder to the
+    /// mutating file tools (bd-cv653.3.13). `workspace` installs the shared
+    /// multi-root handle on every path-confining tool (bd-cv653.3.12).
+    /// Project agent definitions remain excluded without an explicit host
+    /// decision; trust-aware hosts use [`Self::with_workspace_trust`].
+    pub fn with_mutation_recorder(
+        enabled: &[&str],
+        cwd: &Path,
+        config: Option<&Config>,
+        mutation_recorder: Option<Arc<crate::undo::FileMutationRecorder>>,
+        workspace: Option<&WorkspaceHandle>,
+    ) -> Self {
+        Self::with_workspace_trust(
+            enabled,
+            cwd,
+            config,
+            mutation_recorder,
+            workspace,
+            false,
+            None,
+        )
+    }
+
+    /// Build tools with the host's admission for project agent definitions.
+    /// A retained guard takes precedence over the boolean and is revalidated
+    /// before discovery can turn a project profile into child CLI arguments.
+    pub fn with_workspace_trust(
+        enabled: &[&str],
+        cwd: &Path,
+        config: Option<&Config>,
+        mutation_recorder: Option<Arc<crate::undo::FileMutationRecorder>>,
+        workspace: Option<&WorkspaceHandle>,
+        project_trusted: bool,
+        workspace_trust_guard: Option<&crate::workspace_trust::WorkspaceTrustGuard>,
+    ) -> Self {
+        Self::with_builtin_tool_policy(
+            enabled,
+            cwd,
+            config,
+            mutation_recorder,
+            workspace,
+            project_trusted,
+            workspace_trust_guard,
+            true,
+        )
+    }
+
+    /// Build the selected built-ins with the host's workspace admission.
+    /// When implicit tools are disabled, configured automatic tools must also
+    /// appear in `enabled`. Their backend prerequisites still apply. The xdev
+    /// dispatcher may expose only the discoverable targets admitted here.
+    #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+    pub fn with_builtin_tool_policy(
+        enabled: &[&str],
+        cwd: &Path,
+        config: Option<&Config>,
+        mutation_recorder: Option<Arc<crate::undo::FileMutationRecorder>>,
+        workspace: Option<&WorkspaceHandle>,
+        project_trusted: bool,
+        workspace_trust_guard: Option<&crate::workspace_trust::WorkspaceTrustGuard>,
+        allow_implicit_tools: bool,
+    ) -> Self {
+        let legacy_workspace = WorkspaceHandle::default();
+        let workspace = workspace.unwrap_or(&legacy_workspace);
+        let host_ask = crate::ask::AskTool::new(crate::ask::AskPolicy::from_config(
+            config.and_then(|config| config.ask_policy.as_deref()),
+        ));
         let mut tools: Vec<Box<dyn Tool>> = Vec::new();
+        let job_session_scope = crate::jobs::JobSessionScope::default();
+        let model_scope = ToolModelScope::default();
+        let cost_scope = crate::cost::CostScope::default();
+        let media_auth_scope = crate::media_tools::MediaAuthScope::default();
+        let text_file_client_scope = TextFileClientScope::default();
+        let terminal_client_scope = TerminalClientScope::default();
         let shell_path = config.and_then(|c| c.shell_path.clone());
         let shell_command_prefix = config.and_then(|c| c.shell_command_prefix.clone());
         let image_auto_resize = config.is_none_or(Config::image_auto_resize);
         let block_images = config
             .and_then(|c| c.images.as_ref().and_then(|i| i.block_images))
             .unwrap_or(false);
+        let automatic_allowed = |name: &str| allow_implicit_tools || enabled.contains(&name);
 
         for name in enabled {
             match *name {
-                "read" => tools.push(Box::new(ReadTool::with_settings(
+                "read" => tools.push(Box::new(
+                    ReadTool::with_settings(cwd, image_auto_resize, block_images)
+                        .with_url_policy(
+                            config
+                                .and_then(|c| c.read.as_ref())
+                                .and_then(|r| r.url_allow_private_targets)
+                                .unwrap_or(false),
+                        )
+                        .with_workspace(workspace.clone()),
+                )),
+                "bash" => tools.push(Box::new(
+                    BashTool::with_shell(cwd, shell_path.clone(), shell_command_prefix.clone())
+                        .with_mediation(config.and_then(|c| c.bash.clone())),
+                )),
+                "edit" => tools.push(Box::new(
+                    EditTool::new(cwd)
+                        .with_mutation_recorder(mutation_recorder.clone())
+                        .with_workspace(workspace.clone()),
+                )),
+                "write" => tools.push(Box::new(
+                    WriteTool::new(cwd)
+                        .with_output_enabled(
+                            config
+                                .and_then(|config| config.out.as_ref())
+                                .and_then(|settings| settings.enabled)
+                                .unwrap_or(false),
+                        )
+                        .with_mutation_recorder(mutation_recorder.clone())
+                        .with_workspace(workspace.clone()),
+                )),
+                "grep" => tools.push(Box::new(
+                    GrepTool::with_backend(cwd, search_backend_from_config(config))
+                        .with_url_policy(
+                            config
+                                .and_then(|c| c.read.as_ref())
+                                .and_then(|r| r.url_allow_private_targets)
+                                .unwrap_or(false),
+                        )
+                        .with_workspace(workspace.clone()),
+                )),
+                "find" => tools.push(Box::new(
+                    FindTool::with_backend(cwd, search_backend_from_config(config))
+                        .with_workspace(workspace.clone()),
+                )),
+                "ls" => tools.push(Box::new(LsTool::new(cwd).with_workspace(workspace.clone()))),
+                "hashline_edit" => tools.push(Box::new(
+                    HashlineEditTool::new(cwd)
+                        .with_mutation_recorder(mutation_recorder.clone())
+                        .with_workspace(workspace.clone()),
+                )),
+                "jobs" => tools.push(Box::new(JobsTool::new())),
+                "hub" => tools.push(Box::new(HubTool::new(cwd))),
+                // Wall-clock awareness (gh #207, #103): read effects only; the
+                // implementation lives in `crate::current_time`.
+                "current_time" => {
+                    tools.push(Box::new(crate::current_time::CurrentTimeTool::new()));
+                }
+                "security_scan" => {
+                    tools.push(Box::new(crate::security_scan::SecurityScanTool::new(cwd)));
+                }
+                "web_search" => tools.push(Box::new(crate::web_search::WebSearchTool::new())),
+                "eval" => tools.push(Box::new(crate::eval::EvalTool::new(cwd))),
+                "github" => tools.push(Box::new(crate::github::GithubTool::new(
                     cwd,
-                    image_auto_resize,
-                    block_images,
+                    config.and_then(|c| c.gh_path.as_deref()),
                 ))),
-                "bash" => tools.push(Box::new(BashTool::with_shell(
-                    cwd,
-                    shell_path.clone(),
-                    shell_command_prefix.clone(),
-                ))),
-                "edit" => tools.push(Box::new(EditTool::new(cwd))),
-                "write" => tools.push(Box::new(WriteTool::new(cwd))),
-                "grep" => tools.push(Box::new(GrepTool::new(cwd))),
-                "find" => tools.push(Box::new(FindTool::new(cwd))),
-                "ls" => tools.push(Box::new(LsTool::new(cwd))),
-                "hashline_edit" => tools.push(Box::new(HashlineEditTool::new(cwd))),
+                // "ask" is session-host-coupled (its picker handler is
+                // installed by the interactive host) and joins via
+                // extend_tools in main.rs/sdk.rs, like "todo".
+                "ast_grep" => tools.push(Box::new(crate::ast_tools::AstGrepTool::new(cwd))),
+                "ast_edit" => tools.push(Box::new(
+                    crate::ast_tools::AstEditTool::new(cwd)
+                        .with_mutation_recorder(mutation_recorder.clone()),
+                )),
+                "lsp" => tools.push(Box::new(
+                    crate::lsp::LspTool::new(cwd, config)
+                        .with_mutation_recorder(mutation_recorder.clone()),
+                )),
+                "debug" => tools.push(Box::new(crate::debug::DebugTool::new(cwd, config))),
+                "inspect_image" => {
+                    let vision_model = config
+                        .and_then(|c| c.media.as_ref())
+                        .and_then(|m| m.vision_model.clone());
+                    let vision_provider = config
+                        .and_then(|c| c.media.as_ref())
+                        .and_then(|m| m.vision_provider.clone());
+                    tools.push(Box::new(
+                        crate::media_tools::InspectImageTool::with_defaults(
+                            cwd,
+                            vision_provider,
+                            vision_model,
+                        ),
+                    ));
+                }
+                "read_media" => {
+                    let max_bytes = config
+                        .and_then(|c| c.media.as_ref())
+                        .and_then(|m| m.max_bytes);
+                    tools.push(Box::new(
+                        crate::media_tools::ReadMediaTool::new(cwd).with_max_bytes(max_bytes),
+                    ));
+                }
+                "generate_image" => {
+                    let media = config.and_then(|c| c.media.as_ref());
+                    let provider = media.and_then(|m| m.image_gen_provider.clone());
+                    let model = media.and_then(|m| m.image_gen_model.clone());
+                    tools.push(Box::new(
+                        crate::media_tools::GenerateImageTool::with_defaults(cwd, provider, model),
+                    ));
+                }
+                "tts" => {
+                    let media = config.and_then(|c| c.media.as_ref());
+                    let provider = media.and_then(|m| m.tts_provider.clone());
+                    let voice = media.and_then(|m| m.tts_voice.clone());
+                    tools.push(Box::new(crate::media_tools::TtsTool::with_defaults(
+                        cwd, provider, voice,
+                    )));
+                }
+                "computer" => {
+                    let require_approval = config
+                        .and_then(|c| c.computer.as_ref())
+                        .and_then(|comp| comp.require_approval)
+                        .unwrap_or(true);
+                    tools.push(Box::new(
+                        crate::computer::ComputerTool::new(cwd)
+                            .with_require_approval(require_approval)
+                            .with_approval_handler({
+                                let ask = host_ask.clone();
+                                std::sync::Arc::new(move |request| {
+                                    let ask = ask.clone();
+                                    Box::pin(async move { ask.prompt_installed(request).await })
+                                })
+                            }),
+                    ));
+                }
+                "browser" => {
+                    let browser_cfg = config.and_then(|c| c.browser.as_ref());
+                    tools.push(Box::new(
+                        crate::browser::BrowserTool::new(cwd)
+                            .with_domain_allowlist(
+                                browser_cfg.and_then(|b| b.domain_allowlist.clone()),
+                            )
+                            .with_configured_headless(browser_cfg.and_then(|b| b.headless)),
+                    ));
+                }
+                "subagent" => {
+                    let structured_results = config
+                        .and_then(|c| c.subagent_structured_results)
+                        .unwrap_or(false);
+                    let role_model_selection = config.and_then(crate::app::subagent_role_selection);
+                    tools.push(Box::new(
+                        crate::subagents::SubagentTool::new(cwd)
+                            .with_project_trust(project_trusted)
+                            .with_workspace_trust_guard(workspace_trust_guard.cloned())
+                            .with_structured_results(structured_results)
+                            .with_workspace(workspace.clone())
+                            .with_secrets_settings(
+                                config.and_then(|config| config.secrets.as_ref()),
+                            )
+                            .with_role_model_selection(role_model_selection)
+                            .with_model_config(config.cloned()),
+                    ));
+                }
+                // Nothing to build: either a host-coupled tool the session host
+                // joins after construction (`ask`, `todo`, `submit_plan` — see
+                // main.rs and sdk.rs) or a name pi does not have. The two are
+                // told apart by [`ToolRegistry::KNOWN_TOOL_NAMES`], which is
+                // what warns about the second; they cannot be told apart here,
+                // because both do nothing.
                 _ => {}
             }
         }
 
-        Self { tools }
+        // Memory bank (bd-cv653.4.1): backend configuration supplies the bank;
+        // a child's declared tool set also limits individual memory tools.
+        // Check that admission before opening a store, which creates its dir.
+        if config.is_some_and(|cfg| matches!(cfg.memory_backend(), "local" | "cass"))
+            && ["retain", "recall", "reflect", "memory_edit", "learn"]
+                .iter()
+                .any(|name| automatic_allowed(name))
+            && let Ok(store) = crate::memory::MemoryStore::open(cwd)
+        {
+            let store = std::sync::Arc::new(
+                store.with_secrets_settings(config.and_then(|cfg| cfg.secrets.as_ref())),
+            );
+            if automatic_allowed("retain") {
+                tools.push(Box::new(crate::memory::RetainTool::new(
+                    std::sync::Arc::clone(&store),
+                )));
+            }
+            if automatic_allowed("recall") {
+                tools.push(Box::new(
+                    crate::memory::RecallTool::new(std::sync::Arc::clone(&store))
+                        .with_cass_history(
+                            config.is_some_and(|cfg| cfg.memory_backend() == "cass"),
+                        ),
+                ));
+            }
+            if automatic_allowed("reflect") {
+                tools.push(Box::new(
+                    crate::memory::ReflectTool::new(std::sync::Arc::clone(&store))
+                        .with_secrets_settings(config.and_then(|cfg| cfg.secrets.as_ref())),
+                ));
+            }
+            if automatic_allowed("memory_edit") {
+                tools.push(Box::new(crate::memory::MemoryEditTool::new(
+                    std::sync::Arc::clone(&store),
+                )));
+            }
+            if automatic_allowed("learn") {
+                tools.push(Box::new(LearnTool::new(store)));
+            }
+        }
+
+        // Media tools (bd-cv653.2.7): opt-in via config.media
+        // Preserve explicit per-tool choices, including false, before using
+        // the aggregate default. read_media has a separate opt-in.
+        if let Some(media_cfg) = config.and_then(|c| c.media.as_ref()) {
+            if automatic_allowed("inspect_image")
+                && media_cfg
+                    .enable_inspect_image
+                    .or(media_cfg.enable_media)
+                    .unwrap_or(false)
+                && !tools.iter().any(|t| t.name() == "inspect_image")
+            {
+                tools.push(Box::new(
+                    crate::media_tools::InspectImageTool::with_defaults(
+                        cwd,
+                        media_cfg.vision_provider.clone(),
+                        media_cfg.vision_model.clone(),
+                    ),
+                ));
+            }
+            if automatic_allowed("read_media")
+                && media_cfg.enable_read_media.unwrap_or(false)
+                && !tools.iter().any(|t| t.name() == "read_media")
+            {
+                tools.push(Box::new(
+                    crate::media_tools::ReadMediaTool::new(cwd).with_max_bytes(media_cfg.max_bytes),
+                ));
+            }
+            if automatic_allowed("generate_image")
+                && media_cfg
+                    .enable_generate_image
+                    .or(media_cfg.enable_media)
+                    .unwrap_or(false)
+                && !tools.iter().any(|t| t.name() == "generate_image")
+            {
+                tools.push(Box::new(
+                    crate::media_tools::GenerateImageTool::with_defaults(
+                        cwd,
+                        media_cfg.image_gen_provider.clone(),
+                        media_cfg.image_gen_model.clone(),
+                    ),
+                ));
+            }
+            if automatic_allowed("tts")
+                && media_cfg
+                    .enable_tts
+                    .or(media_cfg.enable_media)
+                    .unwrap_or(false)
+                && !tools.iter().any(|t| t.name() == "tts")
+            {
+                tools.push(Box::new(crate::media_tools::TtsTool::with_defaults(
+                    cwd,
+                    media_cfg.tts_provider.clone(),
+                    media_cfg.tts_voice.clone(),
+                )));
+            }
+        }
+
+        // Computer tool (bd-cv653.2.5): opt-in via config.computer
+        if let Some(comp_cfg) = config.and_then(|c| c.computer.as_ref())
+            && automatic_allowed("computer")
+            && comp_cfg.enable_computer.unwrap_or(false)
+            && !tools.iter().any(|t| t.name() == "computer")
+        {
+            let require_approval = comp_cfg.require_approval.unwrap_or(true);
+            tools.push(Box::new(
+                crate::computer::ComputerTool::new(cwd)
+                    .with_require_approval(require_approval)
+                    .with_approval_handler({
+                        let ask = host_ask.clone();
+                        std::sync::Arc::new(move |request| {
+                            let ask = ask.clone();
+                            Box::pin(async move { ask.prompt_installed(request).await })
+                        })
+                    }),
+            ));
+        }
+
+        // Browser tool (bd-cv653.2.4): opt-in via config.browser
+        if let Some(browser_cfg) = config.and_then(|c| c.browser.as_ref())
+            && automatic_allowed("browser")
+            && browser_cfg.enable_browser.unwrap_or(false)
+            && !tools.iter().any(|t| t.name() == "browser")
+        {
+            tools.push(Box::new(
+                crate::browser::BrowserTool::new(cwd)
+                    .with_domain_allowlist(browser_cfg.domain_allowlist.clone())
+                    .with_configured_headless(browser_cfg.headless),
+            ));
+        }
+
+        // manage_skill (bd-cv653.4.2): CRUD over the isolated managed-skills
+        // dir; available by default, subject to the load-mode filter below.
+        if automatic_allowed("manage_skill") {
+            tools.push(Box::new(ManageSkillTool));
+        }
+
+        // The resolved selection is authoritative. Configured Off overrides
+        // also exclude automatically added tools that were not selected by
+        // name, before their definitions can enter the discovery snapshot.
+        // Only explicit overrides count: subagent's default Off tier must not
+        // undo a deliberate opt-in.
+        tools.retain(|tool| {
+            enabled.contains(&tool.name())
+                || crate::xdev::configured_tier(tool.name(), config)
+                    != Some(crate::xdev::LoadMode::Off)
+        });
+
+        let discoverable_names = tools
+            .iter()
+            .filter(|tool| {
+                crate::xdev::tier_for(tool.name(), config) == crate::xdev::LoadMode::Discoverable
+            })
+            .map(|tool| tool.name().to_string())
+            .collect();
+
+        for tool in &mut tools {
+            tool.bind_job_session_scope(job_session_scope.clone());
+            tool.bind_model_scope(model_scope.clone());
+            tool.bind_cost_scope(cost_scope.clone());
+            tool.bind_media_auth_scope(media_auth_scope.clone());
+            tool.bind_text_file_client_scope(text_file_client_scope.clone());
+            tool.bind_terminal_client_scope(terminal_client_scope.clone());
+        }
+
+        let builtins_disabled = !allow_implicit_tools && enabled.is_empty();
+        let tools: Vec<Arc<dyn Tool>> = tools.into_iter().map(Arc::from).collect();
+        let factory_tools = retained_factory_tools(&tools);
+        let mut registry = Self {
+            tools,
+            factory_tools,
+            inactive: Vec::new(),
+            job_session_scope,
+            model_scope,
+            cost_scope,
+            media_auth_scope,
+            text_file_client_scope,
+            terminal_client_scope,
+            discoverable: discoverable_names,
+            load_policy: Arc::new(ToolLoadPolicy::new(
+                enabled,
+                (!builtins_disabled).then_some(cwd),
+                config,
+            )),
+            generated_dispatcher: None,
+            mutation_recorder,
+            host_ask,
+            builtins_disabled,
+            shared: None,
+        };
+        registry.refresh_discovery();
+        registry
+    }
+
+    /// Host-owned interactive picker shared with permission-gated built-ins.
+    ///
+    /// This is deliberately independent of whether the model-facing `ask`
+    /// tool is enabled. Installing a UI here gives the host somewhere to make
+    /// authorization decisions without granting the model a new tool.
+    #[must_use]
+    pub fn host_ask_tool(&self) -> crate::ask::AskTool {
+        self.host_ask.clone()
     }
 
     /// Construct a registry from a pre-built tool list.
-    pub fn from_tools(tools: Vec<Box<dyn Tool>>) -> Self {
-        Self { tools }
+    pub fn from_tools(mut tools: Vec<Box<dyn Tool>>) -> Self {
+        let job_session_scope = crate::jobs::JobSessionScope::default();
+        let model_scope = ToolModelScope::default();
+        let cost_scope = crate::cost::CostScope::default();
+        let media_auth_scope = crate::media_tools::MediaAuthScope::default();
+        let text_file_client_scope = TextFileClientScope::default();
+        let terminal_client_scope = TerminalClientScope::default();
+        let host_ask = crate::ask::AskTool::new(crate::ask::AskPolicy::Error);
+        for tool in &mut tools {
+            tool.bind_job_session_scope(job_session_scope.clone());
+            tool.bind_model_scope(model_scope.clone());
+            tool.bind_cost_scope(cost_scope.clone());
+            tool.bind_media_auth_scope(media_auth_scope.clone());
+            tool.bind_text_file_client_scope(text_file_client_scope.clone());
+            tool.bind_terminal_client_scope(terminal_client_scope.clone());
+        }
+        let tools: Vec<Arc<dyn Tool>> = tools.into_iter().map(Arc::from).collect();
+        let factory_tools = retained_factory_tools(&tools);
+        Self {
+            tools,
+            factory_tools,
+            inactive: Vec::new(),
+            job_session_scope,
+            model_scope,
+            cost_scope,
+            media_auth_scope,
+            text_file_client_scope,
+            terminal_client_scope,
+            discoverable: std::collections::HashSet::new(),
+            load_policy: Arc::new(ToolLoadPolicy::default()),
+            generated_dispatcher: None,
+            mutation_recorder: None,
+            host_ask,
+            builtins_disabled: false,
+            shared: None,
+        }
+    }
+
+    /// Shallow copy: the same tool handles, job/model scopes, discoverability set,
+    /// and undo recorder. [`SharedToolRegistry::update`] publishes a new
+    /// snapshot from it without disturbing readers of the previous one.
+    #[must_use]
+    pub fn clone_shallow(&self) -> Self {
+        Self {
+            tools: self.tools.clone(),
+            factory_tools: self.factory_tools.clone(),
+            inactive: self.inactive.clone(),
+            job_session_scope: self.job_session_scope.clone(),
+            model_scope: self.model_scope.clone(),
+            cost_scope: self.cost_scope.clone(),
+            media_auth_scope: self.media_auth_scope.clone(),
+            text_file_client_scope: self.text_file_client_scope.clone(),
+            terminal_client_scope: self.terminal_client_scope.clone(),
+            discoverable: self.discoverable.clone(),
+            load_policy: Arc::clone(&self.load_policy),
+            generated_dispatcher: self.generated_dispatcher.clone(),
+            mutation_recorder: self.mutation_recorder.clone(),
+            host_ask: self.host_ask.clone(),
+            builtins_disabled: self.builtins_disabled,
+            shared: self.shared.clone(),
+        }
+    }
+
+    /// The shared handle this snapshot was published from, if any. Lets a
+    /// hostcall that only holds a snapshot publish an update (for example
+    /// `setActiveTools`) that the agent's next lookup will observe.
+    #[must_use]
+    pub fn shared_handle(&self) -> Option<SharedToolRegistry> {
+        self.shared
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+            .map(|inner| SharedToolRegistry { inner })
+    }
+
+    /// Apply an extension's `setActiveTools` list: extension-origin tools
+    /// not named are shelved (invisible to `get`/`tools`, so neither the
+    /// provider schema nor execution can reach them), and shelved tools that
+    /// are named again come back. Built-in and MCP tools are never touched.
+    pub fn set_active_extension_tools(&mut self, active: &[String]) {
+        let is_active = |name: &str| active.iter().any(|candidate| candidate == name);
+        let (keep, shelve): (Vec<_>, Vec<_>) = self
+            .tools
+            .drain(..)
+            .partition(|tool| tool.origin() != ToolOrigin::Extension || is_active(tool.name()));
+        let (restore, still_inactive): (Vec<_>, Vec<_>) = self
+            .inactive
+            .drain(..)
+            .partition(|tool| is_active(tool.name()));
+        self.tools = keep;
+        self.tools.extend(restore);
+        self.inactive = shelve;
+        self.inactive.extend(still_inactive);
+        self.refresh_discovery();
+    }
+
+    /// Extension tools currently shelved by `setActiveTools`.
+    #[must_use]
+    pub fn inactive_tools(&self) -> &[Arc<dyn Tool>] {
+        &self.inactive
     }
 
     /// Convert the registry into the owned tool list.
-    pub fn into_tools(self) -> Vec<Box<dyn Tool>> {
+    pub fn into_tools(self) -> Vec<Arc<dyn Tool>> {
         self.tools
     }
 
-    /// Append a tool.
+    /// Whether a tool is currently discoverable-tier (hidden from the
+    /// provider schema until promoted). bd-cv653.1.6.
+    #[must_use]
+    pub fn is_discoverable(&self, name: &str) -> bool {
+        self.discoverable.contains(name)
+    }
+
+    /// Promote a discoverable tool into the live schema set.
+    pub fn mark_promoted(&mut self, name: &str) {
+        if self.discoverable.remove(name) {
+            Arc::make_mut(&mut self.load_policy)
+                .modes
+                .insert(name.to_string(), crate::xdev::LoadMode::Essential);
+            self.refresh_discovery();
+        }
+    }
+
+    /// Names + one-liners of currently discoverable tools (for the
+    /// system-prompt index).
+    #[must_use]
+    pub fn discoverable_index(&self) -> Vec<(String, String)> {
+        self.tools
+            .iter()
+            .filter(|tool| self.discoverable.contains(tool.name()))
+            .map(|tool| {
+                (
+                    tool.name().to_string(),
+                    crate::xdev::one_liner(tool.description()),
+                )
+            })
+            .collect()
+    }
+
+    /// Apply exposure and rebuild the generated discovery catalog in the same
+    /// registry snapshot as its targets. Old snapshots retain their own catalog.
+    fn refresh_discovery(&mut self) {
+        self.tools
+            .retain(|tool| self.load_policy.admits(tool.name()));
+        self.inactive
+            .retain(|tool| self.load_policy.admits(tool.name()));
+        let present: std::collections::HashSet<&str> = self
+            .tools
+            .iter()
+            .chain(&self.inactive)
+            .map(|tool| tool.name())
+            .collect();
+        self.discoverable
+            .retain(|name| present.contains(name.as_str()));
+        for tool in self.tools.iter().chain(&self.inactive) {
+            let name = tool.name();
+            // A dispatcher cannot discover itself. Its explicit Off setting
+            // controls generation separately from ordinary tool selection.
+            if name == "xdev" {
+                self.discoverable.remove(name);
+                continue;
+            }
+            match self.load_policy.modes.get(name) {
+                Some(crate::xdev::LoadMode::Discoverable) => {
+                    self.discoverable.insert(name.to_string());
+                }
+                Some(crate::xdev::LoadMode::Essential | crate::xdev::LoadMode::Off) => {
+                    self.discoverable.remove(name);
+                }
+                None => {}
+            }
+        }
+
+        let owned_index = self.generated_dispatcher.as_ref().and_then(|generated| {
+            let owned: Arc<dyn Tool> = generated.clone();
+            self.tools.iter().position(|tool| Arc::ptr_eq(tool, &owned))
+        });
+        if owned_index.is_none()
+            && self
+                .tools
+                .iter()
+                .chain(&self.inactive)
+                .any(|tool| tool.name() == "xdev")
+        {
+            self.generated_dispatcher = None;
+            return;
+        }
+        let catalog: Vec<crate::xdev::DiscoverableToolInfo> =
+            if self.load_policy.dispatcher_cwd.is_some() {
+                self.tools
+                    .iter()
+                    .filter(|tool| self.discoverable.contains(tool.name()))
+                    .map(|tool| crate::xdev::DiscoverableToolInfo {
+                        name: tool.name().to_string(),
+                        one_liner: crate::xdev::one_liner(tool.description()),
+                        description: tool.description().to_string(),
+                        parameters: tool.parameters(),
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+        let Some(cwd) = self
+            .load_policy
+            .dispatcher_cwd
+            .as_deref()
+            .filter(|_| !catalog.is_empty())
+        else {
+            if let Some(index) = owned_index {
+                self.tools.remove(index);
+            }
+            self.generated_dispatcher = None;
+            return;
+        };
+        if owned_index.is_some()
+            && self
+                .generated_dispatcher
+                .as_ref()
+                .is_some_and(|generated| generated.discoverable() == catalog.as_slice())
+        {
+            return;
+        }
+        let generated = Arc::new(crate::xdev::XdevTool::new(cwd, catalog));
+        if let Some(index) = owned_index {
+            self.tools[index] = generated.clone();
+        } else {
+            self.tools.push(generated.clone());
+        }
+        self.generated_dispatcher = Some(generated);
+    }
+
+    fn push_unpublished(&mut self, mut tool: Box<dyn Tool>) {
+        if !self.load_policy.admits(tool.name()) {
+            return;
+        }
+        tool.bind_job_session_scope(self.job_session_scope.clone());
+        tool.bind_model_scope(self.model_scope.clone());
+        tool.bind_cost_scope(self.cost_scope.clone());
+        tool.bind_media_auth_scope(self.media_auth_scope.clone());
+        tool.bind_text_file_client_scope(self.text_file_client_scope.clone());
+        tool.bind_terminal_client_scope(self.terminal_client_scope.clone());
+        let name = tool.name();
+        // Replacement owns this name immediately, even if an older extension
+        // wrapper is shelved. setActiveTools must not restore a second handle.
+        self.inactive.retain(|previous| previous.name() != name);
+        if let Some(pos) = self.tools.iter().position(|t| t.name() == name) {
+            self.tools[pos] = Arc::from(tool);
+        } else {
+            self.tools.push(Arc::from(tool));
+        }
+    }
+
+    /// Append or replace a tool while preserving configured exposure.
     pub fn push(&mut self, tool: Box<dyn Tool>) {
-        self.tools.push(tool);
+        self.push_unpublished(tool);
+        self.refresh_discovery();
     }
 
     /// Extend the registry with additional tools.
@@ -2703,11 +6812,196 @@ impl ToolRegistry {
     where
         I: IntoIterator<Item = Box<dyn Tool>>,
     {
-        self.tools.extend(tools);
+        for tool in tools {
+            self.push_unpublished(tool);
+        }
+        self.refresh_discovery();
+    }
+
+    /// Publish a complete extension catalog while retaining exact ownership.
+    /// A later host replacement must not be mistaken for one of our wrappers
+    /// merely because it has the same name or extension origin.
+    fn reconcile_extension_tools(
+        &mut self,
+        previous: &[Arc<dyn Tool>],
+        replacements: Vec<Box<dyn Tool>>,
+        active: Option<&[String]>,
+        initial: bool,
+    ) -> Vec<Arc<dyn Tool>> {
+        let owned = |tool: &Arc<dyn Tool>| previous.iter().any(|old| Arc::ptr_eq(old, tool));
+        let foreign_names: std::collections::HashSet<String> = self
+            .tools
+            .iter()
+            .chain(&self.inactive)
+            .filter(|tool| !owned(tool))
+            .map(|tool| tool.name().to_string())
+            .collect();
+        let mut replacements: std::collections::BTreeMap<String, Arc<dyn Tool>> = replacements
+            .into_iter()
+            .filter(|tool| self.load_policy.admits(tool.name()))
+            .map(|mut tool| {
+                tool.bind_job_session_scope(self.job_session_scope.clone());
+                tool.bind_model_scope(self.model_scope.clone());
+                tool.bind_cost_scope(self.cost_scope.clone());
+                tool.bind_media_auth_scope(self.media_auth_scope.clone());
+                tool.bind_text_file_client_scope(self.text_file_client_scope.clone());
+                tool.bind_terminal_client_scope(self.terminal_client_scope.clone());
+                (tool.name().to_string(), Arc::from(tool))
+            })
+            .collect();
+        let is_active =
+            |name: &str| active.is_none_or(|names| names.iter().any(|candidate| candidate == name));
+        let initial_names: std::collections::HashSet<String> = if initial {
+            replacements
+                .keys()
+                .filter(|name| is_active(name))
+                .cloned()
+                .collect()
+        } else {
+            std::collections::HashSet::new()
+        };
+        let mut published = Vec::with_capacity(replacements.len());
+        let old_active = std::mem::take(&mut self.tools);
+        let old_inactive = std::mem::take(&mut self.inactive);
+        for (was_active, old_tools) in [(true, old_active), (false, old_inactive)] {
+            for tool in old_tools {
+                if owned(&tool) || initial_names.contains(tool.name()) {
+                    // push/extend can replace an active name while an older
+                    // wrapper with that name is shelved. Retire the stale
+                    // wrapper too; a refresh cannot resurrect it over the host.
+                    if !initial && foreign_names.contains(tool.name()) {
+                        replacements.remove(tool.name());
+                        continue;
+                    }
+                    if let Some(next) = replacements.remove(tool.name()) {
+                        published.push(Arc::clone(&next));
+                        if is_active(next.name()) {
+                            self.tools.push(next);
+                        } else {
+                            self.inactive.push(next);
+                        }
+                    }
+                } else if was_active {
+                    self.tools.push(tool);
+                } else {
+                    self.inactive.push(tool);
+                }
+            }
+        }
+        for (name, next) in replacements {
+            if foreign_names.contains(&name) {
+                // Initial publication above preserves the existing ability
+                // to override a built-in. Automatic later refreshes cannot
+                // overwrite host/MCP registrations mounted in the meantime.
+                continue;
+            }
+            published.push(Arc::clone(&next));
+            if is_active(&name) {
+                self.tools.push(next);
+            } else {
+                self.inactive.push(next);
+            }
+        }
+        self.refresh_discovery();
+        published
+    }
+
+    /// Reconcile one manager's authoritative catalog without replacing any
+    /// unrelated tool, including a currently shelved extension registration.
+    /// Old snapshots retain their Arc handles for calls already in flight.
+    pub(crate) fn reconcile_mcp_tools(
+        &mut self,
+        manager: &Arc<crate::mcp::McpManager>,
+        mut replacements: Vec<Box<dyn Tool>>,
+    ) -> usize {
+        replacements.retain(|tool| self.load_policy.admits(tool.name()));
+        let owned = |tool: &dyn Tool| {
+            tool.mcp_manager()
+                .is_some_and(|owner| Arc::ptr_eq(owner, manager))
+        };
+        let mut changed = 0usize;
+        self.tools.retain_mut(|tool| {
+            if !owned(tool.as_ref()) {
+                return true;
+            }
+            let Some(index) = replacements
+                .iter()
+                .position(|next| next.name() == tool.name())
+            else {
+                changed += 1;
+                return false;
+            };
+            let mut next = replacements.remove(index);
+            if next.description() != tool.description() || next.parameters() != tool.parameters() {
+                next.bind_job_session_scope(self.job_session_scope.clone());
+                next.bind_model_scope(self.model_scope.clone());
+                next.bind_cost_scope(self.cost_scope.clone());
+                next.bind_media_auth_scope(self.media_auth_scope.clone());
+                next.bind_text_file_client_scope(self.text_file_client_scope.clone());
+                next.bind_terminal_client_scope(self.terminal_client_scope.clone());
+                *tool = Arc::from(next);
+                changed += 1;
+            }
+            true
+        });
+        for mut next in replacements {
+            if self
+                .tools
+                .iter()
+                .chain(&self.inactive)
+                .any(|tool| tool.name() == next.name())
+            {
+                continue;
+            }
+            next.bind_job_session_scope(self.job_session_scope.clone());
+            next.bind_model_scope(self.model_scope.clone());
+            next.bind_cost_scope(self.cost_scope.clone());
+            next.bind_media_auth_scope(self.media_auth_scope.clone());
+            next.bind_text_file_client_scope(self.text_file_client_scope.clone());
+            next.bind_terminal_client_scope(self.terminal_client_scope.clone());
+            self.tools.push(Arc::from(next));
+            changed += 1;
+        }
+        if changed > 0 {
+            self.refresh_discovery();
+        }
+        changed
+    }
+
+    /// The shared scope captured by the job completion fetcher.
+    #[must_use]
+    pub fn job_session_scope(&self) -> crate::jobs::JobSessionScope {
+        self.job_session_scope.clone()
+    }
+
+    /// Rebind every job-aware tool and fetcher to a live session resolver.
+    pub fn bind_job_session_resolver(&self, resolver: crate::jobs::JobSessionIdResolver) {
+        self.job_session_scope.bind(resolver);
+    }
+
+    /// The live host model shared by every snapshot and delegating tool.
+    #[must_use]
+    pub fn model_scope(&self) -> ToolModelScope {
+        self.model_scope.clone()
+    }
+
+    /// The live budget shared by snapshots and tools; a running invocation
+    /// captures its current handle so switching sessions cannot move its bill.
+    #[must_use]
+    pub fn cost_scope(&self) -> crate::cost::CostScope {
+        self.cost_scope.clone()
+    }
+
+    pub(crate) fn claim_media_auth_owner(&self, owner: &Arc<()>) {
+        self.media_auth_scope.claim_owner(owner);
+    }
+
+    pub(crate) fn set_media_auth_storage(&self, owner: &Arc<()>, auth: crate::auth::AuthStorage) {
+        self.media_auth_scope.set(owner, auth);
     }
 
     /// Get all tools.
-    pub fn tools(&self) -> &[Box<dyn Tool>] {
+    pub fn tools(&self) -> &[Arc<dyn Tool>] {
         &self.tools
     }
 
@@ -2716,7 +7010,220 @@ impl ToolRegistry {
         self.tools
             .iter()
             .find(|t| t.name() == name)
-            .map(std::convert::AsRef::as_ref)
+            .map(|tool| &**tool)
+    }
+
+    /// The original admitted implementation behind an imported factory.
+    /// Dynamic registrations cannot add authority to this retained set.
+    pub(crate) fn get_factory_tool(&self, name: &str) -> Option<&dyn Tool> {
+        if self.builtins_disabled || !self.load_policy.admits(name) {
+            return None;
+        }
+        self.factory_tools
+            .iter()
+            .find(|tool| tool.name() == name)
+            .map(|tool| &**tool)
+    }
+
+    pub(crate) fn set_text_file_client(&self, client: Arc<dyn TextFileClient>) -> Result<()> {
+        self.text_file_client_scope.set(client)
+    }
+
+    pub(crate) fn set_terminal_client(&self, client: Arc<dyn TerminalClient>) -> Result<()> {
+        self.terminal_client_scope.set(client)
+    }
+}
+
+/// One tool registry shared by the agent and every extension host.
+///
+/// Readers take an immutable snapshot and never hold a lock across an
+/// `await`; mounting tools publishes a new snapshot (clone-and-swap), so a
+/// `pi.tool` hostcall issued after a later mount sees the mounted tool on its
+/// next snapshot. Before this handle existed the extension runtime was given
+/// its own plain registry at pre-warm and never saw tools mounted later
+/// (bd-4t6oz).
+#[derive(Clone)]
+pub struct SharedToolRegistry {
+    inner: Arc<SharedToolRegistryInner>,
+}
+
+/// The cell every handle and every snapshot's back-pointer share: the
+/// current registry and the update counter live together so a handle
+/// rebuilt from a snapshot observes and bumps the same version.
+pub struct SharedToolRegistryInner {
+    registry: std::sync::RwLock<Arc<ToolRegistry>>,
+    /// Retained independently of wrappers, including an empty or denied
+    /// catalog, so a later successful refresh can mount newly added tools.
+    mcp_managers: std::sync::Mutex<Vec<Arc<crate::mcp::McpManager>>>,
+    /// Bumped on every published update; the agent folds it into its tool
+    /// schema cache key so a swap made from a hostcall (for example
+    /// `setActiveTools`) reaches the next provider request without any
+    /// out-of-band invalidation.
+    version: std::sync::atomic::AtomicU64,
+}
+
+impl SharedToolRegistry {
+    #[must_use]
+    pub fn new(mut registry: ToolRegistry) -> Self {
+        let mut mcp_managers = registry
+            .shared_handle()
+            .map_or_else(Vec::new, |shared| shared.mcp_managers());
+        for tool in registry.tools() {
+            if let Some(manager) = tool.mcp_manager()
+                && !mcp_managers.iter().any(|bound| Arc::ptr_eq(bound, manager))
+            {
+                mcp_managers.push(Arc::clone(manager));
+            }
+        }
+        let inner = Arc::new_cyclic(|weak| {
+            registry.shared = Some(weak.clone());
+            SharedToolRegistryInner {
+                registry: std::sync::RwLock::new(Arc::new(registry)),
+                mcp_managers: std::sync::Mutex::new(mcp_managers),
+                version: std::sync::atomic::AtomicU64::new(0),
+            }
+        });
+        Self { inner }
+    }
+
+    #[must_use]
+    pub fn from_arc(registry: Arc<ToolRegistry>) -> Self {
+        let registry = Arc::try_unwrap(registry).unwrap_or_else(|shared| shared.clone_shallow());
+        Self::new(registry)
+    }
+
+    /// Current snapshot. Cheap to take; hold it for one lookup plus the
+    /// tool's execution so the tool handle stays alive.
+    #[must_use]
+    pub fn snapshot(&self) -> Arc<ToolRegistry> {
+        match self.inner.registry.read() {
+            Ok(guard) => Arc::clone(&guard),
+            Err(poisoned) => Arc::clone(&poisoned.into_inner()),
+        }
+    }
+
+    /// Number of updates published so far (see the `version` field).
+    #[must_use]
+    pub fn version(&self) -> u64 {
+        self.inner.version.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub(crate) fn bind_mcp_manager(&self, manager: &Arc<crate::mcp::McpManager>) {
+        let mut managers = self
+            .inner
+            .mcp_managers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !managers.iter().any(|bound| Arc::ptr_eq(bound, manager)) {
+            managers.push(Arc::clone(manager));
+        }
+    }
+
+    pub(crate) fn mcp_managers(&self) -> Vec<Arc<crate::mcp::McpManager>> {
+        self.inner
+            .mcp_managers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    // The write guard spans the whole read-modify-write and the version bump:
+    // releasing it after the swap would let a reader pair the new snapshot
+    // with the old version.
+    #[allow(clippy::significant_drop_tightening)]
+    pub(crate) fn reconcile_mcp_tools(
+        &self,
+        manager: &Arc<crate::mcp::McpManager>,
+        replacements: Vec<Box<dyn Tool>>,
+    ) -> usize {
+        let mut guard = self
+            .inner
+            .registry
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut next = guard.clone_shallow();
+        let changed = next.reconcile_mcp_tools(manager, replacements);
+        if changed > 0 {
+            *guard = Arc::new(next);
+            self.inner
+                .version
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        changed
+    }
+
+    /// Atomically refresh wrappers, including inactive registrations. Rebind
+    /// execution handles even when their schemas are unchanged, but invalidate
+    /// the provider schema cache only when its visible definitions change.
+    #[allow(clippy::significant_drop_tightening)]
+    pub(crate) fn reconcile_extension_tools(
+        &self,
+        previous: &[Arc<dyn Tool>],
+        replacements: Vec<Box<dyn Tool>>,
+        active: Option<&[String]>,
+        initial: bool,
+    ) -> Vec<Arc<dyn Tool>> {
+        let mut guard = self
+            .inner
+            .registry
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut next = guard.clone_shallow();
+        let published = next.reconcile_extension_tools(previous, replacements, active, initial);
+        let schema_changed = guard.discoverable != next.discoverable
+            || guard.tools.len() != next.tools.len()
+            || guard.tools.iter().zip(&next.tools).any(|(before, after)| {
+                before.name() != after.name()
+                    || before.label() != after.label()
+                    || before.description() != after.description()
+                    || before.parameters() != after.parameters()
+            });
+        *guard = Arc::new(next);
+        if schema_changed {
+            self.inner
+                .version
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        published
+    }
+
+    /// Publish a modified registry: shallow-copy the current snapshot, apply
+    /// `mutate`, and swap the result in atomically.
+    pub fn update(&self, mutate: impl FnOnce(&mut ToolRegistry)) {
+        {
+            let mut guard = self
+                .inner
+                .registry
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut next = guard.clone_shallow();
+            next.shared = Some(Arc::downgrade(&self.inner));
+            mutate(&mut next);
+            *guard = Arc::new(next);
+        }
+        self.inner
+            .version
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl From<ToolRegistry> for SharedToolRegistry {
+    fn from(registry: ToolRegistry) -> Self {
+        Self::new(registry)
+    }
+}
+
+impl From<Arc<ToolRegistry>> for SharedToolRegistry {
+    fn from(registry: Arc<ToolRegistry>) -> Self {
+        Self::from_arc(registry)
+    }
+}
+
+impl std::fmt::Debug for SharedToolRegistry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SharedToolRegistry")
+            .field("tools", &self.snapshot().tools().len())
+            .finish()
     }
 }
 
@@ -2725,7 +7232,7 @@ impl ToolRegistry {
 // ============================================================================
 
 /// Input parameters for the read tool.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ReadInput {
     path: String,
@@ -2733,42 +7240,99 @@ struct ReadInput {
     limit: Option<i64>,
     #[serde(default)]
     hashline: bool,
+    #[serde(default)]
+    raw: bool,
+    #[serde(default)]
+    rendered: bool,
 }
 
+#[derive(Clone)]
 pub struct ReadTool {
     cwd: PathBuf,
+    text_file_client: TextFileClientScope,
     /// Whether to auto-resize images to fit token limits.
     auto_resize: bool,
     block_images: bool,
     artifact_root: Option<PathBuf>,
+    /// SSRF override for URL reads (bd-cv653.2.2): allow private/loopback
+    /// targets (from `read.urlAllowPrivateTargets`).
+    allow_private_urls: bool,
+    workspace: WorkspaceHandle,
+    #[cfg(test)]
+    after_open_hook: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl ReadTool {
     pub fn new(cwd: &Path) -> Self {
         Self {
             cwd: cwd.to_path_buf(),
+            text_file_client: TextFileClientScope::default(),
+            workspace: WorkspaceHandle::default(),
             auto_resize: true,
             block_images: false,
             artifact_root: None,
+            allow_private_urls: false,
+            #[cfg(test)]
+            after_open_hook: None,
         }
+    }
+
+    /// Attach the session workspace root handle (bd-cv653.3.12).
+    #[must_use]
+    pub fn with_workspace(mut self, workspace: WorkspaceHandle) -> Self {
+        self.workspace = workspace;
+        self
     }
 
     pub fn with_settings(cwd: &Path, auto_resize: bool, block_images: bool) -> Self {
         Self {
             cwd: cwd.to_path_buf(),
+            text_file_client: TextFileClientScope::default(),
+            workspace: WorkspaceHandle::default(),
             auto_resize,
             block_images,
             artifact_root: None,
+            allow_private_urls: false,
+            #[cfg(test)]
+            after_open_hook: None,
         }
+    }
+
+    /// SSRF override for URL reads (bd-cv653.2.2).
+    #[must_use]
+    pub const fn with_url_policy(mut self, allow_private_urls: bool) -> Self {
+        self.allow_private_urls = allow_private_urls;
+        self
     }
 
     #[cfg(test)]
     fn with_artifact_root(cwd: &Path, artifact_root: &Path) -> Self {
         Self {
             cwd: cwd.to_path_buf(),
+            text_file_client: TextFileClientScope::default(),
+            workspace: WorkspaceHandle::default(),
             auto_resize: true,
             block_images: false,
             artifact_root: Some(artifact_root.to_path_buf()),
+            allow_private_urls: false,
+            after_open_hook: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_after_open_hook(
+        cwd: &Path,
+        after_open_hook: impl Fn() + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            cwd: cwd.to_path_buf(),
+            text_file_client: TextFileClientScope::default(),
+            workspace: WorkspaceHandle::default(),
+            auto_resize: true,
+            block_images: false,
+            artifact_root: None,
+            allow_private_urls: false,
+            after_open_hook: Some(Arc::new(after_open_hook)),
         }
     }
 }
@@ -2792,9 +7356,402 @@ where
     .await
 }
 
+impl ReadTool {
+    async fn execute_json_query(
+        &self,
+        input: &ReadInput,
+        request: structured_json::QueryRequest,
+    ) -> Result<ToolOutput> {
+        if input.hashline {
+            return Err(Error::tool(
+                "read",
+                "[JSON_QUERY_HASHLINE] Query results are not source edit anchors; read the source path without q for hashline edits",
+            ));
+        }
+        let source = request.source_path.clone();
+        let bytes = if source.starts_with("http://") || source.starts_with("https://") {
+            let policy = if self.allow_private_urls {
+                crate::url_read::SsrfPolicy::AllowPrivateTargets
+            } else {
+                crate::url_read::SsrfPolicy::BlockPrivateTargets
+            };
+            let outcome =
+                crate::url_read::fetch(&source, policy, crate::url_read::UrlReadMode::SourceUtf8)
+                    .await?;
+            if outcome.download_truncated {
+                return Err(Error::tool(
+                    "read",
+                    "[JSON_QUERY_INCOMPLETE] Cannot query a truncated download",
+                ));
+            }
+            outcome.content.into_bytes()
+        } else if crate::url_router::has_scheme(&source) {
+            crate::url_router::resolve(&source, &self.cwd)?
+                .content
+                .into_bytes()
+        } else {
+            let archive = crate::archive_read::parse_path(&source)?;
+            let source_path = archive
+                .as_ref()
+                .map_or(source.as_str(), |archive| archive.archive_path.as_str());
+            let path = resolve_read_path(source_path, &self.cwd);
+            let path = enforce_read_scope(&path, &self.cwd, &self.workspace)?;
+            let mut roots = self.workspace.snapshot_or(&self.cwd).all();
+            roots.push(Config::global_dir());
+            asupersync::runtime::spawn_blocking(move || -> Result<Vec<u8>> {
+                let file = open_regular_file_within_roots_with(&path, &roots, || {})
+                    .map_err(|error| Error::tool("read", error.to_string()))?;
+                if let Some(archive) = archive {
+                    let outcome = crate::archive_read::read_open_file(file, &archive.member)?;
+                    if outcome.is_directory {
+                        return Err(Error::tool(
+                            "read",
+                            "[JSON_QUERY_SOURCE] Select a JSON archive member, not a directory",
+                        ));
+                    }
+                    Ok(outcome.content.into_bytes())
+                } else {
+                    read_open_file_capped_at(&file, structured_json::MAX_INPUT_BYTES as u64)
+                        .map_err(|error| {
+                            Error::tool(
+                                "read",
+                                format!("[JSON_QUERY_SOURCE] Cannot read JSON within the 10 MiB input limit: {error}"),
+                            )
+                        })
+                }
+            })
+            .await?
+        };
+        let mut outcome = structured_json::execute(request, bytes).await?;
+        outcome.metadata["source"] = serde_json::json!(source);
+        outcome.metadata["rendered"] = serde_json::json!(true);
+        let mut output = document_read_output(input, &outcome.content, outcome.metadata, true)?;
+        output.is_error = outcome.is_error;
+        Ok(output)
+    }
+
+    /// Internal-scheme reads (bd-cv653.6.3): resolve via the URL router,
+    /// then apply the same line-window/truncation contract as text files.
+    async fn execute_scheme_read(&self, input: &ReadInput) -> Result<ToolOutput> {
+        use std::fmt::Write as _;
+
+        if !input.raw
+            && input.path.starts_with("ssh://")
+            && crate::notebook::is_notebook_path(Path::new(&input.path))
+        {
+            let input = input.clone();
+            return asupersync::runtime::spawn_blocking(move || {
+                let source = crate::url_router::ssh_fetch_document(
+                    &input.path,
+                    crate::notebook::MAX_NOTEBOOK_BYTES as u64,
+                )?;
+                notebook_source_read_output(
+                    &input,
+                    &source,
+                    serde_json::json!({"path": input.path, "scheme": "ssh"}),
+                )
+            })
+            .await;
+        }
+        let resolved = crate::url_router::resolve(&input.path, &self.cwd)?;
+        let total_lines = resolved.content.lines().count();
+        let start_line = input
+            .offset
+            .and_then(|n| usize::try_from(n).ok())
+            .map_or(0, |n| n.saturating_sub(1));
+        if total_lines == 0 {
+            return Ok(ToolOutput {
+                content: vec![ContentBlock::Text(TextContent::new(""))],
+                details: Some(serde_json::to_value(&resolved)?),
+                is_error: false,
+            });
+        }
+        if start_line >= total_lines {
+            let offset_display = input.offset.unwrap_or(0);
+            return Err(Error::tool(
+                "read",
+                format!(
+                    "Offset {offset_display} is beyond end of document ({total_lines} lines total)"
+                ),
+            ));
+        }
+        let max_lines_for_truncation = input
+            .limit
+            .and_then(|l| usize::try_from(l).ok())
+            .unwrap_or(DEFAULT_MAX_LINES);
+        let limit_lines = input
+            .limit
+            .and_then(|l| usize::try_from(l).ok())
+            .unwrap_or(usize::MAX);
+        let lines_to_take = limit_lines.min(max_lines_for_truncation.saturating_add(1));
+
+        let mut selected_content = String::new();
+        let max_line_num = start_line.saturating_add(lines_to_take).min(total_lines);
+        let line_num_width = max_line_num.to_string().len().max(5);
+        for (i, line) in resolved.content.lines().skip(start_line).enumerate() {
+            if i >= lines_to_take || start_line + i >= total_lines {
+                break;
+            }
+            if i > 0 {
+                selected_content.push('\n');
+            }
+            let line = line.strip_suffix('\r').unwrap_or(line);
+            let line_idx = start_line + i;
+            if input.hashline {
+                let tag = format_hashline_tag(line_idx, line);
+                let _ = write!(selected_content, "{tag}:{line}");
+            } else {
+                let line_num = line_idx + 1;
+                let _ = write!(selected_content, "{line_num:>line_num_width$}→{line}");
+            }
+            if selected_content.len() > DEFAULT_MAX_BYTES * 2 {
+                break;
+            }
+        }
+
+        let mut truncation = truncate_head(
+            selected_content,
+            max_lines_for_truncation,
+            DEFAULT_MAX_BYTES,
+        );
+        truncation.total_lines = total_lines;
+        let mut output_text = std::mem::take(&mut truncation.content);
+        if truncation.truncated {
+            let end_line = (start_line + lines_to_take).min(total_lines);
+            let _ = write!(
+                output_text,
+                "\n\n[Showing lines {}-{end_line} of {total_lines}. Document: {}]",
+                start_line + 1,
+                input.path
+            );
+        }
+        let mut details = serde_json::to_value(&resolved)?;
+        details["truncated"] = serde_json::Value::Bool(truncation.truncated);
+        details["totalLines"] = serde_json::Value::from(total_lines);
+        Ok(ToolOutput {
+            content: vec![ContentBlock::Text(TextContent::new(output_text))],
+            details: Some(details),
+            is_error: false,
+        })
+    }
+
+    /// URL reads (bd-cv653.2.2): fetch, optionally convert, then window with
+    /// the same 1-based offset/limit and continuation-notice shapes as file
+    /// reads. A trailing `:raw` selector bypasses conversion.
+    async fn execute_url_read(&self, input: &ReadInput) -> Result<ToolOutput> {
+        let (raw, url) = input.path.strip_suffix(":raw").map_or_else(
+            || (false, input.path.clone()),
+            |stripped| (true, stripped.to_string()),
+        );
+        let policy = if self.allow_private_urls {
+            crate::url_read::SsrfPolicy::AllowPrivateTargets
+        } else {
+            crate::url_read::SsrfPolicy::BlockPrivateTargets
+        };
+        let mode = if raw || input.raw {
+            crate::url_read::UrlReadMode::Raw
+        } else {
+            crate::url_read::UrlReadMode::Reader
+        };
+        if input.hashline && mode == crate::url_read::UrlReadMode::Reader {
+            return Err(Error::tool(
+                "read",
+                "[DOCUMENT_HASHLINE] Rendered URL lines are not source edit locations; save source text locally before using hashline edits",
+            ));
+        }
+        let mut outcome = crate::url_read::fetch(&url, policy, mode).await?;
+        if outcome.download_truncated {
+            outcome.content.push_str(
+                "\n\n[Download truncated at 10 MiB; the source page continues beyond this point.]",
+            );
+        }
+
+        document_read_output(
+            input,
+            &outcome.content,
+            serde_json::json!({
+                "url": outcome.final_url,
+                "contentType": outcome.kind.as_str(),
+                "wireContentType": outcome.wire_content_type,
+                "extractor": outcome.extractor,
+                "downloadTruncated": outcome.download_truncated,
+            }),
+            false,
+        )
+    }
+}
+
+/// One notebook view contract for admitted disk files, SSH snapshots and
+/// editor-owned buffers. Output windows never duplicate full text in details.
+fn notebook_source_read_output(
+    input: &ReadInput,
+    source: &[u8],
+    mut details: serde_json::Value,
+) -> Result<ToolOutput> {
+    if source.len() > crate::notebook::MAX_NOTEBOOK_BYTES {
+        return Err(Error::tool(
+            "read",
+            "[NOTEBOOK_EDIT] Notebook exceeds the 10 MiB limit",
+        ));
+    }
+    details["contentType"] = serde_json::json!("notebook");
+    details["sourceBytes"] = serde_json::json!(source.len());
+    details["rendered"] = serde_json::json!(input.rendered);
+    details["editable"] = serde_json::json!(!input.rendered);
+    if input.rendered {
+        if input.hashline {
+            return Err(Error::tool(
+                "read",
+                "[DOCUMENT_HASHLINE] Saved notebook output is not an edit location; omit rendered for cell-source anchors or use raw=true for JSON anchors",
+            ));
+        }
+        let rendered =
+            crate::url_read::convert_bytes(&input.path, "application/x-ipynb+json", source, false)?;
+        details["extractor"] = serde_json::json!(rendered.extractor);
+        return document_read_output(input, &rendered.content, details, true);
+    }
+    let source = std::str::from_utf8(source)
+        .map_err(|_| Error::tool("read", "[NOTEBOOK_EDIT] Notebook JSON must be valid UTF-8"))?;
+    let notebook = crate::notebook::Notebook::parse(source, &input.path)?;
+    let editable = notebook.editable_text()?;
+    details["extractor"] = serde_json::json!("notebook-cells");
+    notebook_read_output(input, &editable, details)
+}
+
+/// Window rendered documents without returning their full text a second time
+/// in `details`. Offsets address the projection, never the source's edit lines.
+fn document_read_output(
+    input: &ReadInput,
+    content: &str,
+    details: serde_json::Value,
+    numbered: bool,
+) -> Result<ToolOutput> {
+    window_read_output(input, content, details, numbered, false)
+}
+
+fn notebook_read_output(
+    input: &ReadInput,
+    content: &str,
+    details: serde_json::Value,
+) -> Result<ToolOutput> {
+    window_read_output(input, content, details, true, input.hashline)
+}
+
+fn window_read_output(
+    input: &ReadInput,
+    content: &str,
+    mut details: serde_json::Value,
+    numbered: bool,
+    hashline: bool,
+) -> Result<ToolOutput> {
+    let total_lines = content.lines().count();
+    let start = usize::try_from(input.offset.unwrap_or(1))
+        .unwrap_or(1)
+        .max(1);
+    if start > total_lines && total_lines > 0 {
+        return Err(Error::tool(
+            "read",
+            format!("Offset {start} is beyond end of document ({total_lines} lines total)"),
+        ));
+    }
+    let limit = input
+        .limit
+        .and_then(|limit| usize::try_from(limit).ok())
+        .unwrap_or(DEFAULT_MAX_LINES)
+        .clamp(1, DEFAULT_MAX_LINES);
+    let width = start
+        .saturating_add(limit)
+        .saturating_sub(1)
+        .min(total_lines)
+        .to_string()
+        .len()
+        .max(5);
+    let mut output_text = String::new();
+    let mut shown = 0usize;
+    let mut byte_limited = false;
+    for (index, line) in content.lines().skip(start - 1).take(limit).enumerate() {
+        let prefix = if hashline {
+            format!("{}:", format_hashline_tag(start + index - 1, line))
+        } else if numbered {
+            format!("{:>width$}→", start + index)
+        } else {
+            String::new()
+        };
+        let additional = line
+            .len()
+            .saturating_add(prefix.len())
+            .saturating_add(usize::from(shown > 0));
+        if additional > DEFAULT_MAX_BYTES.saturating_sub(output_text.len()) {
+            if shown == 0 {
+                return Err(Error::tool(
+                    "read",
+                    format!(
+                        "[DOCUMENT_LINE_LIMIT] Rendered line {start} exceeds the {DEFAULT_MAX_BYTES} byte output limit; read the source with raw=true or inspect it with a format-specific tool"
+                    ),
+                ));
+            }
+            byte_limited = true;
+            break;
+        }
+        if shown > 0 {
+            output_text.push('\n');
+        }
+        output_text.push_str(&prefix);
+        output_text.push_str(line);
+        shown += 1;
+    }
+    let end = start.saturating_sub(1).saturating_add(shown);
+    let remaining = end < total_lines;
+    if remaining {
+        let next = end + 1;
+        let _ = write!(
+            output_text,
+            "\n\n[Showing lines {start}-{end} of {total_lines}. Use offset={next} to continue.]"
+        );
+    }
+    let source_truncated = details["downloadTruncated"].as_bool().unwrap_or(false);
+    details["totalLines"] = serde_json::json!(total_lines);
+    details["offset"] = serde_json::json!(start);
+    details["limit"] = serde_json::json!(limit);
+    details["outputLines"] = serde_json::json!(shown);
+    details["truncated"] = serde_json::json!(remaining || source_truncated);
+    details["byteLimited"] = serde_json::json!(byte_limited);
+    if remaining {
+        details["nextOffset"] = serde_json::json!(end + 1);
+    }
+    Ok(ToolOutput {
+        content: vec![ContentBlock::Text(TextContent::new(output_text))],
+        details: Some(details),
+        is_error: false,
+    })
+}
+
 #[async_trait]
 #[allow(clippy::unnecessary_literal_bound)]
 impl Tool for ReadTool {
+    async fn execute_from_factory(
+        &self,
+        tool_call_id: &str,
+        input: serde_json::Value,
+        cwd: Option<&str>,
+        options: &serde_json::Value,
+        on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+    ) -> Result<ToolOutput> {
+        validate_builtin_factory_options("read", options, &["autoResizeImages"])?;
+        let mut tool = self.clone();
+        if let Some(value) = options.get("autoResizeImages") {
+            tool.auto_resize = value.as_bool().ok_or_else(|| {
+                Error::validation("read factory autoResizeImages must be a boolean")
+            })?;
+        }
+        let input = rebase_builtin_factory_input("read", input, cwd, &self.cwd, &self.workspace)?;
+        tool.execute(tool_call_id, input, on_update).await
+    }
+
+    fn bind_text_file_client_scope(&mut self, scope: TextFileClientScope) {
+        self.text_file_client = scope;
+    }
+
     fn name(&self) -> &str {
         "read"
     }
@@ -2802,7 +7759,7 @@ impl Tool for ReadTool {
         "read"
     }
     fn description(&self) -> &str {
-        "Read the contents of a file. Supports text files and images (jpg, png, gif, webp). Images are sent as attachments. For text files, output is truncated to 2000 lines or 1MB (whichever is hit first). Use offset/limit for large files. When you need the full file, continue with offset until complete."
+        "Read local files, document URLs, ZIP archive members, images (jpg, png, gif, webp), and video frames. Local videos return metadata and a contact sheet; clip.mp4:42 selects a zero-based frame, and clip.mp4:1m2s or :00:01:02 selects a timestamp. Video decoding requires ffmpeg/ffprobe with the fd protocol and does not support hashline or line windows. Query JSON/JSONL with data.json?q=<jq filter> and optional &raw=true, &compact=true, &limit=N, &offset=N (zero-based result paging). Browse local SQLite with data.sqlite, data.sqlite:table, :table:key, :table?where=...&order=column:desc&limit=N&offset=N, or data.sqlite?q=SELECT...; queries are read-only and include committed WAL data. Structured queries need supported process memory limits (Linux or macOS 13+). DOCX/PPTX render text, XLSX renders saved cells and formula results, and EPUB renders chapters. Local/SSH notebooks expose editable # %% cell markers and support hashline; rendered=true shows their saved cells and outputs instead. Notebook reads never execute code. PDF extraction requires url-pdf. Read archive.zip to list children or archive.zip:path/to/file for a UTF-8 member. Use raw=true on the source path for original text, and raw=true on edit/hashline_edit when editing notebook JSON. Query results, rendered documents, and archive members have no hashline edit anchors. Images are attachments. Output is limited to 2000 lines or 1MB; tool offset/limit address rendered lines (one-based), separately from query result paging."
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -2811,7 +7768,7 @@ impl Tool for ReadTool {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Path to the file to read (relative or absolute)"
+                    "description": "File path, video.mp4[:frame-index|timestamp], archive.zip:member/path, http(s) URL, internal resource URL, JSON source?q=<jq filter>, or SQLite path[:table[:key]][?q=<SQL>|where=<predicate>&order=column:asc&limit=N&offset=N]. Video timestamps include 1m2s and 00:01:02; a bare integer is a zero-based frame. Encode literal query ampersands as %26; + remains arithmetic."
                 },
                 "offset": {
                     "type": "integer",
@@ -2824,6 +7781,14 @@ impl Tool for ReadTool {
                 "hashline": {
                     "type": "boolean",
                     "description": "When true, output each line as N#AB:content where N is the line number and AB is a content hash. Use with hashline_edit tool for precise edits."
+                },
+                "raw": {
+                    "type": "boolean",
+                    "description": "Read original source text instead of converting a document or querying data. Use the source path without query selectors, with hashline=true for editing JSON. This differs from &raw=true in a JSON query, which prints returned strings without quotes."
+                },
+                "rendered": {
+                    "type": "boolean",
+                    "description": "For a notebook, show saved cells and outputs instead of editable cell markers. Does not execute code; incompatible with hashline. raw=true takes precedence."
                 }
             },
             "required": ["path"]
@@ -2856,29 +7821,210 @@ impl Tool for ReadTool {
             ));
         }
 
-        let path = resolve_read_path(&input.path, &self.cwd);
-        let path = enforce_read_scope(&path, &self.cwd)?;
-
-        let meta = asupersync::fs::metadata(&path).await.ok();
-        if let Some(meta) = &meta {
-            if !meta.is_file() {
-                return Err(Error::tool(
-                    "read",
-                    format!("Path {} is not a regular file", path.display()),
-                ));
-            }
+        // A reply's ignored suffix must not turn it into a structured-file
+        // query before the URL router can explain that it is write-only.
+        if is_interim_response_path(&input.path) {
+            return self.execute_scheme_read(&input).await;
         }
 
-        let cache_key = tool_cache_key("read", &self.cwd, &input_value);
-        let cache_mode = ToolCacheFingerprintMode::FileContent;
-        let cache_deps = cache_dependency_for_path(&path, cache_mode);
-        if let Some(output) = cached_tool_output(&cache_key, cache_deps.as_deref()) {
+        if !input.raw
+            && let Some(request) = structured_json::parse_path(&input.path)?
+        {
+            return self.execute_json_query(&input, request).await;
+        }
+
+        // URL reads (bd-cv653.2.2): http(s) paths fetch + convert to
+        // reader-mode markdown; pagination/truncation shapes match file reads.
+        if input.path.starts_with("http://") || input.path.starts_with("https://") {
+            return self.execute_url_read(&input).await;
+        }
+
+        // Internal URL schemes (bd-cv653.6.3): skill://, prompt://,
+        // local://, conflict://, pr://, issue://, ssh:// resolve into
+        // virtual documents with the same pagination contract as file
+        // reads. Unknown schemes error with the registered list — never a
+        // silent filesystem fallback.
+        if crate::url_router::has_scheme(&input.path) {
+            return self.execute_scheme_read(&input).await;
+        }
+
+        let sqlite_request = if input.raw {
+            None
+        } else {
+            structured_sqlite::parse_path(&input.path)?
+        };
+        let file_path = sqlite_request
+            .as_ref()
+            .map_or(input.path.as_str(), |request| request.source_path.as_str());
+        let archive_path = crate::archive_read::parse_path(file_path)?
+            .filter(|archive| !input.raw || !archive.member.is_empty());
+        // Preserve literal colon filenames before interpreting a video frame
+        // selector. Even that existence probe stays within the read scope.
+        // Archive members and SQLite selectors keep their own routing rules.
+        let video_target = if input.raw || sqlite_request.is_some() || archive_path.is_some() {
+            None
+        } else {
+            let literal_exists = if input.path.contains(':') {
+                let literal_path = resolve_read_path(&input.path, &self.cwd);
+                enforce_read_scope(&literal_path, &self.cwd, &self.workspace)?.is_file()
+            } else {
+                false
+            };
+            crate::media_tools::video::parse_target(&input.path, literal_exists)?
+        };
+        let source_path = archive_path.as_ref().map_or_else(
+            || {
+                video_target
+                    .as_ref()
+                    .map_or(file_path, |video| video.path.as_str())
+            },
+            |archive| archive.archive_path.as_str(),
+        );
+        let path = resolve_read_path(source_path, &self.cwd);
+        let path = enforce_read_scope(&path, &self.cwd, &self.workspace)?;
+
+        if sqlite_request.is_none()
+            && archive_path.is_none()
+            && video_target.is_none()
+            && let Some(output) = self.execute_client_read(&input, &path).await?
+        {
             return Ok(output);
         }
 
-        let mut file = asupersync::fs::File::open(&path)
+        let path_for_open = path.clone();
+        let mut allowed_roots = self.workspace.snapshot_or(&self.cwd).all();
+        allowed_roots.push(Config::global_dir());
+        let sqlite_roots = allowed_roots.clone();
+        #[cfg(test)]
+        let after_open_hook = self.after_open_hook.clone();
+        let (std_file, cache_file, meta, cache_deps, sqlite_magic) =
+            asupersync::runtime::spawn_blocking_io(move || -> std::io::Result<_> {
+                let file =
+                    open_regular_file_within_roots_with(&path_for_open, &allowed_roots, || {})?;
+                let metadata = file.metadata()?;
+                let cache_file = file.try_clone().ok();
+                #[cfg(test)]
+                if let Some(after_open_hook) = after_open_hook {
+                    after_open_hook();
+                }
+                let cache_deps = cache_file.as_ref().and_then(|cache_file| {
+                    cache_dependency_for_open_file(&path_for_open, cache_file)
+                });
+                let mut prefix = [0_u8; 16];
+                let mut prefix_len = 0;
+                while prefix_len < prefix.len() {
+                    let read =
+                        positioned_file_read(&file, &mut prefix[prefix_len..], prefix_len as u64)?;
+                    if read == 0 {
+                        break;
+                    }
+                    prefix_len += read;
+                }
+                let sqlite_magic = structured_sqlite::is_sqlite(&prefix[..prefix_len]);
+                Ok((file, cache_file, metadata, cache_deps, sqlite_magic))
+            })
             .await
-            .map_err(|e| Error::tool("read", e.to_string()))?;
+            .map_err(|err| Error::tool("read", err.to_string()))?;
+
+        // WAL commits can change results without modifying the main file.
+        // Query the admitted immutable snapshot before the ordinary file cache.
+        if !input.raw && archive_path.is_none() && sqlite_magic {
+            if input.hashline {
+                return Err(Error::tool(
+                    "read",
+                    "[SQLITE_HASHLINE] Database rows are read-only projections, not source edit anchors",
+                ));
+            }
+            let request = sqlite_request
+                .unwrap_or_else(|| structured_sqlite::QueryRequest::plain(input.path.clone()));
+            let mut outcome =
+                structured_sqlite::execute(request, std_file, path.clone(), sqlite_roots).await?;
+            outcome.metadata["path"] = serde_json::json!(path.to_string_lossy());
+            return document_read_output(&input, &outcome.content, outcome.metadata, true);
+        }
+        if sqlite_request
+            .as_ref()
+            .is_some_and(structured_sqlite::QueryRequest::has_selectors)
+        {
+            return Err(Error::tool(
+                "read",
+                "[SQLITE_READ] Table and SQL selectors require a SQLite format 3 database",
+            ));
+        }
+
+        if let Some(video) = video_target {
+            // Visual reads do not have source-line edit anchors or line
+            // windows. Check policy before looking up or spawning a decoder;
+            // video results never bypass it through the text result cache.
+            if self.block_images {
+                return Err(Error::tool("read", "Images are blocked by configuration"));
+            }
+            if input.hashline || input.offset.is_some() || input.limit.is_some() {
+                return Err(Error::tool(
+                    "read",
+                    "[VIDEO_READ_OPTIONS] Video frames do not support hashline, offset, or limit; use a frame or timestamp suffix on the path",
+                ));
+            }
+            return crate::media_tools::video::render_open_file(
+                std_file,
+                PathBuf::from(video.path),
+                video.selector,
+                crate::agent_cx::AgentCx::for_current_or_request(),
+            )
+            .await;
+        }
+
+        let cache_key = tool_cache_key("read", &self.cwd, &input_value);
+        if let Some(output) = cached_tool_output(&cache_key, cache_deps.as_deref()) {
+            let stable_deps = stable_cache_dependency_for_open_file(
+                &path,
+                cache_file.as_ref(),
+                cache_deps.as_deref(),
+            );
+            if stable_deps.is_some() {
+                return Ok(output);
+            }
+        }
+
+        if let Some(archive) = archive_path {
+            if input.hashline {
+                return Err(Error::tool(
+                    "read",
+                    "[ARCHIVE_HASHLINE] Archive members are read-only views and cannot provide source edit anchors",
+                ));
+            }
+            let outcome = asupersync::runtime::spawn_blocking(move || {
+                crate::archive_read::read_open_file(std_file, &archive.member)
+            })
+            .await?;
+            let output = document_read_output(
+                &input,
+                &outcome.content,
+                serde_json::json!({
+                    "path": path.to_string_lossy(),
+                    "contentType": "archive",
+                    "extractor": "zip",
+                    "member": outcome.member,
+                    "isDirectory": outcome.is_directory,
+                    "entryCount": outcome.entry_count,
+                    "sourceBytes": meta.len(),
+                    "rendered": true,
+                }),
+                true,
+            )?;
+            cache_tool_output(
+                cache_key,
+                stable_cache_dependency_for_open_file(
+                    &path,
+                    cache_file.as_ref(),
+                    cache_deps.as_deref(),
+                ),
+                &output,
+            );
+            return Ok(output);
+        }
+
+        let mut file = asupersync::fs::File::from_std(std_file);
 
         // Read initial chunk for mime detection
         let mut buffer = [0u8; 8192];
@@ -2897,6 +8043,42 @@ impl Tool for ReadTool {
         }
         let initial_bytes = &buffer[..initial_read];
 
+        if !input.raw && crate::notebook::is_notebook_path(&path) {
+            let bound = crate::notebook::MAX_NOTEBOOK_BYTES;
+            if meta.len() > bound as u64 {
+                return Err(Error::tool(
+                    "read",
+                    "[NOTEBOOK_EDIT] Notebook exceeds the 10 MiB limit; use raw=true to inspect the JSON source",
+                ));
+            }
+            // Continue through the already-admitted descriptor. Conversion
+            // must see the whole notebook, even for a one-line source window.
+            let mut bytes = initial_bytes.to_vec();
+            let remaining = bound.saturating_sub(bytes.len());
+            file.take(remaining as u64 + 1)
+                .read_to_end(&mut bytes)
+                .await
+                .map_err(|error| {
+                    Error::tool("read", format!("Failed to read notebook: {error}"))
+                })?;
+            let request = input.clone();
+            let display = path.to_string_lossy().into_owned();
+            let output = asupersync::runtime::spawn_blocking(move || {
+                notebook_source_read_output(&request, &bytes, serde_json::json!({"path": display}))
+            })
+            .await?;
+            cache_tool_output(
+                cache_key,
+                stable_cache_dependency_for_open_file(
+                    &path,
+                    cache_file.as_ref(),
+                    cache_deps.as_deref(),
+                ),
+                &output,
+            );
+            return Ok(output);
+        }
+
         if let Some(mime_type) = detect_supported_image_mime_type_from_bytes(initial_bytes) {
             if self.block_images {
                 return Err(Error::tool(
@@ -2909,17 +8091,15 @@ impl Tool for ReadTool {
             // within the read-tool input bound; resize/re-encode may still
             // bring the API payload under IMAGE_MAX_BYTES.
             let max_image_input_bytes = usize::try_from(READ_TOOL_MAX_BYTES).unwrap_or(usize::MAX);
-            if let Some(meta) = &meta {
-                if meta.len() > READ_TOOL_MAX_BYTES {
-                    return Err(Error::tool(
-                        "read",
-                        format!(
-                            "Image is too large ({} bytes). Max allowed is {} bytes.",
-                            meta.len(),
-                            READ_TOOL_MAX_BYTES
-                        ),
-                    ));
-                }
+            if meta.len() > READ_TOOL_MAX_BYTES {
+                return Err(Error::tool(
+                    "read",
+                    format!(
+                        "Image is too large ({} bytes). Max allowed is {} bytes.",
+                        meta.len(),
+                        READ_TOOL_MAX_BYTES
+                    ),
+                ));
             }
             let mut all_bytes = Vec::with_capacity(initial_read);
             all_bytes.extend_from_slice(initial_bytes);
@@ -2969,23 +8149,22 @@ impl Tool for ReadTool {
                 base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &resized.bytes);
 
             let mut note = format!("Read image file [{}]", resized.mime_type);
-            if resized.resized {
-                if let (Some(ow), Some(oh), Some(w), Some(h)) = (
+            if resized.resized
+                && let (Some(ow), Some(oh), Some(w), Some(h)) = (
                     resized.original_width,
                     resized.original_height,
                     resized.width,
                     resized.height,
-                ) {
-                    if w > 0 {
-                        let scale = f64::from(ow) / f64::from(w);
-                        let _ = write!(
-                            note,
-                            "\n[Image: original {ow}x{oh}, displayed at {w}x{h}. Multiply coordinates by {scale:.2} to map to original image.]"
-                        );
-                    } else {
-                        let _ =
-                            write!(note, "\n[Image: original {ow}x{oh}, displayed at {w}x{h}.]");
-                    }
+                )
+            {
+                if w > 0 {
+                    let scale = f64::from(ow) / f64::from(w);
+                    let _ = write!(
+                        note,
+                        "\n[Image: original {ow}x{oh}, displayed at {w}x{h}. Multiply coordinates by {scale:.2} to map to original image.]"
+                    );
+                } else {
+                    let _ = write!(note, "\n[Image: original {ow}x{oh}, displayed at {w}x{h}.]");
                 }
             }
 
@@ -3000,6 +8179,92 @@ impl Tool for ReadTool {
                 details: None,
                 is_error: false,
             });
+        }
+
+        // Documents are decoded from the admitted descriptor, never reopened
+        // by pathname after the scope check. Ordinary HTML remains source text
+        // for coding workflows; document reads expose useful saved content.
+        let document_mime = if input.raw {
+            None
+        } else if initial_bytes.starts_with(b"%PDF")
+            || path
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("pdf"))
+        {
+            Some("application/pdf")
+        } else if path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("epub"))
+        {
+            Some("application/epub+zip")
+        } else {
+            crate::document_read::recognize(&path.to_string_lossy(), "").map(|kind| match kind {
+                crate::document_read::DocumentKind::Docx => {
+                    "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                }
+                crate::document_read::DocumentKind::Pptx => {
+                    "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+                }
+                crate::document_read::DocumentKind::Xlsx => {
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                }
+            })
+        };
+        if let Some(document_mime) = document_mime {
+            if input.hashline {
+                return Err(Error::tool(
+                    "read",
+                    "[DOCUMENT_HASHLINE] Rendered document lines are not source edit locations; use raw=true with hashline=true to read the original source",
+                ));
+            }
+            let bound = crate::url_read::MAX_DOWNLOAD_BYTES;
+            if meta.len() > bound as u64 {
+                return Err(Error::tool(
+                    "read",
+                    "[DOCUMENT_TOO_LARGE] Document input exceeds the 10 MiB conversion limit; use raw=true to inspect source text",
+                ));
+            }
+            let mut bytes = initial_bytes.to_vec();
+            let remaining = bound.saturating_sub(bytes.len());
+            file.take(remaining as u64 + 1)
+                .read_to_end(&mut bytes)
+                .await
+                .map_err(|error| {
+                    Error::tool("read", format!("Failed to read document: {error}"))
+                })?;
+            if bytes.len() > bound {
+                return Err(Error::tool(
+                    "read",
+                    "[DOCUMENT_TOO_LARGE] Document grew beyond the 10 MiB conversion limit",
+                ));
+            }
+            let source = path.to_string_lossy().into_owned();
+            let outcome = asupersync::runtime::spawn_blocking(move || {
+                crate::url_read::convert_bytes(&source, document_mime, &bytes, false)
+            })
+            .await?;
+            let output = document_read_output(
+                &input,
+                &outcome.content,
+                serde_json::json!({
+                    "path": path.to_string_lossy(),
+                    "contentType": outcome.kind.as_str(),
+                    "extractor": outcome.extractor,
+                    "sourceBytes": meta.len(),
+                    "rendered": true,
+                }),
+                true,
+            )?;
+            cache_tool_output(
+                cache_key,
+                stable_cache_dependency_for_open_file(
+                    &path,
+                    cache_file.as_ref(),
+                    cache_deps.as_deref(),
+                ),
+                &output,
+            );
+            return Ok(output);
         }
 
         // Text path: optimized streaming read.
@@ -3125,7 +8390,11 @@ impl Tool for ReadTool {
             };
             cache_tool_output(
                 cache_key,
-                stable_cache_dependency_for_path(&path, cache_mode, cache_deps.as_deref()),
+                stable_cache_dependency_for_open_file(
+                    &path,
+                    cache_file.as_ref(),
+                    cache_deps.as_deref(),
+                ),
                 &output,
             );
             return Ok(output);
@@ -3204,6 +8473,19 @@ impl Tool for ReadTool {
         truncation.total_lines = total_lines;
 
         let mut output_text = std::mem::take(&mut truncation.content);
+        // A line the byte limit cut off would read as complete and the
+        // continue offset would skip its tail; with hashline its tag (of the
+        // whole line) still validates, so an edit of it dropped the unseen
+        // tail. Show whole lines only; the next read starts at the cut line.
+        if truncation.last_line_partial
+            && !truncation.first_line_exceeds_limit
+            && let Some(last_newline) = output_text.rfind('\n')
+        {
+            output_text.truncate(last_newline);
+            truncation.output_lines = truncation.output_lines.saturating_sub(1);
+            truncation.output_bytes = output_text.len();
+            truncation.last_line_partial = false;
+        }
         let mut details: Option<serde_json::Value> = None;
 
         if truncation.first_line_exceeds_limit {
@@ -3272,7 +8554,11 @@ impl Tool for ReadTool {
         };
         cache_tool_output(
             cache_key,
-            stable_cache_dependency_for_path(&path, cache_mode, cache_deps.as_deref()),
+            stable_cache_dependency_for_open_file(
+                &path,
+                cache_file.as_ref(),
+                cache_deps.as_deref(),
+            ),
             &output,
         );
         Ok(output)
@@ -3289,13 +8575,21 @@ impl Tool for ReadTool {
 struct BashInput {
     command: String,
     timeout: Option<u64>,
+    /// Run detached as a background job (bd-cv653.3.10): returns a job id
+    /// immediately; completion arrives as a follow-up message.
+    background: Option<bool>,
 }
 
+#[derive(Clone)]
 pub struct BashTool {
     cwd: PathBuf,
     shell_path: Option<String>,
     command_prefix: Option<String>,
     artifact_root: Option<PathBuf>,
+    job_session_scope: crate::jobs::JobSessionScope,
+    terminal_client: TerminalClientScope,
+    /// Mediation settings (`bash.mediation*`, bd-cv653.1.7).
+    mediation: Option<crate::config::BashSettings>,
 }
 
 #[derive(Debug, Clone)]
@@ -3346,7 +8640,299 @@ fn bash_cancellation_details(
     })
 }
 
-#[allow(clippy::too_many_lines)]
+/// Dispatch to the pipe or PTY spawn path (bd-cv653.1.7) with an identical
+/// call shape, so the mediation gate's arms don't duplicate the branch.
+#[allow(clippy::too_many_arguments)]
+async fn execute_bash_spawn(
+    cwd: &Path,
+    shell_path: Option<&str>,
+    command_prefix: Option<&str>,
+    command: &str,
+    timeout_secs: Option<u64>,
+    on_update: Option<&(dyn Fn(ToolUpdate) + Send + Sync)>,
+    use_pty: bool,
+    shell_state: Option<&bash_session::ShellTransaction>,
+) -> Result<BashRunResult> {
+    if use_pty {
+        run_bash_command_pty(
+            cwd,
+            shell_path,
+            command_prefix,
+            command,
+            timeout_secs,
+            on_update,
+            shell_state,
+        )
+        .await
+    } else {
+        run_bash_command_with_state(
+            cwd,
+            shell_path,
+            command_prefix,
+            command,
+            timeout_secs,
+            on_update,
+            shell_state,
+        )
+        .await
+    }
+}
+
+/// What the bash tool says on Windows when no bash can be found (GH #182).
+#[cfg(any(windows, test))]
+const NO_WINDOWS_BASH: &str = "No bash found to run the command. Install Git for Windows \
+(https://git-scm.com/download/win), put a bash.exe (Git Bash, MSYS2, Cygwin) on PATH, \
+or set \"shell_path\" in settings.json to a bash executable.";
+
+/// Logged once per process when no native bash exists and the bash tool,
+/// `!command` or a background job falls back to WSL's launcher (GH #182).
+#[cfg(any(windows, test))]
+const WSL_BASH_NOTICE: &str = "No native bash (Git for Windows, MSYS2, Cygwin) was found, so \
+shell commands run through WSL's bash.exe, inside the default WSL Linux distro: Windows drives \
+appear under /mnt/<drive>, Windows programs and PATH entries may not be available, and a UNC \
+working directory (\\\\server\\share) may not translate, so commands can start in a different \
+directory. To choose the shell, install Git for Windows or set \"shell_path\" in settings.json, \
+e.g. \"C:\\\\Program Files\\\\Git\\\\bin\\\\bash.exe\".";
+
+/// Log [`WSL_BASH_NOTICE`] on the user-diagnostic channel (stderr, or the TUI
+/// log while the TUI owns the terminal; never tool output) the first time
+/// `shell` is WSL's launcher. `shown` makes it once per process. Returns
+/// whether the notice was emitted.
+#[cfg(any(windows, test))]
+fn notice_wsl_bash_once(shell: &Path, shown: &std::sync::atomic::AtomicBool) -> bool {
+    if !is_wsl_bash_launcher(shell) || shown.swap(true, std::sync::atomic::Ordering::AcqRel) {
+        return false;
+    }
+    tracing::warn!(
+        target: crate::config::USER_DIAGNOSTIC_TARGET,
+        shell = %shell.display(),
+        "{WSL_BASH_NOTICE}"
+    );
+    true
+}
+
+/// The shell the bash tool, `!command` and background jobs run when
+/// `shell_path` is not configured.
+///
+/// Unix: the first of `/bin/bash`, `/usr/bin/bash`, `/usr/local/bin/bash`,
+/// else `sh`. Windows has neither those paths nor an `sh` on `PATH`, so the
+/// old `sh` fallback failed every call with "program not found" (GH #182);
+/// see [`find_windows_bash`] for the Windows order.
+///
+/// On Windows, the first time a process falls back to WSL's `bash.exe` it
+/// logs [`WSL_BASH_NOTICE`] once on the user-diagnostic channel; use
+/// [`resolve_default_bash_shell`] to look the shell up without that notice.
+pub(crate) fn default_bash_shell() -> Result<String> {
+    let shell = resolve_default_bash_shell()?;
+    #[cfg(windows)]
+    {
+        static WSL_NOTICE_SHOWN: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        notice_wsl_bash_once(Path::new(&shell), &WSL_NOTICE_SHOWN);
+    }
+    Ok(shell)
+}
+
+/// [`default_bash_shell`] without the one-time WSL notice, for callers such
+/// as `pi doctor` that report the resolved shell themselves.
+// Only the Windows arm can fail.
+#[cfg_attr(not(windows), allow(clippy::unnecessary_wraps))]
+pub(crate) fn resolve_default_bash_shell() -> Result<String> {
+    #[cfg(windows)]
+    {
+        find_windows_bash(&WindowsShellEnv::from_process(), Path::is_file)
+            .map(|path| path.to_string_lossy().into_owned())
+            .ok_or_else(|| Error::tool("bash", NO_WINDOWS_BASH))
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(["/bin/bash", "/usr/bin/bash", "/usr/local/bin/bash"]
+            .into_iter()
+            .find(|path| Path::new(path).exists())
+            .unwrap_or("sh")
+            .to_string())
+    }
+}
+
+/// Where [`find_windows_bash`] looks, read from the environment.
+#[cfg(any(windows, test))]
+struct WindowsShellEnv {
+    /// `%ProgramFiles%`, `%ProgramW6432%`, `%ProgramFiles(x86)%`.
+    program_files: Vec<PathBuf>,
+    /// `%LOCALAPPDATA%` (per-user Git for Windows installs).
+    local_app_data: Option<PathBuf>,
+    /// `%SystemRoot%`, for the WSL launcher.
+    system_root: Option<PathBuf>,
+    path_dirs: Vec<PathBuf>,
+}
+
+#[cfg(any(windows, test))]
+impl WindowsShellEnv {
+    fn from_process() -> Self {
+        let var = |name: &str| {
+            std::env::var_os(name)
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+        };
+        Self {
+            program_files: ["ProgramFiles", "ProgramW6432", "ProgramFiles(x86)"]
+                .into_iter()
+                .filter_map(var)
+                .collect(),
+            local_app_data: var("LOCALAPPDATA"),
+            system_root: var("SystemRoot"),
+            path_dirs: std::env::var_os("PATH")
+                .map(|path| absolute_path_dirs(&path))
+                .unwrap_or_default(),
+        }
+    }
+}
+
+/// The absolute directories of a `PATH` value. An empty entry (a stray or
+/// trailing `;` is common on Windows) or a relative one such as `.` would
+/// otherwise make a `bash.exe` in the current directory, e.g. one committed
+/// to the repository being worked on, the shell every command runs through.
+#[cfg(any(windows, test))]
+fn absolute_path_dirs(path: &std::ffi::OsStr) -> Vec<PathBuf> {
+    std::env::split_paths(path)
+        .filter(|dir| dir.is_absolute())
+        .collect()
+}
+
+/// The `%PATHEXT%` extensions a program can be launched with, lowercase and
+/// without the dot: `com` and `exe` start through `CreateProcess`, `bat` and
+/// `cmd` through `cmd.exe` (the standard library does that, with its argument
+/// escaping). Scripts such as `.js` or `.vbs` need a host and are skipped.
+#[cfg(any(windows, test))]
+const LAUNCHABLE_WINDOWS_EXTENSIONS: [&str; 4] = ["com", "exe", "bat", "cmd"];
+
+/// Find the program a Windows shell would run for `name` (GH #182): each
+/// directory of `path_dirs` in order, trying the launchable extensions of
+/// `pathext` (`%PATHEXT%`, default `.COM;.EXE;.BAT;.CMD`) in their order.
+///
+/// The standard library's own `PATH` search only adds `.exe`, so a bare
+/// `npm` misses the Node.js installer's `npm.cmd`, while a hard-coded
+/// `npm.cmd` misses an `npm.exe` shim such as pnpm's. A `name` that already ends in a launchable
+/// extension is looked up as written. An extensionless file is never
+/// returned: Node.js installs a POSIX `npm` script next to `npm.cmd`, and
+/// Windows cannot start it. `None` for a name with a directory part.
+///
+/// Callers pass absolute directories only (see [`absolute_path_dirs`]), so a
+/// program in the current directory is never picked up through `PATH`.
+#[cfg(any(windows, test))]
+pub(crate) fn find_windows_program(
+    name: &str,
+    path_dirs: &[PathBuf],
+    pathext: Option<&std::ffi::OsStr>,
+    is_file: impl Fn(&Path) -> bool,
+) -> Option<PathBuf> {
+    if name.is_empty() || name.contains(['/', '\\', ':']) {
+        return None;
+    }
+    let launchable = |ext: &str| {
+        LAUNCHABLE_WINDOWS_EXTENSIONS
+            .into_iter()
+            .find(|known| known.eq_ignore_ascii_case(ext))
+    };
+    let has_launchable_extension = name
+        .rsplit_once('.')
+        .is_some_and(|(_, ext)| launchable(ext).is_some());
+    let file_names: Vec<String> = if has_launchable_extension {
+        vec![name.to_string()]
+    } else {
+        let pathext = pathext.map(|value| value.to_string_lossy().into_owned());
+        let mut extensions: Vec<&str> = pathext
+            .as_deref()
+            .unwrap_or_default()
+            .split(';')
+            .filter_map(|ext| launchable(ext.trim().trim_start_matches('.')))
+            .collect();
+        if extensions.is_empty() {
+            extensions = LAUNCHABLE_WINDOWS_EXTENSIONS.to_vec();
+        }
+        extensions
+            .into_iter()
+            .map(|ext| format!("{name}.{ext}"))
+            .collect()
+    };
+    path_dirs
+        .iter()
+        .flat_map(|dir| file_names.iter().map(move |file| dir.join(file)))
+        .find(|candidate| is_file(candidate))
+}
+
+/// [`find_windows_program`] on this process's `PATH` and `PATHEXT`.
+#[cfg(any(windows, test))]
+pub(crate) fn find_windows_program_on_path(name: &str) -> Option<PathBuf> {
+    let path_dirs = std::env::var_os("PATH")
+        .map(|path| absolute_path_dirs(&path))
+        .unwrap_or_default();
+    find_windows_program(
+        name,
+        &path_dirs,
+        std::env::var_os("PATHEXT").as_deref(),
+        Path::is_file,
+    )
+}
+
+/// Whether `path` is WSL's `bash.exe` launcher (`System32\bash.exe`, or the
+/// Store app alias under `WindowsApps`), which runs the command inside the
+/// default Linux distro rather than on Windows.
+pub(crate) fn is_wsl_bash_launcher(path: &Path) -> bool {
+    let in_system32 = path.parent().and_then(Path::file_name).is_some_and(|dir| {
+        dir.eq_ignore_ascii_case("system32") || dir.eq_ignore_ascii_case("sysnative")
+    });
+    in_system32
+        || path
+            .components()
+            .any(|part| part.as_os_str().eq_ignore_ascii_case("WindowsApps"))
+}
+
+/// Pick a bash on Windows (GH #182), in this order:
+///
+/// 1. Git for Windows in its standard install locations
+///    (`<ProgramFiles>\Git\bin\bash.exe`,
+///    `%LOCALAPPDATA%\Programs\Git\bin\bash.exe`).
+/// 2. `PATH`, in order: a `bash.exe` (Git Bash, MSYS2, Cygwin, Scoop shims),
+///    or the `bin\bash.exe` next to a Git install whose `cmd\git.exe` is on
+///    `PATH` (Git's default PATH option adds only `Git\cmd`).
+/// 3. WSL's `bash.exe` launcher, last: it works, but the command runs inside
+///    Linux, where Windows paths appear under `/mnt/<drive>`.
+#[cfg(any(windows, test))]
+fn find_windows_bash(env: &WindowsShellEnv, is_file: impl Fn(&Path) -> bool) -> Option<PathBuf> {
+    let git_bash = |git_root: &Path| git_root.join("bin").join("bash.exe");
+    let installed = env
+        .program_files
+        .iter()
+        .map(|dir| git_bash(&dir.join("Git")))
+        .chain(
+            env.local_app_data
+                .iter()
+                .map(|dir| git_bash(&dir.join("Programs").join("Git"))),
+        );
+    let on_path = env.path_dirs.iter().flat_map(|dir| {
+        let beside_git = is_file(&dir.join("git.exe"))
+            .then(|| dir.parent().map(git_bash))
+            .flatten();
+        std::iter::once(dir.join("bash.exe")).chain(beside_git)
+    });
+    if let Some(found) = installed
+        .chain(on_path)
+        .find(|candidate| !is_wsl_bash_launcher(candidate) && is_file(candidate))
+    {
+        return Some(found);
+    }
+    env.path_dirs
+        .iter()
+        .map(|dir| dir.join("bash.exe"))
+        .chain(
+            env.system_root
+                .iter()
+                .map(|root| root.join("System32").join("bash.exe")),
+        )
+        .find(|candidate| is_wsl_bash_launcher(candidate) && is_file(candidate))
+}
+
 pub(crate) async fn run_bash_command(
     cwd: &Path,
     shell_path: Option<&str>,
@@ -3354,6 +8940,28 @@ pub(crate) async fn run_bash_command(
     command: &str,
     timeout_secs: Option<u64>,
     on_update: Option<&(dyn Fn(ToolUpdate) + Send + Sync)>,
+) -> Result<BashRunResult> {
+    run_bash_command_with_state(
+        cwd,
+        shell_path,
+        command_prefix,
+        command,
+        timeout_secs,
+        on_update,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_lines)]
+async fn run_bash_command_with_state(
+    cwd: &Path,
+    shell_path: Option<&str>,
+    command_prefix: Option<&str>,
+    command: &str,
+    timeout_secs: Option<u64>,
+    on_update: Option<&(dyn Fn(ToolUpdate) + Send + Sync)>,
+    shell_state: Option<&bash_session::ShellTransaction>,
 ) -> Result<BashRunResult> {
     let timeout_secs = match timeout_secs {
         None => Some(DEFAULT_BASH_TIMEOUT_SECS),
@@ -3376,17 +8984,11 @@ pub(crate) async fn run_bash_command(
         ));
     }
 
-    let shell = shell_path.unwrap_or_else(|| {
-        for path in ["/bin/bash", "/usr/bin/bash", "/usr/local/bin/bash"] {
-            if Path::new(path).exists() {
-                return path;
-            }
-        }
-        "sh"
-    });
+    let shell = shell_path.map_or_else(default_bash_shell, |path| Ok(path.to_string()))?;
+    let shell = shell.as_str();
 
     let mut cmd = command_with_default_sigpipe_in_dir(shell, cwd)
-        .map_err(|e| Error::tool("bash", format!("Failed to prepare shell: {e}")))?;
+        .map_err(|e| Error::tool("bash", format!("Failed to prepare shell {shell}: {e}")))?;
     cmd.arg("-c")
         .arg(&command)
         .current_dir(cwd)
@@ -3394,25 +8996,33 @@ pub(crate) async fn run_bash_command(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
+    // #210: a proxy configured for Pi also routes the tools Pi shells out to
+    // (git/curl/npm), via a per-child copy of the standard variables. Empty
+    // unless a proxy is actually configured, so the default path is unchanged.
+    for (key, value) in crate::http::proxy::child_process_env() {
+        cmd.env(key, value);
+    }
+    cmd.envs(crate::bash_mediation::NON_INTERACTIVE_ENV.iter().copied());
+
     // Place the shell in its own process group so background children
     // can be killed reliably even if the shell exits first.
     isolate_command_process_group(&mut cmd);
 
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| Error::tool("bash", format!("Failed to spawn shell: {e}")))?;
+    let child = spawn_command_with_job_discipline(&mut cmd)
+        .map_err(|e| Error::tool("bash", format!("Failed to spawn shell {shell}: {e}")))?;
+    let mut guard = ProcessGuard::new(child, ProcessCleanupMode::ProcessGroupTree)
+        .with_shell_state(shell_state);
 
-    let stdout = child
-        .stdout
-        .take()
+    let stdout = guard
+        .child
+        .as_mut()
+        .and_then(|child| child.stdout.take())
         .ok_or_else(|| Error::tool("bash", "Missing stdout".to_string()))?;
-    let stderr = child
-        .stderr
-        .take()
+    let stderr = guard
+        .child
+        .as_mut()
+        .and_then(|child| child.stderr.take())
         .ok_or_else(|| Error::tool("bash", "Missing stderr".to_string()))?;
-
-    // Wrap in ProcessGuard for cleanup (including tree kill)
-    let mut guard = ProcessGuard::new(child, ProcessCleanupMode::ProcessGroupTree);
 
     // We use a bounded channel to provide backpressure. If the child process
     // produces output faster than the async loop can drain it (and spill to disk),
@@ -3568,12 +9178,33 @@ pub(crate) async fn run_bash_command(
     // return, but calling wait() as a belt-and-suspenders ensures the zombie
     // is cleaned up even if try_wait missed it (observed on macOS when the
     // child is in its own process group).
-    if guard.child.is_some() {
-        if let Ok(status) = guard.wait() {
-            exit_code.get_or_insert_with(|| exit_status_code(status));
-        }
+    if guard.child.is_some()
+        && let Ok(status) = guard.wait()
+    {
+        exit_code.get_or_insert_with(|| exit_status_code(status));
     }
 
+    Ok(assemble_bash_run_result(
+        bash_output,
+        exit_code,
+        timed_out,
+        cancelled,
+        cancellation_reason,
+        timeout_secs,
+    ))
+}
+
+/// Shared bash result assembly for the pipe and PTY spawn paths
+/// (bd-cv653.1.7): truncation annotation, timeout suffix, and the
+/// `BashRunResult` shape are identical across both.
+fn assemble_bash_run_result(
+    mut bash_output: BashOutputState,
+    exit_code: Option<i32>,
+    timed_out: bool,
+    mut cancelled: bool,
+    cancellation_reason: Option<BashCancellationReason>,
+    timeout_secs: Option<u64>,
+) -> BashRunResult {
     drop(bash_output.temp_file.take());
 
     let raw_output = concat_chunks(&bash_output.chunks);
@@ -3610,9 +9241,16 @@ pub(crate) async fn run_bash_command(
             .saturating_add(1);
         let end_line = truncation.total_lines;
 
-        let display_path = full_output_path.as_deref().unwrap_or("undefined");
+        let display_path = bash_output
+            .partial_output_path
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .or_else(|| full_output_path.clone())
+            .unwrap_or_else(|| "unavailable".to_string());
         let file_limit_hit = bash_output.total_bytes > BASH_FILE_LIMIT_BYTES;
-        let output_qualifier = if file_limit_hit {
+        let output_qualifier = if bash_output.partial_output_path.is_some() {
+            "Partial output artifact".to_string()
+        } else if file_limit_hit {
             format!(
                 "Partial output (capped at {})",
                 format_size(BASH_FILE_LIMIT_BYTES)
@@ -3661,7 +9299,7 @@ pub(crate) async fn run_bash_command(
         let _ = write!(output_text, "\n\nCommand exited with code {exit_code}");
     }
 
-    Ok(BashRunResult {
+    BashRunResult {
         output: output_text,
         exit_code,
         cancelled,
@@ -3674,7 +9312,222 @@ pub(crate) async fn run_bash_command(
         } else {
             None
         },
-    })
+    }
+}
+
+/// Run a bash command under a pseudo-terminal (bd-cv653.1.7). Selected for
+/// isatty-requiring commands (`ssh`, `top`, `vim`, `python -i`, …) when
+/// `bash.pty` is `auto`/`always`. The child sees a real controlling terminal,
+/// so programs that probe `isatty(3)` behave exactly as they do in an
+/// interactive shell. The observable tool contract — output truncation,
+/// timeout/tree-kill, cancellation, streaming updates, `BashRunResult` — is
+/// identical to the pipe path.
+#[allow(clippy::too_many_lines)]
+pub(crate) async fn run_bash_command_pty(
+    cwd: &Path,
+    shell_path: Option<&str>,
+    command_prefix: Option<&str>,
+    command: &str,
+    timeout_secs: Option<u64>,
+    on_update: Option<&(dyn Fn(ToolUpdate) + Send + Sync)>,
+    shell_state: Option<&bash_session::ShellTransaction>,
+) -> Result<BashRunResult> {
+    use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+
+    let timeout_secs = match timeout_secs {
+        None => Some(DEFAULT_BASH_TIMEOUT_SECS),
+        Some(0) => None,
+        Some(value) => Some(value),
+    };
+    let command = command_prefix.filter(|p| !p.trim().is_empty()).map_or_else(
+        || command.to_string(),
+        |prefix| format!("{prefix}\n{command}"),
+    );
+    let command = format!("trap 'code=$?; wait; exit $code' EXIT\n{command}");
+
+    if !cwd.exists() {
+        return Err(Error::tool(
+            "bash",
+            format!(
+                "Working directory does not exist: {}\nCannot execute bash commands.",
+                cwd.display()
+            ),
+        ));
+    }
+
+    let shell = shell_path.map_or_else(default_bash_shell, |path| Ok(path.to_string()))?;
+    let shell = shell.as_str();
+
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: 40,
+            cols: 120,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .map_err(|e| Error::tool("bash", format!("Failed to allocate PTY: {e}")))?;
+
+    let mut pty_cmd = CommandBuilder::new(shell);
+    pty_cmd.arg("-c");
+    pty_cmd.arg(&command);
+    pty_cmd.cwd(cwd);
+    // #210: same proxy propagation as the pipe path.
+    for (key, value) in crate::http::proxy::child_process_env() {
+        pty_cmd.env(key, value);
+    }
+    for (key, value) in crate::bash_mediation::NON_INTERACTIVE_ENV {
+        pty_cmd.env(key, value);
+    }
+
+    // portable-pty puts the child in its own session (setsid) on unix, so the
+    // child pid is its process-group id and the shared tree-kill helpers work
+    // exactly as they do for the pipe path's isolated process group.
+    let child = pair
+        .slave
+        .spawn_command(pty_cmd)
+        .map_err(|e| Error::tool("bash", format!("Failed to spawn shell {shell} on PTY: {e}")))?;
+    let mut child = PtyProcessGuard::new(child, shell_state);
+    // Drop our handle to the slave side so the master sees EOF when the child
+    // exits; otherwise the pump thread would block forever.
+    drop(pair.slave);
+    let reader = pair
+        .master
+        .try_clone_reader()
+        .map_err(|e| Error::tool("bash", format!("Failed to clone PTY reader: {e}")))?;
+
+    let (tx, rx) = mpsc::sync_channel::<BashPipeFrame>(1024);
+    let pty_thread = thread::spawn(move || pump_stream(reader, "pty", &tx));
+
+    let max_chunks_bytes = DEFAULT_MAX_BYTES.saturating_mul(2);
+    let mut bash_output = BashOutputState::new(max_chunks_bytes);
+    bash_output.timeout_ms = timeout_secs.map(|s| s.saturating_mul(1000));
+
+    let cx = AgentCx::for_current_or_request();
+    let mut timed_out = false;
+    let mut cancelled = false;
+    let mut cancellation_reason: Option<BashCancellationReason> = None;
+    let mut exit_code: Option<i32> = None;
+    let start = cx
+        .cx()
+        .timer_driver()
+        .map_or_else(wall_now, |timer| timer.now());
+    let timeout = timeout_secs.map(Duration::from_secs);
+    let mut terminate_deadline: Option<asupersync::Time> = None;
+
+    let tick = Duration::from_millis(10);
+    loop {
+        let mut updated = false;
+        while let Ok(frame) = rx.try_recv() {
+            if let Err(err) = ingest_bash_pipe_frame(frame, &mut bash_output).await {
+                let _ = child.kill();
+                return Err(err);
+            }
+            updated = true;
+        }
+
+        if updated {
+            emit_bash_update(&bash_output, on_update)?;
+        }
+
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                exit_code = Some(pty_exit_status_code(&status));
+                break;
+            }
+            Ok(None) => {}
+            Err(err) => return Err(Error::tool("bash", err.to_string())),
+        }
+
+        let now = cx
+            .cx()
+            .timer_driver()
+            .map_or_else(wall_now, |timer| timer.now());
+
+        if let Some(deadline) = terminate_deadline {
+            if now >= deadline {
+                let _ = child.kill();
+                if let Ok(status) = child.wait() {
+                    exit_code = Some(pty_exit_status_code(&status));
+                }
+                break;
+            }
+        } else if let Some(timeout) = timeout {
+            let elapsed = std::time::Duration::from_nanos(now.duration_since(start));
+            if elapsed >= timeout {
+                timed_out = true;
+                cancellation_reason = Some(BashCancellationReason::Timeout);
+                terminate_process_group_tree(child.process_id());
+                terminate_deadline = Some(now + Duration::from_secs(BASH_TERMINATE_GRACE_SECS));
+            }
+        }
+
+        if terminate_deadline.is_none() && cx.checkpoint().is_err() {
+            cancelled = true;
+            cancellation_reason = Some(BashCancellationReason::AmbientCancellation);
+            let _ = child.kill();
+            exit_code = Some(-1);
+            break;
+        }
+
+        sleep(now, tick).await;
+    }
+
+    // Drain remaining frames while the pump observes EOF (same 5s safety cap
+    // as the pipe path for fd-inheriting grandchildren).
+    {
+        let drain_start = cx
+            .cx()
+            .timer_driver()
+            .map_or_else(wall_now, |timer| timer.now());
+        let drain_deadline = drain_start + Duration::from_secs(5);
+        loop {
+            let mut got_data = false;
+            while let Ok(frame) = rx.try_recv() {
+                if let Err(err) = ingest_bash_pipe_frame(frame, &mut bash_output).await {
+                    let _ = child.kill();
+                    return Err(err);
+                }
+                got_data = true;
+            }
+            if got_data {
+                emit_bash_update(&bash_output, on_update)?;
+            }
+
+            if pty_thread.is_finished() {
+                while let Ok(frame) = rx.try_recv() {
+                    if let Err(err) = ingest_bash_pipe_frame(frame, &mut bash_output).await {
+                        let _ = child.kill();
+                        return Err(err);
+                    }
+                }
+                break;
+            }
+
+            let now = cx
+                .cx()
+                .timer_driver()
+                .map_or_else(wall_now, |timer| timer.now());
+            if now >= drain_deadline {
+                break;
+            }
+            sleep(now, tick).await;
+        }
+    }
+
+    // Reap the child to avoid zombies (belt-and-suspenders with try_wait).
+    if let Ok(status) = child.wait() {
+        exit_code.get_or_insert_with(|| pty_exit_status_code(&status));
+    }
+
+    Ok(assemble_bash_run_result(
+        bash_output,
+        exit_code,
+        timed_out,
+        cancelled,
+        cancellation_reason,
+        timeout_secs,
+    ))
 }
 
 impl BashTool {
@@ -3684,6 +9537,9 @@ impl BashTool {
             shell_path: None,
             command_prefix: None,
             artifact_root: None,
+            job_session_scope: crate::jobs::JobSessionScope::default(),
+            terminal_client: TerminalClientScope::default(),
+            mediation: None,
         }
     }
 
@@ -3697,74 +9553,243 @@ impl BashTool {
             shell_path,
             command_prefix,
             artifact_root: None,
+            job_session_scope: crate::jobs::JobSessionScope::default(),
+            terminal_client: TerminalClientScope::default(),
+            mediation: None,
         }
     }
 
-    #[cfg(test)]
-    fn with_artifact_root(cwd: &Path, artifact_root: &Path) -> Self {
-        Self {
-            cwd: cwd.to_path_buf(),
-            shell_path: None,
-            command_prefix: None,
-            artifact_root: Some(artifact_root.to_path_buf()),
+    /// Attach mediation settings (`bash.mediation*`, bd-cv653.1.7).
+    #[must_use]
+    pub fn with_mediation(mut self, mediation: Option<crate::config::BashSettings>) -> Self {
+        self.mediation = mediation;
+        self
+    }
+
+    async fn still_owns_foreground(&self, owner: &AgentCx, session_id: &str) -> Result<bool> {
+        if owner.checkpoint().is_err() {
+            return Ok(false);
         }
-    }
-}
-
-#[async_trait]
-#[allow(clippy::unnecessary_literal_bound)]
-impl Tool for BashTool {
-    fn name(&self) -> &str {
-        "bash"
-    }
-    fn label(&self) -> &str {
-        "bash"
-    }
-    fn description(&self) -> &str {
-        "Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to last 2000 lines or 1MB (whichever is hit first). If truncated, full output is saved to a temp file. `timeout` defaults to 120 seconds; set `timeout: 0` to disable."
+        let current_session = self.job_session_scope.session_id().await?;
+        // Resolution may suspend while cancellation arrives. The caller must
+        // observe that cancellation before transferring process ownership.
+        Ok(owner.checkpoint().is_ok() && current_session == session_id)
     }
 
-    fn parameters(&self) -> serde_json::Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "command": {
-                    "type": "string",
-                    "description": "Bash command to execute"
-                },
-                "timeout": {
-                    "type": "integer",
-                    "description": "Timeout in seconds (default 120; set 0 to disable)"
-                }
-            },
-            "required": ["command"]
-        })
-    }
-
-    fn effects(&self) -> ToolEffects {
-        ToolEffects::process().union(ToolEffects::write())
-    }
-
-    #[allow(clippy::too_many_lines)]
-    async fn execute(
+    /// Wait on the managed process itself; promotion transfers ownership and
+    /// never spawns or replays the user's command.
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    async fn execute_auto_background(
         &self,
         tool_call_id: &str,
-        input: serde_json::Value,
-        on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
-    ) -> Result<ToolOutput> {
-        let input: BashInput =
-            serde_json::from_value(input).map_err(|e| Error::validation(e.to_string()))?;
-
-        let result = run_bash_command(
-            &self.cwd,
+        session_id: &str,
+        input: &BashInput,
+        threshold_ms: u64,
+        on_update: Option<&(dyn Fn(ToolUpdate) + Send + Sync)>,
+        shell_state: Option<&bash_session::ShellTransaction>,
+    ) -> Result<Option<ToolOutput>> {
+        let owner = AgentCx::for_current_or_request();
+        owner
+            .checkpoint()
+            .map_err(|_| Error::tool("bash", "Command cancelled before spawn"))?;
+        let job = match crate::jobs::spawn_foreground(
+            session_id,
+            shell_state.map_or(self.cwd.as_path(), bash_session::ShellTransaction::cwd),
             self.shell_path.as_deref(),
             self.command_prefix.as_deref(),
             &input.command,
             input.timeout,
-            on_update.as_deref(),
-        )
-        .await?;
+            self.artifact_root.as_deref(),
+            shell_state,
+        ) {
+            Ok(job) => job,
+            // This named refusal precedes OS spawn, so falling back cannot
+            // execute the command twice. Other failures are never replayed.
+            Err(Error::Tool { message, .. }) if message.starts_with("PI_JOBS_AT_CAPACITY:") => {
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
+        let started = std::time::Instant::now();
+        let threshold = Duration::from_millis(threshold_ms);
+        let mut last_bytes = None;
+        loop {
+            let snapshot = job.snapshot()?;
+            // Preserve a completed exit even if cancellation arrives while
+            // the caller is observing the already settled output.
+            if snapshot.status != "running" {
+                return self
+                    .managed_bash_output(tool_call_id, snapshot, input.timeout)
+                    .map(Some);
+            }
+            if !self.still_owns_foreground(&owner, session_id).await? {
+                let snapshot = job.cancel().await?;
+                return self
+                    .managed_bash_output(tool_call_id, snapshot, input.timeout)
+                    .map(Some);
+            }
+            if last_bytes != Some(snapshot.output_bytes) {
+                if let Some(callback) = on_update {
+                    let preview =
+                        truncate_tail(snapshot.output_tail, DEFAULT_MAX_LINES, DEFAULT_MAX_BYTES);
+                    callback(ToolUpdate {
+                        content: vec![ContentBlock::Text(TextContent::new(preview.content))],
+                        details: Some(serde_json::json!({
+                            "progress": {
+                                "elapsedMs": started.elapsed().as_millis(),
+                                "lineCount": snapshot.output_lines,
+                                "byteCount": snapshot.output_bytes,
+                            }
+                        })),
+                    });
+                }
+                last_bytes = Some(snapshot.output_bytes);
+            }
+            // An update callback or the session resolver can cancel the
+            // turn. Recheck after its await, immediately before promotion.
+            if !self.still_owns_foreground(&owner, session_id).await? {
+                let snapshot = job.cancel().await?;
+                return self
+                    .managed_bash_output(tool_call_id, snapshot, input.timeout)
+                    .map(Some);
+            }
+            if started.elapsed() >= threshold {
+                return match job.promote()? {
+                    crate::jobs::ForegroundPromotion::Completed(snapshot) => self
+                        .managed_bash_output(tool_call_id, snapshot, input.timeout)
+                        .map(Some),
+                    crate::jobs::ForegroundPromotion::Background(snapshot) => {
+                        Self::background_start_output(snapshot, true).map(Some)
+                    }
+                };
+            }
+            job.wait(
+                threshold
+                    .saturating_sub(started.elapsed())
+                    .min(Duration::from_millis(50)),
+            )
+            .await?;
+        }
+    }
 
+    fn background_start_output(
+        mut job: crate::jobs::JobSnapshot,
+        automatic: bool,
+    ) -> Result<ToolOutput> {
+        let preview = truncate_tail(job.output_tail, DEFAULT_MAX_LINES, 64 * 1024);
+        job.tail_truncated |= preview.truncated;
+        job.output_tail = preview.content;
+        let mut details = serde_json::to_value(&job)?;
+        details["autoBackgrounded"] = serde_json::json!(automatic);
+        let preview = truncate_tail(job.output_tail, DEFAULT_MAX_LINES, DEFAULT_MAX_BYTES).content;
+        let mut text = if preview.is_empty() {
+            String::new()
+        } else {
+            format!("{preview}\n\n")
+        };
+        let reason = if automatic {
+            "Command continues in the background"
+        } else {
+            "Background job started"
+        };
+        let _ = write!(
+            text,
+            "{reason}: {} (pid {}). Output streams to {}. \
+             A completion notice will arrive as a follow-up message; \
+             manage it with the jobs tool (list/wait/cancel).",
+            job.id,
+            job.pid
+                .map_or_else(|| "unknown".to_string(), |pid| pid.to_string()),
+            job.artifact_path,
+        );
+        Ok(ToolOutput {
+            content: vec![ContentBlock::Text(TextContent::new(text))],
+            details: Some(details),
+            is_error: false,
+        })
+    }
+
+    fn managed_bash_output(
+        &self,
+        tool_call_id: &str,
+        snapshot: crate::jobs::JobSnapshot,
+        timeout_secs: Option<u64>,
+    ) -> Result<ToolOutput> {
+        if snapshot.tail_truncated && snapshot.output_bytes == 0 {
+            return Err(Error::tool(
+                "bash",
+                "PI_JOBS_OUTPUT_UNAVAILABLE: command settled but its output snapshot is unavailable",
+            ));
+        }
+        let capture_complete = snapshot.output_complete
+            && !snapshot.artifact_truncated
+            && snapshot.artifact_error.is_none();
+        let mut state = BashOutputState::new(DEFAULT_MAX_BYTES.saturating_mul(2));
+        state.total_bytes = snapshot.output_bytes;
+        state.last_byte_was_newline = snapshot.output_tail.ends_with('\n');
+        state.line_count = snapshot.output_lines.saturating_sub(usize::from(
+            snapshot.output_bytes > 0 && !state.last_byte_was_newline,
+        ));
+        state.chunks_bytes = snapshot.output_tail.len();
+        state.chunks.push_back(snapshot.output_tail.into_bytes());
+        if capture_complete {
+            state.temp_file_path = Some(PathBuf::from(&snapshot.artifact_path));
+        } else {
+            state.partial_output_path = Some(PathBuf::from(&snapshot.artifact_path));
+        }
+        let timed_out = snapshot.status == "timedOut";
+        let cancelled = snapshot.status == "killed" || timed_out;
+        let cancellation_reason = if timed_out {
+            Some(BashCancellationReason::Timeout)
+        } else if cancelled {
+            Some(BashCancellationReason::AmbientCancellation)
+        } else {
+            None
+        };
+        let result = assemble_bash_run_result(
+            state,
+            snapshot.exit_code,
+            timed_out,
+            cancelled,
+            cancellation_reason,
+            match timeout_secs {
+                Some(0) => None,
+                Some(value) => Some(value),
+                None => Some(DEFAULT_BASH_TIMEOUT_SECS),
+            },
+        );
+        let mut output = self.bash_result_output(tool_call_id, result)?;
+        if cancelled
+            && !timed_out
+            && let Some(ContentBlock::Text(text)) = output.content.first_mut()
+        {
+            text.text.push_str("\n\nCommand cancelled");
+        }
+        if !capture_complete {
+            let warning = format!(
+                "\n\n[Command capture: outputComplete={}, artifactTruncated={}, artifactError={}. \
+                 Retained artifact: {}]",
+                snapshot.output_complete,
+                snapshot.artifact_truncated,
+                snapshot.artifact_error.as_deref().unwrap_or("none"),
+                snapshot.artifact_path,
+            );
+            if let Some(ContentBlock::Text(text)) = output.content.first_mut() {
+                text.text.push_str(&warning);
+            }
+            output.is_error |= !snapshot.output_complete;
+            let details = output.details.get_or_insert_with(|| serde_json::json!({}));
+            details["capture"] = serde_json::json!({
+                "outputComplete": snapshot.output_complete,
+                "artifactTruncated": snapshot.artifact_truncated,
+                "artifactError": snapshot.artifact_error,
+                "artifactPath": snapshot.artifact_path,
+            });
+        }
+        Ok(output)
+    }
+
+    fn bash_result_output(&self, tool_call_id: &str, result: BashRunResult) -> Result<ToolOutput> {
         let mut details_map = serde_json::Map::new();
         if let Some(truncation) = result.truncation.as_ref() {
             details_map.insert("truncation".to_string(), serde_json::to_value(truncation)?);
@@ -3810,11 +9835,1828 @@ impl Tool for BashTool {
             is_error,
         })
     }
+
+    fn annotate_bash_mediation(
+        mut output: ToolOutput,
+        warning: Option<&(String, serde_json::Value)>,
+    ) -> ToolOutput {
+        if let Some((rules, payload)) = warning {
+            if let Some(ContentBlock::Text(text)) = output.content.first_mut() {
+                text.text = format!("[MEDIATION WARN: {rules}]\n\n{}", text.text);
+            }
+            let details = output.details.get_or_insert_with(|| serde_json::json!({}));
+            // Foreground warnings historically exposed their audit fields
+            // at the top level. Keep that contract alongside execution
+            // metadata, without replacing a background job's own schema.
+            if details.get("schema").and_then(serde_json::Value::as_str)
+                != Some(crate::jobs::JOB_SCHEMA)
+                && let (Some(fields), Some(audit)) = (details.as_object_mut(), payload.as_object())
+            {
+                for (key, value) in audit {
+                    fields.entry(key.clone()).or_insert_with(|| value.clone());
+                }
+            }
+            details["mediation"] = payload.clone();
+        }
+        output
+    }
+
+    fn annotate_shell_state(mut output: ToolOutput, notice: Option<&str>) -> ToolOutput {
+        if let Some(notice) = notice {
+            if let Some(ContentBlock::Text(text)) = output.content.first_mut() {
+                let _ = write!(text.text, "\n\n[Shell state] {notice}");
+            }
+            let details = output.details.get_or_insert_with(|| serde_json::json!({}));
+            details["shellState"] = serde_json::json!({
+                "mode": "temporary",
+                "notice": notice,
+            });
+        }
+        output
+    }
+
+    #[cfg(test)]
+    fn with_artifact_root(cwd: &Path, artifact_root: &Path) -> Self {
+        Self {
+            cwd: cwd.to_path_buf(),
+            shell_path: None,
+            command_prefix: None,
+            artifact_root: Some(artifact_root.to_path_buf()),
+            job_session_scope: crate::jobs::JobSessionScope::default(),
+            terminal_client: TerminalClientScope::default(),
+            mediation: None,
+        }
+    }
+}
+
+#[async_trait]
+#[allow(clippy::unnecessary_literal_bound)]
+impl Tool for BashTool {
+    async fn execute_from_factory(
+        &self,
+        tool_call_id: &str,
+        mut input: serde_json::Value,
+        cwd: Option<&str>,
+        options: &serde_json::Value,
+        on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+    ) -> Result<ToolOutput> {
+        validate_builtin_factory_options("bash", options, &["commandPrefix"])?;
+        let mut tool = self.clone();
+        tool.cwd = builtin_factory_cwd("bash", cwd, &self.cwd, &WorkspaceHandle::default())?;
+        if let Some(prefix) = options.get("commandPrefix") {
+            let prefix = prefix
+                .as_str()
+                .ok_or_else(|| Error::validation("bash factory commandPrefix must be a string"))?;
+            if !prefix.is_empty()
+                && let Some(command) = input.get("command").and_then(serde_json::Value::as_str)
+            {
+                // Keep the host's shell prefix and mediation intact. The
+                // extension prefix is part of the command they inspect.
+                let command = format!("{prefix}\n{command}");
+                input["command"] = serde_json::Value::String(command);
+            }
+        }
+        // The factory contract returns the completed command. Background
+        // promotion would end streaming and abandon the supplied AbortSignal.
+        if let Some(params) = input.as_object_mut() {
+            params.insert("background".to_string(), serde_json::Value::Bool(false));
+        }
+        tool.execute(tool_call_id, input, on_update).await
+    }
+
+    fn name(&self) -> &str {
+        "bash"
+    }
+    fn label(&self) -> &str {
+        "bash"
+    }
+    fn description(&self) -> &str {
+        "Execute a bash command. On Unix, foreground calls retain Bash variables, arrays, functions, aliases, options, and working directory within this session, including after automatic promotion. State is saved when a command returns normally; exit, shell abort, timeout, or cancellation retain the previously saved state. Overlapping calls use a temporary shell and report that their state will not persist; explicit background jobs are isolated. Returns stdout and stderr, limited to the last 2000 lines or 1MB. Non-PTY calls automatically continue as background jobs after 60 seconds unless configured otherwise; manage them with jobs (list/wait/cancel). Automatic mode retains an artifact capped at 16MiB even when the command finishes inline. background:true starts immediately; background:false stays in the foreground with the larger direct-runner spill limit. Foreground/automatic timeout defaults to 120 seconds and still applies after promotion; explicit background defaults to 1800 seconds. Set timeout:0 to disable. When an ACP editor provides terminals, foreground commands use an isolated editor shell with a live terminal card: shell state does not persist and automatic local backgrounding is disabled. Explicit background:true still starts a local managed job."
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "command": {
+                    "type": "string",
+                    "description": "Bash command to execute"
+                },
+                "timeout": {
+                    "type": "integer",
+                    "description": "Timeout in seconds (foreground/automatic default 120; explicit background default 1800; set 0 to disable). Automatic promotion preserves this deadline."
+                },
+                "background": {
+                    "type": "boolean",
+                    "description": "true: start a local managed background job immediately; false: keep this call in the foreground. When an ACP editor provides terminals, false or omitted uses an isolated editor terminal without automatic backgrounding. Otherwise omitted long-running non-PTY calls automatically background according to bash.autoBackground (default after 60 seconds). Automatic local mode uses the 16MiB job artifact cap even before promotion. A completion notice arrives later; manage local jobs with jobs (list/wait/cancel)."
+                }
+            },
+            "required": ["command"]
+        })
+    }
+
+    fn effects(&self) -> ToolEffects {
+        ToolEffects::process().union(ToolEffects::write())
+    }
+
+    fn bind_job_session_scope(&mut self, scope: crate::jobs::JobSessionScope) {
+        self.job_session_scope = scope;
+    }
+
+    fn bind_terminal_client_scope(&mut self, scope: TerminalClientScope) {
+        self.terminal_client = scope;
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn execute(
+        &self,
+        tool_call_id: &str,
+        input: serde_json::Value,
+        on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+    ) -> Result<ToolOutput> {
+        let input: BashInput =
+            serde_json::from_value(input).map_err(|e| Error::validation(e.to_string()))?;
+        let client_terminal = if input.background == Some(true) {
+            None
+        } else {
+            self.terminal_client.get()?
+        };
+        // PTY auto-selection (bd-cv653.1.7): isatty-requiring commands get a
+        // real pseudo-terminal when `bash.pty` is auto/always; the tool
+        // contract is identical either way.
+        let use_pty = match crate::bash_mediation::PtyMode::from_setting(
+            self.mediation.as_ref().and_then(|s| s.pty.as_deref()),
+        ) {
+            crate::bash_mediation::PtyMode::Off => false,
+            crate::bash_mediation::PtyMode::Always => true,
+            crate::bash_mediation::PtyMode::Auto => {
+                crate::bash_mediation::pty_required(&input.command)
+            }
+        };
+
+        let auto_settings = self
+            .mediation
+            .as_ref()
+            .and_then(|settings| settings.auto_background.as_ref());
+        let threshold_ms = auto_settings
+            .and_then(|settings| settings.threshold_ms)
+            .unwrap_or(60_000)
+            .min(600_000);
+        let timeout_secs = input.timeout.unwrap_or(DEFAULT_BASH_TIMEOUT_SECS);
+        // A deadline that comes before promotion uses the ordinary foreground
+        // runner, avoiding a pointless job transition just before it expires.
+        let auto_background = input.background.is_none()
+            && client_terminal.is_none()
+            && !use_pty
+            && auto_settings
+                .and_then(|settings| settings.enabled)
+                .unwrap_or(true)
+            && (timeout_secs == 0 || timeout_secs.saturating_mul(1000) > threshold_ms);
+        let persistent = cfg!(unix)
+            && client_terminal.is_none()
+            && input.background != Some(true)
+            && self
+                .mediation
+                .as_ref()
+                .and_then(|settings| settings.persistent)
+                .unwrap_or(true);
+        let background_session_id =
+            if input.background == Some(true) || auto_background || persistent {
+                Some(self.job_session_scope.session_id().await?)
+            } else {
+                None
+            };
+        let mut shell_state = None;
+        let mut shell_notice = None;
+        if persistent {
+            let shell = self
+                .shell_path
+                .clone()
+                .map_or_else(default_bash_shell, Ok)?;
+            // Shell snapshots use native Bash declarations. An explicitly
+            // selected non-Bash shell continues using its existing runner.
+            if Path::new(&shell)
+                .file_name()
+                .is_some_and(|name| name == "bash")
+            {
+                match bash_session::acquire(
+                    background_session_id.as_deref().ok_or_else(|| {
+                        Error::tool("bash", "session shell scope was not resolved")
+                    })?,
+                    &self.cwd,
+                    &shell,
+                    self.command_prefix.as_deref(),
+                    &input.command,
+                )? {
+                    bash_session::Acquisition::Persistent(transaction) => {
+                        shell_state = Some(transaction);
+                    }
+                    bash_session::Acquisition::Temporary(notice) => shell_notice = Some(notice),
+                }
+            }
+        }
+        let execution_cwd = shell_state
+            .as_ref()
+            .map_or(self.cwd.as_path(), bash_session::ShellTransaction::cwd);
+        let mut mediation_warning = None;
+
+        // Mediation gate (bd-cv653.1.7): classify before spawn against
+        // `bash.mediation`. This runs on the execution path, so it applies
+        // whatever the approval mode said — including yolo — and `off` is
+        // byte-identical to the pre-mediation path. (`bash.mediationForced`
+        // was meant to select this; it turned out to be the only behaviour,
+        // and nothing reads the field. See `config::BashSettings`.)
+        if let Some(mediation) = &self.mediation {
+            let mode =
+                crate::bash_mediation::MediationMode::from_setting(mediation.mediation.as_deref());
+            if mode != crate::bash_mediation::MediationMode::Off {
+                // DCG policy bridge: imported allow_patterns from .dcg.toml
+                // (project + global) win over every classifier hit — users
+                // maintain ONE rule set.
+                let allows = crate::bash_mediation::import_dcg_overrides(
+                    execution_cwd,
+                    &crate::config::Config::global_dir(),
+                );
+                if crate::bash_mediation::covered_by_allow(&input.command, &allows) {
+                    let verdict = crate::bash_mediation::MediationVerdict::Allow { hits: vec![] };
+                    let _ = verdict;
+                } else {
+                    let verdict = crate::bash_mediation::assess(
+                        &input.command,
+                        mediation,
+                        mode,
+                        execution_cwd,
+                    );
+                    match verdict {
+                        crate::bash_mediation::MediationVerdict::Allow { hits } => {
+                            if !hits.is_empty() {
+                                let payload =
+                                    crate::bash_mediation::MediationVerdict::Allow { hits }
+                                        .audit_payload(mode, &input.command);
+                                tracing::info!(
+                                    event = "pi.bash.mediation",
+                                    payload = %payload,
+                                    "bash mediation allow with hits"
+                                );
+                            }
+                        }
+                        crate::bash_mediation::MediationVerdict::Warn { hits } => {
+                            let payload = crate::bash_mediation::MediationVerdict::Warn { hits }
+                                .audit_payload(mode, &input.command);
+                            tracing::info!(
+                                event = "pi.bash.mediation",
+                                payload = %payload,
+                                "bash mediation warn"
+                            );
+                            let rules = payload["hits"]
+                                .as_array()
+                                .map(|hits| {
+                                    hits.iter()
+                                        .filter_map(|hit| hit["ruleId"].as_str())
+                                        .collect::<Vec<_>>()
+                                        .join(", ")
+                                })
+                                .unwrap_or_default();
+                            mediation_warning = Some((rules, payload));
+                        }
+                        crate::bash_mediation::MediationVerdict::Block { hits } => {
+                            let payload = crate::bash_mediation::MediationVerdict::Block { hits }
+                                .audit_payload(mode, &input.command);
+                            tracing::info!(
+                                event = "pi.bash.mediation",
+                                payload = %payload,
+                                "bash mediation block"
+                            );
+                            let reasons = payload["hits"]
+                                .as_array()
+                                .map(|hits| {
+                                    hits.iter()
+                                        .map(|hit| {
+                                            format!(
+                                                "- {} [{}]: {}",
+                                                hit["ruleId"].as_str().unwrap_or("?"),
+                                                hit["tier"].as_str().unwrap_or("?"),
+                                                hit["reason"].as_str().unwrap_or("?"),
+                                            )
+                                        })
+                                        .collect::<Vec<_>>()
+                                        .join("\n")
+                                })
+                                .unwrap_or_default();
+                            return Ok(ToolOutput {
+                                content: vec![ContentBlock::Text(TextContent::new(format!(
+                                    "[MEDIATION BLOCK] command refused by bash.mediation mode '{}':\n{reasons}\n\nCommand: {}",
+                                    mode.as_str(),
+                                    input.command
+                                )))],
+                                details: Some(payload),
+                                is_error: true,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        // Every execution route passes the same mediation gate above.
+        if let Some(client) = client_terminal {
+            let command = self.client_terminal_command(&input)?;
+            return client
+                .execute(command, on_update.as_deref())
+                .await
+                .map(|output| Self::annotate_bash_mediation(output, mediation_warning.as_ref()));
+        }
+        if input.background == Some(true) {
+            let job = match crate::jobs::spawn_background(
+                background_session_id.as_deref().ok_or_else(|| {
+                    Error::tool("bash", "background job session scope was not resolved")
+                })?,
+                &self.cwd,
+                self.shell_path.as_deref(),
+                self.command_prefix.as_deref(),
+                &input.command,
+                input.timeout,
+                self.artifact_root.as_deref(),
+            ) {
+                Ok(job) => job,
+                Err(error) => {
+                    return Ok(Self::annotate_bash_mediation(
+                        ToolOutput {
+                            content: vec![ContentBlock::Text(TextContent::new(error.to_string()))],
+                            details: None,
+                            is_error: true,
+                        },
+                        mediation_warning.as_ref(),
+                    ));
+                }
+            };
+            return Self::background_start_output(job, false)
+                .map(|output| Self::annotate_bash_mediation(output, mediation_warning.as_ref()));
+        }
+
+        if shell_state.is_some()
+            && !self
+                .still_owns_foreground(
+                    &AgentCx::for_current_or_request(),
+                    background_session_id.as_deref().ok_or_else(|| {
+                        Error::tool("bash", "session shell scope was not resolved")
+                    })?,
+                )
+                .await?
+        {
+            return Err(Error::tool(
+                "bash",
+                "Command cancelled before the session shell could start",
+            ));
+        }
+
+        if auto_background
+            && let Some(output) = self
+                .execute_auto_background(
+                    tool_call_id,
+                    background_session_id.as_deref().ok_or_else(|| {
+                        Error::tool("bash", "managed job session scope was not resolved")
+                    })?,
+                    &input,
+                    threshold_ms,
+                    on_update.as_deref(),
+                    shell_state.as_ref(),
+                )
+                .await?
+        {
+            return Ok(Self::annotate_bash_mediation(
+                Self::annotate_shell_state(output, shell_notice),
+                mediation_warning.as_ref(),
+            ));
+        }
+
+        let result = execute_bash_spawn(
+            execution_cwd,
+            self.shell_path.as_deref(),
+            if shell_state.is_some() {
+                None
+            } else {
+                self.command_prefix.as_deref()
+            },
+            shell_state.as_ref().map_or(
+                input.command.as_str(),
+                bash_session::ShellTransaction::command,
+            ),
+            input.timeout,
+            on_update.as_deref(),
+            use_pty,
+            shell_state.as_ref(),
+        )
+        .await?;
+
+        if let Some(shell_state) = &shell_state {
+            let owns_session = self
+                .still_owns_foreground(
+                    &AgentCx::for_current_or_request(),
+                    background_session_id.as_deref().unwrap_or_default(),
+                )
+                .await
+                .unwrap_or(false);
+            shell_state.finish(!result.cancelled && result.exit_code >= 0 && owns_session);
+        }
+
+        self.bash_result_output(tool_call_id, result).map(|output| {
+            Self::annotate_bash_mediation(
+                Self::annotate_shell_state(output, shell_notice),
+                mediation_warning.as_ref(),
+            )
+        })
+    }
 }
 
 // ============================================================================
-// Edit Tool
+// Jobs Tool (bd-cv653.3.10)
 // ============================================================================
+
+/// Input parameters for the jobs tool.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct JobsInput {
+    /// `list` (all jobs), `wait` (block until settle or budget), or
+    /// `cancel` (TERM → grace → KILL + tree walk).
+    action: String,
+    /// Job id for `wait`/`cancel` (from the bash background start result).
+    job_id: Option<String>,
+    /// Wait budget in milliseconds for `wait` (default 30000, max 600000).
+    timeout_ms: Option<u64>,
+}
+
+/// Manage background bash jobs spawned with `bash {background: true}`
+/// (bd-cv653.3.10). The future hub tool's jobs action group wraps the same
+/// registry (bd-cv653.5.4).
+pub struct JobsTool {
+    job_session_scope: crate::jobs::JobSessionScope,
+}
+
+impl JobsTool {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            job_session_scope: crate::jobs::JobSessionScope::default(),
+        }
+    }
+}
+
+impl Default for JobsTool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+#[allow(clippy::unnecessary_literal_bound)]
+impl Tool for JobsTool {
+    fn name(&self) -> &str {
+        "jobs"
+    }
+
+    fn label(&self) -> &str {
+        "jobs"
+    }
+
+    fn description(&self) -> &str {
+        "Manage this session's background bash jobs, async subagent tasks and \
+         retained eval model requests. \
+         Actions: `list` (jobs with status/pid/artifact), `wait` (wait until a job \
+         settles, bounded; timeoutMs:0 polls), `cancel` (stop owned work and its \
+         child process tree). Native task snapshots include their complete \
+         protected ToolOutput in result after settlement. Completion notices \
+         also arrive automatically as follow-up messages."
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["list", "wait", "cancel"],
+                    "description": "list | wait | cancel"
+                },
+                "jobId": {
+                    "type": "string",
+                    "description": "Job id (required for wait and cancel)"
+                },
+                "timeoutMs": {
+                    "type": "integer",
+                    "description": "Wait budget in milliseconds for wait (default 30000, max 600000)"
+                }
+            },
+            "required": ["action"]
+        })
+    }
+
+    fn effects(&self) -> ToolEffects {
+        ToolEffects::process()
+    }
+
+    fn bind_job_session_scope(&mut self, scope: crate::jobs::JobSessionScope) {
+        self.job_session_scope = scope;
+    }
+
+    async fn execute(
+        &self,
+        _tool_call_id: &str,
+        input: serde_json::Value,
+        _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+    ) -> Result<ToolOutput> {
+        let input: JobsInput =
+            serde_json::from_value(input).map_err(|e| Error::validation(e.to_string()))?;
+        let owner_session_id = self.job_session_scope.session_id().await?;
+        let action = input.action.trim().to_ascii_lowercase();
+        let payload = match action.as_str() {
+            "list" => {
+                let jobs = crate::jobs::list(&owner_session_id)?;
+                serde_json::json!({ "schema": crate::jobs::JOB_SCHEMA, "jobs": jobs })
+            }
+            "wait" => {
+                let job_id = input
+                    .job_id
+                    .as_deref()
+                    .ok_or_else(|| Error::validation("jobs wait requires jobId".to_string()))?;
+                let budget_ms = input.timeout_ms.unwrap_or(30_000).min(600_000);
+                let snapshot = crate::jobs::wait_async(
+                    &owner_session_id,
+                    job_id,
+                    std::time::Duration::from_millis(budget_ms),
+                )
+                .await?;
+                serde_json::to_value(&snapshot)?
+            }
+            "cancel" => {
+                let job_id = input
+                    .job_id
+                    .as_deref()
+                    .ok_or_else(|| Error::validation("jobs cancel requires jobId".to_string()))?;
+                let snapshot = crate::jobs::cancel_async(&owner_session_id, job_id).await?;
+                serde_json::to_value(&snapshot)?
+            }
+            other => {
+                return Err(Error::validation(format!(
+                    "Unknown jobs action '{other}'; expected list, wait, or cancel"
+                )));
+            }
+        };
+        let text = match action.as_str() {
+            "list" => {
+                let count = payload["jobs"].as_array().map_or(0, Vec::len);
+                if count == 0 {
+                    "No background jobs this session.".to_string()
+                } else {
+                    let lines: Vec<String> = payload["jobs"]
+                        .as_array()
+                        .map(|jobs| {
+                            jobs.iter()
+                                .map(|job| {
+                                    format!(
+                                        "{}: {}{} (pid {}, exit {}, artifact {})",
+                                        job["id"].as_str().unwrap_or("?"),
+                                        job["status"].as_str().unwrap_or("?"),
+                                        if job.get("schema").and_then(serde_json::Value::as_str)
+                                            == Some("pi.host_job.v1")
+                                        {
+                                            format!(
+                                                " [{}]",
+                                                job.get("command")
+                                                    .and_then(serde_json::Value::as_str)
+                                                    .unwrap_or("native task")
+                                            )
+                                        } else {
+                                            String::new()
+                                        },
+                                        job["pid"].as_i64().map_or_else(
+                                            || "n/a".to_string(),
+                                            |pid| pid.to_string()
+                                        ),
+                                        job["exitCode"].as_i64().map_or_else(
+                                            || "n/a".to_string(),
+                                            |code| code.to_string()
+                                        ),
+                                        job["artifactPath"].as_str().unwrap_or("?")
+                                    )
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    format!("{count} background job(s):\n{}", lines.join("\n"))
+                }
+            }
+            "wait" | "cancel" => format!(
+                "job {}: {} (exit {})\noutput tail:\n{}",
+                payload["id"].as_str().unwrap_or("?"),
+                payload["status"].as_str().unwrap_or("?"),
+                payload["exitCode"]
+                    .as_i64()
+                    .map_or_else(|| "n/a".to_string(), |code| code.to_string()),
+                payload["outputTail"].as_str().unwrap_or("")
+            ),
+            _ => String::new(),
+        };
+        Ok(ToolOutput {
+            content: vec![ContentBlock::Text(TextContent::new(text))],
+            details: Some(payload),
+            is_error: false,
+        })
+    }
+}
+
+// ============================================================================
+// Learn Tool (bd-cv653.4.2)
+// ============================================================================
+
+/// Input parameters for the learn tool.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LearnInput {
+    /// The reusable lesson to capture.
+    lesson: String,
+    /// Optional context (when/why this applies).
+    context: Option<String>,
+    /// Also draft a managed skill from the lesson (default false).
+    promote: Option<bool>,
+    /// Optional skill name for promotion (slugified otherwise).
+    skill_name: Option<String>,
+}
+
+/// Capture a reusable lesson (memory kind=lesson, bd-cv653.4.1) and
+/// optionally promote it into a managed skill.
+pub struct LearnTool {
+    store: std::sync::Arc<crate::memory::MemoryStore>,
+}
+
+impl LearnTool {
+    pub const fn new(store: std::sync::Arc<crate::memory::MemoryStore>) -> Self {
+        Self { store }
+    }
+}
+
+/// Derive a valid skill slug from free text: lowercase, non-alnum → hyphen,
+/// collapsed, trimmed, capped at 48 chars.
+fn slugify(text: &str) -> String {
+    let mut slug = String::with_capacity(text.len().min(48));
+    let mut last_was_hyphen = true; // suppress leading hyphen
+    for ch in text.chars() {
+        let mapped = if ch.is_ascii_alphanumeric() {
+            Some(ch.to_ascii_lowercase())
+        } else {
+            None
+        };
+        match mapped {
+            Some(c) => {
+                slug.push(c);
+                last_was_hyphen = false;
+            }
+            None if !last_was_hyphen => {
+                slug.push('-');
+                last_was_hyphen = true;
+            }
+            None => {}
+        }
+        if slug.len() >= 48 {
+            break;
+        }
+    }
+    let slug = slug.trim_end_matches('-').to_string();
+    if slug.is_empty() {
+        "lesson".to_string()
+    } else {
+        slug
+    }
+}
+
+#[async_trait]
+#[allow(clippy::unnecessary_literal_bound)]
+impl Tool for LearnTool {
+    fn name(&self) -> &str {
+        "learn"
+    }
+
+    fn label(&self) -> &str {
+        "learn"
+    }
+
+    fn description(&self) -> &str {
+        "Capture a reusable lesson into this project's memory bank (survives \
+         sessions). With promote=true, also draft a managed skill from the \
+         lesson (lint-gated; invalid drafts stay lessons with a warning)."
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "lesson": { "type": "string", "description": "The reusable lesson" },
+                "context": { "type": "string", "description": "When/why this applies (optional)" },
+                "promote": { "type": "boolean", "description": "Also draft a managed skill (default false)" },
+                "skillName": { "type": "string", "description": "Skill name for promotion (derived from the lesson otherwise)" }
+            },
+            "required": ["lesson"]
+        })
+    }
+
+    fn effects(&self) -> ToolEffects {
+        ToolEffects::write()
+    }
+
+    async fn execute(
+        &self,
+        _tool_call_id: &str,
+        input: serde_json::Value,
+        _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+    ) -> Result<ToolOutput> {
+        let input: LearnInput =
+            serde_json::from_value(input).map_err(|e| Error::validation(e.to_string()))?;
+        if input.lesson.trim().is_empty() {
+            return Err(Error::validation(
+                "learn requires a non-empty lesson".to_string(),
+            ));
+        }
+        // Screen each source before composing the memory, and before
+        // truncating a description or slugifying a filename. Those operations
+        // can otherwise cut a key into an unrecognizable but still sensitive
+        // fragment, or defeat an anchored user credential pattern.
+        let lesson = self.store.screen_text(&input.lesson);
+        let context = input
+            .context
+            .as_deref()
+            .map(|context| self.store.screen_text(context));
+        let content = context.as_deref().map_or_else(
+            || lesson.clone(),
+            |context| format!("{lesson}\n\nContext: {context}"),
+        );
+        let memory = self.store.retain(
+            crate::memory::MemoryKind::Lesson,
+            &content,
+            &["learn".to_string()],
+            None,
+        )?;
+        let mut lines = vec![format!("Lesson captured [{}].", memory.id)];
+        let mut promoted: Option<serde_json::Value> = None;
+        if input.promote.unwrap_or(false) {
+            let requested_name = input
+                .skill_name
+                .as_deref()
+                .map(|name| self.store.screen_text(name));
+            let name = requested_name
+                .as_deref()
+                .map(slugify)
+                .filter(|slug| slug != "lesson")
+                .unwrap_or_else(|| slugify(&lesson));
+            let description: String = lesson.chars().take(200).collect();
+            match crate::skills_managed::create(&name, &description, &memory.content) {
+                Ok(info) => {
+                    lines.push(format!(
+                        "Promoted to managed skill '{name}' ({}).",
+                        info.path
+                    ));
+                    promoted = Some(serde_json::to_value(&info)?);
+                }
+                Err(err) => {
+                    lines.push(format!("Skill promotion skipped: {err} (lesson kept)."));
+                }
+            }
+        }
+        Ok(ToolOutput {
+            content: vec![ContentBlock::Text(TextContent::new(lines.join("\n")))],
+            details: Some(serde_json::json!({
+                "schema": crate::memory::MEMORY_SCHEMA,
+                "memory": memory,
+                "promoted": promoted,
+            })),
+            is_error: false,
+        })
+    }
+}
+
+// ============================================================================
+// Manage Skill Tool (bd-cv653.4.2)
+// ============================================================================
+
+/// Input parameters for the manage_skill tool.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ManageSkillInput {
+    /// create | update | delete | list.
+    op: String,
+    /// Skill name (required for create/update/delete).
+    name: Option<String>,
+    /// Description (create; optional for update).
+    description: Option<String>,
+    /// Skill body markdown (create/update).
+    content: Option<String>,
+}
+
+/// CRUD over the isolated managed-skills dir. The managed tier loads dead
+/// last — user/project skills always win collisions.
+pub struct ManageSkillTool;
+
+#[async_trait]
+#[allow(clippy::unnecessary_literal_bound)]
+impl Tool for ManageSkillTool {
+    fn name(&self) -> &str {
+        "manage_skill"
+    }
+
+    fn label(&self) -> &str {
+        "manage skill"
+    }
+
+    fn description(&self) -> &str {
+        "Create, update, delete, or list agent-authored managed skills. \
+         Managed skills load dead-last in precedence (user/project skills \
+         always win) and carry a `managed: true` marker; operations on \
+         content lacking the marker are refused."
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "op": {
+                    "type": "string",
+                    "enum": ["create", "update", "delete", "list"],
+                    "description": "Operation"
+                },
+                "name": { "type": "string", "description": "Skill name (create/update/delete)" },
+                "description": { "type": "string", "description": "Skill description (create; optional for update)" },
+                "content": { "type": "string", "description": "Skill body markdown (create/update)" }
+            },
+            "required": ["op"]
+        })
+    }
+
+    fn effects(&self) -> ToolEffects {
+        ToolEffects::write()
+    }
+
+    async fn execute(
+        &self,
+        _tool_call_id: &str,
+        input: serde_json::Value,
+        _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+    ) -> Result<ToolOutput> {
+        let input: ManageSkillInput =
+            serde_json::from_value(input).map_err(|e| Error::validation(e.to_string()))?;
+        let op = input.op.trim().to_ascii_lowercase();
+        let name_required = |op: &str| -> Result<String> {
+            input
+                .name
+                .clone()
+                .filter(|name| !name.trim().is_empty())
+                .ok_or_else(|| Error::validation(format!("manage_skill {op} requires name")))
+        };
+        let result: Result<(String, serde_json::Value)> = (|| match op.as_str() {
+            "create" => {
+                let name = name_required("create")?;
+                let description = input.description.clone().ok_or_else(|| {
+                    Error::validation("manage_skill create requires description".to_string())
+                })?;
+                let content = input.content.clone().unwrap_or_default();
+                let info = crate::skills_managed::create(&name, &description, &content)?;
+                Ok((
+                    format!("Managed skill '{name}' created at {}.", info.path),
+                    serde_json::to_value(&info)?,
+                ))
+            }
+            "update" => {
+                let name = name_required("update")?;
+                let content = input.content.clone().unwrap_or_default();
+                let info =
+                    crate::skills_managed::update(&name, input.description.as_deref(), &content)?;
+                Ok((
+                    format!("Managed skill '{name}' updated."),
+                    serde_json::to_value(&info)?,
+                ))
+            }
+            "delete" => {
+                let name = name_required("delete")?;
+                crate::skills_managed::delete(&name)?;
+                Ok((
+                    format!("Managed skill '{name}' deleted."),
+                    serde_json::json!({
+                        "schema": crate::skills_managed::SKILL_SCHEMA,
+                        "name": name,
+                        "op": "delete",
+                    }),
+                ))
+            }
+            "list" => {
+                let skills = crate::skills_managed::list()?;
+                let text = if skills.is_empty() {
+                    "No managed skills.".to_string()
+                } else {
+                    skills
+                        .iter()
+                        .map(|skill| {
+                            format!(
+                                "- {} (managed: {}): {}\n  {}",
+                                skill.name, skill.managed, skill.description, skill.path
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                };
+                Ok((
+                    text,
+                    serde_json::json!({
+                        "schema": crate::skills_managed::SKILL_SCHEMA,
+                        "skills": skills,
+                    }),
+                ))
+            }
+            other => Err(Error::validation(format!(
+                "Unknown manage_skill op '{other}'; expected create, update, delete, or list"
+            ))),
+        })();
+        match result {
+            Ok((text, details)) => Ok(ToolOutput {
+                content: vec![ContentBlock::Text(TextContent::new(text))],
+                details: Some(details),
+                is_error: false,
+            }),
+            Err(err) => Ok(ToolOutput {
+                content: vec![ContentBlock::Text(TextContent::new(err.to_string()))],
+                details: Some(serde_json::json!({ "error": err.to_string() })),
+                is_error: true,
+            }),
+        }
+    }
+}
+
+// ============================================================================
+// Hub Tool (bd-cv653.5.4)
+// ============================================================================
+
+/// Input parameters for the hub tool (omp hub parity).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HubInput {
+    /// `start` | `ps` | `logs` | `stop` | `restart` | `describe` | `send` |
+    /// `jobs`.
+    op: String,
+    /// Service name (start/ps target). Unique per project directory.
+    name: Option<String>,
+    /// Program to spawn for `start` (omp parity: `application`).
+    application: Option<String>,
+    /// Program arguments for `start`.
+    args: Option<Vec<String>>,
+    /// Working directory for `start` (default: tool cwd).
+    cwd: Option<String>,
+    /// Extra environment for `start` (`{"KEY": "value"}`).
+    env: Option<std::collections::HashMap<String, String>>,
+    /// Readiness gates: log regex AND/OR TCP port, plus timeout seconds.
+    ready: Option<HubReadyInput>,
+    /// Survive session exit (state file re-discovery).
+    detached: Option<bool>,
+    /// `logs`, `agent inbox`, or `agent wait`: cursor from a previous page.
+    cursor: Option<u64>,
+    /// `logs`: last N lines (snapshot read).
+    tail: Option<usize>,
+    /// `logs`: substring filter.
+    grep: Option<String>,
+    /// `logs` or `agent wait`: bounded wait in milliseconds.
+    wait_ms: Option<u64>,
+    /// `send`: literal text to write to the service's PTY stdin.
+    text: Option<String>,
+    /// `send`: append ENTER after `text` (default true).
+    enter: Option<bool>,
+    /// `send`: named keys (ENTER, TAB, ESCAPE, CTRL_C, CTRL_D, arrows).
+    keys: Option<Vec<String>>,
+    /// `send`: signal name (SIGINT, SIGTERM, SIGHUP, SIGQUIT, SIGKILL).
+    signal: Option<String>,
+    /// `jobs`: list | wait | cancel.
+    /// `agent`: roster | transcript | steer | kill | revive | send | inbox | wait.
+    action: Option<String>,
+    /// `jobs`: job id for wait/cancel.
+    job_id: Option<String>,
+    /// `agent steer|send`: parent label, or the authenticated child's own run id.
+    from: Option<String>,
+    /// `jobs`: wait budget in milliseconds.
+    timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HubReadyInput {
+    log: Option<String>,
+    port: Option<u16>,
+    timeout_secs: Option<u64>,
+}
+
+/// Supervise long-running processes (bd-cv653.5.4) and manage background
+/// jobs (bd-cv653.3.10) from one surface. The `messaging` action group
+/// lands with the agent-hub registry (bd-cv653.5.3).
+pub struct HubTool {
+    cwd: PathBuf,
+    job_session_scope: crate::jobs::JobSessionScope,
+}
+
+impl HubTool {
+    pub fn new(cwd: &Path) -> Self {
+        Self {
+            cwd: cwd.to_path_buf(),
+            job_session_scope: crate::jobs::JobSessionScope::default(),
+        }
+    }
+}
+
+#[async_trait]
+#[allow(clippy::unnecessary_literal_bound)]
+impl Tool for HubTool {
+    fn name(&self) -> &str {
+        "hub"
+    }
+
+    fn label(&self) -> &str {
+        "hub"
+    }
+
+    fn description(&self) -> &str {
+        "Supervise long-running processes and manage background jobs. A dev \
+         server, watcher, debugger, REPL, or any process needing later input \
+         MUST use hub, not bash. Ops: `start` (spawn with optional readiness \
+         gates: ready.log regex AND ready.port TCP accept, both must pass \
+         within ready.timeoutSecs — start returns only after readiness is \
+         observed), `ps` (list services), `logs` (tail/grep/incremental \
+         cursor reads with bounded wait; raw logs retain the first 16 MiB \
+         per run, live tails keep streaming, and logCapture reports loss \
+         and I/O errors), `send` (PTY stdin: text, named \
+         keys, signals), `stop` (graceful tree termination), `restart` \
+         (retained launch spec), `describe` (full descriptor), `jobs` \
+         (background bash jobs: list/wait/cancel), `agent` (subagent children: \
+         roster/transcript/steer/kill/revive/send/inbox/wait; revive executes a \
+         settled native child's original assignment with its retained launch \
+         policy and transcript context, and waits for the replacement result). \
+         Native children use agent roster/send/inbox to reach their parent's hub; \
+         roster returns selfId, send accepts a live sibling id or parent, and inbox \
+         defaults to the caller. Agent wait reads the caller's own inbox for replies \
+         from name (peer run id or parent), after cursor (a sent seq or prior wait \
+         nextCursor). Omit name to await any reply to your outstanding sends; \
+         automatic waits use the previous inbox/wait cursor, or omit it initially. \
+         unrelated running agents do not keep this wait open. It returns on \
+         messages, peer exit, a dependency cycle, no pending replies, retention loss, or waitMs \
+         (default 30000, range 1..60000). It does not send or consume messages. \
+         Include hub in a child's declared tools to enable messaging."
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "op": {
+                    "type": "string",
+                    "enum": ["start", "ps", "logs", "stop", "restart", "describe", "send", "jobs", "agent"],
+                    "description": "Operation"
+                },
+                "name": { "type": "string", "description": "Service name, child run id, or parent for agent send/inbox/wait; omit for agent wait to await outstanding replies automatically; a child inbox defaults to itself" },
+                "application": { "type": "string", "description": "Program to spawn (start)" },
+                "args": { "type": "array", "items": { "type": "string" }, "description": "Program arguments (start)" },
+                "cwd": { "type": "string", "description": "Working directory (start; default: session cwd)" },
+                "env": { "type": "object", "description": "Extra environment (start)" },
+                "ready": {
+                    "type": "object",
+                    "properties": {
+                        "log": { "type": "string", "description": "Regex that must match service output" },
+                        "port": { "type": "integer", "description": "TCP port on 127.0.0.1 that must accept" },
+                        "timeoutSecs": { "type": "integer", "description": "Readiness budget (default 30)" }
+                    },
+                    "description": "Readiness gates; all supplied gates must pass"
+                },
+                "detached": { "type": "boolean", "description": "Skip session-exit cleanup (default false); PTY ownership remains in this Pi process, with no cross-process reattachment" },
+                "cursor": { "type": "integer", "minimum": 0, "description": "logs/agent inbox: nextCursor; named agent wait: sent seq or prior nextCursor for the same peer; automatic wait: prior inbox/automatic wait nextCursor, or omit initially" },
+                "tail": { "type": "integer", "description": "logs: last N lines" },
+                "grep": { "type": "string", "description": "logs: substring filter" },
+                "waitMs": { "type": "integer", "description": "logs or agent wait: bounded wait in ms (max 60000); agent wait defaults to 30000 and requires at least 1" },
+                "text": { "type": "string", "description": "send: text for PTY stdin" },
+                "enter": { "type": "boolean", "description": "send: append ENTER after text (default true)" },
+                "keys": { "type": "array", "items": { "type": "string" }, "description": "send: named keys (ENTER, TAB, ESCAPE, CTRL_C, CTRL_D, UP, DOWN, LEFT, RIGHT)" },
+                "signal": { "type": "string", "description": "send: SIGINT, SIGTERM, SIGHUP, SIGQUIT, or SIGKILL" },
+                "action": { "type": "string", "enum": ["list", "wait", "cancel", "roster", "transcript", "steer", "kill", "revive", "send", "inbox"], "description": "jobs: list/wait/cancel; agent: roster/transcript/steer/kill/revive/send/inbox/wait" },
+                "from": { "type": "string", "description": "agent steer/send: parent sender label; native children may only identify themselves" },
+                "jobId": { "type": "string", "description": "jobs: job id for wait/cancel" },
+                "timeoutMs": { "type": "integer", "description": "jobs: wait budget in ms" }
+            },
+            "required": ["op"]
+        })
+    }
+
+    fn effects(&self) -> ToolEffects {
+        ToolEffects::process()
+    }
+
+    fn bind_job_session_scope(&mut self, scope: crate::jobs::JobSessionScope) {
+        self.job_session_scope = scope;
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn execute(
+        &self,
+        _tool_call_id: &str,
+        input: serde_json::Value,
+        on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+    ) -> Result<ToolOutput> {
+        let input: HubInput =
+            serde_json::from_value(input).map_err(|e| Error::validation(e.to_string()))?;
+        let op = input.op.trim().to_ascii_lowercase();
+        let dispatched = if op == "agent"
+            && input
+                .action
+                .as_deref()
+                .is_some_and(|action| action.trim().eq_ignore_ascii_case("wait"))
+        {
+            Self::dispatch_agent_wait(&input).await
+        } else if op == "agent" && crate::agent_hub::ipc::inherited_channel_present() {
+            Self::dispatch_inherited_agent(&input).await
+        } else if op == "agent"
+            && input
+                .action
+                .as_deref()
+                .is_some_and(|action| action.eq_ignore_ascii_case("revive"))
+        {
+            match input.name.as_deref().filter(|id| !id.trim().is_empty()) {
+                Some(id) => crate::subagents::revive_child(id, on_update).await,
+                None => Err(Error::validation(
+                    "hub agent revive requires name (child run id)",
+                )),
+            }
+        } else {
+            self.dispatch(&op, &input)
+                .await
+                .map(|(text, details)| ToolOutput {
+                    content: vec![ContentBlock::Text(TextContent::new(text))],
+                    details: Some(details),
+                    is_error: false,
+                })
+        };
+        Ok(match dispatched {
+            Ok(output) => output,
+            Err(err) => {
+                // Domain refusals (PI_HUB_*) surface as tool results the
+                // model can read, matching the jobs capacity contract.
+                ToolOutput {
+                    content: vec![ContentBlock::Text(TextContent::new(err.to_string()))],
+                    details: Some(serde_json::json!({ "error": err.to_string() })),
+                    is_error: true,
+                }
+            }
+        })
+    }
+}
+
+impl HubTool {
+    async fn dispatch_agent_wait(input: &HubInput) -> Result<ToolOutput> {
+        let result = crate::agent_hub::wait_for_replies(
+            input.name.as_deref(),
+            input.cursor,
+            input.wait_ms.unwrap_or(30_000),
+            input.from.as_deref(),
+        )
+        .await?;
+        let (text, details) =
+            Self::format_agent_reply(crate::agent_hub::ipc::Reply::Wait { result });
+        Ok(ToolOutput {
+            content: vec![ContentBlock::Text(TextContent::new(text))],
+            details: Some(details),
+            is_error: false,
+        })
+    }
+
+    async fn dispatch_inherited_agent(input: &HubInput) -> Result<ToolOutput> {
+        use crate::agent_hub::ipc::{Action, Request, call_from_env};
+
+        let action = input.action.as_deref().unwrap_or("roster").trim();
+        let action = if action.eq_ignore_ascii_case("roster") {
+            Action::Roster
+        } else if action.eq_ignore_ascii_case("send") {
+            Action::Send
+        } else if action.eq_ignore_ascii_case("inbox") {
+            Action::Inbox
+        } else {
+            return Err(Error::tool(
+                "hub",
+                "PI_HUB_IPC_ACTION: a native child may only use agent roster, send, or inbox",
+            ));
+        };
+        let reply = call_from_env(Request {
+            action,
+            name: input.name.clone(),
+            text: input.text.clone(),
+            claimed_from: input.from.clone(),
+            cursor: input.cursor,
+        })
+        .await?
+        .ok_or_else(|| Error::tool("hub", "PI_HUB_IPC_CONFIG: inherited channel is unavailable"))?;
+        let (text, details) = Self::format_agent_reply(reply);
+        Ok(ToolOutput {
+            content: vec![ContentBlock::Text(TextContent::new(text))],
+            details: Some(details),
+            is_error: false,
+        })
+    }
+
+    fn format_agent_reply(reply: crate::agent_hub::ipc::Reply) -> (String, serde_json::Value) {
+        use crate::agent_hub::ipc::Reply;
+
+        match reply {
+            Reply::Roster {
+                self_id,
+                children,
+                truncated,
+            } => {
+                let lines = children
+                    .iter()
+                    .map(|entry| {
+                        format!(
+                            "{} [{} kind={}] {}",
+                            entry.id,
+                            entry.status.as_str(),
+                            entry.kind.as_str(),
+                            entry.task,
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let mut text = format!(
+                    "You are {self_id}. {} child run(s):\n{}",
+                    children.len(),
+                    lines.join("\n"),
+                );
+                if truncated {
+                    text.push_str(
+                        "\n[Roster exceeds the response limit; showing a bounded prefix.]",
+                    );
+                }
+                let details = serde_json::json!({
+                    "schema": "pi.agent-hub.roster/v1",
+                    "selfId": self_id,
+                    "children": children,
+                    "truncated": truncated,
+                });
+                (text, details)
+            }
+            Reply::Sent { message } => {
+                let text = format!("Message queued for {} (seq {}).", message.to, message.seq);
+                (text, serde_json::json!(message))
+            }
+            Reply::Inbox {
+                id,
+                messages,
+                next_cursor,
+                has_more,
+                oldest_cursor,
+            } => {
+                let text = if messages.is_empty() {
+                    format!("{id}: inbox empty.")
+                } else {
+                    let lines = messages
+                        .iter()
+                        .map(|message| {
+                            format!("#{} from {}: {}", message.seq, message.from, message.body)
+                        })
+                        .collect::<Vec<_>>();
+                    format!("{id}: {} message(s):\n{}", messages.len(), lines.join("\n"))
+                };
+                let details = serde_json::json!({
+                    "schema": "pi.agent-hub.inbox/v1",
+                    "id": id,
+                    "messages": messages,
+                    "nextCursor": next_cursor,
+                    "hasMore": has_more,
+                    "oldestCursor": oldest_cursor,
+                });
+                (text, details)
+            }
+            Reply::Wait { result } => Self::format_wait_reply(&result),
+        }
+    }
+
+    fn format_wait_reply(
+        result: &crate::agent_hub::InboxWaitResult,
+    ) -> (String, serde_json::Value) {
+        use crate::agent_hub::InboxWaitStatus;
+
+        let mut text = match result.status {
+            InboxWaitStatus::Messages => result
+                .messages
+                .iter()
+                .map(|message| format!("#{} from {}: {}", message.seq, message.from, message.body))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            InboxWaitStatus::PeerStopped => format!(
+                "{} finished without a newer reply. Read its result or continue without the answer.",
+                result.peer.as_deref().unwrap_or("All messaged agents")
+            ),
+            InboxWaitStatus::PeerBlocked => format!(
+                "{} cannot reply before you finish: the wait depends on your result. Continue without the answer to break the dependency cycle.",
+                result.blocked_peers.join(", ")
+            ),
+            InboxWaitStatus::HistoryLost => format!(
+                "{}: inbox or pending-reply history after the requested cursor was evicted; inspect the reported gaps before continuing.",
+                result.id
+            ),
+            InboxWaitStatus::TimedOut => format!(
+                "Reply wait timed out; {} may still be working. Messages remain in the inbox.",
+                result.peer.as_deref().unwrap_or("an agent you messaged")
+            ),
+            InboxWaitStatus::Pending => "No newer reply yet.".to_string(),
+            InboxWaitStatus::NothingPending =>
+                "Nothing to wait for: no unanswered sends remain. Unrelated agents do not owe a reply.".to_string(),
+        };
+        if result.dropped_through_cursor != 0 && result.status != InboxWaitStatus::HistoryLost {
+            let _ = write!(
+                text,
+                "\n[Inbox history was evicted through sequence {}; earlier replies may be missing.]",
+                result.dropped_through_cursor
+            );
+        }
+        if result.dropped_tracking_through_cursor != 0 {
+            let _ = write!(
+                text,
+                "\n[Pending-reply tracking was evicted through sequence {}; older unanswered sends may be missing.]",
+                result.dropped_tracking_through_cursor
+            );
+        }
+        for reply in &result.pending_replies {
+            let _ = write!(
+                text,
+                "\n{}: sent at sequence {}, {}.",
+                reply.peer,
+                reply.sent_cursor,
+                if reply.blocked_on_caller {
+                    "waiting on your result"
+                } else if reply.can_reply {
+                    "reply still pending"
+                } else {
+                    "cannot reply in this run"
+                }
+            );
+        }
+        if result.has_more {
+            text.push_str(
+                "\n[More replies are available; continue with nextCursor and the same name selection.]",
+            );
+        }
+        let mut details = serde_json::json!(result);
+        details["schema"] = serde_json::json!("pi.agent-hub.wait/v1");
+        (text, details)
+    }
+
+    fn append_log_capture_notice(text: &mut String, capture: &crate::hub::LogCapture) {
+        if capture.truncated {
+            let _ = write!(
+                text,
+                "\n[Raw service log is incomplete: {} of {} bytes retained, {} omitted; \
+                 per-artifact limit {} bytes. Live tails are retained separately.]",
+                capture.retained_bytes,
+                capture.observed_bytes,
+                capture.dropped_bytes,
+                capture.byte_limit
+            );
+        }
+        if let Some(error) = &capture.write_error {
+            let _ = write!(text, "\n[Service log artifact error: {error}]");
+        }
+        if let Some(error) = &capture.read_error {
+            let _ = write!(text, "\n[Service output capture error: {error}]");
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn dispatch(&self, op: &str, input: &HubInput) -> Result<(String, serde_json::Value)> {
+        let name_required = |op: &str| -> Result<String> {
+            input
+                .name
+                .clone()
+                .filter(|name| !name.trim().is_empty())
+                .ok_or_else(|| Error::validation(format!("hub {op} requires name")))
+        };
+        let (text, details) = match op {
+            "start" => {
+                let name = name_required("start")?;
+                let application = input
+                    .application
+                    .clone()
+                    .filter(|app| !app.trim().is_empty())
+                    .ok_or_else(|| {
+                        Error::validation("hub start requires application".to_string())
+                    })?;
+                let cwd = input
+                    .cwd
+                    .as_deref()
+                    .map_or_else(|| self.cwd.clone(), PathBuf::from);
+                let ready = input.ready.as_ref().map(|ready| crate::hub::ReadySpec {
+                    log: ready.log.clone(),
+                    port: ready.port,
+                    timeout_secs: ready.timeout_secs,
+                });
+                let spec = crate::hub::LaunchSpec {
+                    name: name.clone(),
+                    program: application,
+                    args: input.args.clone().unwrap_or_default(),
+                    cwd,
+                    env: input.env.clone().unwrap_or_default().into_iter().collect(),
+                    ready,
+                    detached: input.detached.unwrap_or(false),
+                };
+                let snapshot = crate::hub::run_service_request(move |request| {
+                    crate::hub::start_for_request(&spec, request)
+                })
+                .await?;
+                let details = serde_json::to_value(&snapshot)?;
+                let mut text = format!(
+                    "Service '{name}' is running (pid {}, log: {}).",
+                    snapshot
+                        .pid
+                        .map_or_else(|| "?".to_string(), |pid| pid.to_string()),
+                    snapshot.log_path
+                );
+                Self::append_log_capture_notice(&mut text, &snapshot.log_capture);
+                (text, details)
+            }
+            "ps" => {
+                let services = crate::hub::run_service_request(|_| crate::hub::ps()).await?;
+                let details = serde_json::json!({
+                    "schema": crate::hub::SERVICE_SCHEMA,
+                    "services": services,
+                });
+                let text = if services.is_empty() {
+                    "No supervised services this session.".to_string()
+                } else {
+                    let lines: Vec<String> = services
+                        .iter()
+                        .map(|svc| {
+                            let mut text = format!(
+                                "{}: {} (pid {}, command `{}`, log {})",
+                                svc.name,
+                                svc.status,
+                                svc.pid
+                                    .map_or_else(|| "n/a".to_string(), |pid| pid.to_string()),
+                                svc.command,
+                                svc.log_path
+                            );
+                            Self::append_log_capture_notice(&mut text, &svc.log_capture);
+                            text
+                        })
+                        .collect();
+                    format!("{} service(s):\n{}", services.len(), lines.join("\n"))
+                };
+                (text, details)
+            }
+            "logs" => {
+                let name = name_required("logs")?;
+                let cursor = input.cursor;
+                let tail = input.tail;
+                let grep = input.grep.clone();
+                let wait_ms = input.wait_ms.unwrap_or(0);
+                let page = crate::hub::run_service_request(move |request| {
+                    crate::hub::logs_for_request(
+                        &name,
+                        cursor,
+                        tail,
+                        grep.as_deref(),
+                        wait_ms,
+                        request,
+                    )
+                })
+                .await?;
+                let details = serde_json::to_value(&page)?;
+                let mut text = page.lines.join("\n");
+                if text.is_empty() {
+                    text = "(no new lines)".to_string();
+                }
+                if page.lost_lines != 0 {
+                    let _ = write!(
+                        text,
+                        "\n[{} requested log lines were evicted; oldest available cursor: {}.]",
+                        page.lost_lines, page.oldest_cursor
+                    );
+                }
+                Self::append_log_capture_notice(&mut text, &page.log_capture);
+                (text, details)
+            }
+            "stop" => {
+                let name = name_required("stop")?;
+                let stop_name = name.clone();
+                let snapshot =
+                    crate::hub::run_service_request(move |_| crate::hub::stop(&stop_name)).await?;
+                let details = serde_json::to_value(&snapshot)?;
+                let mut text = format!("Service '{name}' stopped (status: {}).", snapshot.status);
+                Self::append_log_capture_notice(&mut text, &snapshot.log_capture);
+                (text, details)
+            }
+            "restart" => {
+                let name = name_required("restart")?;
+                let restart_name = name.clone();
+                let snapshot = crate::hub::run_service_request(move |request| {
+                    crate::hub::restart_for_request(&restart_name, request)
+                })
+                .await?;
+                let details = serde_json::to_value(&snapshot)?;
+                let mut text = format!("Service '{name}' restarted (status: {}).", snapshot.status);
+                Self::append_log_capture_notice(&mut text, &snapshot.log_capture);
+                (text, details)
+            }
+            "describe" => {
+                let name = name_required("describe")?;
+                let snapshot =
+                    crate::hub::run_service_request(move |_| crate::hub::describe(&name)).await?;
+                let details = serde_json::to_value(&snapshot)?;
+                (
+                    serde_json::to_string_pretty(&snapshot).unwrap_or_default(),
+                    details,
+                )
+            }
+            "send" => {
+                let name = name_required("send")?;
+                let text = input.text.clone();
+                let enter = input.enter.unwrap_or(true);
+                let keys = input.keys.clone();
+                let signal = input.signal.clone();
+                crate::hub::run_service_request(move |request| {
+                    let mut actions = Vec::new();
+                    if let Some(text) = text.as_deref() {
+                        request.check()?;
+                        crate::hub::send_text(&name, text, enter)?;
+                        actions.push(format!("sent {} byte(s) of text", text.len()));
+                    }
+                    if let Some(keys) = keys.as_ref()
+                        && !keys.is_empty()
+                    {
+                        request.check()?;
+                        crate::hub::send_keys(&name, keys)?;
+                        actions.push(format!("sent keys: {}", keys.join(", ")));
+                    }
+                    if let Some(signal) = signal.as_deref() {
+                        let mapped = match signal.to_ascii_uppercase().as_str() {
+                            "SIGINT" => sysinfo::Signal::Interrupt,
+                            "SIGTERM" => sysinfo::Signal::Term,
+                            "SIGHUP" => sysinfo::Signal::Hangup,
+                            "SIGQUIT" => sysinfo::Signal::Quit,
+                            "SIGKILL" => sysinfo::Signal::Kill,
+                            other => {
+                                return Err(Error::validation(format!(
+                                    "Unknown signal '{other}'; expected SIGINT, SIGTERM, SIGHUP, \
+                                     SIGQUIT, or SIGKILL"
+                                )));
+                            }
+                        };
+                        request.check()?;
+                        crate::hub::send_signal(&name, mapped)?;
+                        actions.push(format!("sent {}", signal.to_ascii_uppercase()));
+                    }
+                    if actions.is_empty() {
+                        return Err(Error::validation(
+                            "hub send requires text, keys, or signal".to_string(),
+                        ));
+                    }
+                    let details = serde_json::json!({
+                        "schema": "pi.hub.send.v1",
+                        "name": name,
+                        "actions": actions,
+                    });
+                    Ok((format!("To '{name}': {}", actions.join("; ")), details))
+                })
+                .await?
+            }
+            "jobs" => {
+                let owner_session_id = self.job_session_scope.session_id().await?;
+                let action = input
+                    .action
+                    .clone()
+                    .unwrap_or_else(|| "list".to_string())
+                    .to_ascii_lowercase();
+                match action.as_str() {
+                    "list" => {
+                        let jobs = crate::jobs::list(&owner_session_id)?;
+                        let details = serde_json::json!({
+                            "schema": crate::jobs::JOB_SCHEMA,
+                            "jobs": jobs,
+                        });
+                        let text = if jobs.is_empty() {
+                            "No background jobs this session.".to_string()
+                        } else {
+                            let lines: Vec<String> = jobs
+                                .iter()
+                                .map(|job| {
+                                    format!(
+                                        "{}: {} (exit {})",
+                                        job.id,
+                                        job.status,
+                                        job.exit_code.map_or_else(
+                                            || "n/a".to_string(),
+                                            |code| code.to_string()
+                                        )
+                                    )
+                                })
+                                .collect();
+                            format!("{} background job(s):\n{}", jobs.len(), lines.join("\n"))
+                        };
+                        (text, details)
+                    }
+                    "wait" => {
+                        let job_id = input.job_id.clone().ok_or_else(|| {
+                            Error::validation("hub jobs wait requires jobId".to_string())
+                        })?;
+                        let budget = input.timeout_ms.unwrap_or(30_000).min(600_000);
+                        let snapshot = crate::jobs::wait_async(
+                            &owner_session_id,
+                            &job_id,
+                            std::time::Duration::from_millis(budget),
+                        )
+                        .await?;
+                        let details = serde_json::to_value(&snapshot)?;
+                        (
+                            format!(
+                                "job {}: {} (exit {})",
+                                snapshot.id,
+                                snapshot.status,
+                                snapshot
+                                    .exit_code
+                                    .map_or_else(|| "n/a".to_string(), |code| code.to_string())
+                            ),
+                            details,
+                        )
+                    }
+                    "cancel" => {
+                        let job_id = input.job_id.clone().ok_or_else(|| {
+                            Error::validation("hub jobs cancel requires jobId".to_string())
+                        })?;
+                        let snapshot =
+                            crate::jobs::cancel_async(&owner_session_id, &job_id).await?;
+                        let details = serde_json::to_value(&snapshot)?;
+                        (format!("job {}: {}", snapshot.id, snapshot.status), details)
+                    }
+                    other => {
+                        return Err(Error::validation(format!(
+                            "Unknown jobs action '{other}'; expected list, wait, or cancel"
+                        )));
+                    }
+                }
+            }
+            "agent" => {
+                let action = input
+                    .action
+                    .clone()
+                    .unwrap_or_else(|| "roster".to_string())
+                    .to_ascii_lowercase();
+                Self::dispatch_agent(&action, input)?
+            }
+            other => {
+                return Err(Error::validation(format!(
+                    "Unknown hub op '{other}'; expected start, ps, logs, stop, restart, \
+                     describe, send, jobs, or agent"
+                )));
+            }
+        };
+        Ok((text, details))
+    }
+
+    /// Agent-hub action group (bd-cv653.5.3): roster / transcript / steer /
+    /// kill / revive / send / inbox over this session's subagent children.
+    #[allow(clippy::too_many_lines)] // Cohesive action dispatcher: one arm per hub op.
+    fn dispatch_agent(action: &str, input: &HubInput) -> Result<(String, serde_json::Value)> {
+        let id_required = |action: &str| -> Result<String> {
+            input
+                .name
+                .clone()
+                .filter(|name| !name.trim().is_empty())
+                .ok_or_else(|| {
+                    Error::validation(format!("hub agent {action} requires name (child run id)"))
+                })
+        };
+        let from = input.from.clone().unwrap_or_else(|| "parent".to_string());
+        let (text, details) = match action {
+            "roster" => {
+                let entries = crate::agent_hub::registry()
+                    .lock()
+                    .map_err(|_| Error::tool("hub", "agent registry lock poisoned"))?
+                    .roster();
+                let details = serde_json::json!({
+                    "schema": "pi.agent-hub.roster/v1",
+                    "children": entries,
+                });
+                let text = if entries.is_empty() {
+                    "No subagent children this session.".to_string()
+                } else {
+                    let lines: Vec<String> = entries
+                        .iter()
+                        .map(|e| {
+                            format!(
+                                "{} [{} kind={}] {} (pid {}, {} bytes out)",
+                                e.id,
+                                e.status.as_str(),
+                                e.kind.as_str(),
+                                e.task,
+                                e.pid
+                                    .map_or_else(|| "n/a".to_string(), |pid| pid.to_string()),
+                                e.output_bytes
+                            )
+                        })
+                        .collect();
+                    format!("{} child run(s):\n{}", entries.len(), lines.join("\n"))
+                };
+                (text, details)
+            }
+            "transcript" => {
+                let id = id_required("transcript")?;
+                let page = crate::agent_hub::registry()
+                    .lock()
+                    .map_err(|_| Error::tool("hub", "agent registry lock poisoned"))?
+                    .transcript_page(&id)?;
+                let details = serde_json::json!({
+                    "schema": "pi.agent-hub.transcript/v1",
+                    "id": id,
+                    "redacted": true,
+                });
+                let text = if page.is_empty() {
+                    "(no transcript frames yet)".to_string()
+                } else {
+                    page
+                };
+                (text, details)
+            }
+            "steer" | "send" => {
+                let id = id_required(action)?;
+                let body = input
+                    .text
+                    .clone()
+                    .filter(|t| !t.trim().is_empty())
+                    .ok_or_else(|| {
+                        Error::validation(format!("hub agent {action} requires text"))
+                    })?;
+                let message = {
+                    let mut registry = crate::agent_hub::registry()
+                        .lock()
+                        .map_err(|_| Error::tool("hub", "agent registry lock poisoned"))?;
+                    if action == "send" {
+                        registry.bus_send(&id, &from, &body)?
+                    } else {
+                        registry.steer(&id, &from, &body)?
+                    }
+                };
+                if action == "send" {
+                    Self::format_agent_reply(crate::agent_hub::ipc::Reply::Sent { message })
+                } else {
+                    let details = serde_json::to_value(&message)?;
+                    (
+                        format!("Steering queued for {id} (seq {}).", message.seq),
+                        details,
+                    )
+                }
+            }
+            "kill" => {
+                let id = id_required("kill")?;
+                {
+                    let mut reg = crate::agent_hub::registry()
+                        .lock()
+                        .map_err(|_| Error::tool("hub", "agent registry lock poisoned"))?;
+                    let entry = reg
+                        .get(&id)
+                        .ok_or_else(|| Error::validation(format!("hub: unknown child '{id}'")))?;
+                    if entry.status.settled() {
+                        return Err(Error::validation(format!(
+                            "hub: cannot kill '{id}' — already {}",
+                            entry.status.as_str()
+                        )));
+                    }
+                    if let Some(pid) = reg.control_pid(&id) {
+                        // Historical PIDs remain in the roster after reaping.
+                        // Only a live process grants authority to signal it.
+                        crate::tools::kill_process_group_tree(Some(pid));
+                    }
+                    // A reaped child may still be awaiting ordered writeback.
+                    // Revoking it must prevent application even without a PID.
+                    reg.mark_killed(&id);
+                }
+                let details = serde_json::json!({
+                    "schema": "pi.agent-hub.kill/v1",
+                    "id": id,
+                    "killedBy": from,
+                });
+                (format!("Child {id} killed by operator."), details)
+            }
+            "inbox" => {
+                let id = id_required("inbox")?;
+                let page = crate::agent_hub::registry()
+                    .lock()
+                    .map_err(|_| Error::tool("hub", "agent registry lock poisoned"))?
+                    .inbox_page(&id, input.cursor)?;
+                Self::format_agent_reply(page)
+            }
+            other => {
+                return Err(Error::validation(format!(
+                    "Unknown agent action '{other}'; expected roster, transcript, steer, \
+                     kill, revive, send, or inbox"
+                )));
+            }
+        };
+        Ok((text, details))
+    }
+}
 
 /// Input parameters for the edit tool.
 #[derive(Debug, Deserialize)]
@@ -3823,16 +11665,54 @@ struct EditInput {
     path: String,
     old_text: String,
     new_text: String,
+    #[serde(default)]
+    raw: bool,
 }
 
 pub struct EditTool {
     cwd: PathBuf,
+    text_file_client: TextFileClientScope,
+    before_persist_hook: Option<Arc<dyn Fn() + Send + Sync>>,
+    mutation_recorder: Option<Arc<crate::undo::FileMutationRecorder>>,
+    workspace: WorkspaceHandle,
 }
 
 impl EditTool {
     pub fn new(cwd: &Path) -> Self {
         Self {
             cwd: cwd.to_path_buf(),
+            text_file_client: TextFileClientScope::default(),
+            workspace: WorkspaceHandle::default(),
+            before_persist_hook: None,
+            mutation_recorder: None,
+        }
+    }
+
+    /// Attach the session workspace root handle (bd-cv653.3.12).
+    #[must_use]
+    pub fn with_workspace(mut self, workspace: WorkspaceHandle) -> Self {
+        self.workspace = workspace;
+        self
+    }
+
+    /// Attach the session's undo recorder (bd-cv653.3.13).
+    #[must_use]
+    pub fn with_mutation_recorder(
+        mut self,
+        recorder: Option<Arc<crate::undo::FileMutationRecorder>>,
+    ) -> Self {
+        self.mutation_recorder = recorder;
+        self
+    }
+
+    #[cfg(test)]
+    fn with_before_persist_hook(cwd: &Path, hook: impl Fn() + Send + Sync + 'static) -> Self {
+        Self {
+            cwd: cwd.to_path_buf(),
+            text_file_client: TextFileClientScope::default(),
+            workspace: WorkspaceHandle::default(),
+            before_persist_hook: Some(Arc::new(hook)),
+            mutation_recorder: None,
         }
     }
 }
@@ -3842,23 +11722,17 @@ fn strip_bom(s: &str) -> (&str, bool) {
         .map_or_else(|| (s, false), |stripped| (stripped, true))
 }
 
+/// The first LF decides, as in OMP: CRLF when a CR precedes it. A lone CR
+/// before it is content (a carriage return inside a string literal, or the
+/// first CR of `\r\r\n`); only a file with no LF at all is CR-terminated.
 fn detect_line_ending(content: &str) -> &'static str {
-    let bytes = content.as_bytes();
-    let mut idx = 0;
-    while idx < bytes.len() {
-        match bytes[idx] {
-            b'\r' => {
-                return if bytes.get(idx + 1) == Some(&b'\n') {
-                    "\r\n"
-                } else {
-                    "\r"
-                };
-            }
-            b'\n' => return "\n",
-            _ => idx += 1,
+    match content.find('\n') {
+        Some(lf) if lf.checked_sub(1).and_then(|cr| content.as_bytes().get(cr)) == Some(&b'\r') => {
+            "\r\n"
         }
+        None if content.contains('\r') => "\r",
+        Some(_) | None => "\n",
     }
-    "\n"
 }
 
 fn normalize_to_lf(text: &str) -> String {
@@ -4400,9 +12274,635 @@ fn generate_diff_string(old_content: &str, new_content: &str) -> (String, Option
     (state.output, state.first_changed_line)
 }
 
+/// Outcome of the shared unique-replacement core.
+struct TextReplacementOutcome {
+    /// BOM-restored content ready to persist.
+    final_content: String,
+    /// LF-normalized pre-edit content (diff input).
+    before_normalized: String,
+    /// LF-normalized post-edit content (diff input).
+    after_normalized: String,
+}
+
+/// Apply native edits to a notebook's source view, then return JSON for the
+/// existing raw-byte CAS/undo path. Non-notebooks and raw=true retain the
+/// ordinary byte-preserving edit behavior.
+fn apply_file_text_replacement(
+    raw: &[u8],
+    input: &EditInput,
+    file_path: &Path,
+) -> Result<TextReplacementOutcome> {
+    if input.raw || !crate::notebook::is_notebook_path(file_path) {
+        return apply_unique_text_replacement(
+            raw,
+            &input.old_text,
+            &input.new_text,
+            &input.path,
+            "edit",
+        );
+    }
+    let source = std::str::from_utf8(raw)
+        .map_err(|_| Error::tool("edit", "Notebook JSON must be valid UTF-8"))?;
+    let notebook = crate::notebook::Notebook::parse(source, &input.path)?;
+    let editable = notebook.editable_text()?;
+    let mut outcome = apply_unique_text_replacement(
+        editable.as_bytes(),
+        &input.old_text,
+        &input.new_text,
+        &input.path,
+        "edit",
+    )?;
+    outcome.final_content = notebook.serialize_edited(&outcome.final_content)?;
+    // Different marker spellings can refer to the same original cell. The
+    // serialized notebook, rather than its editable projection, owns mutation.
+    if outcome.final_content == source {
+        return Err(Error::tool(
+            "edit",
+            format!(
+                "No changes made to {}. The edit produced identical notebook JSON.",
+                input.path
+            ),
+        ));
+    }
+    Ok(outcome)
+}
+
+fn apply_file_hashline_edits(
+    source: &str,
+    input: &HashlineEditInput,
+    file_path: &Path,
+) -> Result<HashlineApplyOutcome> {
+    if input.raw || !crate::notebook::is_notebook_path(file_path) {
+        return apply_hashline_edits_to_content(source, &input.edits, &input.path);
+    }
+    let notebook = crate::notebook::Notebook::parse(source, &input.path)?;
+    let editable = notebook.editable_text()?;
+    let mut outcome = apply_hashline_edits_to_content(&editable, &input.edits, &input.path)?;
+    outcome.final_content = notebook.serialize_edited(&outcome.final_content)?;
+    if outcome.final_content == source {
+        return Err(Error::tool(
+            "hashline_edit",
+            format!(
+                "No changes made to {}. The edits produced identical notebook JSON.",
+                input.path
+            ),
+        ));
+    }
+    Ok(outcome)
+}
+
+/// Shared text-replacement core for local and `ssh://` edits
+/// (bd-cv653.6.5): exactly one fuzzy-unique match of `old_text` replaced
+/// with `new_text`, preserving BOM, line endings, and unmatched bytes
+/// verbatim. Local edits feed the result through atomic-replace with a CAS
+/// expectation; remote edits stage the result atomically over ssh.
+#[allow(clippy::too_many_lines)]
+fn apply_unique_text_replacement(
+    raw: &[u8],
+    old_text: &str,
+    new_text: &str,
+    display_path: &str,
+    tool: &'static str,
+) -> Result<TextReplacementOutcome> {
+    let raw_content = String::from_utf8(raw.to_vec()).map_err(|_| {
+        Error::tool(
+            tool,
+            "File contains invalid UTF-8 characters and cannot be safely edited as text."
+                .to_string(),
+        )
+    })?;
+
+    // Strip BOM before matching (LLM won't include invisible BOM in oldText).
+    let (content_no_bom, had_bom) = strip_bom(&raw_content);
+
+    let original_ending = detect_line_ending(content_no_bom);
+    let normalized_content = normalize_to_lf(content_no_bom);
+    let content_for_matching = if content_no_bom.contains('\r') && !content_no_bom.contains('\n') {
+        std::borrow::Cow::Owned(content_no_bom.replace('\r', "\n"))
+    } else {
+        std::borrow::Cow::Borrowed(content_no_bom)
+    };
+    let normalized_old_text = normalize_to_lf(old_text);
+
+    if normalized_old_text.is_empty() {
+        return Err(Error::tool(
+            tool,
+            "The old text cannot be empty. To prepend text, include the first line's content in oldText and newText.".to_string(),
+        ));
+    }
+    if build_normalized_content(&normalized_old_text).is_empty() {
+        return Err(Error::tool(
+            tool,
+            "The old text must include at least one non-whitespace character.".to_string(),
+        ));
+    }
+
+    // Try variants of old_text to handle Unicode normalization differences
+    // (NFC vs NFD) and potential input normalization (clipboard, LLM output).
+    let mut variants = Vec::with_capacity(3);
+    variants.push(normalized_old_text.clone());
+
+    let nfc = normalized_old_text.nfc().collect::<String>();
+    if nfc != normalized_old_text {
+        variants.push(nfc);
+    }
+
+    let nfd = normalized_old_text.nfd().collect::<String>();
+    if nfd != normalized_old_text {
+        variants.push(nfd);
+    }
+
+    // Pre-compute normalized versions once and reuse for both matching and
+    // occurrence counting (avoids 2x redundant O(n) normalization).
+    let precomputed_content = build_normalized_content(content_for_matching.as_ref());
+
+    // A CRLF file matches the LF needle exactly once their line endings
+    // agree. Left to the fuzzy pass, which trims each line's trailing
+    // whitespace (the CR with it), a needle ending in whitespace leaves that
+    // whitespace outside the matched span and the replacement doubles it.
+    let mut best_match: Option<(FuzzyMatchResult, String, String)> = if original_ending == "\r\n" {
+        variants.iter().find_map(|variant| {
+            let crlf = variant.replace('\n', "\r\n");
+            let index = content_for_matching.find(crlf.as_str())?;
+            let found = FuzzyMatchResult {
+                found: true,
+                index,
+                match_length: crlf.len(),
+                exact_match: true,
+            };
+            Some((found, build_normalized_content(&crlf), crlf))
+        })
+    } else {
+        None
+    };
+
+    for variant in variants {
+        if best_match.is_some() {
+            break;
+        }
+        let precomputed_variant = build_normalized_content(&variant);
+        let match_result = fuzzy_find_text_with_normalized(
+            content_for_matching.as_ref(),
+            &variant,
+            Some(precomputed_content.as_str()),
+            Some(precomputed_variant.as_str()),
+        );
+
+        if match_result.found {
+            best_match = Some((match_result, precomputed_variant, variant));
+            break;
+        }
+    }
+
+    let Some((match_result, precomputed_variant, matched_variant)) = best_match else {
+        return Err(Error::tool(
+            tool,
+            format!(
+                "Could not find the exact text in {display_path}. The old text must match exactly including all whitespace and newlines."
+            ),
+        ));
+    };
+
+    // Count occurrences in the same matching mode to avoid false ambiguity
+    // when normalized matching collapses distinct trailing whitespace. The
+    // approximate count uses the normalized needle that matched; the raw text
+    // can contain whitespace or quotes the normalized file no longer has, and
+    // would count zero copies of an ambiguous match.
+    let occurrences = if match_result.exact_match {
+        count_overlapping_occurrences(content_for_matching.as_ref(), &matched_variant)
+    } else {
+        count_overlapping_occurrences(&precomputed_content, &precomputed_variant)
+    };
+
+    if occurrences > 1 {
+        return Err(Error::tool(
+            tool,
+            format!(
+                "Found {occurrences} occurrences of the text in {display_path}. The text must be unique. Please provide more context to make it unique."
+            ),
+        ));
+    }
+
+    // Perform replacement in the original coordinate space to preserve
+    // line endings and unmatched content exactly.
+    let mut idx = match_result.index;
+    let mut match_len = match_result.match_length;
+    // An oldText that starts with "\n" matches the LF half of a CRLF pair.
+    // Take the CR too, or the replacement's own line ending leaves it stray.
+    if content_no_bom[idx..].starts_with('\n') && content_no_bom[..idx].ends_with('\r') {
+        idx -= 1;
+        match_len += 1;
+    }
+
+    // Adapt new_text to match the file's line endings.
+    let adapted_new_text = restore_line_endings(&normalize_to_lf(new_text), original_ending);
+
+    let new_len = content_no_bom.len() - match_len + adapted_new_text.len();
+    let mut new_content = String::with_capacity(new_len);
+    new_content.push_str(&content_no_bom[..idx]);
+    new_content.push_str(&adapted_new_text);
+    new_content.push_str(&content_no_bom[idx + match_len..]);
+
+    if content_no_bom.eq(&new_content) {
+        return Err(Error::tool(
+            tool,
+            format!(
+                "No changes made to {display_path}. The replacement produced identical content. This might indicate an issue with special characters or the text not existing as expected."
+            ),
+        ));
+    }
+
+    let after_normalized = normalize_to_lf(&new_content);
+
+    // Re-add BOM if present.
+    let mut final_content = new_content;
+    if had_bom {
+        final_content = format!("\u{FEFF}{final_content}");
+    }
+
+    Ok(TextReplacementOutcome {
+        final_content,
+        before_normalized: normalized_content,
+        after_normalized,
+    })
+}
+
+/// Outcome of the shared hashline-op core.
+struct HashlineApplyOutcome {
+    /// BOM-restored content ready to persist.
+    final_content: String,
+    /// LF-normalized pre-edit content (diff input).
+    before_normalized: String,
+    /// LF-normalized post-edit content (diff input).
+    after_normalized: String,
+}
+
+/// Shared hashline-op core for local and `ssh://` hashline edits
+/// (bd-cv653.6.5): validates every LINE#HASH anchor against the current
+/// lines, dedupes, resolves ranges, rejects overlaps, splices bottom-up,
+/// then restores line endings and BOM.
+#[allow(clippy::too_many_lines)]
+fn apply_hashline_edits_to_content(
+    raw_content: &str,
+    edits: &[HashlineOp],
+    display_path: &str,
+) -> Result<HashlineApplyOutcome> {
+    let (content_no_bom, had_bom) = strip_bom(raw_content);
+    let original_ending = detect_line_ending(content_no_bom);
+    let normalized = normalize_to_lf(content_no_bom);
+    let file_lines: Vec<&str> = normalized.split('\n').collect();
+
+    // Validate all hash references before making any changes
+    if let Err(e) = collect_mismatches(edits, &file_lines, had_bom) {
+        return Err(Error::tool(
+            "hashline_edit",
+            format!("Hash validation failed — re-read the file to get current tags.\n\n{e}"),
+        ));
+    }
+
+    // Deduplicate edits
+    let mut seen = std::collections::HashSet::new();
+    let mut deduped_edits: Vec<&HashlineOp> = Vec::new();
+    for edit in edits {
+        let pos_line = edit
+            .pos
+            .as_ref()
+            .and_then(|p| parse_hashline_tag(p).ok())
+            .map(|(n, _)| n);
+        let end_line = edit
+            .end
+            .as_ref()
+            .and_then(|e| parse_hashline_tag(e).ok())
+            .map(|(n, _)| n);
+        let key = NormalizedEdit {
+            op: edit.op.clone(),
+            pos_line,
+            end_line,
+            lines: edit.get_lines(),
+        };
+        if seen.insert(key) {
+            deduped_edits.push(edit);
+        }
+    }
+
+    // Resolve line indices and sort bottom-up
+    let mut resolved: Vec<ResolvedEdit<'_>> = Vec::new();
+    for edit in &deduped_edits {
+        let replacement_lines: Vec<String> = edit
+            .get_lines()
+            .into_iter()
+            .map(|l| strip_hashline_prefix(&l).to_string())
+            .collect();
+
+        match edit.op.as_str() {
+            "replace" => {
+                let start_idx = match &edit.pos {
+                    Some(pos) => validate_line_ref(pos, &file_lines, had_bom)
+                        .map_err(|e| Error::tool("hashline_edit", e))?,
+                    None => {
+                        return Err(Error::tool(
+                            "hashline_edit",
+                            "replace operation requires a pos anchor",
+                        ));
+                    }
+                };
+                let end_idx = match &edit.end {
+                    Some(end) => validate_line_ref(end, &file_lines, had_bom)
+                        .map_err(|e| Error::tool("hashline_edit", e))?,
+                    None => start_idx,
+                };
+                if end_idx < start_idx {
+                    return Err(Error::tool(
+                        "hashline_edit",
+                        format!(
+                            "End anchor (line {}) is before start anchor (line {})",
+                            end_idx + 1,
+                            start_idx + 1
+                        ),
+                    ));
+                }
+                resolved.push(ResolvedEdit {
+                    op: "replace",
+                    start: start_idx,
+                    end: end_idx,
+                    lines: replacement_lines,
+                });
+            }
+            "prepend" => {
+                let idx = match &edit.pos {
+                    Some(pos) => validate_line_ref(pos, &file_lines, had_bom)
+                        .map_err(|e| Error::tool("hashline_edit", e))?,
+                    None => 0, // BOF
+                };
+                let end_idx = if file_lines == [""] && edit.pos.is_none() {
+                    0 // replace the empty line
+                } else {
+                    idx
+                };
+                resolved.push(ResolvedEdit {
+                    op: if file_lines == [""] && edit.pos.is_none() {
+                        "replace"
+                    } else {
+                        "prepend"
+                    },
+                    start: idx,
+                    end: end_idx,
+                    lines: replacement_lines,
+                });
+            }
+            "append" => {
+                let idx = match &edit.pos {
+                    Some(pos) => validate_line_ref(pos, &file_lines, had_bom)
+                        .map_err(|e| Error::tool("hashline_edit", e))?,
+                    None => {
+                        if file_lines.len() > 1 && file_lines.last() == Some(&"") {
+                            file_lines.len() - 2
+                        } else {
+                            file_lines.len() - 1
+                        }
+                    }
+                };
+                resolved.push(ResolvedEdit {
+                    // Like prepend: an empty file's only "line" is replaced,
+                    // not kept as a leading blank line.
+                    op: if file_lines == [""] && edit.pos.is_none() {
+                        "replace"
+                    } else {
+                        "append"
+                    },
+                    start: idx,
+                    end: idx,
+                    lines: replacement_lines,
+                });
+            }
+            _ => {}
+        }
+    }
+
+    // Sort bottom-up: highest line first, then by precedence (replace < append < prepend)
+    resolved.sort_by(|a, b| {
+        b.start
+            .cmp(&a.start)
+            .then_with(|| op_precedence(a.op).cmp(&op_precedence(b.op)))
+    });
+
+    // Detect overlapping edit ranges (undefined behavior if applied bottom-up)
+    for i in 0..resolved.len() {
+        for j in (i + 1)..resolved.len() {
+            let a = &resolved[i];
+            let b = &resolved[j];
+            if a.start <= b.end && b.start <= a.end {
+                return Err(Error::tool(
+                    "hashline_edit",
+                    format!(
+                        "Overlapping edits detected: {} at line {}-{} and {} at line {}-{}. \
+                         Please combine overlapping edits into a single operation.",
+                        a.op,
+                        a.start + 1,
+                        a.end + 1,
+                        b.op,
+                        b.start + 1,
+                        b.end + 1
+                    ),
+                ));
+            }
+        }
+    }
+
+    // Apply splices bottom-up on a mutable Vec of lines
+    let mut lines: Vec<String> = file_lines.iter().map(|s| (*s).to_string()).collect();
+    let mut any_change = false;
+
+    for edit in &resolved {
+        match edit.op {
+            "replace" => {
+                // Check if it's a no-op
+                let existing: Vec<&str> = lines[edit.start..=edit.end]
+                    .iter()
+                    .map(String::as_str)
+                    .collect();
+                if existing.eq(&edit.lines.iter().map(String::as_str).collect::<Vec<&str>>()) {
+                    continue; // no-op
+                }
+                // Splice: remove old range, insert new lines
+                lines.splice(edit.start..=edit.end, edit.lines.iter().cloned());
+                any_change = true;
+            }
+            "prepend" => {
+                // Insert before the target line
+                lines.splice(edit.start..edit.start, edit.lines.iter().cloned());
+                if !edit.lines.is_empty() {
+                    any_change = true;
+                }
+            }
+            "append" => {
+                // Insert after the target line
+                let insert_at = edit.start + 1;
+                lines.splice(insert_at..insert_at, edit.lines.iter().cloned());
+                if !edit.lines.is_empty() {
+                    any_change = true;
+                }
+            }
+            _ => {} // unreachable due to earlier validation
+        }
+    }
+
+    // Reconstruct content
+    let after_normalized = lines.join("\n");
+    let new_content = restore_line_endings(&after_normalized, original_ending);
+    let mut final_content = new_content;
+    if had_bom {
+        final_content = format!("\u{FEFF}{final_content}");
+    }
+
+    // Individually effective, nonoverlapping operations can cancel each other
+    // out. A successful edit must change the final image, not just a splice.
+    if !any_change || final_content == raw_content {
+        return Err(Error::tool(
+            "hashline_edit",
+            format!(
+                "No changes made to {display_path}. The edits were no-ops or cancelled each other out, leaving identical content."
+            ),
+        ));
+    }
+
+    Ok(HashlineApplyOutcome {
+        final_content,
+        before_normalized: normalized,
+        after_normalized,
+    })
+}
+
+impl EditTool {
+    /// `edit` over `ssh://host/path` (bd-cv653.6.5): fetch the FULL remote
+    /// content (never truncated — an editor on a truncated view would
+    /// overwrite real data), run the same replacement core as local edits,
+    /// then stage and check the original bytes before remote replacement.
+    async fn execute_ssh_edit(&self, input: &EditInput) -> Result<ToolOutput> {
+        let url = input.path.clone();
+        let raw = asupersync::runtime::spawn_blocking_io(move || {
+            crate::url_router::ssh_fetch_document(&url, READ_TOOL_MAX_BYTES)
+                .map_err(std::io::Error::other)
+        })
+        .await
+        .map_err(|e| Error::tool("edit", format!("ssh read failed: {e}")))?;
+        let outcome = apply_file_text_replacement(&raw, input, Path::new(&input.path))?;
+        let write_url = input.path.clone();
+        let payload = outcome.final_content.clone();
+        let write_details = asupersync::runtime::spawn_blocking_io(move || {
+            crate::url_router::ssh_replace_document(&write_url, &raw, &payload)
+                .map_err(std::io::Error::other)
+        })
+        .await
+        .map_err(|e| Error::tool("edit", format!("ssh write failed: {e}")))?;
+
+        let (diff, first_changed_line) =
+            generate_diff_string(&outcome.before_normalized, &outcome.after_normalized);
+        let mut details = serde_json::Map::new();
+        details.insert("diff".to_string(), serde_json::Value::String(diff));
+        if let Some(line) = first_changed_line {
+            details.insert(
+                "firstChangedLine".to_string(),
+                serde_json::Value::Number(serde_json::Number::from(line)),
+            );
+        }
+        if let serde_json::Value::Object(remote) = write_details {
+            for (key, value) in remote {
+                details.entry(key).or_insert(value);
+            }
+        }
+
+        Ok(ToolOutput {
+            content: vec![ContentBlock::Text(TextContent::new(format!(
+                "Successfully replaced text in {}.",
+                input.path
+            )))],
+            details: Some(serde_json::Value::Object(details)),
+            is_error: false,
+        })
+    }
+}
+
+impl HashlineEditTool {
+    /// `hashline_edit` over `ssh://host/path` (bd-cv653.6.5): full remote
+    /// fetch, the same anchor-validation/splice core as local hashline
+    /// edits (stale anchors rejected), and a remote original-content guard.
+    async fn execute_ssh_hashline_edit(&self, input: &HashlineEditInput) -> Result<ToolOutput> {
+        let url = input.path.clone();
+        let raw = asupersync::runtime::spawn_blocking_io(move || {
+            crate::url_router::ssh_fetch_document(&url, READ_TOOL_MAX_BYTES)
+                .map_err(std::io::Error::other)
+        })
+        .await
+        .map_err(|e| Error::tool("hashline_edit", format!("ssh read failed: {e}")))?;
+        if raw.len() as u64 > READ_TOOL_MAX_BYTES {
+            return Err(Error::tool(
+                "hashline_edit",
+                format!("File too large (> {READ_TOOL_MAX_BYTES} bytes)"),
+            ));
+        }
+        let raw_content = String::from_utf8(raw).map_err(|_| {
+            Error::tool(
+                "hashline_edit",
+                "File contains invalid UTF-8 characters and cannot be safely edited as text."
+                    .to_string(),
+            )
+        })?;
+        let outcome = apply_file_hashline_edits(&raw_content, input, Path::new(&input.path))?;
+
+        let write_url = input.path.clone();
+        let payload = outcome.final_content.clone();
+        let write_details = asupersync::runtime::spawn_blocking_io(move || {
+            crate::url_router::ssh_replace_document(&write_url, raw_content.as_bytes(), &payload)
+                .map_err(std::io::Error::other)
+        })
+        .await
+        .map_err(|e| Error::tool("hashline_edit", format!("ssh write failed: {e}")))?;
+        let (diff, first_changed_line) =
+            generate_diff_string(&outcome.before_normalized, &outcome.after_normalized);
+        let mut details = serde_json::Map::new();
+        details.insert("diff".to_string(), serde_json::Value::String(diff));
+        if let Some(line) = first_changed_line {
+            details.insert(
+                "firstChangedLine".to_string(),
+                serde_json::Value::Number(serde_json::Number::from(line)),
+            );
+        }
+        if let serde_json::Value::Object(remote) = write_details {
+            for (key, value) in remote {
+                details.entry(key).or_insert(value);
+            }
+        }
+
+        Ok(ToolOutput {
+            content: vec![ContentBlock::Text(TextContent::new(format!(
+                "Successfully applied hashline edits to {}.",
+                input.path
+            )))],
+            details: Some(serde_json::Value::Object(details)),
+            is_error: false,
+        })
+    }
+}
 #[async_trait]
 #[allow(clippy::unnecessary_literal_bound)]
 impl Tool for EditTool {
+    fn builtin_factory_context(&self) -> Option<(&Path, &WorkspaceHandle)> {
+        Some((&self.cwd, &self.workspace))
+    }
+
+    fn prewalk_evidence(
+        &self,
+        input: &serde_json::Value,
+        output: &ToolOutput,
+    ) -> crate::prewalk::ToolEvidence {
+        crate::prewalk::ToolEvidence::text_edit(input, output)
+    }
+
+    fn bind_text_file_client_scope(&mut self, scope: TextFileClientScope) {
+        self.text_file_client = scope;
+    }
+
     fn name(&self) -> &str {
         "edit"
     }
@@ -4410,7 +12910,7 @@ impl Tool for EditTool {
         "edit"
     }
     fn description(&self) -> &str {
-        "Edit a file by replacing text. The oldText must match a unique region; matching is exact but normalizes line endings, Unicode spaces/quotes/dashes, and ignores trailing whitespace."
+        "Edit a file by replacing text. The oldText must match a unique region; matching is exact but normalizes line endings, Unicode spaces/quotes/dashes, and ignores trailing whitespace. For .ipynb, edit the cell-marked view returned by read; cell:N preserves that cell's identity, metadata and saved outputs. Use raw=true to edit notebook JSON instead."
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -4429,6 +12929,10 @@ impl Tool for EditTool {
                 "newText": {
                     "type": "string",
                     "description": "New text to replace the old text with"
+                },
+                "raw": {
+                    "type": "boolean",
+                    "description": "Edit original notebook JSON instead of its editable cell-marked view. Use with a prior read(raw=true)."
                 }
             },
             "required": ["path", "oldText", "newText"]
@@ -4438,7 +12942,7 @@ impl Tool for EditTool {
     #[allow(clippy::too_many_lines)]
     async fn execute(
         &self,
-        _tool_call_id: &str,
+        tool_call_id: &str,
         input: serde_json::Value,
         _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
     ) -> Result<ToolOutput> {
@@ -4453,21 +12957,29 @@ impl Tool for EditTool {
             )));
         }
 
-        let absolute_path = resolve_read_path(&input.path, &self.cwd);
-        let absolute_path = enforce_cwd_scope(&absolute_path, &self.cwd, "edit")?;
+        // Scheme URLs route through the router — never a silent filesystem
+        // fallback (bd-cv653.6.5).
+        if crate::url_router::has_scheme(&input.path) {
+            return self.execute_ssh_edit(&input).await;
+        }
 
-        let meta = asupersync::fs::metadata(&absolute_path)
-            .await
-            .map_err(|err| {
-                let message = match err.kind() {
-                    std::io::ErrorKind::NotFound => format!("File not found: {}", input.path),
-                    std::io::ErrorKind::PermissionDenied => {
-                        format!("Permission denied: {}", input.path)
-                    }
-                    _ => format!("Failed to access file {}: {err}", input.path),
-                };
-                Error::tool("edit", message)
-            })?;
+        let absolute_path = resolve_read_path(&input.path, &self.cwd);
+        let absolute_path = enforce_cwd_scope(&absolute_path, &self.cwd, "edit", &self.workspace)?;
+
+        if let Some(output) = self.execute_client_edit(&input, &absolute_path).await? {
+            return Ok(output);
+        }
+
+        let meta = std_metadata_async(&absolute_path).await.map_err(|err| {
+            let message = match err.kind() {
+                std::io::ErrorKind::NotFound => format!("File not found: {}", input.path),
+                std::io::ErrorKind::PermissionDenied => {
+                    format!("Permission denied: {}", input.path)
+                }
+                _ => format!("Failed to access file {}: {err}", input.path),
+            };
+            Error::tool("edit", message)
+        })?;
 
         if !meta.is_file() {
             return Err(Error::tool(
@@ -4475,6 +12987,32 @@ impl Tool for EditTool {
                 format!("Path {} is not a regular file", absolute_path.display()),
             ));
         }
+        ensure_effective_mode_access(
+            &meta,
+            &absolute_path,
+            UNIX_ACCESS_READ | UNIX_ACCESS_WRITE,
+            "file editing",
+        )
+        .map_err(|err| {
+            let message = match err.kind() {
+                std::io::ErrorKind::PermissionDenied => {
+                    format!("Permission denied: {}", input.path)
+                }
+                _ => format!("Failed to access file {}: {err}", input.path),
+            };
+            Error::tool("edit", message)
+        })?;
+        ensure_parent_allows_creation(&absolute_path)
+            .await
+            .map_err(|err| {
+                let message = match err.kind() {
+                    std::io::ErrorKind::PermissionDenied => {
+                        format!("Permission denied: {}", input.path)
+                    }
+                    _ => format!("Failed to access parent directory: {err}"),
+                };
+                Error::tool("edit", message)
+            })?;
         if meta.len() > READ_TOOL_MAX_BYTES {
             return Err(Error::tool(
                 "edit",
@@ -4502,16 +13040,18 @@ impl Tool for EditTool {
             return Err(Error::tool("edit", message));
         }
 
-        // Read bytes strictly up to the limit to prevent OOM if metadata failed or file grows.
-        let file = asupersync::fs::File::open(&absolute_path)
-            .await
-            .map_err(|e| Error::tool("edit", format!("Failed to open file: {e}")))?;
-        let mut raw = Vec::new();
-        let mut limiter = file.take(READ_TOOL_MAX_BYTES.saturating_add(1));
-        limiter
-            .read_to_end(&mut raw)
-            .await
-            .map_err(|e| Error::tool("edit", format!("Failed to read file: {e}")))?;
+        // Read the transformation source through the validated, no-follow
+        // descriptor path. The digest of these exact bytes becomes the
+        // optimistic-CAS expectation checked immediately before rename.
+        // Same roots as the scope check and the atomic replace, so files
+        // under an /add-dir root are editable.
+        let path_for_read = absolute_path.clone();
+        let roots_for_read = self.workspace.snapshot_or(&self.cwd).all();
+        let raw = asupersync::runtime::spawn_blocking_io(move || {
+            read_file_capped_within_roots_sync(&path_for_read, &roots_for_read, READ_TOOL_MAX_BYTES)
+        })
+        .await
+        .map_err(|e| Error::tool("edit", format!("Failed to read file: {e}")))?;
 
         if raw.len() > usize::try_from(READ_TOOL_MAX_BYTES).unwrap_or(usize::MAX) {
             return Err(Error::tool(
@@ -4520,181 +13060,58 @@ impl Tool for EditTool {
             ));
         }
 
-        let raw_content = String::from_utf8(raw).map_err(|_| {
-            Error::tool(
-                "edit",
-                "File contains invalid UTF-8 characters and cannot be safely edited as text."
-                    .to_string(),
-            )
-        })?;
-
-        // Strip BOM before matching (LLM won't include invisible BOM in oldText).
-        let (content_no_bom, had_bom) = strip_bom(&raw_content);
-
-        let original_ending = detect_line_ending(content_no_bom);
-        let normalized_content = normalize_to_lf(content_no_bom);
-        let content_for_matching =
-            if content_no_bom.contains('\r') && !content_no_bom.contains('\n') {
-                std::borrow::Cow::Owned(content_no_bom.replace('\r', "\n"))
-            } else {
-                std::borrow::Cow::Borrowed(content_no_bom)
-            };
-        let normalized_old_text = normalize_to_lf(&input.old_text);
-
-        if normalized_old_text.is_empty() {
-            return Err(Error::tool(
-                "edit",
-                "The old text cannot be empty. To prepend text, include the first line's content in oldText and newText.".to_string(),
-            ));
-        }
-        if build_normalized_content(&normalized_old_text).is_empty() {
-            return Err(Error::tool(
-                "edit",
-                "The old text must include at least one non-whitespace character.".to_string(),
-            ));
-        }
-
-        // Try variants of old_text to handle Unicode normalization differences (NFC vs NFD)
-        // and potential input normalization (clipboard, LLM output).
-        //
-        // Note: normalized_content is already LF-normalized but preserves Unicode form
-        // (from String::from_utf8).
-
-        let mut variants = Vec::with_capacity(3);
-        variants.push(normalized_old_text.clone());
-
-        let nfc = normalized_old_text.nfc().collect::<String>();
-        if nfc != normalized_old_text {
-            variants.push(nfc);
-        }
-
-        let nfd = normalized_old_text.nfd().collect::<String>();
-        if nfd != normalized_old_text {
-            variants.push(nfd);
-        }
-
-        // Pre-compute normalized versions once and reuse for both matching and
-        // occurrence counting (avoids 2x redundant O(n) normalization).
-        let precomputed_content = build_normalized_content(content_for_matching.as_ref());
-
-        let mut best_match: Option<(FuzzyMatchResult, String, String)> = None;
-
-        for variant in variants {
-            let precomputed_variant = build_normalized_content(&variant);
-            let match_result = fuzzy_find_text_with_normalized(
-                content_for_matching.as_ref(),
-                &variant,
-                Some(precomputed_content.as_str()),
-                Some(precomputed_variant.as_str()),
-            );
-
-            if match_result.found {
-                best_match = Some((match_result, precomputed_variant, variant));
-                break;
-            }
-        }
-
-        let Some((match_result, normalized_old_text, matched_variant)) = best_match else {
-            return Err(Error::tool(
-                "edit",
-                format!(
-                    "Could not find the exact text in {}. The old text must match exactly including all whitespace and newlines.",
-                    input.path
-                ),
-            ));
-        };
-
-        // Count occurrences in the same matching mode to avoid false ambiguity
-        // when normalized matching collapses distinct trailing whitespace.
-        let occurrences = if match_result.exact_match {
-            count_overlapping_occurrences(content_for_matching.as_ref(), &matched_variant)
-        } else {
-            count_overlapping_occurrences(&precomputed_content, &normalized_old_text)
-        };
-
-        if occurrences > 1 {
-            return Err(Error::tool(
-                "edit",
-                format!(
-                    "Found {occurrences} occurrences of the text in {}. The text must be unique. Please provide more context to make it unique.",
-                    input.path
-                ),
-            ));
-        }
-
-        // Perform replacement in the original coordinate space to preserve
-        // line endings and unmatched content exactly.
-        let idx = match_result.index;
-        let match_len = match_result.match_length;
-
-        // Adapt new_text to match the file's line endings.
-        // normalize_to_lf ensures we start from a known state (LF), then
-        // restore_line_endings converts LFs to the target ending (e.g. CRLF).
-        let adapted_new_text =
-            restore_line_endings(&normalize_to_lf(&input.new_text), original_ending);
-
-        let new_len = content_no_bom.len() - match_len + adapted_new_text.len();
-        let mut new_content = String::with_capacity(new_len);
-        new_content.push_str(&content_no_bom[..idx]);
-        new_content.push_str(&adapted_new_text);
-        new_content.push_str(&content_no_bom[idx + match_len..]);
-
-        if content_no_bom.eq(&new_content) {
-            return Err(Error::tool(
-                "edit",
-                format!(
-                    "No changes made to {}. The replacement produced identical content. This might indicate an issue with special characters or the text not existing as expected.",
-                    input.path
-                ),
-            ));
-        }
-
-        let new_content_for_diff = normalize_to_lf(&new_content);
-
-        // Re-add BOM if present.
-        let mut final_content = new_content;
-        if had_bom {
-            final_content = format!("\u{FEFF}{final_content}");
-        }
+        let source_expectation = AtomicContentExpectation::from_bytes(&raw);
+        let outcome = apply_file_text_replacement(&raw, &input, &absolute_path)?;
+        let final_content = outcome.final_content;
+        let normalized_content = outcome.before_normalized;
+        let new_content_for_diff = outcome.after_normalized;
 
         // Atomic write (safe improvement vs legacy, behavior-equivalent).
         let absolute_path_clone = absolute_path.clone();
+        // Full canonical root set (primary + /add-dir roots) so mutations in
+        // additional workspace roots are not rejected by the atomic-replace
+        // containment check.
+        let cwd_clone = self.workspace.snapshot_or(&self.cwd).all();
         let final_content_bytes = final_content.into_bytes();
-        asupersync::runtime::spawn_blocking_io(move || {
-            // Capture original permissions before the file is replaced.
-            let original_perms = std::fs::metadata(&absolute_path_clone)
-                .ok()
-                .map(|m| m.permissions());
-            let parent = absolute_path_clone
-                .parent()
-                .unwrap_or_else(|| Path::new("."));
-            let mut temp_file = tempfile::NamedTempFile::new_in(parent)?;
-
-            temp_file.as_file_mut().write_all(&final_content_bytes)?;
-            temp_file.as_file_mut().sync_all()?;
-
-            // Restore original file permissions (tempfile defaults to 0o600) before persisting.
-            if let Some(perms) = original_perms {
-                let _ = temp_file.as_file().set_permissions(perms);
-            } else {
-                // Default to 0644 (rw-r--r--) instead of tempfile's 0600 if we couldn't read original perms.
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    let _ = temp_file
-                        .as_file()
-                        .set_permissions(std::fs::Permissions::from_mode(0o644));
-                }
-            }
-
-            temp_file
-                .persist(&absolute_path_clone)
-                .map_err(|e| e.error)?;
-            sync_parent_dir(&absolute_path_clone)?;
-            Ok(())
+        let before_persist_hook = self.before_persist_hook.clone();
+        if let Some(recorder) = &self.mutation_recorder {
+            recorder
+                .begin_file(tool_call_id, "edit", &absolute_path)
+                .map_err(|error| {
+                    Error::tool("edit", format!("Cannot record undo intent: {error}"))
+                })?;
+        }
+        let persisted = asupersync::runtime::spawn_blocking_io(move || {
+            before_persist_hook.map_or_else(
+                || {
+                    atomic_replace_file_if_unchanged(
+                        &absolute_path_clone,
+                        &cwd_clone,
+                        &final_content_bytes,
+                        source_expectation,
+                    )
+                },
+                |hook| {
+                    atomic_replace_file_with(
+                        &absolute_path_clone,
+                        &cwd_clone,
+                        &final_content_bytes,
+                        Some(source_expectation),
+                        move || hook(),
+                    )
+                },
+            )
         })
         .await
-        .map_err(|e| Error::tool("edit", format!("Failed to write file: {e}")))?;
+        .map_err(|e| Error::tool("edit", format!("Failed to write file: {e}")));
+        if let Some(recorder) = &self.mutation_recorder {
+            if persisted.is_ok() {
+                recorder.commit(tool_call_id);
+            } else {
+                recorder.abort(tool_call_id);
+            }
+        }
+        persisted?;
 
         let (diff, first_changed_line) =
             generate_diff_string(&normalized_content, &new_content_for_diff);
@@ -4730,21 +13147,218 @@ struct WriteInput {
     content: String,
 }
 
+/// Compare the admitted preimage without allocating another file-sized buffer.
+/// An unreadable preimage is unknown, not evidence that a write changed bytes;
+/// write-only access must retain its existing successful execution behavior.
+fn write_content_changed(path: &Path, roots: &[PathBuf], content: &[u8]) -> Option<bool> {
+    let mut file = match open_regular_file_within_roots_with(path, roots, || {}) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Some(true),
+        Err(_) => return None,
+    };
+    if file.metadata().ok()?.len() != u64::try_from(content.len()).ok()? {
+        return Some(true);
+    }
+    let mut buffer = [0_u8; 8192];
+    let mut offset = 0;
+    while offset < content.len() {
+        let length = buffer.len().min(content.len() - offset);
+        match file.read_exact(&mut buffer[..length]) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Some(true),
+            Err(_) => return None,
+        }
+        if buffer[..length] != content[offset..offset + length] {
+            return Some(true);
+        }
+        offset += length;
+    }
+    Some(file.read(&mut buffer[..1]).ok()? != 0)
+}
+
 pub struct WriteTool {
     cwd: PathBuf,
+    output_enabled: bool,
+    text_file_client: TextFileClientScope,
+    before_persist_hook: Option<Arc<dyn Fn() + Send + Sync>>,
+    mutation_recorder: Option<Arc<crate::undo::FileMutationRecorder>>,
+    workspace: WorkspaceHandle,
 }
 
 impl WriteTool {
     pub fn new(cwd: &Path) -> Self {
         Self {
             cwd: cwd.to_path_buf(),
+            output_enabled: false,
+            text_file_client: TextFileClientScope::default(),
+            workspace: WorkspaceHandle::default(),
+            before_persist_hook: None,
+            mutation_recorder: None,
         }
     }
+
+    /// Enable the host's interim reply surface. Native child agents remain
+    /// unable to address the user even when their inherited settings opt in.
+    #[must_use]
+    pub const fn with_output_enabled(mut self, enabled: bool) -> Self {
+        self.output_enabled = enabled;
+        self
+    }
+
+    /// Attach the session workspace root handle (bd-cv653.3.12).
+    #[must_use]
+    pub fn with_workspace(mut self, workspace: WorkspaceHandle) -> Self {
+        self.workspace = workspace;
+        self
+    }
+
+    /// Attach the session's undo recorder (bd-cv653.3.13).
+    #[must_use]
+    pub fn with_mutation_recorder(
+        mut self,
+        recorder: Option<Arc<crate::undo::FileMutationRecorder>>,
+    ) -> Self {
+        self.mutation_recorder = recorder;
+        self
+    }
+
+    async fn execute_conflict_write(
+        &self,
+        tool_call_id: &str,
+        input: &serde_json::Value,
+    ) -> Result<ToolOutput> {
+        let prepared = crate::url_router::prepare_conflict_write(&self.cwd, input)?;
+        let paths = prepared.paths();
+        for path in &paths {
+            enforce_cwd_scope(path, &self.cwd, "write", &self.workspace)?;
+            let metadata = std_metadata_async(path).await.map_err(|error| {
+                Error::tool("write", format!("Cannot inspect conflict file: {error}"))
+            })?;
+            if !metadata.is_file() {
+                return Err(Error::tool(
+                    "write",
+                    "A conflict target is not a regular file",
+                ));
+            }
+            ensure_effective_mode_access(&metadata, path, UNIX_ACCESS_WRITE, "conflict resolution")
+                .map_err(|error| {
+                    Error::tool("write", format!("Cannot write conflict file: {error}"))
+                })?;
+        }
+        if let Some(hook) = &self.before_persist_hook {
+            hook();
+        }
+        // Recheck the live root set after preparation and any awaited I/O.
+        // The transaction separately checks exact preimages and path identity.
+        for path in &paths {
+            enforce_cwd_scope(path, &self.cwd, "write", &self.workspace)?;
+        }
+        if let Some(recorder) = &self.mutation_recorder {
+            for path in &paths {
+                recorder
+                    .begin_file(tool_call_id, "write", path)
+                    .map_err(|error| {
+                        Error::tool("write", format!("Cannot record undo intent: {error}"))
+                    })?;
+            }
+        }
+        let resolved = prepared.apply();
+        if let Some(recorder) = &self.mutation_recorder {
+            if resolved.is_ok() {
+                recorder.commit(tool_call_id);
+            } else {
+                recorder.abort(tool_call_id);
+            }
+        }
+        let resolved = resolved?;
+        let regions: Vec<_> = resolved
+            .regions
+            .iter()
+            .map(|region| serde_json::json!({"index": region.index, "file": region.file}))
+            .collect();
+        Ok(ToolOutput {
+            content: vec![ContentBlock::Text(TextContent::new(format!(
+                "Resolved {} conflict region(s) in {} file(s). Re-read conflict://* before resolving more regions.",
+                regions.len(),
+                paths.len()
+            )))],
+            details: Some(serde_json::json!({
+                "schema": "pi.conflict.write.v1",
+                "regions": regions,
+                "paths": paths,
+                "changedPaths": resolved.changed_paths,
+                "gitIndexUpdated": false
+            })),
+            is_error: false,
+        })
+    }
+
+    #[cfg(test)]
+    fn with_before_persist_hook(cwd: &Path, hook: impl Fn() + Send + Sync + 'static) -> Self {
+        Self {
+            cwd: cwd.to_path_buf(),
+            output_enabled: false,
+            text_file_client: TextFileClientScope::default(),
+            workspace: WorkspaceHandle::default(),
+            before_persist_hook: Some(Arc::new(hook)),
+            mutation_recorder: None,
+        }
+    }
+}
+
+/// Whether the last non-empty line is one of read's continue notices
+/// (`[Showing lines …]` or `[N more lines in file. …]`).
+fn ends_with_read_truncation_notice(content: &str) -> bool {
+    content
+        .trim_end()
+        .rsplit(['\n', '\r'])
+        .next()
+        .map(str::trim)
+        .is_some_and(|line| {
+            line.ends_with(" to continue.]")
+                && line.contains("Use offset=")
+                && (line.starts_with("[Showing lines ")
+                    || (line.starts_with('[') && line.contains(" more lines in file.")))
+        })
 }
 
 #[async_trait]
 #[allow(clippy::unnecessary_literal_bound)]
 impl Tool for WriteTool {
+    fn builtin_factory_context(&self) -> Option<(&Path, &WorkspaceHandle)> {
+        Some((&self.cwd, &self.workspace))
+    }
+
+    fn prewalk_evidence(
+        &self,
+        input: &serde_json::Value,
+        output: &ToolOutput,
+    ) -> crate::prewalk::ToolEvidence {
+        let Some(details) = &output.details else {
+            return crate::prewalk::ToolEvidence::default();
+        };
+        if details["schema"] == "pi.conflict.write.v1" {
+            return crate::prewalk::ToolEvidence::paths(
+                details["changedPaths"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(serde_json::Value::as_str),
+            );
+        }
+        if details["changed"] == true {
+            crate::prewalk::ToolEvidence::paths(
+                input.get("path").and_then(serde_json::Value::as_str),
+            )
+        } else {
+            crate::prewalk::ToolEvidence::default()
+        }
+    }
+
+    fn bind_text_file_client_scope(&mut self, scope: TextFileClientScope) {
+        self.text_file_client = scope;
+    }
+
     fn name(&self) -> &str {
         "write"
     }
@@ -4752,33 +13366,137 @@ impl Tool for WriteTool {
         "write"
     }
     fn description(&self) -> &str {
-        "Write content to a file. Creates the file if it doesn't exist, overwrites if it does. Automatically creates parent directories."
+        if self.output_enabled && !interim_response::caller_is_child() {
+            "Write content to a file, creating parent directories as needed. For .ipynb, provide complete notebook JSON; use edit or hashline_edit to modify the cell-marked view from read. Write nonempty Markdown to out:// (up to 64 KiB UTF-8) to answer the user or report progress without ending the task, then keep working; out:// never writes a file. Resolve merge conflicts using literal content at conflict://N/token or typed conflicts at conflict://*. Read conflict://* first for current indices and tokens; side views are read-only."
+        } else {
+            "Write content to a file, creating parent directories as needed. For .ipynb, provide complete notebook JSON; use edit or hashline_edit to modify the cell-marked view from read. Resolve merge conflicts using literal content at conflict://N/token or typed conflicts at conflict://*. Read conflict://* first for current indices and tokens; side views are read-only."
+        }
+    }
+
+    fn effects(&self) -> ToolEffects {
+        ToolEffects::write()
+            .union(ToolEffects::process())
+            .union(ToolEffects::network())
+    }
+
+    fn effects_for_input(&self, input: &serde_json::Value) -> ToolEffects {
+        let Some(path) = input.get("path").and_then(serde_json::Value::as_str) else {
+            return self.effects();
+        };
+        if is_interim_response_path(path) && interim_response::validated_input(input).is_ok() {
+            return ToolEffects::read();
+        }
+        if path.starts_with("conflict://") {
+            // Git inventory uses a process even though publication is local.
+            ToolEffects::write().union(ToolEffects::process())
+        } else if crate::url_router::has_scheme(path)
+            || input
+                .get("content")
+                .and_then(serde_json::Value::as_str)
+                .is_none()
+            || input.get("conflicts").is_some()
+        {
+            self.effects()
+        } else {
+            ToolEffects::write()
+        }
     }
 
     fn parameters(&self) -> serde_json::Value {
+        // Gemini's legacy parameters field accepts its OpenAPI subset.
+        // Exact envelopes and unknown-field rejection remain native checks.
+        let content = serde_json::json!({
+            "type": "string",
+            "description": "Exact content to write; always literal, including @ours or @theirs. Required except with path conflict://*; omit for a conflict batch."
+        });
+        let conflicts = serde_json::json!({
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 64,
+            "description": "Choices from one fresh conflict://* read. Valid only with path conflict://* and no content.",
+            "items": {
+                "type": "object",
+                "required": ["index", "token", "resolution"],
+                "properties": {
+                    "index": {"type": "integer", "minimum": 0},
+                    "token": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+                    "resolution": {
+                        "anyOf": [
+                            {
+                                "type": "object",
+                                "required": ["kind"],
+                                "properties": {
+                                    "kind": {"type": "string", "enum": ["ours", "theirs", "base"]}
+                                }
+                            },
+                            {
+                                "type": "object",
+                                "required": ["kind", "value"],
+                                "properties": {
+                                    "kind": {"type": "string", "enum": ["text"]},
+                                    "value": {"type": "string"}
+                                }
+                            }
+                        ]
+                    }
+                }
+            }
+        });
+        let path_description = if self.output_enabled && !interim_response::caller_is_child() {
+            "File path; out:// for a mid-task Markdown reply (no file write, maximum 64 KiB UTF-8); conflict://N/token for literal replacement, or conflict://* for typed choices"
+        } else {
+            "File path, conflict://N/token for literal replacement, or conflict://* for typed choices"
+        };
         serde_json::json!({
             "type": "object",
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Path to the file to write (relative or absolute)"
+                    "description": path_description
                 },
-                "content": {
-                    "type": "string",
-                    "description": "Content to write to the file"
-                }
+                "content": content,
+                "conflicts": conflicts
             },
-            "required": ["path", "content"]
+            "required": ["path"],
+            "anyOf": [
+                {
+                    "type": "object",
+                    "properties": {"content": content},
+                    "required": ["content"]
+                },
+                {
+                    "type": "object",
+                    "properties": {"conflicts": conflicts},
+                    "required": ["conflicts"]
+                }
+            ]
         })
     }
 
     #[allow(clippy::too_many_lines)]
     async fn execute(
         &self,
-        _tool_call_id: &str,
+        tool_call_id: &str,
         input: serde_json::Value,
-        _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+        on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
     ) -> Result<ToolOutput> {
+        if input
+            .get("path")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(is_interim_response_path)
+        {
+            return self.execute_interim_response(&input, on_update.as_deref());
+        }
+        if input
+            .get("path")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|path| path.starts_with("conflict://"))
+        {
+            return self.execute_conflict_write(tool_call_id, &input).await;
+        }
+        if input.get("conflicts").is_some() {
+            return Err(Error::validation("conflicts requires path conflict://*"));
+        }
         let input: WriteInput =
             serde_json::from_value(input).map_err(|e| Error::validation(e.to_string()))?;
 
@@ -4790,33 +13508,94 @@ impl Tool for WriteTool {
             )));
         }
 
-        let path = resolve_path(&input.path, &self.cwd);
-        let path = enforce_cwd_scope(&path, &self.cwd, "write")?;
+        // Scheme URLs route through the router — never a silent filesystem
+        // fallback (bd-cv653.6.5).
+        if crate::url_router::has_scheme(&input.path) {
+            let details = crate::url_router::ssh_write_document(&input.path, &input.content)?;
+            return Ok(ToolOutput {
+                content: vec![ContentBlock::Text(TextContent::new(format!(
+                    "Successfully wrote {} bytes to {}",
+                    input.content.len(),
+                    input.path
+                )))],
+                details: Some(details),
+                is_error: false,
+            });
+        }
 
-        if let Ok(meta) = asupersync::fs::metadata(&path).await {
-            if !meta.is_file() {
+        let path = resolve_path(&input.path, &self.cwd);
+        let path = enforce_cwd_scope(&path, &self.cwd, "write", &self.workspace)?;
+
+        if let Some(output) = self.execute_client_write(&input, &path).await? {
+            return Ok(output);
+        }
+
+        match std_metadata_async(&path).await {
+            Ok(meta) => {
+                if !meta.is_file() {
+                    return Err(Error::tool(
+                        "write",
+                        format!("Path {} is not a regular file", path.display()),
+                    ));
+                }
+                ensure_effective_mode_access(&meta, &path, UNIX_ACCESS_WRITE, "file writing")
+                    .map_err(|err| {
+                        let message = match err.kind() {
+                            std::io::ErrorKind::PermissionDenied => {
+                                format!("Permission denied: {}", input.path)
+                            }
+                            _ => format!("Failed to access file for writing: {err}"),
+                        };
+                        Error::tool("write", message)
+                    })?;
+                if let Err(err) = asupersync::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&path)
+                    .await
+                {
+                    let message = match err.kind() {
+                        std::io::ErrorKind::PermissionDenied => {
+                            format!("Permission denied: {}", input.path)
+                        }
+                        _ => format!("Failed to open file for writing: {err}"),
+                    };
+                    return Err(Error::tool("write", message));
+                }
+                // Content that ends in read's continue notice is a truncated
+                // read written back: it would cut the file to what that read
+                // showed. OMP refuses it the same way.
+                if ends_with_read_truncation_notice(&input.content)
+                    && meta.len() > u64::try_from(input.content.len()).unwrap_or(u64::MAX)
+                {
+                    return Err(Error::tool(
+                        "write",
+                        format!(
+                            "Refusing to overwrite {} with an incomplete read: the content ends with read's truncation notice and is shorter than the file, so the unread rest would be lost. Read the remaining lines and write the whole file, or use edit for a partial change.",
+                            input.path
+                        ),
+                    ));
+                }
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
                 return Err(Error::tool(
                     "write",
-                    format!("Path {} is not a regular file", path.display()),
+                    format!("Failed to access file for writing: {err}"),
                 ));
-            }
-            if let Err(err) = asupersync::fs::OpenOptions::new()
-                .write(true)
-                .open(&path)
-                .await
-            {
-                let message = match err.kind() {
-                    std::io::ErrorKind::PermissionDenied => {
-                        format!("Permission denied: {}", input.path)
-                    }
-                    _ => format!("Failed to open file for writing: {err}"),
-                };
-                return Err(Error::tool("write", message));
             }
         }
 
         // Create parent directories if needed
         if let Some(parent) = path.parent() {
+            ensure_parent_allows_creation(&path).await.map_err(|err| {
+                let message = match err.kind() {
+                    std::io::ErrorKind::PermissionDenied => {
+                        format!("Permission denied: {}", input.path)
+                    }
+                    _ => format!("Failed to access parent directory: {err}"),
+                };
+                Error::tool("write", message)
+            })?;
             asupersync::fs::create_dir_all(parent)
                 .await
                 .map_err(|e| Error::tool("write", format!("Failed to create directories: {e}")))?;
@@ -4827,44 +13606,53 @@ impl Tool for WriteTool {
 
         // Write atomically using tempfile on a blocking thread
         let path_clone = path.clone();
+        // Full canonical root set (primary + /add-dir roots) so mutations in
+        // additional workspace roots are not rejected by the atomic-replace
+        // containment check.
+        let cwd_clone = self.workspace.snapshot_or(&self.cwd).all();
         let content_bytes = input.content.into_bytes();
-        asupersync::runtime::spawn_blocking_io(move || {
-            // Capture original permissions before the file is replaced (new files get None).
-            let original_perms = std::fs::metadata(&path_clone).ok().map(|m| m.permissions());
-            let parent = path_clone.parent().unwrap_or_else(|| Path::new("."));
-            let mut temp_file = tempfile::NamedTempFile::new_in(parent)?;
-
-            temp_file.as_file_mut().write_all(&content_bytes)?;
-            temp_file.as_file_mut().sync_all()?;
-
-            // Restore original file permissions (tempfile defaults to 0o600) before persisting.
-            if let Some(perms) = original_perms {
-                let _ = temp_file.as_file().set_permissions(perms);
-            } else {
-                // New file: default to 0644 (rw-r--r--) instead of tempfile's 0600.
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    let _ = temp_file
-                        .as_file()
-                        .set_permissions(std::fs::Permissions::from_mode(0o644));
-                }
-            }
-
-            // Persist (atomic rename)
-            temp_file.persist(&path_clone).map_err(|e| e.error)?;
-            sync_parent_dir(&path_clone)?;
-            Ok(())
+        let before_persist_hook = self.before_persist_hook.clone();
+        if let Some(recorder) = &self.mutation_recorder {
+            recorder
+                .begin_file(tool_call_id, "write", &path)
+                .map_err(|error| {
+                    Error::tool("write", format!("Cannot record undo intent: {error}"))
+                })?;
+        }
+        let persisted = asupersync::runtime::spawn_blocking_io(move || {
+            let changed = write_content_changed(&path_clone, &cwd_clone, &content_bytes);
+            before_persist_hook
+                .map_or_else(
+                    || atomic_replace_file(&path_clone, &cwd_clone, &content_bytes),
+                    |hook| {
+                        atomic_replace_file_with(
+                            &path_clone,
+                            &cwd_clone,
+                            &content_bytes,
+                            None,
+                            move || hook(),
+                        )
+                    },
+                )
+                .map(|()| changed)
         })
         .await
-        .map_err(|e| Error::tool("write", format!("Failed to write file: {e}")))?;
+        .map_err(|e| Error::tool("write", format!("Failed to write file: {e}")));
+        if let Some(recorder) = &self.mutation_recorder {
+            if persisted.is_ok() {
+                recorder.commit(tool_call_id);
+            } else {
+                recorder.abort(tool_call_id);
+            }
+        }
+        let changed = persisted?;
 
         Ok(ToolOutput {
             content: vec![ContentBlock::Text(TextContent::new(format!(
                 "Successfully wrote {} bytes to {}",
                 bytes_written, input.path
             )))],
-            details: None,
+            details: Some(serde_json::json!({"changed":changed})),
             is_error: false,
         })
     }
@@ -4889,16 +13677,272 @@ struct GrepInput {
     hashline: bool,
 }
 
+const MAX_GREP_RESOURCE_PATHS: usize = 16;
+const MAX_GREP_RESOURCE_PATH_BYTES: usize = 64 * 1024;
+const MAX_GREP_RESOURCE_BYTES: usize = 10 * 1024 * 1024;
+const MAX_GREP_RESOURCE_MATCHES: usize = 10_000;
+const MAX_GREP_PATH_ENTRIES: usize = 64;
+
+/// One filesystem root plus explicit exclusions. A real filename always
+/// wins over the list syntax, including names beginning with `!` and names
+/// containing semicolons. Failed or inconclusive probes remain paths so the
+/// ordinary scoped access checks report them instead of widening the search.
+#[derive(Debug)]
+struct GrepFilesystemScope {
+    path: String,
+    exclusions: Vec<String>,
+}
+
+fn grep_path_is_missing(path: &str, cwd: &Path) -> bool {
+    let path = resolve_to_cwd(path, cwd);
+    matches!(
+        std::fs::symlink_metadata(path),
+        Err(error) if matches!(
+            error.kind(),
+            std::io::ErrorKind::NotFound
+                | std::io::ErrorKind::NotADirectory
+                | std::io::ErrorKind::InvalidFilename
+        )
+    )
+}
+
+fn grep_exclusion_glob(pattern: &str) -> Result<globset::Glob> {
+    globset::GlobBuilder::new(pattern)
+        .literal_separator(true)
+        .backslash_escape(false)
+        .build()
+        .map_err(|error| {
+            Error::tool(
+                "grep",
+                format!("[GREP_EXCLUSION] Invalid exclusion pattern: {error}"),
+            )
+        })
+}
+
+fn grep_filesystem_scope(path: Option<&str>, cwd: &Path) -> Result<GrepFilesystemScope> {
+    let path = path.unwrap_or(".");
+    let literal = || GrepFilesystemScope {
+        path: path.to_string(),
+        exclusions: Vec::new(),
+    };
+    if !path.split(';').any(|part| part.trim().starts_with('!')) {
+        return Ok(literal());
+    }
+    if path.len() > MAX_GREP_RESOURCE_PATH_BYTES {
+        return Err(Error::tool(
+            "grep",
+            "[GREP_PATH_LIMIT] Search paths exceed 64 KiB",
+        ));
+    }
+    if path.contains('\0') {
+        return Err(Error::tool(
+            "grep",
+            "[GREP_PATH_LIST] Search paths and exclusions cannot contain NUL bytes",
+        ));
+    }
+    if !grep_path_is_missing(path, cwd) {
+        return Ok(literal());
+    }
+
+    let mut root = None;
+    let mut exclusions = Vec::new();
+    for (index, entry) in path.split(';').map(str::trim).enumerate() {
+        if index >= MAX_GREP_PATH_ENTRIES {
+            return Err(Error::tool(
+                "grep",
+                "[GREP_PATH_LIMIT] Search at most 64 path/exclusion entries per call",
+            ));
+        }
+        if entry.is_empty() || crate::url_router::has_scheme(entry) {
+            return Err(Error::tool(
+                "grep",
+                "[GREP_PATH_LIST] Use one filesystem path and !glob exclusions; search resource URLs separately",
+            ));
+        }
+        if let Some(pattern) = entry.strip_prefix('!')
+            && grep_path_is_missing(entry, cwd)
+        {
+            let normalized = pattern.trim().replace('\\', "/");
+            let normalized = normalized.trim_end_matches('/');
+            if normalized.is_empty() || normalized.contains('\0') {
+                return Err(Error::tool(
+                    "grep",
+                    "[GREP_EXCLUSION] An exclusion needs a non-empty glob",
+                ));
+            }
+            // Validate even exclusions that later rebase outside the chosen
+            // root. A malformed suffix must never be silently ignored.
+            grep_exclusion_glob(normalized)?;
+            exclusions.push(normalized.to_string());
+        } else if root.replace(entry.to_string()).is_some() {
+            return Err(Error::tool(
+                "grep",
+                "[GREP_PATH_LIST] Use one filesystem root per search; separate it from exclusions with semicolons",
+            ));
+        }
+    }
+
+    Ok(GrepFilesystemScope {
+        path: root.unwrap_or_else(|| ".".to_string()),
+        exclusions,
+    })
+}
+
+/// Root-relative filters shared by permission admission, the native walker,
+/// and external ripgrep. Rebase from logical paths before entering descriptor
+/// space, so a pinned cwd cannot change slash-containing glob semantics.
+struct GrepExclusions {
+    matcher: ignore::overrides::Override,
+    rg_globs: Vec<String>,
+}
+
+impl GrepExclusions {
+    fn for_root(
+        cwd: &Path,
+        root: &Path,
+        lexical_root: &Path,
+        patterns: &[String],
+    ) -> Result<Option<Arc<Self>>> {
+        if patterns.is_empty() {
+            return Ok(None);
+        }
+        let mut builder = ignore::overrides::OverrideBuilder::new("");
+        let mut rg_globs = Vec::new();
+        for pattern in patterns {
+            let (relative, anchored) = if !pattern.contains('/') || pattern.starts_with("**") {
+                let relative = if pattern.contains('/') {
+                    pattern.clone()
+                } else {
+                    format!("**/{pattern}")
+                };
+                (relative, false)
+            } else {
+                let target = normalize_dot_segments(&resolve_to_cwd(pattern, cwd));
+                let Ok(relative) = target
+                    .strip_prefix(lexical_root)
+                    .or_else(|_| target.strip_prefix(root))
+                else {
+                    continue;
+                };
+                // Explicit roots are always searched, even when named by an
+                // exclusion. Only their descendants can be filtered out.
+                if relative.as_os_str().is_empty() {
+                    continue;
+                }
+                let relative = relative.to_str().ok_or_else(|| {
+                    Error::tool("grep", "[GREP_EXCLUSION] Exclusion path is not UTF-8")
+                })?;
+                (relative.replace('\\', "/"), true)
+            };
+            let rg_glob = if anchored {
+                format!("!/{relative}")
+            } else {
+                format!("!{relative}")
+            };
+            builder.add(&rg_glob).map_err(|error| {
+                Error::tool(
+                    "grep",
+                    format!("[GREP_EXCLUSION] Invalid exclusion: {error}"),
+                )
+            })?;
+            rg_globs.push(rg_glob);
+        }
+        let matcher = builder.build().map_err(|error| {
+            Error::tool(
+                "grep",
+                format!("[GREP_EXCLUSION] Invalid exclusions: {error}"),
+            )
+        })?;
+        Ok(Some(Arc::new(Self { matcher, rg_globs })))
+    }
+
+    fn excludes(&self, relative: &Path) -> bool {
+        relative
+            .ancestors()
+            .take_while(|path| !path.as_os_str().is_empty())
+            .any(|path| self.matcher.matched(path, false).is_ignore())
+    }
+}
+
+/// Internal URL operands have their own semicolon-list syntax. A semicolon
+/// in an HTTP URL keeps its normal meaning. Validate the complete URL list
+/// before resolving anything, so a malformed suffix cannot be skipped.
+fn grep_resource_paths(path: Option<&str>) -> Result<Option<Vec<&str>>> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    if !crate::url_router::has_scheme(path) {
+        return Ok(None);
+    }
+    if path.len() > MAX_GREP_RESOURCE_PATH_BYTES {
+        return Err(Error::tool(
+            "grep",
+            "[GREP_RESOURCE_PATH_LIMIT] Resource paths exceed 64 KiB",
+        ));
+    }
+    if path.starts_with("http://") || path.starts_with("https://") {
+        return Ok(Some(vec![path]));
+    }
+    let paths: Vec<_> = path.split(';').map(str::trim).collect();
+    if paths.len() > MAX_GREP_RESOURCE_PATHS {
+        return Err(Error::tool(
+            "grep",
+            format!(
+                "[GREP_RESOURCE_COUNT] Search at most {MAX_GREP_RESOURCE_PATHS} internal URLs per call"
+            ),
+        ));
+    }
+    if paths.iter().any(|path| {
+        !crate::url_router::has_scheme(path)
+            || path.starts_with("http://")
+            || path.starts_with("https://")
+    }) {
+        return Err(Error::tool(
+            "grep",
+            "[GREP_RESOURCE_LIST] Separate internal URLs with semicolons; search HTTP URLs and filesystem paths in separate calls",
+        ));
+    }
+    Ok(Some(paths))
+}
+
 pub struct GrepTool {
     cwd: PathBuf,
     artifact_root: Option<PathBuf>,
+    backend: SearchBackend,
+    allow_private_urls: bool,
+    workspace: WorkspaceHandle,
+    #[cfg(test)]
+    after_scope_hook: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl GrepTool {
     pub fn new(cwd: &Path) -> Self {
+        Self::with_backend(cwd, SearchBackend::default())
+    }
+
+    /// Attach the session workspace root handle (bd-cv653.3.12).
+    #[must_use]
+    pub fn with_workspace(mut self, workspace: WorkspaceHandle) -> Self {
+        self.workspace = workspace;
+        self
+    }
+
+    /// Apply the same explicit private-target override used by URL reads.
+    #[must_use]
+    pub const fn with_url_policy(mut self, allow_private_urls: bool) -> Self {
+        self.allow_private_urls = allow_private_urls;
+        self
+    }
+
+    pub(crate) fn with_backend(cwd: &Path, backend: SearchBackend) -> Self {
         Self {
             cwd: cwd.to_path_buf(),
             artifact_root: None,
+            backend,
+            allow_private_urls: false,
+            workspace: WorkspaceHandle::default(),
+            #[cfg(test)]
+            after_scope_hook: None,
         }
     }
 
@@ -4907,8 +13951,368 @@ impl GrepTool {
         Self {
             cwd: cwd.to_path_buf(),
             artifact_root: Some(artifact_root.to_path_buf()),
+            backend: SearchBackend::default(),
+            allow_private_urls: false,
+            workspace: WorkspaceHandle::default(),
+            after_scope_hook: None,
         }
     }
+
+    #[cfg(test)]
+    fn with_after_scope_hook(
+        cwd: &Path,
+        after_scope_hook: impl Fn() + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            cwd: cwd.to_path_buf(),
+            artifact_root: None,
+            backend: SearchBackend::default(),
+            allow_private_urls: false,
+            workspace: WorkspaceHandle::default(),
+            after_scope_hook: Some(Arc::new(after_scope_hook)),
+        }
+    }
+
+    /// Resolve through the same admitted document surfaces as ReadTool. The
+    /// worker retains the caller's restricted context and cancellation budget;
+    /// agent results still use the authenticated immediate-parent resolver.
+    async fn resolve_grep_resource(&self, path: &str) -> Result<GrepResource> {
+        let owner = AgentCx::for_current_or_request();
+        owner
+            .checkpoint()
+            .map_err(|_| Error::tool("grep", "Command cancelled"))?;
+        let process_backed = matches!(
+            path.split_once("://").map(|(scheme, _)| scheme),
+            Some("pr" | "issue" | "ssh" | "conflict")
+        );
+        let capabilities = owner.capabilities();
+        if !capabilities.io || (process_backed && !capabilities.spawn) {
+            return Err(Error::tool(
+                "grep",
+                "[GREP_RESOURCE_PERMISSION] Resource searches require I/O authority; process-backed documents also require spawn authority",
+            ));
+        }
+        if path.starts_with("http://") || path.starts_with("https://") {
+            let (url, mode) = path
+                .strip_suffix(":raw")
+                .map_or((path, crate::url_read::UrlReadMode::Reader), |url| {
+                    (url, crate::url_read::UrlReadMode::Raw)
+                });
+            let policy = if self.allow_private_urls {
+                crate::url_read::SsrfPolicy::AllowPrivateTargets
+            } else {
+                crate::url_read::SsrfPolicy::BlockPrivateTargets
+            };
+            let outcome = crate::url_read::fetch(url, policy, mode).await?;
+            return Ok(GrepResource {
+                content: outcome.content,
+                details: serde_json::json!({
+                    "path": path,
+                    "url": outcome.final_url,
+                    "contentType": outcome.kind.as_str(),
+                    "extractor": outcome.extractor,
+                    "sourceTruncated": outcome.download_truncated,
+                }),
+                source_truncated: outcome.download_truncated,
+            });
+        }
+        let path_owned = path.to_string();
+        let cwd = self.cwd.clone();
+        let resolved = asupersync::runtime::spawn_blocking(move || {
+            let _guard = owner.cx().clone().set_current_restricted();
+            owner
+                .checkpoint()
+                .map_err(|_| Error::tool("grep", "Command cancelled"))?;
+            crate::url_router::resolve(&path_owned, &cwd)
+        })
+        .await?;
+        let source_truncated = resolved
+            .metadata
+            .get("truncated")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+            || resolved
+                .metadata
+                .get("cappedAt")
+                .and_then(serde_json::Value::as_u64)
+                .is_some_and(|cap| resolved.content.len() as u64 >= cap);
+        Ok(GrepResource {
+            content: resolved.content,
+            details: serde_json::json!({
+                "path": path,
+                "scheme": resolved.scheme,
+                "reference": resolved.reference,
+                "contentType": resolved.content_type,
+                "sourceTruncated": source_truncated,
+            }),
+            source_truncated,
+        })
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn execute_resource_grep(
+        &self,
+        tool_call_id: &str,
+        input: &GrepInput,
+        paths: &[&str],
+    ) -> Result<ToolOutput> {
+        if input.hashline {
+            return Err(Error::tool(
+                "grep",
+                "[DOCUMENT_HASHLINE] Virtual document lines are search locations, not source edit anchors; save source text locally before using hashline edits",
+            ));
+        }
+        if input.glob.is_some() {
+            return Err(Error::tool(
+                "grep",
+                "[GREP_RESOURCE_GLOB] glob applies to filesystem searches; select the internal document or URL directly",
+            ));
+        }
+        let effective_limit = input.limit.unwrap_or(DEFAULT_GREP_LIMIT);
+        if effective_limit > MAX_GREP_RESOURCE_MATCHES {
+            return Err(Error::tool(
+                "grep",
+                format!(
+                    "[GREP_RESOURCE_MATCH_LIMIT] Resource searches support at most {MAX_GREP_RESOURCE_MATCHES} matches; narrow the pattern or resource list"
+                ),
+            ));
+        }
+        let pattern = if input.literal.unwrap_or(false) {
+            regex::escape(&input.pattern)
+        } else {
+            input.pattern.clone()
+        };
+        // Compile before doing network or subprocess work.
+        let matcher = Arc::new(
+            grep_regex::RegexMatcherBuilder::new()
+                .case_insensitive(input.ignore_case.unwrap_or(false))
+                .build(&pattern)
+                .map_err(|error| Error::tool("grep", format!("regex parse error: {error}")))?,
+        );
+        let mut output_builder = HeadTruncatingLineWriter::new(DEFAULT_MAX_BYTES);
+        let mut artifact_source = String::new();
+        let mut resources = Vec::new();
+        let mut match_count = 0usize;
+        let mut match_limit_reached = false;
+        let mut lines_truncated = false;
+        let mut source_truncated = false;
+        let owner = AgentCx::for_current_or_request();
+
+        for path in paths {
+            owner
+                .checkpoint()
+                .map_err(|_| Error::tool("grep", "Command cancelled"))?;
+            let mut resource = self.resolve_grep_resource(path).await?;
+            if resource.content.len() > MAX_GREP_RESOURCE_BYTES {
+                return Err(Error::tool(
+                    "grep",
+                    "[GREP_RESOURCE_BYTES] A resource exceeds the 10 MiB search limit; select a smaller document or agent JSON field",
+                ));
+            }
+            source_truncated |= resource.source_truncated;
+            let scan_limit = effective_limit
+                .saturating_sub(match_count)
+                .saturating_add(1);
+            let scan_matcher = Arc::clone(&matcher);
+            let scan_owner = owner.clone();
+            let (content, mut match_lines) = asupersync::runtime::spawn_blocking(move || {
+                grep_resource_match_lines(resource.content, &scan_matcher, scan_limit, &scan_owner)
+            })
+            .await?;
+            let remaining = effective_limit.saturating_sub(match_count);
+            if match_lines.len() > remaining {
+                match_limit_reached = true;
+                match_lines.truncate(remaining);
+            }
+            match_count += match_lines.len();
+            let total_lines = content.lines().count();
+            resource.details["totalLines"] = serde_json::json!(total_lines);
+            resource.details["matches"] = serde_json::json!(match_lines.len());
+            resources.push(resource.details);
+            lines_truncated |= render_grep_resource(
+                path,
+                &content,
+                &match_lines,
+                input.context.unwrap_or(0),
+                total_lines,
+                &owner,
+                &mut output_builder,
+                &mut artifact_source,
+            )?;
+            if match_limit_reached {
+                break;
+            }
+        }
+
+        owner
+            .checkpoint()
+            .map_err(|_| Error::tool("grep", "Command cancelled"))?;
+        let mut truncation = output_builder.finish();
+        let mut output = if match_count == 0 {
+            "No matches found".to_string()
+        } else {
+            std::mem::take(&mut truncation.content)
+        };
+        let skipped = paths.len().saturating_sub(resources.len());
+        let mut details = serde_json::json!({
+            "resources": resources,
+            "matches": match_count,
+            "resourcesSkipped": skipped,
+        });
+        let mut notices = Vec::new();
+        if match_limit_reached {
+            details["matchLimitReached"] = serde_json::json!(effective_limit);
+            notices.push(format!(
+                "{effective_limit} matches limit reached. Increase limit or refine pattern"
+            ));
+        }
+        if skipped > 0 {
+            notices.push(format!(
+                "{skipped} remaining resources were not searched after the match limit"
+            ));
+        }
+        if truncation.truncated {
+            notices.push(format!("{} limit reached", format_size(DEFAULT_MAX_BYTES)));
+            details["truncation"] = serde_json::to_value(truncation)?;
+        }
+        if lines_truncated {
+            details["linesTruncated"] = serde_json::json!(true);
+            notices.push(format!(
+                "Some lines truncated to {GREP_MAX_LINE_LENGTH} chars. Use read tool to see full lines"
+            ));
+        }
+        if source_truncated {
+            notices.push("A source document was truncated by its resolver; unreturned source content was not searched".to_string());
+        }
+        if !notices.is_empty() {
+            let _ = write!(output, "\n\n[{}]", notices.join(". "));
+        }
+        let mut details = Some(details);
+        attach_text_artifact_if_needed_with_root(
+            self.artifact_root.as_deref(),
+            &mut output,
+            &mut details,
+            "grep",
+            tool_call_id,
+            "searchResults",
+            &artifact_source,
+        );
+        Ok(ToolOutput {
+            content: vec![ContentBlock::Text(TextContent::new(output))],
+            details,
+            is_error: false,
+        })
+    }
+}
+
+struct GrepResource {
+    content: String,
+    details: serde_json::Value,
+    source_truncated: bool,
+}
+
+fn grep_resource_match_lines(
+    content: String,
+    matcher: &grep_regex::RegexMatcher,
+    scan_limit: usize,
+    owner: &AgentCx,
+) -> Result<(String, Vec<usize>)> {
+    use grep_searcher::{BinaryDetection, SearcherBuilder, sinks};
+
+    owner
+        .checkpoint()
+        .map_err(|_| Error::tool("grep", "Command cancelled"))?;
+    let mut matches = Vec::new();
+    SearcherBuilder::new()
+        .line_number(true)
+        // These are already decoded, size-bounded documents. Binary file
+        // heuristics must not hide later matches in a JSON string or raw URL.
+        .binary_detection(BinaryDetection::none())
+        .bom_sniffing(false)
+        .build()
+        .search_reader(
+            matcher,
+            content.as_bytes(),
+            sinks::UTF8(|line_number, _| {
+                if owner.checkpoint().is_err() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Interrupted,
+                        "scan cancelled",
+                    ));
+                }
+                let line_number = usize::try_from(line_number)
+                    .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+                matches.push(line_number);
+                Ok(matches.len() < scan_limit)
+            }),
+        )
+        .map_err(|error| Error::tool("grep", error_for_line_output(&error)))?;
+    owner
+        .checkpoint()
+        .map_err(|_| Error::tool("grep", "Command cancelled"))?;
+    Ok((content, matches))
+}
+
+/// Render context by walking the document once. Do not allocate a reference
+/// per source line: small newline-only documents can contain millions of them.
+#[allow(clippy::too_many_arguments)]
+fn render_grep_resource(
+    path: &str,
+    content: &str,
+    matches: &[usize],
+    context: usize,
+    total_lines: usize,
+    owner: &AgentCx,
+    output: &mut HeadTruncatingLineWriter,
+    artifact: &mut String,
+) -> Result<bool> {
+    let mut blocks: Vec<(usize, usize)> = Vec::new();
+    for &line in matches {
+        let start = line.saturating_sub(context).max(1);
+        let end = line.saturating_add(context).min(total_lines);
+        if let Some(last) = blocks.last_mut()
+            && start <= last.1.saturating_add(1)
+        {
+            last.1 = last.1.max(end);
+        } else {
+            blocks.push((start, end));
+        }
+    }
+    let path = escape_bytes_for_line_output(path.as_bytes());
+    let mut block = 0;
+    let mut lines_truncated = false;
+    for (index, line) in content.lines().enumerate() {
+        if index % 1024 == 0 {
+            owner
+                .checkpoint()
+                .map_err(|_| Error::tool("grep", "Command cancelled"))?;
+        }
+        let current = index + 1;
+        while blocks.get(block).is_some_and(|(_, end)| current > *end) {
+            block += 1;
+        }
+        let Some(&(start, _)) = blocks.get(block) else {
+            break;
+        };
+        if current < start {
+            continue;
+        }
+        if block > 0 && current == start {
+            output.push_line("--");
+            append_artifact_source_line(artifact, "--");
+        }
+        let sanitized = line.replace('\r', "");
+        let truncated = truncate_line(&sanitized, GREP_MAX_LINE_LENGTH);
+        lines_truncated |= truncated.was_truncated;
+        let line = if matches.binary_search(&current).is_ok() {
+            format!("{path}:{current}: {}", truncated.text)
+        } else {
+            format!("{path}-{current}- {}", truncated.text)
+        };
+        output.push_line(&line);
+        append_artifact_source_line(artifact, &line);
+    }
+    Ok(lines_truncated)
 }
 
 /// Result of truncating a single grep output line.
@@ -4937,73 +14341,436 @@ fn truncate_line(line: &str, max_chars: usize) -> TruncateLineResult {
     }
 }
 
+fn path_from_rg_json(event: &serde_json::Value) -> Result<PathBuf> {
+    if let Some(path) = event
+        .pointer("/data/path/text")
+        .and_then(serde_json::Value::as_str)
+    {
+        return Ok(PathBuf::from(path));
+    }
+
+    let encoded = event
+        .pointer("/data/path/bytes")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            Error::tool(
+                "grep",
+                "ripgrep match event is missing path.text and path.bytes",
+            )
+        })?;
+    let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, encoded)
+        .map_err(|error| {
+            Error::tool(
+                "grep",
+                format!(
+                    "ripgrep match event has invalid path.bytes base64: {}",
+                    error_for_line_output(&error)
+                ),
+            )
+        })?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt as _;
+        Ok(PathBuf::from(OsString::from_vec(bytes)))
+    }
+
+    #[cfg(not(unix))]
+    String::from_utf8(bytes)
+        .map(PathBuf::from)
+        .map_err(|error| {
+            Error::tool(
+                "grep",
+                format!(
+                    "ripgrep match event has non-UTF-8 path.bytes on this platform: {}",
+                    error_for_line_output(&error)
+                ),
+            )
+        })
+}
+
 fn process_rg_json_match_line(
     line_res: std::io::Result<String>,
     matches: &mut Vec<(PathBuf, usize)>,
     match_count: &mut usize,
     match_limit_reached: &mut bool,
     scan_limit: usize,
-) {
+) -> Result<()> {
+    process_rg_json_match_line_with_filter(
+        line_res,
+        None,
+        None,
+        None,
+        None,
+        matches,
+        match_count,
+        match_limit_reached,
+        scan_limit,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn process_rg_json_match_line_with_filter(
+    line_res: std::io::Result<String>,
+    scoped_root: Option<&ScopedScanRoot>,
+    glob_override: Option<&ignore::overrides::Override>,
+    workspace_ignore: Option<&ignore::gitignore::Gitignore>,
+    exclusions: Option<&GrepExclusions>,
+    matches: &mut Vec<(PathBuf, usize)>,
+    match_count: &mut usize,
+    match_limit_reached: &mut bool,
+    scan_limit: usize,
+) -> Result<()> {
     if *match_limit_reached {
-        return;
+        return Ok(());
     }
 
     let line = match line_res {
         Ok(l) => l,
         Err(e) => {
-            tracing::debug!("Skipping ripgrep output line due to read error: {e}");
-            return;
+            return Err(Error::tool(
+                "grep",
+                format!(
+                    "Failed to read ripgrep JSON output: {}",
+                    error_for_line_output(&e)
+                ),
+            ));
         }
     };
     if line.trim().is_empty() {
-        return;
+        return Ok(());
     }
 
-    let Ok(event) = serde_json::from_str::<serde_json::Value>(&line) else {
-        return;
-    };
+    let event = serde_json::from_str::<serde_json::Value>(&line).map_err(|error| {
+        Error::tool(
+            "grep",
+            format!(
+                "Invalid ripgrep JSON output: {}",
+                error_for_line_output(&error)
+            ),
+        )
+    })?;
 
     if event.get("type").and_then(serde_json::Value::as_str) != Some("match") {
-        return;
+        return Ok(());
     }
 
-    let file_path = event
-        .pointer("/data/path/text")
-        .and_then(serde_json::Value::as_str)
-        .map(PathBuf::from);
+    let file_path = path_from_rg_json(&event)?;
+    if let Some(scoped_root) = scoped_root
+        && (glob_override.is_some() || workspace_ignore.is_some() || exclusions.is_some())
+    {
+        let mapped = scoped_root.map_child_output(&file_path).map_err(|error| {
+            Error::tool(
+                "grep",
+                format!(
+                    "ripgrep returned an invalid path: {}",
+                    error_for_line_output(&error)
+                ),
+            )
+        })?;
+        if let Some(glob_override) = glob_override
+            && glob_override
+                .matched(&mapped.logical_path, false)
+                .is_ignore()
+        {
+            return Ok(());
+        }
+        if let Some(workspace_ignore) = workspace_ignore
+            && workspace_ignore
+                .matched_path_or_any_parents(&mapped.logical_path, false)
+                .is_ignore()
+        {
+            return Ok(());
+        }
+        if let Some(exclusions) = exclusions
+            && let Ok(relative) = mapped.logical_path.strip_prefix(scoped_root.logical_path())
+            && exclusions.excludes(relative)
+        {
+            return Ok(());
+        }
+    }
     let line_number = event
         .pointer("/data/line_number")
         .and_then(serde_json::Value::as_u64)
-        .and_then(|n| usize::try_from(n).ok());
+        .and_then(|n| usize::try_from(n).ok())
+        .filter(|line_number| *line_number > 0)
+        .ok_or_else(|| Error::tool("grep", "ripgrep match event is missing a valid line_number"))?;
 
-    if let (Some(fp), Some(ln)) = (file_path, line_number) {
-        matches.push((fp, ln));
-        *match_count += 1;
-        if *match_count >= scan_limit {
-            *match_limit_reached = true;
-        }
+    matches.push((file_path, line_number));
+    *match_count += 1;
+    if *match_count >= scan_limit {
+        *match_limit_reached = true;
     }
+    Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn drain_rg_stdout(
     stdout_rx: &std::sync::mpsc::Receiver<std::io::Result<String>>,
+    scoped_root: &ScopedScanRoot,
+    glob_override: Option<&ignore::overrides::Override>,
+    workspace_ignore: Option<&ignore::gitignore::Gitignore>,
+    exclusions: Option<&GrepExclusions>,
     matches: &mut Vec<(PathBuf, usize)>,
     match_count: &mut usize,
     match_limit_reached: &mut bool,
     scan_limit: usize,
-) {
+) -> Result<()> {
     while let Ok(line_res) = stdout_rx.try_recv() {
-        process_rg_json_match_line(
+        process_rg_json_match_line_with_filter(
             line_res,
+            Some(scoped_root),
+            glob_override,
+            workspace_ignore,
+            exclusions,
             matches,
             match_count,
             match_limit_reached,
             scan_limit,
-        );
+        )?;
         if *match_limit_reached {
             break;
         }
     }
+    Ok(())
+}
+
+/// Build a gitignore matcher for the workspace root's `.gitignore`, applied
+/// to scanner results as a post-filter.
+///
+/// External scanners run from the pinned scan root with `--no-ignore-parent`,
+/// so a workspace-root `.gitignore` above the scan root is invisible to their
+/// native discovery. Passing it via `--ignore-file` does not work either:
+/// rg/fd anchor such patterns to the scanner's working directory, so rules
+/// like `subdir/file.txt` written relative to the workspace root can never
+/// match while scanning inside `subdir`. Matching mapped logical result paths
+/// against a matcher rooted at the workspace keeps the workspace-relative
+/// anchoring the rules were written for.
+fn build_workspace_ignore_matcher(
+    cwd_scope: &ScopedScanRoot,
+) -> Option<ignore::gitignore::Gitignore> {
+    let workspace_root = cwd_scope.logical_path();
+    // Read rule content through the pinned io-space path so a concurrent
+    // workspace-root swap cannot inject attacker-controlled ignore rules,
+    // while anchoring the patterns at the logical root they were written for.
+    let pinned_gitignore = cwd_scope.io_path().join(".gitignore");
+    let content = std::fs::read_to_string(pinned_gitignore).ok()?;
+    let logical_gitignore = workspace_root.join(".gitignore");
+    let mut builder = ignore::gitignore::GitignoreBuilder::new(workspace_root);
+    for line in content.lines() {
+        let _ = builder.add_line(Some(logical_gitignore.clone()), line);
+    }
+    builder.build().ok()
+}
+
+/// Result of an in-process grep scan, handing the pinned roots and filters
+/// back to the async caller alongside the collected matches.
+struct InprocGrepScan {
+    scoped_root: ScopedScanRoot,
+    glob_override: Option<ignore::overrides::Override>,
+    workspace_ignore: Option<ignore::gitignore::Gitignore>,
+    matches: Vec<(PathBuf, usize)>,
+    match_count: usize,
+    limit_reached: bool,
+}
+
+/// In-process `grep` backend (bd-cv653.1.5): search with the engines ripgrep
+/// is built from (`grep-regex` matcher + `grep-searcher`), walking the pinned
+/// scan root with the same ignore surface the external `rg` invocation
+/// consumed. Result-path filters (glob + workspace gitignore) are applied per
+/// candidate file before its contents are searched — both are path-level, so
+/// this yields exactly the per-match filtering of the external drain path.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn grep_inproc_scan_sync(
+    scoped_root: ScopedScanRoot,
+    glob_override: Option<ignore::overrides::Override>,
+    workspace_ignore: Option<ignore::gitignore::Gitignore>,
+    exclusions: Option<Arc<GrepExclusions>>,
+    include_workspace_ignore: bool,
+    operation_cwd: &Path,
+    is_directory: bool,
+    pattern: &str,
+    ignore_case: bool,
+    literal: bool,
+    scan_limit: usize,
+    cancelled: &std::sync::atomic::AtomicBool,
+) -> std::io::Result<InprocGrepScan> {
+    use grep_searcher::{BinaryDetection, SearcherBuilder, sinks};
+
+    let pattern_for_matcher = if literal {
+        regex::escape(pattern)
+    } else {
+        pattern.to_string()
+    };
+    let matcher = grep_regex::RegexMatcherBuilder::new()
+        .case_insensitive(ignore_case)
+        .build(&pattern_for_matcher)
+        .map_err(|err| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("regex parse error: {err}"),
+            )
+        })?;
+    let mut searcher = SearcherBuilder::new()
+        .line_number(true)
+        // rg's default binary handling: stop searching a file at the first
+        // NUL byte.
+        .binary_detection(BinaryDetection::quit(0))
+        .build();
+
+    let mut matches: Vec<(PathBuf, usize)> = Vec::new();
+    let mut match_count: usize = 0;
+    let mut limit_reached = false;
+
+    if is_directory {
+        let scan_root = scoped_root.io_path();
+        let global_git_ignore = resolved_global_git_ignore_for_scan(operation_cwd)?;
+        let mut builder = recursive_scan_walk_builder(
+            &scan_root,
+            operation_cwd,
+            RecursiveScanAccess::ReadableFiles,
+            None,
+            global_git_ignore.as_deref(),
+            include_workspace_ignore,
+        )?;
+        if let Some(exclusions) = exclusions {
+            let exclusion_root = scan_root.clone();
+            builder.filter_entry(move |entry| {
+                !entry
+                    .path()
+                    .strip_prefix(&exclusion_root)
+                    .is_ok_and(|relative| exclusions.excludes(relative))
+            });
+        }
+        'walk: for entry in builder.build() {
+            if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "scan cancelled",
+                ));
+            }
+            let entry = match entry {
+                Ok(entry) => entry,
+                // rg reports unreadable entries on stderr and keeps
+                // searching; the permission preflight already failed closed
+                // on anything the effective mode model forbids.
+                Err(err) => {
+                    tracing::debug!("in-process grep skipped an unreadable entry: {err}");
+                    continue;
+                }
+            };
+            if !entry
+                .file_type()
+                .is_some_and(|file_type| file_type.is_file())
+            {
+                continue;
+            }
+            let path = entry.path();
+            let Ok(relative) = path.strip_prefix(&scan_root) else {
+                continue;
+            };
+            let relative = relative.to_path_buf();
+            if glob_override.is_some() || workspace_ignore.is_some() {
+                let Ok(mapped) = scoped_root.map_child_output(&relative) else {
+                    continue;
+                };
+                if let Some(glob_override) = glob_override.as_ref()
+                    && glob_override
+                        .matched(&mapped.logical_path, false)
+                        .is_ignore()
+                {
+                    continue;
+                }
+                if let Some(workspace_ignore) = workspace_ignore.as_ref()
+                    && workspace_ignore
+                        .matched_path_or_any_parents(&mapped.logical_path, false)
+                        .is_ignore()
+                {
+                    continue;
+                }
+            }
+            let mut file_hit_limit = false;
+            let search = searcher.search_path(
+                &matcher,
+                path,
+                sinks::Lossy(|line_number, _line| {
+                    matches.push((
+                        relative.clone(),
+                        usize::try_from(line_number).unwrap_or(usize::MAX),
+                    ));
+                    match_count += 1;
+                    if match_count >= scan_limit {
+                        file_hit_limit = true;
+                        Ok(false)
+                    } else {
+                        Ok(true)
+                    }
+                }),
+            );
+            if let Err(err) = search {
+                tracing::debug!(
+                    "in-process grep skipped an unreadable file {}: {err}",
+                    path_for_line_output(path)
+                );
+            }
+            if file_hit_limit {
+                limit_reached = true;
+                break 'walk;
+            }
+        }
+    } else {
+        // Pinned regular file: search the held descriptor itself (dup'd, so
+        // the parent's handle keeps an untouched offset) — a post-pin
+        // rename/symlink swap cannot redirect the search.
+        let sink = sinks::Lossy(|line_number, _line| {
+            matches.push((
+                PathBuf::new(),
+                usize::try_from(line_number).unwrap_or(usize::MAX),
+            ));
+            match_count += 1;
+            if match_count >= scan_limit {
+                limit_reached = true;
+                Ok(false)
+            } else {
+                Ok(true)
+            }
+        });
+        #[cfg(unix)]
+        {
+            let handle = scoped_root.handle.try_clone()?;
+            searcher.search_reader(&matcher, handle, sink)?;
+        }
+        // Windows pins parent components rather than the file itself; the
+        // logical-path read matches the platform's established posture.
+        #[cfg(not(unix))]
+        searcher.search_path(&matcher, scoped_root.logical_path(), sink)?;
+    }
+
+    Ok(InprocGrepScan {
+        scoped_root,
+        glob_override,
+        workspace_ignore,
+        matches,
+        match_count,
+        limit_reached,
+    })
+}
+
+fn build_grep_glob_override(
+    cwd: &Path,
+    glob: Option<&str>,
+) -> Result<Option<ignore::overrides::Override>> {
+    let Some(glob) = glob else {
+        return Ok(None);
+    };
+    let mut builder = ignore::overrides::OverrideBuilder::new(cwd);
+    builder
+        .add(glob)
+        .map_err(|error| Error::tool("grep", error_for_line_output(&error)))?;
+    builder
+        .build()
+        .map(Some)
+        .map_err(|error| Error::tool("grep", error_for_line_output(&error)))
 }
 
 fn drain_rg_stderr(
@@ -5011,16 +14778,45 @@ fn drain_rg_stderr(
     stderr_bytes: &mut Vec<u8>,
 ) -> Result<()> {
     while let Ok(chunk_result) = stderr_rx.try_recv() {
-        let chunk = chunk_result
-            .map_err(|err| Error::tool("grep", format!("Failed to read stderr: {err}")))?;
+        let chunk = chunk_result.map_err(|err| {
+            Error::tool(
+                "grep",
+                format!("Failed to read stderr: {}", error_for_line_output(&err)),
+            )
+        })?;
         stderr_bytes.extend_from_slice(&chunk);
     }
     Ok(())
 }
 
+fn rg_exit_failure(status: std::process::ExitStatus, stderr: &str) -> Option<String> {
+    if matches!(status.code(), Some(0 | 1)) {
+        return None;
+    }
+    if !stderr.is_empty() {
+        return Some(stderr.to_string());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt as _;
+
+        if let Some(signal) = status.signal() {
+            return Some(format!("ripgrep terminated by signal {signal}"));
+        }
+    }
+    Some(status.code().map_or_else(
+        || "ripgrep terminated without an exit code".to_string(),
+        |code| format!("ripgrep exited with code {code}"),
+    ))
+}
+
 #[async_trait]
 #[allow(clippy::unnecessary_literal_bound)]
 impl Tool for GrepTool {
+    fn builtin_factory_context(&self) -> Option<(&Path, &WorkspaceHandle)> {
+        Some((&self.cwd, &self.workspace))
+    }
+
     fn name(&self) -> &str {
         "grep"
     }
@@ -5028,7 +14824,7 @@ impl Tool for GrepTool {
         "grep"
     }
     fn description(&self) -> &str {
-        "Search file contents for a pattern. Returns matching lines with file paths and line numbers. Respects .gitignore. Output is truncated to 100 matches or 1MB (whichever is hit first). Long lines are truncated to 500 chars. Use hashline=true to get N#AB content-hash tags for use with hashline_edit."
+        "Search files, internal documents (agent://, skill://, local://, pr://, and other read URLs), or an HTTP(S) URL for a pattern. Separate up to 16 internal URLs with semicolons. For files, use one root plus !glob exclusions, e.g. 'src;!*.test.ts' or '.;!vendor;!gen'; exclusions prune files and directories below that root. HTTP URLs use reader text; append :raw for source. Returns matching lines with source paths and line numbers. Filesystem searches respect .gitignore. Output defaults to 100 matches or 1MB; long lines are truncated to 500 chars. Use hashline=true for filesystem edit anchors only."
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -5041,7 +14837,7 @@ impl Tool for GrepTool {
                 },
                 "path": {
                     "type": "string",
-                    "description": "Directory or file to search (default: current directory)"
+                    "description": "Directory/file (default: current directory), optionally followed by ;!glob exclusions. Bare !vendor matches anywhere below the root; !src/legacy is relative to cwd. Only exclusions imply cwd. Existing filenames stay literal. Alternatively, internal document URLs separated by semicolons, or one HTTP(S) URL (optional :raw suffix)."
                 },
                 "glob": {
                     "type": "string",
@@ -5061,7 +14857,7 @@ impl Tool for GrepTool {
                 },
                 "limit": {
                     "type": "integer",
-                    "description": "Maximum number of matches to return (default: 100)"
+                    "description": "Maximum number of matches to return across all sources (default: 100; at most 10000 for resource URLs)"
                 },
                 "hashline": {
                     "type": "boolean",
@@ -5074,6 +14870,41 @@ impl Tool for GrepTool {
 
     fn effects(&self) -> ToolEffects {
         ToolEffects::read()
+            .union(ToolEffects::network())
+            .union(ToolEffects::process())
+    }
+
+    fn effects_for_input(&self, input: &serde_json::Value) -> ToolEffects {
+        let Ok(input) = serde_json::from_value::<GrepInput>(input.clone()) else {
+            return self.effects();
+        };
+        let paths = match grep_resource_paths(input.path.as_deref()) {
+            Ok(Some(paths)) => paths,
+            Ok(None) => {
+                return if self.backend == SearchBackend::External {
+                    ToolEffects::read().union(ToolEffects::process())
+                } else {
+                    ToolEffects::read()
+                };
+            }
+            Err(_) => return self.effects(),
+        };
+        paths
+            .into_iter()
+            .fold(ToolEffects::read(), |effects, path| {
+                let scheme = path.split_once("://").map_or("", |(scheme, _)| scheme);
+                let resource_effects = match scheme {
+                    "http" | "https" => ToolEffects::network(),
+                    "pr" | "issue" | "ssh" => ToolEffects::process().union(ToolEffects::network()),
+                    "conflict" => ToolEffects::process(),
+                    "agent" if crate::agent_hub::ipc::inherited_channel_present() => {
+                        ToolEffects::network()
+                    }
+                    "agent" | "skill" | "prompt" | "local" => ToolEffects::read(),
+                    _ => self.effects(),
+                };
+                effects.union(resource_effects)
+            })
     }
 
     #[allow(clippy::too_many_lines)]
@@ -5093,26 +14924,167 @@ impl Tool for GrepTool {
             ));
         }
 
-        if !rg_available() {
+        if let Some(paths) = grep_resource_paths(input.path.as_deref())? {
+            return self
+                .execute_resource_grep(tool_call_id, &input, &paths)
+                .await;
+        }
+
+        let filesystem_scope = grep_filesystem_scope(input.path.as_deref(), &self.cwd)?;
+
+        if self.backend == SearchBackend::External && !rg_available() {
             return Err(Error::tool(
                 "grep",
                 "ripgrep (rg) is not available (please install ripgrep)".to_string(),
             ));
         }
 
-        let search_dir = input.path.as_deref().unwrap_or(".");
-        let search_path = resolve_read_path(search_dir, &self.cwd);
-        let search_path = enforce_cwd_scope(&search_path, &self.cwd, "grep")?;
-
-        let is_directory = asupersync::fs::metadata(&search_path)
+        let cwd_scope = open_scoped_scan_root(&self.cwd, &self.cwd, false, None)
             .await
-            .map_err(|e| {
+            .map_err(|err| {
                 Error::tool(
                     "grep",
-                    format!("Cannot access path {}: {e}", search_path.display()),
+                    format!(
+                        "Cannot pin working directory {} for scanning: {}",
+                        path_for_line_output(&self.cwd),
+                        error_for_line_output(&err)
+                    ),
                 )
-            })?
-            .is_dir();
+            })?;
+        let operation_cwd = cwd_scope.io_path();
+
+        let search_dir = &filesystem_scope.path;
+        let lexical_search_path = resolve_read_path(search_dir, &self.cwd);
+        let search_path =
+            enforce_cwd_scope(&lexical_search_path, &self.cwd, "grep", &self.workspace)?;
+        ensure_scan_path_ancestors_searchable(&lexical_search_path, &search_path)
+            .await
+            .map_err(|err| {
+                Error::tool(
+                    "grep",
+                    format!(
+                        "Cannot access path {}: {}",
+                        path_for_line_output(&search_path),
+                        error_for_line_output(&err)
+                    ),
+                )
+            })?;
+
+        let search_metadata = std_metadata_async(&search_path).await.map_err(|e| {
+            Error::tool(
+                "grep",
+                format!(
+                    "Cannot access path {}: {}",
+                    path_for_line_output(&search_path),
+                    error_for_line_output(&e)
+                ),
+            )
+        })?;
+        let is_directory = search_metadata.is_dir();
+        let required_access = if is_directory {
+            UNIX_ACCESS_READ | UNIX_ACCESS_SEARCH
+        } else {
+            UNIX_ACCESS_READ
+        };
+        ensure_effective_mode_access(
+            &search_metadata,
+            &search_path,
+            required_access,
+            "content scanning",
+        )
+        .map_err(|err| {
+            Error::tool(
+                "grep",
+                format!(
+                    "Cannot access path {}: {}",
+                    path_for_line_output(&search_path),
+                    error_for_line_output(&err)
+                ),
+            )
+        })?;
+        #[cfg(test)]
+        let after_scope_hook = self.after_scope_hook.clone();
+        #[cfg(not(test))]
+        let after_scope_hook = None;
+        // Pin within the same live workspace authority used for admission.
+        // A sibling --add-dir root is authorized without becoming a child of
+        // the primary cwd. Revoked roots must fail before any content scan.
+        let roots = self.workspace.snapshot_or(&self.cwd);
+        let allowed_roots = if roots.additional().is_empty() {
+            vec![cwd_scope.logical_path().to_path_buf()]
+        } else {
+            roots.all()
+        };
+        let scan_scope_root = allowed_roots
+            .into_iter()
+            .filter(|root| search_path.starts_with(root))
+            .max_by_key(|root| root.components().count())
+            .ok_or_else(|| Error::tool("grep", "Search root is no longer in the workspace"))?;
+        let scoped_root =
+            open_scoped_scan_root(&search_path, &scan_scope_root, true, after_scope_hook)
+                .await
+                .map_err(|err| {
+                    Error::tool(
+                        "grep",
+                        format!(
+                            "Cannot pin path {} for scanning: {}",
+                            path_for_line_output(&search_path),
+                            error_for_line_output(&err)
+                        ),
+                    )
+                })?;
+        if !scoped_root.logical_path().starts_with(&scan_scope_root) {
+            return Err(Error::tool(
+                "grep",
+                "Search root changed outside the workspace while being pinned",
+            ));
+        }
+        let scan_io_path = scoped_root.io_path();
+        let include_workspace_ignore = scoped_root
+            .logical_path()
+            .starts_with(cwd_scope.logical_path());
+        // Keep a symlinked search root's spelling for cwd-relative patterns
+        // such as alias;!alias/vendor. Normalize only the cwd alias here;
+        // resolving the root alias would silently discard those exclusions.
+        let lexical_root = lexical_search_path
+            .strip_prefix(normalize_dot_segments(&self.cwd))
+            .map_or_else(
+                |_| lexical_search_path.clone(),
+                |relative| cwd_scope.logical_path().join(relative),
+            );
+        let exclusions = GrepExclusions::for_root(
+            cwd_scope.logical_path(),
+            scoped_root.logical_path(),
+            &lexical_root,
+            &filesystem_scope.exclusions,
+        )?;
+        if is_directory {
+            ensure_recursive_scan_access(
+                &scan_io_path,
+                &operation_cwd,
+                "recursive content scanning",
+                RecursiveScanAccess::ReadableFiles,
+                input.glob.clone(),
+                exclusions.clone(),
+                include_workspace_ignore,
+            )
+            .await
+            .map_err(|err| {
+                let message = if err.kind() == std::io::ErrorKind::PermissionDenied {
+                    format!(
+                        "Permission denied while scanning descendants of {}",
+                        path_for_line_output(&search_path)
+                    )
+                } else {
+                    format!(
+                        "Cannot scan path {}: {}",
+                        path_for_line_output(&search_path),
+                        error_for_line_output(&err)
+                    )
+                };
+                Error::tool("grep", message)
+            })?;
+        }
 
         let context_value = input.context.unwrap_or(0);
         let effective_limit = input.limit.unwrap_or(DEFAULT_GREP_LIMIT).max(1);
@@ -5124,226 +15096,348 @@ impl Tool for GrepTool {
         } else {
             ToolCacheFingerprintMode::FileContent
         };
-        let cache_deps = cache_dependency_for_path(&search_path, cache_mode);
+        let recursive_cache_access = is_directory.then_some(RecursiveScanAccess::ReadableFiles);
+        // Recursive cache fingerprints read the entire tree. Until those
+        // fingerprints carry the search filter, bypass the cache rather than
+        // opening files the caller explicitly excluded from this search.
+        let cache_deps = if exclusions.is_some() {
+            None
+        } else {
+            cache_dependencies_for_scoped_scan(
+                &scoped_root,
+                &cwd_scope,
+                cache_mode,
+                recursive_cache_access,
+            )
+        };
         if let Some(output) = cached_tool_output(&cache_key, cache_deps.as_deref()) {
             return Ok(output);
         }
 
-        let mut args: Vec<String> = vec![
-            "--json".to_string(),
-            "--line-number".to_string(),
-            "--color=never".to_string(),
-            "--hidden".to_string(),
-            // Prevent massive JSON lines from minified files causing OOM
-            "--max-columns=10000".to_string(),
-        ];
+        // The scanner runs from the pinned search root, while grep globs are
+        // defined relative to the command cwd. Apply that glob to mapped
+        // logical result paths so a descriptor path cannot change its
+        // slash-containing semantics.
+        let glob_override =
+            build_grep_glob_override(cwd_scope.logical_path(), input.glob.as_deref())?;
 
-        if input.ignore_case.unwrap_or(false) {
-            args.push("--ignore-case".to_string());
-        }
-        if input.literal.unwrap_or(false) {
-            args.push("--fixed-strings".to_string());
-        }
-        if let Some(glob) = &input.glob {
-            args.push("--glob".to_string());
-            args.push(glob.clone());
-        }
-
-        // Mirror find-tool behavior: explicitly pass root/nested .gitignore files
-        // so ignore rules apply consistently even outside a git worktree.
-        let ignore_root = if is_directory {
-            search_path.clone()
+        // Mirror find-tool behavior: the walk discovers .gitignore files
+        // natively, while workspace-root rules above the scan root are
+        // applied as a result-path filter (see build_workspace_ignore_matcher
+        // for why --ignore-file cannot express them). Explicit file operands
+        // bypass ignore filtering entirely, so neither applies to
+        // single-file scans.
+        let workspace_ignore = if is_directory && include_workspace_ignore {
+            build_workspace_ignore_matcher(&cwd_scope)
         } else {
-            search_path
-                .parent()
-                .unwrap_or_else(|| Path::new("."))
-                .to_path_buf()
+            None
         };
-        // NOTE: We rely on rg's native .gitignore discovery. We only explicitly pass
-        // the root .gitignore if it exists, to ensure it's respected even if the
-        // search path logic might otherwise miss it (e.g. searching a subdir).
-        // We do NOT perform a blocking `glob("**/.gitignore")` here, as that stalls
-        // the async runtime on large repos.
-        let workspace_gitignore = self.cwd.join(".gitignore");
-        if workspace_gitignore.exists() {
-            args.push("--ignore-file".to_string());
-            args.push(workspace_gitignore.display().to_string());
-        }
-        let root_gitignore = ignore_root.join(".gitignore");
-        if root_gitignore != workspace_gitignore && root_gitignore.exists() {
-            args.push("--ignore-file".to_string());
-            args.push(root_gitignore.display().to_string());
-        }
-
-        args.push("--".to_string());
-        args.push(input.pattern.clone());
-        args.push(search_path.display().to_string());
-
-        let rg_cmd = find_rg_binary().ok_or_else(|| {
-            Error::tool(
-                "grep",
-                "rg is not available (please install ripgrep or rg)".to_string(),
-            )
-        })?;
-
-        let mut child = command_with_default_sigpipe(rg_cmd)
-            .map_err(|e| Error::tool("grep", format!("Failed to prepare ripgrep: {e}")))?
-            .args(args)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| Error::tool("grep", format!("Failed to run ripgrep: {e}")))?;
-
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| Error::tool("grep", "Missing stdout".to_string()))?;
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| Error::tool("grep", "Missing stderr".to_string()))?;
-
-        let mut guard = ProcessGuard::new(child, ProcessCleanupMode::ChildOnly);
-
-        let (stdout_tx, stdout_rx) = std::sync::mpsc::sync_channel(1024);
-        let (stderr_tx, stderr_rx) =
-            std::sync::mpsc::sync_channel::<std::result::Result<Vec<u8>, String>>(1024);
-
-        let stdout_thread = std::thread::spawn(move || {
-            let reader = std::io::BufReader::new(stdout);
-            for line in reader.lines() {
-                if stdout_tx.send(line).is_err() {
-                    break;
-                }
-            }
-        });
-
-        let stderr_thread = std::thread::spawn(move || {
-            let reader = std::io::BufReader::new(stderr);
-            let _ = stderr_tx.send(read_to_end_capped_and_drain(reader, READ_TOOL_MAX_BYTES));
-        });
 
         let mut matches: Vec<(PathBuf, usize)> = Vec::new();
         let mut match_count: usize = 0;
         let mut match_scan_limit_reached = false;
-        let mut stderr_bytes = Vec::new();
 
-        let tick = Duration::from_millis(10);
-        let mut cx_cancelled = false;
-
-        let exit_status = loop {
-            let agent_cx = AgentCx::for_current_or_request();
-            let cx = agent_cx.cx();
-            if cx.checkpoint().is_err() {
-                cx_cancelled = true;
-                break None;
-            }
-
-            drain_rg_stdout(
-                &stdout_rx,
-                &mut matches,
-                &mut match_count,
-                &mut match_scan_limit_reached,
-                scan_limit,
-            );
-            drain_rg_stderr(&stderr_rx, &mut stderr_bytes)?;
-
-            if match_scan_limit_reached {
-                break None;
-            }
-
-            match guard.try_wait_child() {
-                Ok(Some(status)) => break Some(status),
-                Ok(None) => {
-                    let now = cx.timer_driver().map_or_else(wall_now, |timer| timer.now());
-                    sleep(now, tick).await;
+        let scoped_root = if self.backend == SearchBackend::Inproc {
+            let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let cancel_for_scan = Arc::clone(&cancelled);
+            let operation_cwd_owned = operation_cwd.clone();
+            let pattern = input.pattern.clone();
+            let ignore_case = input.ignore_case.unwrap_or(false);
+            let literal = input.literal.unwrap_or(false);
+            let exclusions_for_scan = exclusions.clone();
+            let mut scan = Box::pin(asupersync::runtime::spawn_blocking_io(move || {
+                grep_inproc_scan_sync(
+                    scoped_root,
+                    glob_override,
+                    workspace_ignore,
+                    exclusions_for_scan,
+                    include_workspace_ignore,
+                    &operation_cwd_owned,
+                    is_directory,
+                    &pattern,
+                    ignore_case,
+                    literal,
+                    scan_limit,
+                    &cancel_for_scan,
+                )
+            }));
+            let tick = Duration::from_millis(10);
+            let outcome = loop {
+                let agent_cx = AgentCx::for_current_or_request();
+                let cx = agent_cx.cx();
+                if cx.checkpoint().is_err() {
+                    cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
+                    return Err(Error::tool("grep", "Command cancelled"));
                 }
-                Err(e) => return Err(Error::tool("grep", e.to_string())),
-            }
-        };
-
-        drain_rg_stdout(
-            &stdout_rx,
-            &mut matches,
-            &mut match_count,
-            &mut match_scan_limit_reached,
-            scan_limit,
-        );
-
-        let code = if match_scan_limit_reached || cx_cancelled {
-            // Avoid buffering unbounded stdout/stderr once we've hit the match limit.
-            // `kill()` terminates the process, and we reap it in a background thread
-            // so the stdout reader threads can exit promptly without blocking this task.
-            let _ = guard.kill();
-            // Drop any buffered stdout/stderr lines that were queued before termination.
-            while stdout_rx.try_recv().is_ok() {}
-            while stderr_rx.try_recv().is_ok() {}
-            0
+                let now = cx.timer_driver().map_or_else(wall_now, |timer| timer.now());
+                let sleeper = Box::pin(sleep(now, tick));
+                match futures::future::select(scan, sleeper).await {
+                    futures::future::Either::Left((result, _)) => break result,
+                    futures::future::Either::Right(((), pending)) => scan = pending,
+                }
+            };
+            let outcome =
+                outcome.map_err(|err| Error::tool("grep", error_for_line_output(&err)))?;
+            matches = outcome.matches;
+            match_count = outcome.match_count;
+            // outcome.limit_reached is equivalent to match_count > effective_limit
+            // (scan_limit is effective_limit + 1), which the shared truncation
+            // check below re-derives from match_count.
+            outcome.scoped_root
         } else {
-            let status = exit_status.expect("rg exit status");
-            status.code().unwrap_or(0)
-        };
+            let mut args: Vec<OsString> = vec![
+                OsString::from("--json"),
+                OsString::from("--line-number"),
+                OsString::from("--color=never"),
+                OsString::from("--hidden"),
+                OsString::from("--no-config"),
+                OsString::from("--no-follow"),
+                OsString::from("--no-ignore-parent"),
+                OsString::from("--no-require-git"),
+                // Prevent massive JSON lines from minified files causing OOM
+                OsString::from("--max-columns=10000"),
+            ];
 
-        // Keep draining while waiting for reader threads to finish; otherwise a
-        // bounded channel can fill and block the sender thread, causing join()
-        // to hang after ripgrep has already exited.
-        while !stdout_thread.is_finished() || !stderr_thread.is_finished() {
-            if match_scan_limit_reached || cx_cancelled {
-                while stdout_rx.try_recv().is_ok() {}
+            if input.ignore_case.unwrap_or(false) {
+                args.push(OsString::from("--ignore-case"));
+            }
+            if input.literal.unwrap_or(false) {
+                args.push(OsString::from("--fixed-strings"));
+            }
+            if is_directory {
+                if let Some(exclusions) = &exclusions {
+                    for glob in &exclusions.rg_globs {
+                        args.push(OsString::from("--glob"));
+                        args.push(OsString::from(glob));
+                    }
+                }
+                let root_gitignore = scoped_root.child_operand().join(".gitignore");
+                if scoped_root.logical_path() != cwd_scope.logical_path()
+                    && scan_io_path.join(".gitignore").exists()
+                {
+                    args.push(OsString::from("--ignore-file"));
+                    args.push(root_gitignore.as_os_str().to_owned());
+                }
+            }
+
+            args.push(OsString::from("--"));
+            args.push(OsString::from(&input.pattern));
+            args.push(if is_directory {
+                scoped_root.child_operand().into_os_string()
             } else {
+                scoped_root.file_child_operand().into_os_string()
+            });
+
+            let rg_cmd = find_rg_binary().ok_or_else(|| {
+                Error::tool(
+                    "grep",
+                    "rg is not available (please install ripgrep or rg)".to_string(),
+                )
+            })?;
+
+            // A child cannot chdir into a regular file, so single-file scans run
+            // from the pinned workspace root and read the pinned file descriptor
+            // via stdin (`-` operand) instead.
+            let child_cwd = if is_directory {
+                scan_io_path.clone()
+            } else {
+                operation_cwd.clone()
+            };
+            let child_stdin = if is_directory {
+                cwd_scope.child_stdin()
+            } else {
+                scoped_root.child_stdin()
+            };
+            let mut child = command_with_default_sigpipe_in_dir(rg_cmd, &child_cwd)
+                .map_err(|e| {
+                    Error::tool(
+                        "grep",
+                        format!("Failed to prepare ripgrep: {}", error_for_line_output(&e)),
+                    )
+                })?
+                .args(args)
+                .current_dir(&child_cwd)
+                .stdin(child_stdin.map_err(|error| {
+                    Error::tool(
+                        "grep",
+                        format!(
+                            "Failed to pin ripgrep workspace: {}",
+                            error_for_line_output(&error)
+                        ),
+                    )
+                })?)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .map_err(|e| {
+                    Error::tool(
+                        "grep",
+                        format!("Failed to run ripgrep: {}", error_for_line_output(&e)),
+                    )
+                })?;
+
+            let stdout = child
+                .stdout
+                .take()
+                .ok_or_else(|| Error::tool("grep", "Missing stdout".to_string()))?;
+            let stderr = child
+                .stderr
+                .take()
+                .ok_or_else(|| Error::tool("grep", "Missing stderr".to_string()))?;
+
+            let mut guard = ProcessGuard::new(child, ProcessCleanupMode::ChildOnly);
+
+            let (stdout_tx, stdout_rx) = std::sync::mpsc::sync_channel(1024);
+            let (stderr_tx, stderr_rx) =
+                std::sync::mpsc::sync_channel::<std::result::Result<Vec<u8>, String>>(1024);
+
+            let stdout_thread = std::thread::spawn(move || {
+                let reader = std::io::BufReader::new(stdout);
+                for line in reader.lines() {
+                    if stdout_tx.send(line).is_err() {
+                        break;
+                    }
+                }
+            });
+
+            let stderr_thread = std::thread::spawn(move || {
+                let reader = std::io::BufReader::new(stderr);
+                let _ = stderr_tx.send(read_to_end_capped_and_drain(reader, READ_TOOL_MAX_BYTES));
+            });
+
+            let mut stderr_bytes = Vec::new();
+
+            let tick = Duration::from_millis(10);
+            let mut cx_cancelled = false;
+
+            let exit_status = loop {
+                let agent_cx = AgentCx::for_current_or_request();
+                let cx = agent_cx.cx();
+                if cx.checkpoint().is_err() {
+                    cx_cancelled = true;
+                    break None;
+                }
+
                 drain_rg_stdout(
                     &stdout_rx,
+                    &scoped_root,
+                    glob_override.as_ref(),
+                    workspace_ignore.as_ref(),
+                    exclusions.as_deref(),
                     &mut matches,
                     &mut match_count,
                     &mut match_scan_limit_reached,
                     scan_limit,
-                );
-            }
-            drain_rg_stderr(&stderr_rx, &mut stderr_bytes)?;
-            sleep(wall_now(), Duration::from_millis(1)).await;
-        }
+                )?;
+                drain_rg_stderr(&stderr_rx, &mut stderr_bytes)?;
 
-        if cx_cancelled {
-            return Err(Error::tool("grep", "Command cancelled"));
-        }
+                if match_scan_limit_reached {
+                    break None;
+                }
 
-        // Ensure stdout/stderr reader threads have fully drained the pipes before
-        // we decide whether matches were found. Without this, fast ripgrep runs can
-        // exit before the reader thread has delivered JSON match lines, causing
-        // false "No matches found" results.
-        stdout_thread
-            .join()
-            .map_err(|_| Error::tool("grep", "ripgrep stdout reader thread panicked"))?;
-        stderr_thread
-            .join()
-            .map_err(|_| Error::tool("grep", "ripgrep stderr reader thread panicked"))?;
+                match guard.try_wait_child() {
+                    Ok(Some(status)) => break Some(status),
+                    Ok(None) => {
+                        let now = cx.timer_driver().map_or_else(wall_now, |timer| timer.now());
+                        sleep(now, tick).await;
+                    }
+                    Err(e) => return Err(Error::tool("grep", error_for_line_output(&e))),
+                }
+            };
 
-        // Drain any remaining stdout/stderr produced after the last poll.
-        if match_scan_limit_reached {
-            while stdout_rx.try_recv().is_ok() {}
-        } else {
             drain_rg_stdout(
                 &stdout_rx,
+                &scoped_root,
+                glob_override.as_ref(),
+                workspace_ignore.as_ref(),
+                exclusions.as_deref(),
                 &mut matches,
                 &mut match_count,
                 &mut match_scan_limit_reached,
                 scan_limit,
-            );
-        }
-        drain_rg_stderr(&stderr_rx, &mut stderr_bytes)?;
+            )?;
 
-        let mut stderr_text = String::from_utf8_lossy(&stderr_bytes).trim().to_string();
-        if stderr_bytes.len() as u64 > READ_TOOL_MAX_BYTES {
-            stderr_text.push_str("\n... [stderr truncated] ...");
-        }
-        if !match_scan_limit_reached && code != 0 && code != 1 {
-            let msg = if stderr_text.is_empty() {
-                format!("ripgrep exited with code {code}")
+            let completed_status = if match_scan_limit_reached || cx_cancelled {
+                // Avoid buffering unbounded stdout/stderr once we've hit the match limit.
+                // `kill()` terminates the process, and we reap it in a background thread
+                // so the stdout reader threads can exit promptly without blocking this task.
+                let _ = guard.kill();
+                // Drop any buffered stdout/stderr lines that were queued before termination.
+                while stdout_rx.try_recv().is_ok() {}
+                while stderr_rx.try_recv().is_ok() {}
+                None
             } else {
-                stderr_text
+                Some(exit_status.expect("rg exit status"))
             };
-            return Err(Error::tool("grep", msg));
-        }
+
+            // Keep draining while waiting for reader threads to finish; otherwise a
+            // bounded channel can fill and block the sender thread, causing join()
+            // to hang after ripgrep has already exited.
+            while !stdout_thread.is_finished() || !stderr_thread.is_finished() {
+                if match_scan_limit_reached || cx_cancelled {
+                    while stdout_rx.try_recv().is_ok() {}
+                } else {
+                    drain_rg_stdout(
+                        &stdout_rx,
+                        &scoped_root,
+                        glob_override.as_ref(),
+                        workspace_ignore.as_ref(),
+                        exclusions.as_deref(),
+                        &mut matches,
+                        &mut match_count,
+                        &mut match_scan_limit_reached,
+                        scan_limit,
+                    )?;
+                }
+                drain_rg_stderr(&stderr_rx, &mut stderr_bytes)?;
+                sleep(wall_now(), Duration::from_millis(1)).await;
+            }
+
+            if cx_cancelled {
+                return Err(Error::tool("grep", "Command cancelled"));
+            }
+
+            // Ensure stdout/stderr reader threads have fully drained the pipes before
+            // we decide whether matches were found. Without this, fast ripgrep runs can
+            // exit before the reader thread has delivered JSON match lines, causing
+            // false "No matches found" results.
+            stdout_thread
+                .join()
+                .map_err(|_| Error::tool("grep", "ripgrep stdout reader thread panicked"))?;
+            stderr_thread
+                .join()
+                .map_err(|_| Error::tool("grep", "ripgrep stderr reader thread panicked"))?;
+
+            // Drain any remaining stdout/stderr produced after the last poll.
+            if match_scan_limit_reached {
+                while stdout_rx.try_recv().is_ok() {}
+            } else {
+                drain_rg_stdout(
+                    &stdout_rx,
+                    &scoped_root,
+                    glob_override.as_ref(),
+                    workspace_ignore.as_ref(),
+                    exclusions.as_deref(),
+                    &mut matches,
+                    &mut match_count,
+                    &mut match_scan_limit_reached,
+                    scan_limit,
+                )?;
+            }
+            drain_rg_stderr(&stderr_rx, &mut stderr_bytes)?;
+
+            let stderr_text = diagnostic_for_line_output(
+                &stderr_bytes,
+                stderr_bytes.len() as u64 > READ_TOOL_MAX_BYTES,
+            );
+            if !match_scan_limit_reached
+                && let Some(message) =
+                    completed_status.and_then(|status| rg_exit_failure(status, &stderr_text))
+            {
+                return Err(Error::tool("grep", message));
+            }
+            scoped_root
+        };
 
         let match_limit_reached = match_count > effective_limit;
         if match_limit_reached {
@@ -5359,13 +15453,18 @@ impl Tool for GrepTool {
             };
             cache_tool_output(
                 cache_key,
-                stable_cache_dependency_for_path(&search_path, cache_mode, cache_deps.as_deref()),
+                stable_cache_dependencies_for_scoped_scan(
+                    &scoped_root,
+                    &cwd_scope,
+                    cache_mode,
+                    recursive_cache_access,
+                    cache_deps.as_deref(),
+                ),
                 &output,
             );
             return Ok(output);
         }
 
-        let mut file_cache: HashMap<PathBuf, Vec<String>> = HashMap::new();
         let mut output_builder = HeadTruncatingLineWriter::new(DEFAULT_MAX_BYTES);
         let mut artifact_source = String::new();
         let mut lines_truncated = false;
@@ -5373,22 +15472,44 @@ impl Tool for GrepTool {
         // Group matches by file to merge overlapping context windows
         let mut file_order: Vec<PathBuf> = Vec::new();
         let mut matches_by_file: HashMap<PathBuf, Vec<usize>> = HashMap::new();
-        for (file_path, line_number) in &matches {
-            if !matches_by_file.contains_key(file_path) {
-                file_order.push(file_path.clone());
+        let mut logical_paths_by_file: HashMap<PathBuf, PathBuf> = HashMap::new();
+        for (child_path, line_number) in &matches {
+            let mapped = scoped_root.map_child_output(child_path).map_err(|error| {
+                Error::tool(
+                    "grep",
+                    format!(
+                        "ripgrep returned an invalid path: {}",
+                        error_for_line_output(&error)
+                    ),
+                )
+            })?;
+            if !matches_by_file.contains_key(&mapped.read_path) {
+                file_order.push(mapped.read_path.clone());
+                logical_paths_by_file.insert(mapped.read_path.clone(), mapped.logical_path.clone());
             }
             matches_by_file
-                .entry(file_path.clone())
+                .entry(mapped.read_path)
                 .or_default()
                 .push(*line_number);
         }
 
+        let scan_read_scope = scoped_root.io_path();
         for file_path in file_order {
             let Some(mut match_lines) = matches_by_file.remove(&file_path) else {
                 continue;
             };
-            let relative_path = format_grep_path(&file_path, &self.cwd);
-            let lines = get_file_lines_async(&file_path, &mut file_cache).await;
+            let logical_path = logical_paths_by_file
+                .remove(&file_path)
+                .ok_or_else(|| Error::tool("grep", "missing logical scanner result path"))?;
+            let relative_path = format_grep_path(&logical_path, cwd_scope.logical_path());
+            // A pinned regular-file root renders context from the held
+            // descriptor so a post-pin rename/symlink swap of the logical
+            // path cannot redirect or break the read.
+            let lines = if scoped_root.is_file_root() {
+                get_pinned_file_lines_async(&scoped_root).await
+            } else {
+                get_file_lines_async(&file_path, &scan_read_scope).await
+            };
 
             if lines.is_empty() {
                 if let Some(first_match) = match_lines.first() {
@@ -5417,11 +15538,11 @@ impl Tool for GrepTool {
                     line_number
                 };
 
-                if let Some(last_block) = blocks.last_mut() {
-                    if start <= last_block.1.saturating_add(1) {
-                        last_block.1 = last_block.1.max(end);
-                        continue;
-                    }
+                if let Some(last_block) = blocks.last_mut()
+                    && start <= last_block.1.saturating_add(1)
+                {
+                    last_block.1 = last_block.1.max(end);
+                    continue;
                 }
                 blocks.push((start, end));
             }
@@ -5472,7 +15593,7 @@ impl Tool for GrepTool {
         if match_limit_reached {
             notices.push(format!(
                 "{effective_limit} matches limit reached. Use limit={} for more, or refine pattern",
-                effective_limit * 2
+                effective_limit.saturating_mul(2)
             ));
             details_map.insert(
                 "matchLimitReached".to_string(),
@@ -5519,7 +15640,13 @@ impl Tool for GrepTool {
         };
         cache_tool_output(
             cache_key,
-            stable_cache_dependency_for_path(&search_path, cache_mode, cache_deps.as_deref()),
+            stable_cache_dependencies_for_scoped_scan(
+                &scoped_root,
+                &cwd_scope,
+                cache_mode,
+                recursive_cache_access,
+                cache_deps.as_deref(),
+            ),
             &output,
         );
         Ok(output)
@@ -5541,20 +15668,54 @@ struct FindInput {
 
 #[derive(Debug)]
 struct FindEntry {
-    rel: String,
+    rel: PathBuf,
     modified: Option<SystemTime>,
+    is_dir: bool,
 }
 
 pub struct FindTool {
     cwd: PathBuf,
     artifact_root: Option<PathBuf>,
+    backend: SearchBackend,
+    workspace: WorkspaceHandle,
+    #[cfg(test)]
+    after_scope_hook: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl FindTool {
     pub fn new(cwd: &Path) -> Self {
+        Self::with_backend(cwd, SearchBackend::default())
+    }
+
+    /// Attach the session workspace root handle (bd-cv653.3.12).
+    #[must_use]
+    pub fn with_workspace(mut self, workspace: WorkspaceHandle) -> Self {
+        self.workspace = workspace;
+        self
+    }
+
+    pub(crate) fn with_backend(cwd: &Path, backend: SearchBackend) -> Self {
         Self {
             cwd: cwd.to_path_buf(),
             artifact_root: None,
+            backend,
+            workspace: WorkspaceHandle::default(),
+            #[cfg(test)]
+            after_scope_hook: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_after_scope_hook(
+        cwd: &Path,
+        after_scope_hook: impl Fn() + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            cwd: cwd.to_path_buf(),
+            artifact_root: None,
+            backend: SearchBackend::default(),
+            workspace: WorkspaceHandle::default(),
+            after_scope_hook: Some(Arc::new(after_scope_hook)),
         }
     }
 }
@@ -5562,6 +15723,10 @@ impl FindTool {
 #[async_trait]
 #[allow(clippy::unnecessary_literal_bound)]
 impl Tool for FindTool {
+    fn builtin_factory_context(&self) -> Option<(&Path, &WorkspaceHandle)> {
+        Some((&self.cwd, &self.workspace))
+    }
+
     fn name(&self) -> &str {
         "find"
     }
@@ -5614,32 +15779,320 @@ impl Tool for FindTool {
             ));
         }
 
-        let search_dir = input.path.as_deref().unwrap_or(".");
-        let search_path = resolve_read_path(search_dir, &self.cwd);
-        let search_path = enforce_cwd_scope(&search_path, &self.cwd, "find")?;
-        let search_path = strip_unc_prefix(search_path);
-        let effective_limit = input.limit.unwrap_or(DEFAULT_FIND_LIMIT);
-        // Overfetch one result so limit notices only appear after confirmed overflow.
-        let scan_limit = effective_limit.saturating_add(1);
+        let cwd_scope = open_scoped_scan_root(&self.cwd, &self.cwd, false, None)
+            .await
+            .map_err(|err| {
+                Error::tool(
+                    "find",
+                    format!(
+                        "Cannot pin working directory {} for scanning: {}",
+                        path_for_line_output(&self.cwd),
+                        error_for_line_output(&err)
+                    ),
+                )
+            })?;
+        let operation_cwd = cwd_scope.io_path();
 
-        if !search_path.exists() {
+        let search_dir = input.path.as_deref().unwrap_or(".");
+        let lexical_search_path = resolve_read_path(search_dir, &self.cwd);
+        let search_path =
+            enforce_cwd_scope(&lexical_search_path, &self.cwd, "find", &self.workspace)?;
+        let search_path = strip_unc_prefix(search_path);
+        ensure_scan_path_ancestors_searchable(&lexical_search_path, &search_path)
+            .await
+            .map_err(|err| {
+                Error::tool(
+                    "find",
+                    format!(
+                        "Cannot access path {}: {}",
+                        path_for_line_output(&search_path),
+                        error_for_line_output(&err)
+                    ),
+                )
+            })?;
+        let effective_limit = input.limit.unwrap_or(DEFAULT_FIND_LIMIT);
+        // Enumerate the complete bounded candidate set before newest-first
+        // selection; stopping at the caller's result limit would make the
+        // advertised global ordering depend on fd traversal order.
+        let scan_limit = FIND_SCAN_HARD_LIMIT.saturating_add(1);
+
+        let search_metadata = std_metadata_async(&search_path).await.map_err(|err| {
+            if err.kind() == std::io::ErrorKind::NotFound {
+                Error::tool(
+                    "find",
+                    format!("Path not found: {}", path_for_line_output(&search_path)),
+                )
+            } else {
+                Error::tool(
+                    "find",
+                    format!(
+                        "Cannot access path {}: {}",
+                        path_for_line_output(&search_path),
+                        error_for_line_output(&err)
+                    ),
+                )
+            }
+        })?;
+        if !search_metadata.is_dir() {
             return Err(Error::tool(
                 "find",
-                format!("Path not found: {}", search_path.display()),
+                format!("Not a directory: {}", path_for_line_output(&search_path)),
             ));
         }
+        ensure_effective_mode_access(
+            &search_metadata,
+            &search_path,
+            UNIX_ACCESS_READ | UNIX_ACCESS_SEARCH,
+            "path scanning",
+        )
+        .map_err(|err| {
+            Error::tool(
+                "find",
+                format!(
+                    "Cannot access path {}: {}",
+                    path_for_line_output(&search_path),
+                    error_for_line_output(&err)
+                ),
+            )
+        })?;
+        #[cfg(test)]
+        let after_scope_hook = self.after_scope_hook.clone();
+        #[cfg(not(test))]
+        let after_scope_hook = None;
+        let scoped_root = open_scoped_scan_root(&search_path, &self.cwd, false, after_scope_hook)
+            .await
+            .map_err(|err| {
+                Error::tool(
+                    "find",
+                    format!(
+                        "Cannot pin path {} for scanning: {}",
+                        path_for_line_output(&search_path),
+                        error_for_line_output(&err)
+                    ),
+                )
+            })?;
+        let scan_io_path = scoped_root.io_path();
+        ensure_recursive_scan_access(
+            &scan_io_path,
+            &operation_cwd,
+            "recursive path scanning",
+            RecursiveScanAccess::DirectoriesOnly,
+            None,
+            None,
+            true,
+        )
+        .await
+        .map_err(|err| {
+            let message = if err.kind() == std::io::ErrorKind::PermissionDenied {
+                format!(
+                    "Permission denied while scanning descendants of {}",
+                    path_for_line_output(&search_path)
+                )
+            } else {
+                format!(
+                    "Cannot scan path {}: {}",
+                    path_for_line_output(&search_path),
+                    error_for_line_output(&err)
+                )
+            };
+            Error::tool("find", message)
+        })?;
 
         let cache_key = tool_cache_key("find", &self.cwd, &input_value);
-        let cache_mode = if search_path.is_dir() {
-            ToolCacheFingerprintMode::DirectoryRecursive
-        } else {
-            ToolCacheFingerprintMode::FileContent
-        };
-        let cache_deps = cache_dependency_for_path(&search_path, cache_mode);
+        let cache_mode = ToolCacheFingerprintMode::DirectoryRecursive;
+        let recursive_cache_access = Some(RecursiveScanAccess::DirectoriesOnly);
+        let cache_deps = cache_dependencies_for_scoped_scan(
+            &scoped_root,
+            &cwd_scope,
+            cache_mode,
+            recursive_cache_access,
+        );
         if let Some(output) = cached_tool_output(&cache_key, cache_deps.as_deref()) {
             return Ok(output);
         }
 
+        // NOTE: Both backends rely on native .gitignore discovery during the
+        // walk. Workspace-root rules above the scan root are applied as a
+        // post-filter on mapped result paths (see
+        // build_workspace_ignore_matcher for why --ignore-file cannot express
+        // them).
+        let workspace_ignore = build_workspace_ignore_matcher(&cwd_scope);
+        // fd matches plain `--glob` patterns against the FILENAME only, so a
+        // path-shaped pattern like `src/**/*.txt` silently matches nothing
+        // (fd 10.3/10.4, both platforms). For those, ask fd for a full-path
+        // superset (`--full-path` with a `**/` anchor that absorbs the
+        // absolute search-root prefix) and restore exact scan-root-relative
+        // glob semantics with a host-side filter over the mapped logical
+        // paths below. The in-process backend applies the same filename/path
+        // split natively during its walk.
+        let path_shaped_pattern = input.pattern.contains('/');
+        let path_glob_filter = if path_shaped_pattern {
+            let mut builder = ignore::overrides::OverrideBuilder::new(scoped_root.logical_path());
+            builder
+                .add(&input.pattern)
+                .map_err(|error| Error::tool("find", error_for_line_output(&error)))?;
+            Some(
+                builder
+                    .build()
+                    .map_err(|error| Error::tool("find", error_for_line_output(&error)))?,
+            )
+        } else {
+            None
+        };
+
+        let raw_paths: Vec<PathBuf> = if self.backend == SearchBackend::Inproc {
+            let scan_root = scan_io_path.clone();
+            let walk_cwd = operation_cwd.clone();
+            let pattern = input.pattern.clone();
+            let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let cancel_for_walk = Arc::clone(&cancelled);
+            let mut walk = Box::pin(asupersync::runtime::spawn_blocking_io(move || {
+                find_inproc_scan_sync(
+                    &scan_root,
+                    &walk_cwd,
+                    &pattern,
+                    path_shaped_pattern,
+                    scan_limit,
+                    &cancel_for_walk,
+                )
+            }));
+            let tick = Duration::from_millis(10);
+            let start_time = std::time::Instant::now();
+            let outcome = loop {
+                let agent_cx = AgentCx::for_current_or_request();
+                let cx = agent_cx.cx();
+                if cx.checkpoint().is_err() {
+                    cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
+                    return Err(Error::tool("find", "Command cancelled"));
+                }
+                if start_time.elapsed().as_millis() > 60_000 {
+                    cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
+                    return Err(Error::tool("find", "Command timed out after 60 seconds"));
+                }
+                let now = cx.timer_driver().map_or_else(wall_now, |timer| timer.now());
+                let sleeper = Box::pin(sleep(now, tick));
+                match futures::future::select(walk, sleeper).await {
+                    futures::future::Either::Left((result, _)) => break result,
+                    futures::future::Either::Right(((), pending)) => walk = pending,
+                }
+            };
+            outcome.map_err(|err| {
+                Error::tool(
+                    "find",
+                    format!("in-process find failed: {}", error_for_line_output(&err)),
+                )
+            })?
+        } else {
+            self.run_external_fd_scan(
+                &input,
+                &scoped_root,
+                &cwd_scope,
+                &scan_io_path,
+                scan_limit,
+                path_shaped_pattern,
+            )
+            .await?
+        };
+
+        if raw_paths.is_empty() {
+            let output = ToolOutput {
+                content: vec![ContentBlock::Text(TextContent::new(
+                    "No files found matching pattern",
+                ))],
+                details: None,
+                is_error: false,
+            };
+            cache_tool_output(
+                cache_key,
+                stable_cache_dependencies_for_scoped_scan(
+                    &scoped_root,
+                    &cwd_scope,
+                    cache_mode,
+                    recursive_cache_access,
+                    cache_deps.as_deref(),
+                ),
+                &output,
+            );
+            return Ok(output);
+        }
+
+        let mut entries: Vec<FindEntry> = Vec::new();
+        for raw_path in raw_paths {
+            let mapped = scoped_root.map_child_output(&raw_path).map_err(|error| {
+                Error::tool(
+                    "find",
+                    format!(
+                        "fd returned an invalid path: {}",
+                        error_for_line_output(&error)
+                    ),
+                )
+            })?;
+            let rel = mapped.relative;
+            let full_path = mapped.read_path;
+            // fd was invoked with --no-follow. Inspect the directory entry
+            // itself as well, otherwise `is_dir`/`metadata` follows a symlink
+            // or junction after the scan and leaks target type/mtime into the
+            // output and sort order.
+            let entry_metadata = std::fs::symlink_metadata(&full_path).ok();
+            let is_dir = entry_metadata
+                .as_ref()
+                .is_some_and(std::fs::Metadata::is_dir);
+            if let Some(workspace_ignore) = workspace_ignore.as_ref()
+                && workspace_ignore
+                    .matched_path_or_any_parents(&mapped.logical_path, is_dir)
+                    .is_ignore()
+            {
+                continue;
+            }
+            // Exact scan-root-relative glob semantics for path-shaped
+            // patterns; the external backend only produced the full-path
+            // superset (see above).
+            if let Some(path_glob_filter) = path_glob_filter.as_ref()
+                && path_glob_filter
+                    .matched(&mapped.logical_path, is_dir)
+                    .is_ignore()
+            {
+                continue;
+            }
+
+            let modified = entry_metadata.and_then(|meta| meta.modified().ok());
+            entries.push(FindEntry {
+                rel,
+                modified,
+                is_dir,
+            });
+        }
+        drop(path_glob_filter);
+        drop(workspace_ignore);
+
+        run_find_output_pipeline(
+            entries,
+            effective_limit,
+            cache_key,
+            &scoped_root,
+            &cwd_scope,
+            cache_mode,
+            recursive_cache_access,
+            cache_deps.as_deref(),
+            self.artifact_root.as_deref(),
+            tool_call_id,
+        )
+    }
+}
+
+impl FindTool {
+    /// External `fd` backend (escape hatch): spawn fd with the historical
+    /// argument surface and return scan-root-relative result paths.
+    #[allow(clippy::too_many_lines)]
+    async fn run_external_fd_scan(
+        &self,
+        input: &FindInput,
+        scoped_root: &ScopedScanRoot,
+        cwd_scope: &ScopedScanRoot,
+        scan_io_path: &Path,
+        scan_limit: usize,
+        path_shaped_pattern: bool,
+    ) -> Result<Vec<PathBuf>> {
         let fd_cmd = find_fd_binary().ok_or_else(|| {
             Error::tool(
                 "find",
@@ -5648,42 +16101,72 @@ impl Tool for FindTool {
         })?;
 
         // Build fd arguments
-        let mut args: Vec<String> = vec![
-            "--glob".to_string(),
-            "--color=never".to_string(),
-            "--hidden".to_string(),
-            "--max-results".to_string(),
-            scan_limit.to_string(),
+        let mut args: Vec<OsString> = vec![
+            OsString::from("--glob"),
+            OsString::from("--color=never"),
+            OsString::from("--hidden"),
+            OsString::from("--no-follow"),
+            OsString::from("--no-ignore-parent"),
+            OsString::from("--no-require-git"),
+            // Filenames may contain newlines on Unix. NUL-delimited records
+            // prevent one real entry from being split into attacker-chosen
+            // path fragments during postprocessing.
+            OsString::from("--print0"),
+            OsString::from("--max-results"),
+            OsString::from(scan_limit.to_string()),
         ];
 
-        // NOTE: We rely on fd's native .gitignore discovery. We only explicitly pass
-        // the root .gitignore if it exists, to ensure it's respected even if the
-        // search path logic might otherwise miss it.
-        // We do NOT perform a blocking `glob("**/.gitignore")` here.
-        let workspace_gitignore = self.cwd.join(".gitignore");
-        if workspace_gitignore.exists() {
-            args.push("--ignore-file".to_string());
-            args.push(workspace_gitignore.display().to_string());
-        }
-        let root_gitignore = search_path.join(".gitignore");
-        if root_gitignore != workspace_gitignore && root_gitignore.exists() {
-            args.push("--ignore-file".to_string());
-            args.push(root_gitignore.display().to_string());
+        let root_gitignore = scoped_root.child_operand().join(".gitignore");
+        if scoped_root.logical_path() != cwd_scope.logical_path()
+            && scan_io_path.join(".gitignore").exists()
+        {
+            args.push(OsString::from("--ignore-file"));
+            args.push(root_gitignore.as_os_str().to_owned());
         }
 
-        args.push("--".to_string());
-        args.push(input.pattern.clone());
-        args.push(search_path.display().to_string());
+        if path_shaped_pattern {
+            args.push(OsString::from("--full-path"));
+        }
+        args.push(OsString::from("--"));
+        if path_shaped_pattern {
+            let anchored = input.pattern.trim_start_matches('/');
+            if anchored.starts_with("**/") {
+                args.push(OsString::from(anchored));
+            } else {
+                args.push(OsString::from(format!("**/{anchored}")));
+            }
+        } else {
+            args.push(OsString::from(&input.pattern));
+        }
+        args.push(scoped_root.child_operand().into_os_string());
 
-        let mut child = command_with_default_sigpipe_in_dir(fd_cmd, &self.cwd)
-            .map_err(|e| Error::tool("find", format!("Failed to prepare fd: {e}")))?
+        let mut child = command_with_default_sigpipe_in_dir(fd_cmd, scan_io_path)
+            .map_err(|e| {
+                Error::tool(
+                    "find",
+                    format!("Failed to prepare fd: {}", error_for_line_output(&e)),
+                )
+            })?
             .args(args)
-            .current_dir(&self.cwd)
-            .stdin(Stdio::null())
+            .current_dir(scan_io_path)
+            .stdin(cwd_scope.child_stdin().map_err(|error| {
+                Error::tool(
+                    "find",
+                    format!(
+                        "Failed to pin fd workspace: {}",
+                        error_for_line_output(&error)
+                    ),
+                )
+            })?)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .map_err(|e| Error::tool("find", format!("Failed to run fd: {e}")))?;
+            .map_err(|e| {
+                Error::tool(
+                    "find",
+                    format!("Failed to run fd: {}", error_for_line_output(&e)),
+                )
+            })?;
 
         let stdout_pipe = child
             .stdout
@@ -5731,18 +16214,28 @@ impl Tool for FindTool {
                     let now = cx.timer_driver().map_or_else(wall_now, |timer| timer.now());
                     sleep(now, tick).await;
                 }
-                Err(e) => return Err(Error::tool("find", e.to_string())),
+                Err(e) => return Err(Error::tool("find", error_for_line_output(&e))),
             }
         };
 
         let stdout_bytes = stdout_handle
             .join()
             .map_err(|_| Error::tool("find", "fd stdout reader thread panicked"))?
-            .map_err(|err| Error::tool("find", format!("Failed to read fd stdout: {err}")))?;
+            .map_err(|err| {
+                Error::tool(
+                    "find",
+                    format!("Failed to read fd stdout: {}", error_for_line_output(&err)),
+                )
+            })?;
         let stderr_bytes = stderr_handle
             .join()
             .map_err(|_| Error::tool("find", "fd stderr reader thread panicked"))?
-            .map_err(|err| Error::tool("find", format!("Failed to read fd stderr: {err}")))?;
+            .map_err(|err| {
+                Error::tool(
+                    "find",
+                    format!("Failed to read fd stderr: {}", error_for_line_output(&err)),
+                )
+            })?;
 
         if cx_cancelled {
             return Err(Error::tool("find", "Command cancelled"));
@@ -5752,22 +16245,28 @@ impl Tool for FindTool {
         }
         let status = status.expect("fd exit status after successful completion");
 
-        let mut stdout = String::from_utf8_lossy(&stdout_bytes).trim().to_string();
         if stdout_bytes.len() as u64 > READ_TOOL_MAX_BYTES {
-            stdout.push_str("\n... [stdout truncated] ...");
+            return Err(Error::tool(
+                "find",
+                "fd output exceeded the safe capture limit; lower `limit` or narrow the pattern",
+            ));
         }
-        let mut stderr = String::from_utf8_lossy(&stderr_bytes).trim().to_string();
-        if stderr_bytes.len() as u64 > READ_TOOL_MAX_BYTES {
-            stderr.push_str("\n... [stderr truncated] ...");
-        }
+        let stderr = diagnostic_for_line_output(
+            &stderr_bytes,
+            stderr_bytes.len() as u64 > READ_TOOL_MAX_BYTES,
+        );
 
-        if !status.success() && stdout.is_empty() {
-            if status.code() == Some(1) && stderr.is_empty() {
+        if !status.success() {
+            if status.code() == Some(1) && stderr.is_empty() && stdout_bytes.is_empty() {
                 // fd uses exit code 1 for "no matches"; treat as empty result.
             } else {
                 let code = status.code().unwrap_or(1);
                 let msg = if stderr.is_empty() {
-                    format!("fd exited with code {code}")
+                    if stdout_bytes.is_empty() {
+                        format!("fd exited with code {code}")
+                    } else {
+                        format!("fd exited with code {code} after producing partial output")
+                    }
                 } else {
                     stderr
                 };
@@ -5775,55 +16274,50 @@ impl Tool for FindTool {
             }
         }
 
-        if stdout.is_empty() {
-            let output = ToolOutput {
-                content: vec![ContentBlock::Text(TextContent::new(
-                    "No files found matching pattern",
-                ))],
-                details: None,
-                is_error: false,
-            };
-            cache_tool_output(
-                cache_key,
-                stable_cache_dependency_for_path(&search_path, cache_mode, cache_deps.as_deref()),
-                &output,
-            );
-            return Ok(output);
-        }
-
-        let mut entries: Vec<FindEntry> = Vec::new();
-        for raw_line in stdout.lines() {
-            let line = raw_line.trim_end_matches('\r').trim();
-            if line.is_empty() {
+        let mut raw_paths = Vec::new();
+        for raw_entry in stdout_bytes.split(|byte| *byte == b'\0') {
+            if raw_entry.is_empty() {
                 continue;
             }
-
-            // On Windows, fd may emit `//?/…` or `\\?\…` extended-length
-            // paths. Strip the prefix so relativization works correctly.
-            let clean = strip_unc_prefix(PathBuf::from(line));
-            let line_path = clean.as_path();
-            let mut rel = if line_path.is_absolute() {
-                line_path.strip_prefix(&search_path).map_or_else(
-                    |_| line_path.to_string_lossy().to_string(),
-                    |stripped| stripped.to_string_lossy().to_string(),
-                )
-            } else {
-                line_path.to_string_lossy().to_string()
+            // `fd --print0` preserves every valid filename byte other than
+            // the impossible NUL byte, including leading/trailing whitespace
+            // and embedded newlines.
+            #[cfg(unix)]
+            let raw_path = {
+                use std::os::unix::ffi::OsStringExt as _;
+                PathBuf::from(OsString::from_vec(raw_entry.to_vec()))
             };
+            #[cfg(not(unix))]
+            let raw_path = PathBuf::from(String::from_utf8_lossy(raw_entry).into_owned());
+            raw_paths.push(raw_path);
+        }
+        Ok(raw_paths)
+    }
+}
 
-            let full_path = if line_path.is_absolute() {
-                line_path.to_path_buf()
-            } else {
-                search_path.join(line_path)
-            };
-            if full_path.is_dir() && !rel.ends_with('/') {
-                rel.push('/');
-            }
-
-            let modified = std::fs::metadata(&full_path)
-                .and_then(|meta| meta.modified())
-                .ok();
-            entries.push(FindEntry { rel, modified });
+/// Shared find output assembly: sort newest-first, apply limits and
+/// truncation, spill artifacts, and cache the rendered output.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn run_find_output_pipeline(
+    mut entries: Vec<FindEntry>,
+    effective_limit: usize,
+    cache_key: String,
+    scoped_root: &ScopedScanRoot,
+    cwd_scope: &ScopedScanRoot,
+    cache_mode: ToolCacheFingerprintMode,
+    recursive_cache_access: Option<RecursiveScanAccess>,
+    cache_deps: Option<&[ToolCacheDependency]>,
+    artifact_root: Option<&Path>,
+    tool_call_id: &str,
+) -> Result<ToolOutput> {
+    {
+        if entries.len() > FIND_SCAN_HARD_LIMIT {
+            return Err(Error::tool(
+                "find",
+                format!(
+                    "find scan exceeded the {FIND_SCAN_HARD_LIMIT} candidate safety limit; narrow the path or pattern"
+                ),
+            ));
         }
 
         entries.sort_by(|a, b| {
@@ -5833,11 +16327,7 @@ impl Tool for FindTool {
                 (None, Some(_)) => Ordering::Greater,
                 (None, None) => Ordering::Equal,
             };
-            ordering.then_with(|| {
-                let a_lower = a.rel.to_lowercase();
-                let b_lower = b.rel.to_lowercase();
-                a_lower.cmp(&b_lower).then_with(|| a.rel.cmp(&b.rel))
-            })
+            ordering.then_with(|| compare_paths_for_line_output(&a.rel, &b.rel))
         });
 
         if entries.is_empty() {
@@ -5850,7 +16340,13 @@ impl Tool for FindTool {
             };
             cache_tool_output(
                 cache_key,
-                stable_cache_dependency_for_path(&search_path, cache_mode, cache_deps.as_deref()),
+                stable_cache_dependencies_for_scoped_scan(
+                    scoped_root,
+                    cwd_scope,
+                    cache_mode,
+                    recursive_cache_access,
+                    cache_deps,
+                ),
                 &output,
             );
             return Ok(output);
@@ -5860,8 +16356,14 @@ impl Tool for FindTool {
         let mut output_builder = HeadTruncatingLineWriter::new(DEFAULT_MAX_BYTES);
         let mut artifact_source = String::new();
         for entry in entries.into_iter().take(effective_limit) {
-            output_builder.push_line(&entry.rel);
-            append_artifact_source_line(&mut artifact_source, &entry.rel);
+            let escaped_path = path_for_line_output(&entry.rel);
+            let line = if entry.is_dir {
+                format!("{escaped_path}/")
+            } else {
+                escaped_path
+            };
+            output_builder.push_line(&line);
+            append_artifact_source_line(&mut artifact_source, &line);
         }
         let mut truncation = output_builder.finish();
 
@@ -5869,15 +16371,10 @@ impl Tool for FindTool {
         let mut notices: Vec<String> = Vec::new();
         let mut details_map = serde_json::Map::new();
 
-        if !status.success() {
-            let code = status.code().unwrap_or(1);
-            notices.push(format!("fd exited with code {code}"));
-        }
-
         if result_limit_reached {
             notices.push(format!(
                 "{effective_limit} results limit reached. Use limit={} for more, or refine pattern",
-                effective_limit * 2
+                effective_limit.saturating_mul(2)
             ));
             details_map.insert(
                 "resultLimitReached".to_string(),
@@ -5901,7 +16398,7 @@ impl Tool for FindTool {
         };
 
         attach_text_artifact_if_needed_with_root(
-            self.artifact_root.as_deref(),
+            artifact_root,
             &mut result_output,
             &mut details,
             "find",
@@ -5917,7 +16414,13 @@ impl Tool for FindTool {
         };
         cache_tool_output(
             cache_key,
-            stable_cache_dependency_for_path(&search_path, cache_mode, cache_deps.as_deref()),
+            stable_cache_dependencies_for_scoped_scan(
+                scoped_root,
+                cwd_scope,
+                cache_mode,
+                recursive_cache_access,
+                cache_deps,
+            ),
             &output,
         );
         Ok(output)
@@ -5937,8 +16440,11 @@ struct LsInput {
 }
 
 pub struct LsTool {
-    cwd: PathBuf,
     artifact_root: Option<PathBuf>,
+    cwd: PathBuf,
+    workspace: WorkspaceHandle,
+    #[cfg(test)]
+    after_scope_hook: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl LsTool {
@@ -5946,7 +16452,17 @@ impl LsTool {
         Self {
             cwd: cwd.to_path_buf(),
             artifact_root: None,
+            workspace: WorkspaceHandle::default(),
+            #[cfg(test)]
+            after_scope_hook: None,
         }
+    }
+
+    /// Attach the session workspace root handle (bd-cv653.3.12).
+    #[must_use]
+    pub fn with_workspace(mut self, workspace: WorkspaceHandle) -> Self {
+        self.workspace = workspace;
+        self
     }
 
     #[cfg(test)]
@@ -5954,6 +16470,21 @@ impl LsTool {
         Self {
             cwd: cwd.to_path_buf(),
             artifact_root: Some(artifact_root.to_path_buf()),
+            workspace: WorkspaceHandle::default(),
+            #[cfg(test)]
+            after_scope_hook: None,
+        }
+    }
+    #[cfg(test)]
+    fn with_after_scope_hook(
+        cwd: &Path,
+        after_scope_hook: impl Fn() + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            cwd: cwd.to_path_buf(),
+            artifact_root: None,
+            workspace: WorkspaceHandle::default(),
+            after_scope_hook: Some(Arc::new(after_scope_hook)),
         }
     }
 }
@@ -5961,6 +16492,10 @@ impl LsTool {
 #[async_trait]
 #[allow(clippy::unnecessary_literal_bound, clippy::too_many_lines)]
 impl Tool for LsTool {
+    fn builtin_factory_context(&self) -> Option<(&Path, &WorkspaceHandle)> {
+        Some((&self.cwd, &self.workspace))
+    }
+
     fn name(&self) -> &str {
         "ls"
     }
@@ -6007,50 +16542,112 @@ impl Tool for LsTool {
             ));
         }
 
+        let cwd_scope = open_scoped_scan_root(&self.cwd, &self.cwd, false, None)
+            .await
+            .map_err(|err| {
+                Error::tool(
+                    "ls",
+                    format!(
+                        "Cannot pin working directory {} for listing: {}",
+                        path_for_line_output(&self.cwd),
+                        error_for_line_output(&err)
+                    ),
+                )
+            })?;
+
         let dir_path = input
             .path
             .as_ref()
             .map_or_else(|| self.cwd.clone(), |p| resolve_read_path(p, &self.cwd));
-        let dir_path = enforce_cwd_scope(&dir_path, &self.cwd, "list")?;
+        let dir_path = enforce_cwd_scope(&dir_path, &self.cwd, "list", &self.workspace)?;
 
         let effective_limit = input.limit.unwrap_or(DEFAULT_LS_LIMIT);
 
-        if !dir_path.exists() {
+        let dir_metadata = std_metadata_async(&dir_path).await.map_err(|err| {
+            if err.kind() == std::io::ErrorKind::NotFound {
+                Error::tool(
+                    "ls",
+                    format!("Path not found: {}", path_for_line_output(&dir_path)),
+                )
+            } else {
+                Error::tool(
+                    "ls",
+                    format!("Cannot read directory: {}", error_for_line_output(&err)),
+                )
+            }
+        })?;
+        if !dir_metadata.is_dir() {
             return Err(Error::tool(
                 "ls",
-                format!("Path not found: {}", dir_path.display()),
+                format!("Not a directory: {}", path_for_line_output(&dir_path)),
             ));
         }
-        if !dir_path.is_dir() {
-            return Err(Error::tool(
+        ensure_ancestors_searchable(&dir_path)
+            .await
+            .map_err(|err| {
+                Error::tool(
+                    "ls",
+                    format!("Cannot read directory: {}", error_for_line_output(&err)),
+                )
+            })?;
+        ensure_effective_mode_access(
+            &dir_metadata,
+            &dir_path,
+            UNIX_ACCESS_READ | UNIX_ACCESS_SEARCH,
+            "directory listing",
+        )
+        .map_err(|err| {
+            Error::tool(
                 "ls",
-                format!("Not a directory: {}", dir_path.display()),
-            ));
-        }
+                format!("Cannot read directory: {}", error_for_line_output(&err)),
+            )
+        })?;
+        #[cfg(test)]
+        let after_scope_hook = self.after_scope_hook.clone();
+        #[cfg(not(test))]
+        let after_scope_hook = None;
+        let scoped_root = open_scoped_scan_root(&dir_path, &self.cwd, false, after_scope_hook)
+            .await
+            .map_err(|err| {
+                Error::tool(
+                    "ls",
+                    format!(
+                        "Cannot pin directory {} for listing: {}",
+                        path_for_line_output(&dir_path),
+                        error_for_line_output(&err)
+                    ),
+                )
+            })?;
+        let listing_path = scoped_root.io_path();
 
         let cache_key = tool_cache_key("ls", &self.cwd, &input_value);
         let cache_mode = ToolCacheFingerprintMode::DirectoryImmediate;
-        let cache_deps = cache_dependency_for_path(&dir_path, cache_mode);
+        let cache_deps =
+            cache_dependencies_for_scoped_scan(&scoped_root, &cwd_scope, cache_mode, None);
         if let Some(output) = cached_tool_output(&cache_key, cache_deps.as_deref()) {
             return Ok(output);
         }
 
         let mut entries = Vec::new();
-        let mut read_dir = asupersync::fs::read_dir(&dir_path)
-            .await
-            .map_err(|e| Error::tool("ls", format!("Cannot read directory: {e}")))?;
+        let mut read_dir = asupersync::fs::read_dir(&listing_path).await.map_err(|e| {
+            Error::tool(
+                "ls",
+                format!("Cannot read directory: {}", error_for_line_output(&e)),
+            )
+        })?;
 
         let mut scan_limit_reached = false;
-        while let Some(entry) = read_dir
-            .next_entry()
-            .await
-            .map_err(|e| Error::tool("ls", format!("Cannot read directory entry: {e}")))?
-        {
+        while let Some(entry) = read_dir.next_entry().await.map_err(|e| {
+            Error::tool(
+                "ls",
+                format!("Cannot read directory entry: {}", error_for_line_output(&e)),
+            )
+        })? {
             if entries.len() >= LS_SCAN_HARD_LIMIT {
                 scan_limit_reached = true;
                 break;
             }
-            let name = entry.file_name().to_string_lossy().to_string();
+            let name = entry.file_name();
             // Handle broken symlinks or permission errors by treating them as non-directories
             // Optimization: use file_type() first to avoid stat overhead on every file.
             let is_dir = match entry.file_type().await {
@@ -6069,8 +16666,9 @@ impl Tool for LsTool {
             entries.push((name, is_dir));
         }
 
-        // Sort alphabetically (case-insensitive).
-        entries.sort_by_cached_key(|(a, _)| a.to_lowercase());
+        // Sort alphabetically (case-insensitive) with a lossless deterministic
+        // tie-breaker for names that differ only by case or invalid Unix bytes.
+        entries.sort_by(|(a, _), (b, _)| compare_paths_for_line_output(Path::new(a), Path::new(b)));
 
         let mut output_builder = HeadTruncatingLineWriter::new(DEFAULT_MAX_BYTES);
         let mut artifact_source = String::new();
@@ -6082,7 +16680,12 @@ impl Tool for LsTool {
                 entry_limit_reached = true;
                 break;
             }
-            let line = if is_dir { format!("{entry}/") } else { entry };
+            let escaped_entry = path_for_line_output(Path::new(&entry));
+            let line = if is_dir {
+                format!("{escaped_entry}/")
+            } else {
+                escaped_entry
+            };
             output_builder.push_line(&line);
             append_artifact_source_line(&mut artifact_source, &line);
             emitted_entries = emitted_entries.saturating_add(1);
@@ -6096,7 +16699,13 @@ impl Tool for LsTool {
             };
             cache_tool_output(
                 cache_key,
-                stable_cache_dependency_for_path(&dir_path, cache_mode, cache_deps.as_deref()),
+                stable_cache_dependencies_for_scoped_scan(
+                    &scoped_root,
+                    &cwd_scope,
+                    cache_mode,
+                    None,
+                    cache_deps.as_deref(),
+                ),
                 &output,
             );
             return Ok(output);
@@ -6112,7 +16721,7 @@ impl Tool for LsTool {
         if entry_limit_reached {
             notices.push(format!(
                 "{effective_limit} entries limit reached. Use limit={} for more",
-                effective_limit * 2
+                effective_limit.saturating_mul(2)
             ));
             details_map.insert(
                 "entryLimitReached".to_string(),
@@ -6162,7 +16771,13 @@ impl Tool for LsTool {
         };
         cache_tool_output(
             cache_key,
-            stable_cache_dependency_for_path(&dir_path, cache_mode, cache_deps.as_deref()),
+            stable_cache_dependencies_for_scoped_scan(
+                &scoped_root,
+                &cwd_scope,
+                cache_mode,
+                None,
+                cache_deps.as_deref(),
+            ),
             &output,
         );
         Ok(output)
@@ -6205,7 +16820,7 @@ pub fn cleanup_temp_files() {
                 && metadata.modified().is_ok_and(|modified| {
                     modified
                         .elapsed()
-                        .is_ok_and(|age| age > Duration::from_secs(24 * 60 * 60))
+                        .is_ok_and(|age| age > Duration::from_hours(24))
                 })
                 && let Err(e) = std::fs::remove_file(&path)
             {
@@ -6366,6 +16981,9 @@ struct BashOutputState {
     start_time: std::time::Instant,
     timeout_ms: Option<u64>,
     temp_file_path: Option<PathBuf>,
+    // Managed jobs may retain a bounded prefix without a complete artifact.
+    // Render that path honestly without publishing it as fullOutputPath.
+    partial_output_path: Option<PathBuf>,
     temp_file: Option<asupersync::fs::File>,
     chunks: VecDeque<Vec<u8>>,
     chunks_bytes: usize,
@@ -6382,6 +17000,7 @@ impl BashOutputState {
             start_time: std::time::Instant::now(),
             timeout_ms: None,
             temp_file_path: None,
+            partial_output_path: None,
             temp_file: None,
             chunks: VecDeque::new(),
             chunks_bytes: 0,
@@ -6393,16 +17012,15 @@ impl BashOutputState {
     fn abandon_spill_file(&mut self) {
         self.spill_failed = true;
         self.temp_file = None;
-        if let Some(path) = self.temp_file_path.take() {
-            if let Err(e) = std::fs::remove_file(&path)
-                && e.kind() != std::io::ErrorKind::NotFound
-            {
-                tracing::debug!(
-                    "Failed to remove incomplete bash spill file {}: {}",
-                    path.display(),
-                    e
-                );
-            }
+        if let Some(path) = self.temp_file_path.take()
+            && let Err(e) = std::fs::remove_file(&path)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::debug!(
+                "Failed to remove incomplete bash spill file {}: {}",
+                path.display(),
+                e
+            );
         }
     }
 }
@@ -6477,7 +17095,11 @@ async fn ingest_bash_chunk(chunk: Vec<u8>, state: &mut BashOutputState) -> Resul
                     #[cfg(unix)]
                     if let Some(expected) = expected_inode {
                         use std::os::unix::fs::MetadataExt;
-                        match file.metadata().await {
+                        // asupersync 0.3.6's fs::Metadata no longer exposes the
+                        // inode (and fs::File has no general AsRawFd), so re-stat
+                        // the path with std symlink_metadata (does not follow
+                        // symlinks) for the TOCTOU/identity guard.
+                        match std::fs::symlink_metadata(&path) {
                             Ok(meta) => {
                                 if !meta.ino().eq(&expected) {
                                     tracing::warn!(
@@ -6604,13 +17226,12 @@ fn emit_bash_update(
             return Ok(());
         };
 
-        if let Some(timeout) = state.timeout_ms {
-            if let Some(progress) = details_map
+        if let Some(timeout) = state.timeout_ms
+            && let Some(progress) = details_map
                 .get_mut("progress")
                 .and_then(|v| v.as_object_mut())
-            {
-                progress.insert("timeoutMs".into(), serde_json::json!(timeout));
-            }
+        {
+            progress.insert("timeoutMs".into(), serde_json::json!(timeout));
         }
         if truncation.truncated {
             details_map.insert("truncation".into(), serde_json::to_value(&truncation)?);
@@ -6633,6 +17254,7 @@ fn emit_bash_update(
 pub(crate) struct ProcessGuard {
     child: Option<std::process::Child>,
     cleanup_mode: ProcessCleanupMode,
+    shell_process: Option<bash_session::ShellProcessLease>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -6646,54 +17268,666 @@ impl ProcessGuard {
         Self {
             child: Some(child),
             cleanup_mode,
+            shell_process: None,
         }
     }
 
+    fn with_shell_state(mut self, state: Option<&bash_session::ShellTransaction>) -> Self {
+        self.shell_process = state.map(bash_session::ShellTransaction::retain_process);
+        self
+    }
+
+    pub(crate) fn take_stdin(&mut self) -> Option<std::process::ChildStdin> {
+        self.child.as_mut().and_then(|child| child.stdin.take())
+    }
+
+    pub(crate) fn take_stdout(&mut self) -> Option<std::process::ChildStdout> {
+        self.child.as_mut().and_then(|child| child.stdout.take())
+    }
+
+    pub(crate) fn take_stderr(&mut self) -> Option<std::process::ChildStderr> {
+        self.child.as_mut().and_then(|child| child.stderr.take())
+    }
+
     pub(crate) fn try_wait_child(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
-        self.child
+        let status = self
+            .child
             .as_mut()
-            .map_or(Ok(None), std::process::Child::try_wait)
+            .map_or(Ok(None), std::process::Child::try_wait)?;
+        if status.is_some()
+            && self.cleanup_mode == ProcessCleanupMode::ProcessGroupTree
+            && (cfg!(windows) || self.shell_process.is_some())
+            && let Some(child) = &self.child
+        {
+            // Descendants can retain stdout after their root exits. Close the
+            // retained Job before the output-drain phase waits for pipe EOF.
+            terminate_reaped_child_discipline(child.id());
+            self.cleanup_mode = ProcessCleanupMode::ChildOnly;
+        }
+        if status.is_some() {
+            drop(self.shell_process.take());
+        }
+        Ok(status)
     }
 
     pub(crate) fn kill(&mut self) -> Option<std::process::ExitStatus> {
         if let Some(mut child) = self.child.take() {
-            cleanup_child(Some(child.id()), self.cleanup_mode);
-            let _ = child.kill();
-            std::thread::spawn(move || {
+            let shell_process = self.shell_process.take();
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    if self.cleanup_mode == ProcessCleanupMode::ProcessGroupTree {
+                        // A previous poll may already have released the Job.
+                        // Never fall back to walking an exited root's PID.
+                        terminate_reaped_child_discipline(child.id());
+                    }
+                    return Some(status);
+                }
+                Ok(None) => {
+                    cleanup_child(Some(child.id()), self.cleanup_mode);
+                    let _ = child.kill();
+                }
+                Err(_) => {
+                    // An ambiguous wait error does not establish ownership
+                    // of a live PID. Release only our retained Windows Job;
+                    // the reaper below still owns the actual child handle.
+                    #[cfg(windows)]
+                    if self.cleanup_mode == ProcessCleanupMode::ProcessGroupTree {
+                        let _ = win_job::terminate(child.id());
+                    }
+                }
+            }
+            dispatch_process_cleanup(move || {
                 let _ = child.wait();
+                drop(shell_process);
             });
-            // We cannot return the exit status synchronously without blocking,
-            // so we return None to indicate the process was forcefully killed.
+            // A live or unconfirmed child is reaped without blocking callers.
             return None;
         }
         None
     }
 
-    pub(crate) fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
-        if let Some(mut child) = self.child.take() {
-            return child.wait();
+    /// Stop an owned process tree and reap its root before returning. Blocking
+    /// subprocess workers use this path when their terminal result requires an
+    /// exit status; async callers can retain the nonblocking `kill` path.
+    pub(crate) fn terminate_and_wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        let reaped = self.try_wait_child()?.is_some();
+        if let Some(child) = self.child.as_mut() {
+            if reaped {
+                if self.cleanup_mode == ProcessCleanupMode::ProcessGroupTree {
+                    // Retire only the owned group/Job. The root PID may have
+                    // been reused since try_wait, so never walk its children.
+                    terminate_reaped_child_discipline(child.id());
+                }
+            } else {
+                cleanup_child(Some(child.id()), self.cleanup_mode);
+                // The tree kill can already have ended the root. Still wait
+                // for its actual status if the direct kill races that exit.
+                let _ = child.kill();
+            }
         }
-        Err(std::io::Error::other("Already waited"))
+        // A wait error leaves this guard armed for a later cleanup attempt.
+        self.wait()
+    }
+
+    pub(crate) fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        let child = self
+            .child
+            .as_mut()
+            .ok_or_else(|| std::io::Error::other("Already waited"))?;
+        // Keep ownership on wait errors so a later retry or Drop still has
+        // the child handle and its registered Windows Job available.
+        let status = child.wait()?;
+        if self.cleanup_mode == ProcessCleanupMode::ProcessGroupTree
+            && (cfg!(windows) || self.shell_process.is_some())
+        {
+            terminate_reaped_child_discipline(child.id());
+            self.cleanup_mode = ProcessCleanupMode::ChildOnly;
+        }
+        drop(self.child.take());
+        drop(self.shell_process.take());
+        Ok(status)
     }
 }
 
 impl Drop for ProcessGuard {
     fn drop(&mut self) {
         if let Some(mut child) = self.child.take() {
-            match child.try_wait() {
-                Ok(None) => {}
-                Ok(Some(_)) | Err(_) => return,
+            let status = child.try_wait();
+            #[cfg(windows)]
+            if !matches!(status, Ok(None))
+                && self.cleanup_mode == ProcessCleanupMode::ProcessGroupTree
+            {
+                // Even an ambiguous wait error must release our owned Job.
+                // Do not infer that the root was reaped or walk its PID.
+                let _ = win_job::terminate(child.id());
+            }
+            if matches!(status, Ok(Some(_))) {
+                if !cfg!(windows)
+                    && self.cleanup_mode == ProcessCleanupMode::ProcessGroupTree
+                    && self.shell_process.is_some()
+                {
+                    terminate_reaped_child_discipline(child.id());
+                }
+                return;
             }
             let cleanup_mode = self.cleanup_mode;
-            std::thread::spawn(move || {
-                cleanup_child(Some(child.id()), cleanup_mode);
-                let _ = child.kill();
+            let shell_process = self.shell_process.take();
+            dispatch_process_cleanup(move || {
+                if matches!(status, Ok(None)) {
+                    cleanup_child(Some(child.id()), cleanup_mode);
+                    let _ = child.kill();
+                }
                 let _ = child.wait();
+                drop(shell_process);
             });
         }
     }
 }
 
+/// The caller retains ownership until a cleanup thread takes its task. If the
+/// OS refuses another thread, reap synchronously instead of dropping a live
+/// child and releasing its shell lease through a failed spawn closure.
+fn dispatch_process_cleanup(cleanup: impl FnOnce() + Send + 'static) {
+    let pending = Arc::new(std::sync::Mutex::new(Some(cleanup)));
+    let worker = Arc::clone(&pending);
+    if thread::Builder::new()
+        .name("pi-process-reaper".to_string())
+        .spawn(move || {
+            let cleanup = worker
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            if let Some(cleanup) = cleanup {
+                cleanup();
+            }
+        })
+        .is_err()
+    {
+        let cleanup = pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(cleanup) = cleanup {
+            cleanup();
+        }
+    }
+}
+
+fn pty_exit_status_code(status: &portable_pty::ExitStatus) -> i32 {
+    if status.signal().is_some() {
+        -1
+    } else {
+        i32::try_from(status.exit_code()).unwrap_or(-1)
+    }
+}
+
+/// PTY children need the same ownership as piped children: dropping a tool
+/// future must kill and reap its process tree before releasing session state.
+struct PtyProcessGuard {
+    child: Option<Box<dyn portable_pty::Child + Send + Sync>>,
+    process_id: Option<u32>,
+    group_active: bool,
+    shell_process: Option<bash_session::ShellProcessLease>,
+}
+
+impl PtyProcessGuard {
+    fn new(
+        child: Box<dyn portable_pty::Child + Send + Sync>,
+        shell_state: Option<&bash_session::ShellTransaction>,
+    ) -> Self {
+        Self {
+            process_id: child.process_id(),
+            child: Some(child),
+            group_active: true,
+            shell_process: shell_state.map(bash_session::ShellTransaction::retain_process),
+        }
+    }
+
+    const fn process_id(&self) -> Option<u32> {
+        self.process_id
+    }
+
+    fn retire_reaped_group(&mut self) {
+        if self.group_active {
+            if let Some(pid) = self.process_id {
+                terminate_reaped_child_discipline(pid);
+            }
+            self.group_active = false;
+        }
+    }
+
+    fn try_wait(&mut self) -> std::io::Result<Option<portable_pty::ExitStatus>> {
+        let status = self
+            .child
+            .as_mut()
+            .map_or(Ok(None), |child| child.try_wait())?;
+        if status.is_some() {
+            self.retire_reaped_group();
+            drop(self.shell_process.take());
+        }
+        Ok(status)
+    }
+
+    fn kill(&mut self) -> std::io::Result<()> {
+        if self.try_wait()?.is_some() {
+            return Ok(());
+        }
+        if let Some(child) = self.child.as_mut() {
+            cleanup_child(self.process_id, ProcessCleanupMode::ProcessGroupTree);
+            child.kill()?;
+        }
+        Ok(())
+    }
+
+    fn wait(&mut self) -> std::io::Result<portable_pty::ExitStatus> {
+        let child = self
+            .child
+            .as_mut()
+            .ok_or_else(|| std::io::Error::other("Already waited"))?;
+        let status = child.wait()?;
+        self.retire_reaped_group();
+        drop(self.child.take());
+        drop(self.shell_process.take());
+        Ok(status)
+    }
+}
+
+impl Drop for PtyProcessGuard {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let status = child.try_wait();
+            if matches!(status, Ok(Some(_))) {
+                self.retire_reaped_group();
+                return;
+            }
+            let process_id = self.process_id;
+            let shell_process = self.shell_process.take();
+            dispatch_process_cleanup(move || {
+                if matches!(status, Ok(None)) {
+                    cleanup_child(process_id, ProcessCleanupMode::ProcessGroupTree);
+                    let _ = child.kill();
+                }
+                let _ = child.wait();
+                drop(shell_process);
+            });
+        }
+    }
+}
+
+/// Spawn with Windows Job membership established before any child code runs.
+///
+/// Unix callers configure their process group on `command` before calling.
+/// A returned child owns exactly one registered Job on Windows. The caller
+/// must immediately retain its cleanup guard and release the discipline when
+/// the root is reaped. There is deliberately no post-spawn attachment API:
+/// replacing an owned kill-on-close Job can terminate a live child.
+pub(crate) fn spawn_command_with_job_discipline(
+    command: &mut Command,
+) -> std::io::Result<std::process::Child> {
+    #[cfg(windows)]
+    return win_job::spawn(command);
+    #[cfg(not(windows))]
+    command.spawn()
+}
+
+/// Terminate descendants still covered by an already-reaped root's platform
+/// discipline without walking a potentially recycled root PID.
+pub(crate) fn terminate_reaped_child_discipline(pid: u32) {
+    #[cfg(windows)]
+    {
+        let _ = win_job::terminate(pid);
+    }
+    #[cfg(unix)]
+    if let Ok(raw_pid) = i32::try_from(pid)
+        && let Some(process_group) = rustix::process::Pid::from_raw(raw_pid)
+    {
+        let _ = rustix::process::kill_process_group(process_group, rustix::process::Signal::KILL);
+    }
+    #[cfg(not(any(unix, windows)))]
+    let _ = pid;
+}
+
+#[cfg(windows)]
+mod win_job {
+    //! Kill-on-close Job objects keyed by root pid (bd-9jgrt item 1).
+    //!
+    //! Windows has no process groups, so the parent-chain walk in
+    //! [`kill_process_tree_with`] races grandchildren spawned after its
+    //! process snapshot. A job closes that race: descendants cannot break
+    //! away (`JOB_OBJECT_LIMIT_BREAKAWAY_OK` is never set), and dropping the
+    //! job's handle terminates every current member in one shot.
+
+    use std::collections::HashMap;
+    use std::os::windows::process::{CommandExt as _, ProcThreadAttributeList};
+    use std::process::{Child, Command};
+    use std::sync::{LazyLock, Mutex};
+
+    use win32job::{ExtendedLimitInfo, Job};
+
+    static REGISTRY: LazyLock<Mutex<HashMap<u32, Job>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+    const PROC_THREAD_ATTRIBUTE_JOB_LIST: usize = 0x0002_000d;
+
+    pub fn spawn(command: &mut Command) -> std::io::Result<Child> {
+        spawn_in_registry(command, &REGISTRY, |_, _| Ok(()))
+    }
+
+    fn spawn_in_registry(
+        command: &mut Command,
+        registry: &Mutex<HashMap<u32, Job>>,
+        before_registration: impl FnOnce(&Child, &Job) -> std::io::Result<()>,
+    ) -> std::io::Result<Child> {
+        let mut map = registry
+            .lock()
+            .map_err(|_| std::io::Error::other("Windows Job registry is poisoned"))?;
+        prune_dead_entries(&mut map);
+        // Nothing fallible remains in registry publication after OS spawn.
+        map.try_reserve(1).map_err(std::io::Error::other)?;
+        let mut limits = ExtendedLimitInfo::new();
+        limits.limit_kill_on_job_close();
+        let job = Job::create_with_limit_info(&limits).map_err(std::io::Error::other)?;
+
+        // Windows 10 / Server 2016+: PROC_THREAD_ATTRIBUTE_JOB_LIST assigns
+        // membership inside CreateProcess, before the first thread can run.
+        // The owned Job and this actual HANDLE-sized array both outlive the
+        // attribute list and spawn. Passing the array itself (not a slice or
+        // pointer to a temporary) supplies the exact documented value size.
+        let job_handles = [job.handle()];
+        let attributes = ProcThreadAttributeList::build()
+            .attribute(PROC_THREAD_ATTRIBUTE_JOB_LIST, &job_handles)
+            .finish()?;
+        let mut child = command.spawn_with_attributes(&attributes)?;
+        drop(attributes);
+        if let Err(error) = before_registration(&child, &job) {
+            drop(job);
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
+        map.insert(child.id(), job);
+        Ok(child)
+    }
+
+    /// Kill the tree rooted at `pid` via its job, returning whether one
+    /// existed. Dropping the stored `Job` closes the handle, and
+    /// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` does the actual termination.
+    pub fn terminate(pid: u32) -> bool {
+        terminate_in_registry(pid, &REGISTRY)
+    }
+
+    fn terminate_in_registry(pid: u32, registry: &Mutex<HashMap<u32, Job>>) -> bool {
+        // Refuse new spawns after a registry panic, but preserve cleanup of
+        // Jobs already owned by callers. Keep the mutex poisoned afterward.
+        let job = registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&pid);
+        job.is_some()
+    }
+
+    /// Drop entries whose root process no longer exists so the map (and its
+    /// kernel handles) stays proportional to live spawned children. Skipped
+    /// while small to avoid a process-table refresh per trivial spawn.
+    fn prune_dead_entries(map: &mut HashMap<u32, Job>) {
+        if map.len() < 8 {
+            return;
+        }
+        let pids: Vec<sysinfo::Pid> = map.keys().map(|&pid| sysinfo::Pid::from_u32(pid)).collect();
+        let mut sys = sysinfo::System::new();
+        sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&pids), true);
+        let dead: Vec<u32> = pids
+            .iter()
+            .filter(|pid| sys.process(**pid).is_none())
+            .map(|pid| pid.as_u32())
+            .collect();
+        for pid in dead {
+            // Jobs whose root died are empty; dropping just reclaims the handle.
+            map.remove(&pid);
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::os::windows::io::AsRawHandle;
+        use std::path::Path;
+        use std::process::Stdio;
+        use std::time::{Duration, Instant};
+
+        const FIXTURE: &str = "tools::win_job::tests::atomic_job_child_fixture";
+        const ROLE_ENV: &str = "PI_TEST_ATOMIC_JOB_ROLE";
+        const PID_FILE_ENV: &str = "PI_TEST_ATOMIC_JOB_PID_FILE";
+
+        fn fixture_command(role: &str, pid_file: &Path) -> Command {
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
+                .args(["--exact", FIXTURE, "--nocapture"])
+                .env(ROLE_ENV, role)
+                .env(PID_FILE_ENV, pid_file)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            command
+        }
+
+        #[test]
+        fn atomic_job_child_fixture() {
+            let Ok(role) = std::env::var(ROLE_ENV) else {
+                return;
+            };
+            let pid_file = std::env::var_os(PID_FILE_ENV).unwrap();
+            if role == "root" || role == "root-exit" {
+                // Deliberately spawn before any parent-side registration can
+                // run. This descendant must inherit containment at birth.
+                let mut descendant = fixture_command("descendant", Path::new(&pid_file))
+                    .spawn()
+                    .unwrap();
+                std::fs::write(&pid_file, descendant.id().to_string()).unwrap();
+                if role == "root-exit" {
+                    let exit_gate = Path::new(&pid_file).with_extension("exit");
+                    let deadline = Instant::now() + Duration::from_secs(10);
+                    while !exit_gate.exists() && Instant::now() < deadline {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    return;
+                }
+                std::thread::sleep(Duration::from_secs(30));
+                let _ = descendant.kill();
+                let _ = descendant.wait();
+            } else {
+                std::thread::sleep(Duration::from_secs(30));
+            }
+        }
+
+        fn descendant_pid(path: &Path) -> u32 {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                if let Ok(text) = std::fs::read_to_string(path)
+                    && let Ok(pid) = text.parse()
+                {
+                    return pid;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "fixture did not publish its descendant"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        fn wait_for_exit(child: &mut Child) {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while child.try_wait().unwrap().is_none() {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("contained process did not exit after its Job closed");
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        #[test]
+        fn child_and_first_descendant_are_contained_before_registration() {
+            let directory = tempfile::tempdir().unwrap();
+            let pid_file = directory.path().join("descendant.pid");
+            let registry = Mutex::new(HashMap::new());
+            let mut child = spawn_in_registry(
+                &mut fixture_command("root", &pid_file),
+                &registry,
+                |child, job| {
+                    let descendant = descendant_pid(&pid_file);
+                    let members = job.query_process_id_list().unwrap();
+                    assert!(members.contains(&usize::try_from(child.id()).unwrap()));
+                    assert!(
+                        members.contains(&usize::try_from(descendant).unwrap()),
+                        "the first descendant escaped before parent-side registration"
+                    );
+                    Ok(())
+                },
+            )
+            .unwrap();
+            let job = registry.lock().unwrap().remove(&child.id()).unwrap();
+            drop(job);
+            wait_for_exit(&mut child);
+            assert!(registry.lock().unwrap().is_empty());
+        }
+
+        #[test]
+        fn poisoned_registry_refuses_before_the_child_is_created() {
+            let registry = Mutex::new(HashMap::new());
+            let _ = std::panic::catch_unwind(|| {
+                let _guard = registry.lock().unwrap();
+                panic!("injected registry poison");
+            });
+            let directory = tempfile::tempdir().unwrap();
+            let pid_file = directory.path().join("must-not-run.pid");
+            let mut spawned = false;
+            let error = spawn_in_registry(
+                &mut fixture_command("root", &pid_file),
+                &registry,
+                |_, _| {
+                    spawned = true;
+                    Ok(())
+                },
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("registry is poisoned"));
+            assert!(!spawned);
+            assert!(!pid_file.exists());
+        }
+
+        #[test]
+        fn poisoned_registry_still_releases_an_owned_job() {
+            let directory = tempfile::tempdir().unwrap();
+            let pid_file = directory.path().join("descendant.pid");
+            let registry = Mutex::new(HashMap::new());
+            let mut child = spawn_in_registry(
+                &mut fixture_command("root", &pid_file),
+                &registry,
+                |child, job| {
+                    let descendant = descendant_pid(&pid_file);
+                    let members = job.query_process_id_list().unwrap();
+                    assert!(members.contains(&usize::try_from(child.id()).unwrap()));
+                    assert!(members.contains(&usize::try_from(descendant).unwrap()));
+                    Ok(())
+                },
+            )
+            .unwrap();
+            let _ = std::panic::catch_unwind(|| {
+                let _guard = registry.lock().unwrap();
+                panic!("injected poison after owned spawn");
+            });
+            assert!(terminate_in_registry(child.id(), &registry));
+            wait_for_exit(&mut child);
+            assert!(!terminate_in_registry(child.id(), &registry));
+            assert!(registry.is_poisoned());
+            assert!(
+                registry
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .is_empty()
+            );
+        }
+
+        #[test]
+        fn failed_publication_reaps_the_child_and_does_not_register_a_job() {
+            let directory = tempfile::tempdir().unwrap();
+            let pid_file = directory.path().join("descendant.pid");
+            let registry = Mutex::new(HashMap::new());
+            // A separate nested Job keeps a queryable observer after the
+            // production Job closes, without relying on a recycled PID probe.
+            let observer = Job::create().unwrap();
+            let mut observed_spawn = false;
+            let error = spawn_in_registry(
+                &mut fixture_command("root", &pid_file),
+                &registry,
+                |child, job| {
+                    let descendant = descendant_pid(&pid_file);
+                    let members = job.query_process_id_list().unwrap();
+                    assert!(members.contains(&usize::try_from(child.id()).unwrap()));
+                    assert!(members.contains(&usize::try_from(descendant).unwrap()));
+                    observer
+                        .assign_process(child.as_raw_handle() as isize)
+                        .unwrap();
+                    observed_spawn = true;
+                    Err(std::io::Error::other("injected publication refusal"))
+                },
+            )
+            .unwrap_err();
+            assert!(observed_spawn);
+            assert_eq!(error.to_string(), "injected publication refusal");
+            assert!(registry.lock().unwrap().is_empty());
+            assert!(
+                observer.query_process_id_list().unwrap().is_empty(),
+                "the failed spawn must finish reaping before returning its error"
+            );
+        }
+
+        #[test]
+        fn process_guard_releases_the_job_when_its_root_exits() {
+            for completion in [
+                "try_wait",
+                "wait",
+                "terminate_and_wait",
+                "kill",
+                "try_wait_then_kill",
+                "drop",
+            ] {
+                let directory = tempfile::tempdir().unwrap();
+                let pid_file = directory.path().join("descendant.pid");
+                let mut child = spawn(&mut fixture_command("root-exit", &pid_file)).unwrap();
+                let pid = child.id();
+                let descendant = descendant_pid(&pid_file);
+                assert!(
+                    REGISTRY.lock().unwrap()[&pid]
+                        .query_process_id_list()
+                        .unwrap()
+                        .contains(&usize::try_from(descendant).unwrap())
+                );
+                std::fs::write(pid_file.with_extension("exit"), "exit").unwrap();
+                wait_for_exit(&mut child);
+                let mut guard = super::super::ProcessGuard::new(
+                    child,
+                    super::super::ProcessCleanupMode::ProcessGroupTree,
+                );
+                match completion {
+                    "try_wait" => assert!(guard.try_wait_child().unwrap().is_some()),
+                    "wait" => assert!(guard.wait().unwrap().success()),
+                    "terminate_and_wait" => assert!(guard.terminate_and_wait().unwrap().success()),
+                    "kill" => assert!(guard.kill().unwrap().success()),
+                    "try_wait_then_kill" => {
+                        assert!(guard.try_wait_child().unwrap().is_some());
+                        assert!(guard.kill().unwrap().success());
+                        assert!(guard.kill().is_none());
+                    }
+                    _ => drop(guard),
+                }
+                assert!(!REGISTRY.lock().unwrap().contains_key(&pid));
+            }
+        }
+    }
+}
 fn cleanup_child(pid: Option<u32>, cleanup_mode: ProcessCleanupMode) {
     if cleanup_mode == ProcessCleanupMode::ProcessGroupTree {
         kill_process_group_tree(pid);
@@ -6704,11 +17938,11 @@ pub fn kill_process_tree(pid: Option<u32>) {
     kill_process_tree_with(pid, sysinfo::Signal::Kill, false);
 }
 
-pub(crate) fn kill_process_group_tree(pid: Option<u32>) {
+pub fn kill_process_group_tree(pid: Option<u32>) {
     kill_process_tree_with(pid, sysinfo::Signal::Kill, true);
 }
 
-fn terminate_process_group_tree(pid: Option<u32>) {
+pub(crate) fn terminate_process_group_tree(pid: Option<u32>) {
     kill_process_tree_with(pid, sysinfo::Signal::Term, true);
 }
 
@@ -6716,6 +17950,17 @@ fn kill_process_tree_with(pid: Option<u32>, signal: sysinfo::Signal, include_pro
     let Some(pid) = pid else {
         return;
     };
+
+    // Windows fast path: children spawned through
+    // `spawn_command_with_job_discipline` carry a Job object containing their whole
+    // descendant tree, so dropping the job kills everyone in one shot —
+    // including grandchildren that appeared after this function would
+    // otherwise have taken its snapshot (bd-9jgrt item 1). Pids without a
+    // job (hub PTY services, external pids) fall through to the walk below.
+    #[cfg(windows)]
+    if win_job::terminate(pid) {
+        return;
+    }
 
     let root = sysinfo::Pid::from_u32(pid);
 
@@ -6738,19 +17983,18 @@ fn kill_process_tree_with(pid: Option<u32>, signal: sysinfo::Signal, include_pro
         // When they do, killing the group first catches background children even
         // if they have already been reparented away from the original root PID.
         #[cfg(unix)]
+        if let Ok(raw_pid) = i32::try_from(pid)
+            && let Some(process_group) = rustix::process::Pid::from_raw(raw_pid)
         {
-            let sig_num = match signal {
-                sysinfo::Signal::Kill => "9",
-                _ => "15",
+            let group_signal = match signal {
+                sysinfo::Signal::Kill => rustix::process::Signal::KILL,
+                _ => rustix::process::Signal::TERM,
             };
-            let _ = Command::new("kill")
-                .arg(format!("-{sig_num}"))
-                .arg("--")
-                .arg(format!("-{pid}"))
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
+            // Use the direct syscall wrapper rather than an ambient-PATH
+            // `kill` executable. Cleanup runs from timeout and Drop paths, so
+            // it must neither execute user-controlled code nor wait on a
+            // subprocess that can hang before the real child is reaped.
+            let _ = rustix::process::kill_process_group(process_group, group_signal);
         }
     }
 
@@ -6806,6 +18050,163 @@ pub(crate) fn command_with_default_sigpipe_in_dir(
     command_with_default_sigpipe_for_cwd(program.as_ref(), Some(cwd))
 }
 
+#[cfg(windows)]
+const WINDOWS_SHARE_JOB_SPEC_ENV: &str = "PI_INTERNAL_SHARE_JOB_SPEC";
+
+#[cfg(windows)]
+#[derive(Serialize, Deserialize)]
+struct WindowsShareJobSpec {
+    program: Vec<u16>,
+    args: Vec<Vec<u16>>,
+    cwd: Vec<u16>,
+    gate_path: Vec<u16>,
+}
+
+/// Keeps the private launch directory alive until a gated `/share` child exits.
+pub(crate) struct JobGatedChildLaunch {
+    #[cfg(windows)]
+    gate_path: PathBuf,
+    #[cfg(windows)]
+    _launch_dir: tempfile::TempDir,
+}
+
+impl JobGatedChildLaunch {
+    /// Allow the wrapper to start its target after process-tree discipline is live.
+    // Not const, and `self` is not unused: the cfg(windows) body opens
+    // `self.gate_path`, which file I/O forbids in a const fn.
+    #[allow(
+        clippy::unnecessary_wraps,
+        clippy::unused_self,
+        clippy::missing_const_for_fn
+    )]
+    pub(crate) fn release(&self) -> std::io::Result<()> {
+        #[cfg(windows)]
+        {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&self.gate_path)?;
+        }
+        Ok(())
+    }
+}
+
+/// Prepare a command whose Windows target waits for its owner's launch gate.
+///
+/// Unix already creates a new process-group leader before the target image
+/// runs. On Windows, a copy of Pi waits on a private file gate using only
+/// in-process operations. Spawn that wrapper with atomic Job membership,
+/// retain its owner and check cancellation before opening the gate. The real
+/// target then inherits the same kill-on-close discipline as the wrapper.
+pub(crate) fn command_with_job_gate_in_dir(
+    program: impl AsRef<OsStr>,
+    args: &[OsString],
+    cwd: &Path,
+) -> std::io::Result<(Command, JobGatedChildLaunch)> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt as _;
+
+        let launch_dir = tempfile::Builder::new()
+            .prefix("pi-share-job-gate-")
+            .tempdir()?;
+        let spec_path = launch_dir.path().join("spec.json");
+        let gate_path = launch_dir.path().join("start");
+        let spec = WindowsShareJobSpec {
+            program: program.as_ref().encode_wide().collect(),
+            args: args
+                .iter()
+                .map(|arg| arg.as_os_str().encode_wide().collect())
+                .collect(),
+            cwd: cwd.as_os_str().encode_wide().collect(),
+            gate_path: gate_path.as_os_str().encode_wide().collect(),
+        };
+        let encoded = serde_json::to_vec(&spec).map_err(std::io::Error::other)?;
+        std::fs::write(&spec_path, encoded)?;
+
+        let mut command = Command::new(std::env::current_exe()?);
+        command.env(WINDOWS_SHARE_JOB_SPEC_ENV, spec_path);
+        Ok((
+            command,
+            JobGatedChildLaunch {
+                gate_path,
+                _launch_dir: launch_dir,
+            },
+        ))
+    }
+    #[cfg(not(windows))]
+    {
+        let mut command = command_with_default_sigpipe_in_dir(program, cwd)?;
+        command.args(args);
+        Ok((command, JobGatedChildLaunch {}))
+    }
+}
+
+/// Run the Windows half of the private target launch gate, if requested.
+///
+/// This is called before normal CLI initialization. The wait itself never
+/// spawns a process, so cancellation can still prevent the target launch.
+#[cfg(windows)]
+#[doc(hidden)]
+pub fn run_windows_share_job_child_if_requested() -> Option<i32> {
+    let spec_path = std::env::var_os(WINDOWS_SHARE_JOB_SPEC_ENV)?;
+    Some(match run_windows_share_job_child(Path::new(&spec_path)) {
+        Ok(exit_code) => exit_code,
+        Err(err) => {
+            eprintln!("pi internal share child failed: {err}");
+            1
+        }
+    })
+}
+
+#[cfg(windows)]
+fn run_windows_share_job_child(spec_path: &Path) -> std::io::Result<i32> {
+    use std::os::windows::ffi::OsStringExt as _;
+
+    const MAX_SPEC_BYTES: u64 = 1024 * 1024;
+    const GATE_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
+    const GATE_POLL_INTERVAL: Duration = Duration::from_millis(1);
+
+    let metadata = std::fs::metadata(spec_path)?;
+    if metadata.len() > MAX_SPEC_BYTES {
+        return Err(std::io::Error::other(
+            "internal share child specification is too large",
+        ));
+    }
+    let encoded = std::fs::read(spec_path)?;
+    let spec: WindowsShareJobSpec =
+        serde_json::from_slice(&encoded).map_err(std::io::Error::other)?;
+    let gate_path = PathBuf::from(OsString::from_wide(&spec.gate_path));
+    if gate_path.parent() != spec_path.parent() {
+        return Err(std::io::Error::other(
+            "internal share launch gate is outside its specification directory",
+        ));
+    }
+
+    let deadline = std::time::Instant::now() + GATE_WAIT_TIMEOUT;
+    while !gate_path.is_file() {
+        if std::time::Instant::now() >= deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "internal share launch gate timed out",
+            ));
+        }
+        std::thread::sleep(GATE_POLL_INTERVAL);
+    }
+
+    let program = OsString::from_wide(&spec.program);
+    let args = spec.args.iter().map(|arg| OsString::from_wide(arg));
+    let cwd = PathBuf::from(OsString::from_wide(&spec.cwd));
+    // ubs:ignore argv comes from the parent-generated private share spec and is
+    // launched without a shell after the Job gate opens.
+    let status = Command::new(program)
+        .args(args)
+        .current_dir(cwd)
+        .env_remove(WINDOWS_SHARE_JOB_SPEC_ENV)
+        .status()?;
+    Ok(status.code().unwrap_or(1))
+}
+
 #[cfg(unix)]
 fn command_with_default_sigpipe_for_cwd(
     program: &OsStr,
@@ -6827,7 +18228,9 @@ fn command_with_default_sigpipe_for_cwd(
     Ok(command)
 }
 
+// Mirrors the Unix arm, which resolves the program against `cwd` and can fail.
 #[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps)]
 fn command_with_default_sigpipe_for_cwd(
     program: &OsStr,
     _cwd: Option<&Path>,
@@ -6899,6 +18302,12 @@ fn resolve_executable_for_shell_trampoline(
 }
 
 /// Detach a child process from pi's controlling terminal.
+// The Unix arm mutates `command`; off Unix there is no controlling terminal to
+// detach from, so the parameter is untouched and the body is a no-op.
+#[cfg_attr(
+    not(unix),
+    allow(clippy::needless_pass_by_ref_mut, clippy::missing_const_for_fn)
+)]
 pub(crate) fn isolate_command_process_group(command: &mut Command) {
     #[cfg(unix)]
     {
@@ -6914,7 +18323,7 @@ pub(crate) fn isolate_command_process_group(command: &mut Command) {
 
 fn format_grep_path(file_path: &Path, cwd: &Path) -> String {
     if let Ok(rel) = file_path.strip_prefix(cwd) {
-        let rel_str = rel.display().to_string().replace('\\', "/");
+        let rel_str = path_for_line_output(rel);
         if !rel_str.is_empty() {
             return rel_str;
         }
@@ -6923,58 +18332,144 @@ fn format_grep_path(file_path: &Path, cwd: &Path) -> String {
     let canonical_file = safe_canonicalize(file_path);
     let canonical_cwd = safe_canonicalize(cwd);
     if let Ok(rel) = canonical_file.strip_prefix(&canonical_cwd) {
-        let rel_str = rel.display().to_string().replace('\\', "/");
+        let rel_str = path_for_line_output(rel);
         if !rel_str.is_empty() {
             return rel_str;
         }
     }
 
-    file_path.display().to_string().replace('\\', "/")
+    path_for_line_output(file_path)
 }
 
-async fn get_file_lines_async<'a>(
-    path: &Path,
-    cache: &'a mut HashMap<PathBuf, Vec<String>>,
-) -> &'a [String] {
-    if !cache.contains_key(path) {
-        // Prevent OOM on huge files and hangs on pipes
-        if let Ok(meta) = asupersync::fs::metadata(path).await {
-            if !meta.is_file() || meta.len() > 10 * 1024 * 1024 {
-                cache.insert(path.to_path_buf(), Vec::new());
-                return &[];
-            }
-        } else {
-            cache.insert(path.to_path_buf(), Vec::new());
-            return &[];
+async fn get_file_lines_async(path: &Path, cwd: &Path) -> Vec<String> {
+    // Match Node's `readFileSync(..., "utf-8")` behavior: decode lossily rather than failing.
+    // Open the exact result path without following a terminal link and
+    // verify its descriptor identity against the scoped path snapshot.
+    // This prevents a concurrent workspace mutation from swapping an rg
+    // result to an out-of-scope file between search and context rendering.
+    let path_for_read = path.to_path_buf();
+    let cwd_for_read = cwd.to_path_buf();
+    let bytes = match asupersync::runtime::spawn_blocking_io(move || {
+        read_scoped_file_capped_sync(&path_for_read, &cwd_for_read, GREP_CONTEXT_MAX_FILE_BYTES)
+    })
+    .await
+    {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            tracing::debug!(
+                "Failed to read grep file {}: {}",
+                path_for_line_output(path),
+                error_for_line_output(&err)
+            );
+            return Vec::new();
         }
+    };
+    split_grep_context_lines(&bytes, path)
+}
 
-        // Match Node's `readFileSync(..., "utf-8")` behavior: decode lossily rather than failing.
-        let bytes = match asupersync::fs::read(path).await {
+/// Render grep context lines for a pinned regular-file scan root by reading
+/// the held descriptor itself (offset-independent `read_at`/`seek_read`), so
+/// a rename/symlink swap of the logical path after pinning cannot redirect or
+/// break context rendering.
+async fn get_pinned_file_lines_async(scoped_root: &ScopedScanRoot) -> Vec<String> {
+    let logical = scoped_root.logical_path().to_path_buf();
+    #[cfg(unix)]
+    let handle = match scoped_root.handle.try_clone() {
+        Ok(handle) => handle,
+        Err(err) => {
+            tracing::debug!(
+                "Failed to clone pinned grep file handle {}: {}",
+                path_for_line_output(&logical),
+                error_for_line_output(&err)
+            );
+            return Vec::new();
+        }
+    };
+    #[cfg(unix)]
+    let bytes = {
+        let read = asupersync::runtime::spawn_blocking_io(move || {
+            use std::os::unix::fs::FileExt as _;
+
+            let cap = usize::try_from(GREP_CONTEXT_MAX_FILE_BYTES).unwrap_or(usize::MAX);
+            let mut bytes = Vec::new();
+            let mut offset = 0u64;
+            // Heap-allocated: 64KiB on the stack trips clippy::large_stack_arrays.
+            let mut chunk = vec![0u8; 64 * 1024];
+            loop {
+                let read = handle.read_at(&mut chunk, offset)?;
+                if read == 0 {
+                    break;
+                }
+                bytes.extend_from_slice(&chunk[..read]);
+                offset = offset.saturating_add(read as u64);
+                if bytes.len() > cap {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("pinned grep file exceeds {GREP_CONTEXT_MAX_FILE_BYTES} bytes"),
+                    ));
+                }
+            }
+            Ok(bytes)
+        })
+        .await;
+        match read {
             Ok(bytes) => bytes,
             Err(err) => {
-                tracing::debug!("Failed to read grep file {}: {err}", path.display());
-                cache.insert(path.to_path_buf(), Vec::new());
-                return &[];
-            }
-        };
-        let content = String::from_utf8_lossy(&bytes);
-        let mut lines = Vec::new();
-        for line in content.split('\n') {
-            let trimmed = line.strip_suffix('\r').unwrap_or(line);
-            for piece in trimmed.split('\r') {
-                lines.push(piece.to_string());
+                tracing::debug!(
+                    "Failed to read pinned grep file {}: {}",
+                    path_for_line_output(&logical),
+                    error_for_line_output(&err)
+                );
+                return Vec::new();
             }
         }
-        if content.ends_with('\n') && lines.last().is_some_and(std::string::String::is_empty) {
-            lines.pop();
+    };
+    // Windows pins parent components rather than the file itself; the
+    // logical-path read below matches the platform's established posture.
+    #[cfg(not(unix))]
+    let bytes = {
+        let path_for_read = logical.clone();
+        match asupersync::runtime::spawn_blocking_io(move || {
+            read_file_capped_sync(&path_for_read, GREP_CONTEXT_MAX_FILE_BYTES)
+        })
+        .await
+        {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                tracing::debug!(
+                    "Failed to read pinned grep file {}: {}",
+                    path_for_line_output(&logical),
+                    error_for_line_output(&err)
+                );
+                return Vec::new();
+            }
         }
-        cache.insert(path.to_path_buf(), lines);
+    };
+    split_grep_context_lines(&bytes, &logical)
+}
+
+/// Lossily decode grep file bytes into display lines, normalizing `\r`
+/// variants and enforcing [`GREP_CONTEXT_MAX_LINES`].
+fn split_grep_context_lines(bytes: &[u8], path: &Path) -> Vec<String> {
+    let content = String::from_utf8_lossy(bytes);
+    let mut lines = Vec::new();
+    for line in content.split('\n') {
+        let trimmed = line.strip_suffix('\r').unwrap_or(line);
+        for piece in trimmed.split('\r') {
+            if lines.len() == GREP_CONTEXT_MAX_LINES {
+                tracing::debug!(
+                    "Refusing to materialize more than {GREP_CONTEXT_MAX_LINES} grep context lines from {}",
+                    path_for_line_output(path)
+                );
+                return Vec::new();
+            }
+            lines.push(piece.to_string());
+        }
     }
-    if let Some(lines) = cache.get(path) {
-        lines.as_slice()
-    } else {
-        &[]
+    if content.ends_with('\n') && lines.last().is_some_and(std::string::String::is_empty) {
+        lines.pop();
     }
+    lines
 }
 
 fn find_fd_binary() -> Option<&'static str> {
@@ -7142,6 +18637,8 @@ fn strip_hashline_prefix(line: &str) -> &str {
 struct HashlineEditInput {
     path: String,
     edits: Vec<HashlineOp>,
+    #[serde(default)]
+    raw: bool,
 }
 
 /// A single hashline edit operation.
@@ -7190,12 +18687,48 @@ struct ResolvedEdit<'a> {
 
 pub struct HashlineEditTool {
     cwd: PathBuf,
+    text_file_client: TextFileClientScope,
+    before_persist_hook: Option<Arc<dyn Fn() + Send + Sync>>,
+    mutation_recorder: Option<Arc<crate::undo::FileMutationRecorder>>,
+    workspace: WorkspaceHandle,
 }
 
 impl HashlineEditTool {
     pub fn new(cwd: &Path) -> Self {
         Self {
             cwd: cwd.to_path_buf(),
+            text_file_client: TextFileClientScope::default(),
+            before_persist_hook: None,
+            mutation_recorder: None,
+            workspace: WorkspaceHandle::default(),
+        }
+    }
+
+    /// Attach the session's undo recorder (bd-cv653.3.13).
+    #[must_use]
+    pub fn with_mutation_recorder(
+        mut self,
+        recorder: Option<Arc<crate::undo::FileMutationRecorder>>,
+    ) -> Self {
+        self.mutation_recorder = recorder;
+        self
+    }
+
+    /// Attach the session workspace root handle (bd-cv653.3.12).
+    #[must_use]
+    pub fn with_workspace(mut self, workspace: WorkspaceHandle) -> Self {
+        self.workspace = workspace;
+        self
+    }
+
+    #[cfg(test)]
+    fn with_before_persist_hook(cwd: &Path, hook: impl Fn() + Send + Sync + 'static) -> Self {
+        Self {
+            cwd: cwd.to_path_buf(),
+            text_file_client: TextFileClientScope::default(),
+            before_persist_hook: Some(Arc::new(hook)),
+            mutation_recorder: None,
+            workspace: WorkspaceHandle::default(),
         }
     }
 }
@@ -7250,31 +18783,31 @@ fn collect_mismatches(
 ) -> std::result::Result<(), String> {
     let mut errors = Vec::new();
     for edit in edits {
-        if let Some(ref pos) = edit.pos {
-            if let Err(e) = validate_line_ref(pos, file_lines, had_bom) {
-                // Find the line index for context
-                if let Ok((line_num, _)) = parse_hashline_tag(pos) {
-                    let idx = (line_num - 1).min(file_lines.len().saturating_sub(1));
-                    errors.push(format!(
-                        "{e}\n{}",
-                        mismatch_context(file_lines, idx, 2, had_bom)
-                    ));
-                } else {
-                    errors.push(e);
-                }
+        if let Some(ref pos) = edit.pos
+            && let Err(e) = validate_line_ref(pos, file_lines, had_bom)
+        {
+            // Find the line index for context
+            if let Ok((line_num, _)) = parse_hashline_tag(pos) {
+                let idx = (line_num - 1).min(file_lines.len().saturating_sub(1));
+                errors.push(format!(
+                    "{e}\n{}",
+                    mismatch_context(file_lines, idx, 2, had_bom)
+                ));
+            } else {
+                errors.push(e);
             }
         }
-        if let Some(ref end) = edit.end {
-            if let Err(e) = validate_line_ref(end, file_lines, had_bom) {
-                if let Ok((line_num, _)) = parse_hashline_tag(end) {
-                    let idx = (line_num - 1).min(file_lines.len().saturating_sub(1));
-                    errors.push(format!(
-                        "{e}\n{}",
-                        mismatch_context(file_lines, idx, 2, had_bom)
-                    ));
-                } else {
-                    errors.push(e);
-                }
+        if let Some(ref end) = edit.end
+            && let Err(e) = validate_line_ref(end, file_lines, had_bom)
+        {
+            if let Ok((line_num, _)) = parse_hashline_tag(end) {
+                let idx = (line_num - 1).min(file_lines.len().saturating_sub(1));
+                errors.push(format!(
+                    "{e}\n{}",
+                    mismatch_context(file_lines, idx, 2, had_bom)
+                ));
+            } else {
+                errors.push(e);
             }
         }
     }
@@ -7307,6 +18840,18 @@ fn op_precedence(op: &str) -> u8 {
 #[async_trait]
 #[allow(clippy::unnecessary_literal_bound)]
 impl Tool for HashlineEditTool {
+    fn prewalk_evidence(
+        &self,
+        input: &serde_json::Value,
+        output: &ToolOutput,
+    ) -> crate::prewalk::ToolEvidence {
+        crate::prewalk::ToolEvidence::text_edit(input, output)
+    }
+
+    fn bind_text_file_client_scope(&mut self, scope: TextFileClientScope) {
+        self.text_file_client = scope;
+    }
+
     fn name(&self) -> &str {
         "hashline_edit"
     }
@@ -7317,7 +18862,8 @@ impl Tool for HashlineEditTool {
         "Apply precise file edits using LINE#HASH tags from a prior read with hashline=true. \
          Each edit specifies an op (replace/prepend/append), a pos anchor (\"N#AB\"), an optional \
          end anchor for range replace, and replacement lines. Edits are validated against current \
-         file hashes and applied bottom-up to avoid index invalidation."
+         file hashes and applied bottom-up to avoid index invalidation. For .ipynb, anchors \
+         address the editable cell view; set raw=true when the preceding read used raw=true."
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -7327,6 +18873,10 @@ impl Tool for HashlineEditTool {
                 "path": {
                     "type": "string",
                     "description": "Path to the file to edit (relative or absolute)"
+                },
+                "raw": {
+                    "type": "boolean",
+                    "description": "Apply anchors to original notebook JSON instead of the editable cell view; match read(raw=true)."
                 },
                 "edits": {
                     "type": "array",
@@ -7367,7 +18917,7 @@ impl Tool for HashlineEditTool {
     #[allow(clippy::too_many_lines)]
     async fn execute(
         &self,
-        _tool_call_id: &str,
+        tool_call_id: &str,
         input: serde_json::Value,
         _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
     ) -> Result<ToolOutput> {
@@ -7378,29 +18928,54 @@ impl Tool for HashlineEditTool {
             return Err(Error::tool("hashline_edit", "No edits provided"));
         }
 
+        // Scheme URLs route through the router — never a silent filesystem
+        // fallback (bd-cv653.6.5).
+        if crate::url_router::has_scheme(&input.path) {
+            return self.execute_ssh_hashline_edit(&input).await;
+        }
+
         // Resolve file path and enforce scope before touching the filesystem.
         let resolved = resolve_read_path(&input.path, &self.cwd);
-        let absolute_path = enforce_cwd_scope(&resolved, &self.cwd, "hashline_edit")?;
+        let absolute_path =
+            enforce_cwd_scope(&resolved, &self.cwd, "hashline_edit", &self.workspace)?;
+
+        if let Some(output) = self
+            .execute_client_hashline_edit(&input, &absolute_path)
+            .await?
+        {
+            return Ok(output);
+        }
 
         // Check file size
-        let metadata = asupersync::fs::metadata(&absolute_path)
-            .await
-            .map_err(|err| {
-                let message = match err.kind() {
-                    std::io::ErrorKind::NotFound => format!("File not found: {}", input.path),
-                    std::io::ErrorKind::PermissionDenied => {
-                        format!("Permission denied: {}", input.path)
-                    }
-                    _ => format!("Cannot read file metadata: {err}"),
-                };
-                Error::tool("hashline_edit", message)
-            })?;
+        let metadata = std_metadata_async(&absolute_path).await.map_err(|err| {
+            let message = match err.kind() {
+                std::io::ErrorKind::NotFound => format!("File not found: {}", input.path),
+                std::io::ErrorKind::PermissionDenied => {
+                    format!("Permission denied: {}", input.path)
+                }
+                _ => format!("Cannot read file metadata: {err}"),
+            };
+            Error::tool("hashline_edit", message)
+        })?;
         if !metadata.is_file() {
             return Err(Error::tool(
                 "hashline_edit",
                 format!("Path {} is not a regular file", absolute_path.display()),
             ));
         }
+        ensure_ancestors_searchable(&absolute_path)
+            .await
+            .map_err(|err| Error::tool("hashline_edit", err.to_string()))?;
+        ensure_effective_mode_access(
+            &metadata,
+            &absolute_path,
+            UNIX_ACCESS_READ | UNIX_ACCESS_WRITE,
+            "hashline editing",
+        )
+        .map_err(|err| Error::tool("hashline_edit", err.to_string()))?;
+        ensure_parent_allows_creation(&absolute_path)
+            .await
+            .map_err(|err| Error::tool("hashline_edit", err.to_string()))?;
         if metadata.len() > READ_TOOL_MAX_BYTES {
             return Err(Error::tool(
                 "hashline_edit",
@@ -7412,16 +18987,18 @@ impl Tool for HashlineEditTool {
             ));
         }
 
-        // Read file content
-        let file = asupersync::fs::File::open(&absolute_path)
-            .await
-            .map_err(|e| Error::tool("hashline_edit", format!("Cannot open file: {e}")))?;
-        let mut raw = Vec::new();
-        let mut limiter = file.take(READ_TOOL_MAX_BYTES.saturating_add(1));
-        limiter
-            .read_to_end(&mut raw)
-            .await
-            .map_err(|e| Error::tool("hashline_edit", format!("Cannot read file: {e}")))?;
+        // Read the transformation source through the validated, no-follow
+        // descriptor path. The digest of these exact bytes becomes the
+        // optimistic-CAS expectation checked immediately before rename.
+        // Same roots as the scope check and the atomic replace, so files
+        // under an /add-dir root are editable.
+        let path_for_read = absolute_path.clone();
+        let roots_for_read = self.workspace.snapshot_or(&self.cwd).all();
+        let raw = asupersync::runtime::spawn_blocking_io(move || {
+            read_file_capped_within_roots_sync(&path_for_read, &roots_for_read, READ_TOOL_MAX_BYTES)
+        })
+        .await
+        .map_err(|e| Error::tool("hashline_edit", format!("Cannot read file: {e}")))?;
 
         if raw.len() as u64 > READ_TOOL_MAX_BYTES {
             return Err(Error::tool(
@@ -7430,6 +19007,7 @@ impl Tool for HashlineEditTool {
             ));
         }
 
+        let source_expectation = AtomicContentExpectation::from_bytes(&raw);
         let raw_content = String::from_utf8(raw).map_err(|_| {
             Error::tool(
                 "hashline_edit",
@@ -7438,266 +19016,60 @@ impl Tool for HashlineEditTool {
             )
         })?;
 
-        let (content_no_bom, had_bom) = strip_bom(&raw_content);
-        let original_ending = detect_line_ending(content_no_bom);
-        let normalized = normalize_to_lf(content_no_bom);
-        let file_lines: Vec<&str> = normalized.split('\n').collect();
-
-        // Validate all hash references before making any changes
-        if let Err(e) = collect_mismatches(&input.edits, &file_lines, had_bom) {
-            return Err(Error::tool(
-                "hashline_edit",
-                format!("Hash validation failed — re-read the file to get current tags.\n\n{e}"),
-            ));
-        }
-
-        // Deduplicate edits
-        let mut seen = std::collections::HashSet::new();
-        let mut deduped_edits: Vec<&HashlineOp> = Vec::new();
-        for edit in &input.edits {
-            let pos_line = edit
-                .pos
-                .as_ref()
-                .and_then(|p| parse_hashline_tag(p).ok())
-                .map(|(n, _)| n);
-            let end_line = edit
-                .end
-                .as_ref()
-                .and_then(|e| parse_hashline_tag(e).ok())
-                .map(|(n, _)| n);
-            let key = NormalizedEdit {
-                op: edit.op.clone(),
-                pos_line,
-                end_line,
-                lines: edit.get_lines(),
-            };
-            if seen.insert(key) {
-                deduped_edits.push(edit);
-            }
-        }
-
-        // Resolve line indices and sort bottom-up
-        let mut resolved: Vec<ResolvedEdit<'_>> = Vec::new();
-        for edit in &deduped_edits {
-            let replacement_lines: Vec<String> = edit
-                .get_lines()
-                .into_iter()
-                .map(|l| strip_hashline_prefix(&l).to_string())
-                .collect();
-
-            match edit.op.as_str() {
-                "replace" => {
-                    let start_idx = match &edit.pos {
-                        Some(pos) => validate_line_ref(pos, &file_lines, had_bom)
-                            .map_err(|e| Error::tool("hashline_edit", e))?,
-                        None => {
-                            return Err(Error::tool(
-                                "hashline_edit",
-                                "replace operation requires a pos anchor",
-                            ));
-                        }
-                    };
-                    let end_idx = match &edit.end {
-                        Some(end) => validate_line_ref(end, &file_lines, had_bom)
-                            .map_err(|e| Error::tool("hashline_edit", e))?,
-                        None => start_idx,
-                    };
-                    if end_idx < start_idx {
-                        return Err(Error::tool(
-                            "hashline_edit",
-                            format!(
-                                "End anchor (line {}) is before start anchor (line {})",
-                                end_idx + 1,
-                                start_idx + 1
-                            ),
-                        ));
-                    }
-                    resolved.push(ResolvedEdit {
-                        op: "replace",
-                        start: start_idx,
-                        end: end_idx,
-                        lines: replacement_lines,
-                    });
-                }
-                "prepend" => {
-                    let idx = match &edit.pos {
-                        Some(pos) => validate_line_ref(pos, &file_lines, had_bom)
-                            .map_err(|e| Error::tool("hashline_edit", e))?,
-                        None => 0, // BOF
-                    };
-                    let end_idx = if file_lines == [""] && edit.pos.is_none() {
-                        0 // replace the empty line
-                    } else {
-                        idx
-                    };
-                    resolved.push(ResolvedEdit {
-                        op: if file_lines == [""] && edit.pos.is_none() {
-                            "replace"
-                        } else {
-                            "prepend"
-                        },
-                        start: idx,
-                        end: end_idx,
-                        lines: replacement_lines,
-                    });
-                }
-                "append" => {
-                    let idx = match &edit.pos {
-                        Some(pos) => validate_line_ref(pos, &file_lines, had_bom)
-                            .map_err(|e| Error::tool("hashline_edit", e))?,
-                        None => {
-                            if file_lines.len() > 1 && file_lines.last() == Some(&"") {
-                                file_lines.len() - 2
-                            } else {
-                                file_lines.len().saturating_sub(1)
-                            }
-                        }
-                    };
-                    let end_idx = if file_lines == [""] && edit.pos.is_none() {
-                        0 // replace the empty line
-                    } else {
-                        idx
-                    };
-                    resolved.push(ResolvedEdit {
-                        op: if file_lines == [""] && edit.pos.is_none() {
-                            "replace"
-                        } else {
-                            "append"
-                        },
-                        start: idx,
-                        end: end_idx,
-                        lines: replacement_lines,
-                    });
-                }
-                other => {
-                    return Err(Error::tool(
-                        "hashline_edit",
-                        format!("Unknown op: {other:?}. Must be replace, prepend, or append."),
-                    ));
-                }
-            }
-        }
-
-        // Sort bottom-up: highest line first, then by precedence (replace < append < prepend)
-        resolved.sort_by(|a, b| {
-            b.start
-                .cmp(&a.start)
-                .then_with(|| op_precedence(a.op).cmp(&op_precedence(b.op)))
-        });
-
-        // Detect overlapping edit ranges (undefined behavior if applied bottom-up)
-        for i in 0..resolved.len() {
-            for j in (i + 1)..resolved.len() {
-                let a = &resolved[i];
-                let b = &resolved[j];
-                if a.start <= b.end && b.start <= a.end {
-                    return Err(Error::tool(
-                        "hashline_edit",
-                        format!(
-                            "Overlapping edits detected: {} at line {}-{} and {} at line {}-{}. \
-                             Please combine overlapping edits into a single operation.",
-                            a.op,
-                            a.start + 1,
-                            a.end + 1,
-                            b.op,
-                            b.start + 1,
-                            b.end + 1
-                        ),
-                    ));
-                }
-            }
-        }
-
-        // Apply splices bottom-up on a mutable Vec of lines
-        let mut lines: Vec<String> = file_lines.iter().map(|s| (*s).to_string()).collect();
-        let mut any_change = false;
-
-        for edit in &resolved {
-            match edit.op {
-                "replace" => {
-                    // Check if it's a no-op
-                    let existing: Vec<&str> = lines[edit.start..=edit.end]
-                        .iter()
-                        .map(String::as_str)
-                        .collect();
-                    if existing.eq(&edit.lines.iter().map(String::as_str).collect::<Vec<&str>>()) {
-                        continue; // no-op
-                    }
-                    // Splice: remove old range, insert new lines
-                    lines.splice(edit.start..=edit.end, edit.lines.iter().cloned());
-                    any_change = true;
-                }
-                "prepend" => {
-                    // Insert before the target line
-                    lines.splice(edit.start..edit.start, edit.lines.iter().cloned());
-                    if !edit.lines.is_empty() {
-                        any_change = true;
-                    }
-                }
-                "append" => {
-                    // Insert after the target line
-                    let insert_at = edit.start + 1;
-                    lines.splice(insert_at..insert_at, edit.lines.iter().cloned());
-                    if !edit.lines.is_empty() {
-                        any_change = true;
-                    }
-                }
-                _ => {} // unreachable due to earlier validation
-            }
-        }
-
-        if !any_change {
-            return Err(Error::tool(
-                "hashline_edit",
-                format!(
-                    "No changes made to {}. All edits were no-ops (replacement identical to existing content).",
-                    input.path
-                ),
-            ));
-        }
-
-        // Reconstruct content
-        let new_normalized = lines.join("\n");
-        let new_content = restore_line_endings(&new_normalized, original_ending);
-        let mut final_content = new_content;
-        if had_bom {
-            final_content = format!("\u{FEFF}{final_content}");
-        }
+        let outcome = apply_file_hashline_edits(&raw_content, &input, &absolute_path)?;
+        let final_content = outcome.final_content;
+        let normalized = outcome.before_normalized;
+        let new_normalized = outcome.after_normalized;
 
         // Atomic write (same pattern as EditTool)
         let absolute_path_clone = absolute_path.clone();
+        // Full canonical root set (primary + /add-dir roots) so mutations in
+        // additional workspace roots are not rejected by the atomic-replace
+        // containment check.
+        let cwd_clone = self.workspace.snapshot_or(&self.cwd).all();
         let final_content_bytes = final_content.into_bytes();
-        asupersync::runtime::spawn_blocking_io(move || {
-            let original_perms = std::fs::metadata(&absolute_path_clone)
-                .ok()
-                .map(|m| m.permissions());
-            let parent = absolute_path_clone
-                .parent()
-                .unwrap_or_else(|| Path::new("."));
-            let mut temp_file = tempfile::NamedTempFile::new_in(parent)?;
-
-            temp_file.as_file_mut().write_all(&final_content_bytes)?;
-            temp_file.as_file_mut().sync_all()?;
-
-            if let Some(perms) = original_perms {
-                let _ = temp_file.as_file().set_permissions(perms);
-            } else {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    let _ = temp_file
-                        .as_file()
-                        .set_permissions(std::fs::Permissions::from_mode(0o644));
-                }
-            }
-
-            temp_file
-                .persist(&absolute_path_clone)
-                .map_err(|e| e.error)?;
-            Ok(())
+        let before_persist_hook = self.before_persist_hook.clone();
+        if let Some(recorder) = &self.mutation_recorder {
+            recorder
+                .begin_file(tool_call_id, "hashline_edit", &absolute_path)
+                .map_err(|error| {
+                    Error::tool(
+                        "hashline_edit",
+                        format!("Cannot record undo intent: {error}"),
+                    )
+                })?;
+        }
+        let persisted = asupersync::runtime::spawn_blocking_io(move || {
+            before_persist_hook.map_or_else(
+                || {
+                    atomic_replace_file_if_unchanged(
+                        &absolute_path_clone,
+                        &cwd_clone,
+                        &final_content_bytes,
+                        source_expectation,
+                    )
+                },
+                |hook| {
+                    atomic_replace_file_with(
+                        &absolute_path_clone,
+                        &cwd_clone,
+                        &final_content_bytes,
+                        Some(source_expectation),
+                        move || hook(),
+                    )
+                },
+            )
         })
         .await
-        .map_err(|e| Error::tool("hashline_edit", format!("Failed to write file: {e}")))?;
+        .map_err(|e| Error::tool("hashline_edit", format!("Failed to write file: {e}")));
+        if let Some(recorder) = &self.mutation_recorder {
+            if persisted.is_ok() {
+                recorder.commit(tool_call_id);
+            } else {
+                recorder.abort(tool_call_id);
+            }
+        }
+        persisted?;
 
         // Generate diff
         let (diff, first_changed_line) = generate_diff_string(&normalized, &new_normalized);
@@ -7726,11 +19098,737 @@ impl Tool for HashlineEditTool {
 // ============================================================================
 
 #[cfg(test)]
+#[path = "tools/notebook_tests.rs"]
+mod notebook_tool_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use proptest::prelude::*;
     #[cfg(target_os = "linux")]
     use std::time::Duration;
+
+    /// A Windows-shaped environment for [`find_windows_bash`] with the given
+    /// `PATH`. Which files exist is up to each test. Paths are built with
+    /// `join`, so the tests run on any OS.
+    fn windows_shell_env(path_dirs: Vec<PathBuf>) -> WindowsShellEnv {
+        WindowsShellEnv {
+            program_files: vec![PathBuf::from("C:").join("Program Files")],
+            local_app_data: Some(
+                PathBuf::from("C:")
+                    .join("Users")
+                    .join("me")
+                    .join("AppData")
+                    .join("Local"),
+            ),
+            system_root: Some(PathBuf::from("C:").join("Windows")),
+            path_dirs,
+        }
+    }
+
+    fn system32() -> PathBuf {
+        PathBuf::from("C:").join("Windows").join("System32")
+    }
+
+    fn pick(env: &WindowsShellEnv, existing: &[PathBuf]) -> Option<PathBuf> {
+        find_windows_bash(env, |path| existing.iter().any(|file| file == path))
+    }
+
+    /// GH #182: with WSL's System32\bash.exe first on PATH, Git for
+    /// Windows in Program Files still wins.
+    #[test]
+    fn windows_bash_prefers_git_for_windows_over_the_wsl_launcher() {
+        let git_bash = PathBuf::from("C:")
+            .join("Program Files")
+            .join("Git")
+            .join("bin")
+            .join("bash.exe");
+        let wsl = system32().join("bash.exe");
+        let env = windows_shell_env(vec![system32()]);
+        assert_eq!(pick(&env, &[wsl, git_bash.clone()]), Some(git_bash));
+    }
+
+    /// Per-user Git installs live under %LOCALAPPDATA%\Programs\Git.
+    #[test]
+    fn windows_bash_finds_a_per_user_git_install() {
+        let git_bash = PathBuf::from("C:")
+            .join("Users")
+            .join("me")
+            .join("AppData")
+            .join("Local")
+            .join("Programs")
+            .join("Git")
+            .join("bin")
+            .join("bash.exe");
+        let env = windows_shell_env(Vec::new());
+        assert_eq!(pick(&env, std::slice::from_ref(&git_bash)), Some(git_bash));
+    }
+
+    /// A bash.exe on PATH (MSYS2 here) beats WSL's launcher even when the
+    /// launcher's directory comes first on PATH.
+    #[test]
+    fn windows_bash_takes_a_path_bash_before_the_wsl_launcher() {
+        let msys = PathBuf::from("C:").join("msys64").join("usr").join("bin");
+        let env = windows_shell_env(vec![system32(), msys.clone()]);
+        let existing = [system32().join("bash.exe"), msys.join("bash.exe")];
+        assert_eq!(pick(&env, &existing), Some(msys.join("bash.exe")));
+    }
+
+    /// Git's default PATH option adds only `Git\cmd`; its bash is found
+    /// next to it, wherever Git was installed.
+    #[test]
+    fn windows_bash_derives_git_bash_from_git_cmd_on_path() {
+        let git = PathBuf::from("D:").join("Tools").join("Git");
+        let env = windows_shell_env(vec![system32(), git.join("cmd")]);
+        let existing = [
+            system32().join("bash.exe"),
+            git.join("cmd").join("git.exe"),
+            git.join("bin").join("bash.exe"),
+        ];
+        assert_eq!(
+            pick(&env, &existing),
+            Some(git.join("bin").join("bash.exe"))
+        );
+    }
+
+    /// GH #182's setup: only WSL's launcher exists. It is used as the last
+    /// resort, from PATH or from %SystemRoot%\System32.
+    #[test]
+    fn windows_bash_falls_back_to_the_wsl_launcher() {
+        let wsl = system32().join("bash.exe");
+        assert_eq!(
+            pick(
+                &windows_shell_env(vec![system32()]),
+                std::slice::from_ref(&wsl)
+            ),
+            Some(wsl.clone())
+        );
+        assert_eq!(
+            pick(&windows_shell_env(Vec::new()), std::slice::from_ref(&wsl)),
+            Some(wsl)
+        );
+    }
+
+    /// Logs at WARN on `target` while `emit` runs and returns what was written.
+    fn warnings_on_target(target: &str, emit: impl FnOnce()) -> String {
+        #[derive(Clone, Default)]
+        struct Captured(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Captured {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+            type Writer = Self;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let captured = Captured::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::new(format!("{target}=warn")))
+            .with_ansi(false)
+            .with_writer(captured.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, emit);
+        let bytes = captured
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        String::from_utf8(bytes).expect("utf-8 log output")
+    }
+
+    /// Falling back to WSL's launcher explains itself once per process, on
+    /// the user-diagnostic channel: that commands run inside WSL, the UNC
+    /// working-directory caveat, and how to pick a shell with `shell_path`.
+    /// A native bash never triggers it.
+    #[test]
+    fn wsl_launcher_fallback_notices_once_on_the_user_channel() {
+        let shown = std::sync::atomic::AtomicBool::new(false);
+        let wsl = system32().join("bash.exe");
+        let git_bash = PathBuf::from("C:")
+            .join("Program Files")
+            .join("Git")
+            .join("bin")
+            .join("bash.exe");
+
+        let mut results = Vec::new();
+        let logged = warnings_on_target(crate::config::USER_DIAGNOSTIC_TARGET, || {
+            results.push(notice_wsl_bash_once(&git_bash, &shown));
+            results.push(notice_wsl_bash_once(&wsl, &shown));
+            results.push(notice_wsl_bash_once(&wsl, &shown));
+        });
+        assert_eq!(results, [false, true, false]);
+        assert_eq!(logged.matches("WSL's bash.exe").count(), 1, "{logged}");
+        assert!(
+            logged.contains("inside the default WSL Linux distro"),
+            "{logged}"
+        );
+        assert!(logged.contains("UNC"), "{logged}");
+        assert!(logged.contains("\"shell_path\""), "{logged}");
+        assert!(logged.contains(&wsl.display().to_string()), "{logged}");
+
+        // Nothing is shown for a native bash even before any WSL notice.
+        let fresh = std::sync::atomic::AtomicBool::new(false);
+        let quiet = warnings_on_target(crate::config::USER_DIAGNOSTIC_TARGET, || {
+            assert!(!notice_wsl_bash_once(&git_bash, &fresh));
+        });
+        assert!(quiet.is_empty(), "{quiet}");
+    }
+
+    #[test]
+    fn windows_bash_is_none_without_any_bash() {
+        let env = windows_shell_env(vec![system32()]);
+        assert_eq!(pick(&env, &[]), None);
+        assert!(NO_WINDOWS_BASH.contains("shell_path"));
+    }
+
+    #[test]
+    fn wsl_launcher_detection() {
+        assert!(is_wsl_bash_launcher(&system32().join("bash.exe")));
+        assert!(is_wsl_bash_launcher(
+            &PathBuf::from("C:")
+                .join("WINDOWS")
+                .join("SYSTEM32")
+                .join("bash.exe")
+        ));
+        assert!(is_wsl_bash_launcher(
+            &PathBuf::from("C:")
+                .join("Users")
+                .join("me")
+                .join("AppData")
+                .join("Local")
+                .join("Microsoft")
+                .join("WindowsApps")
+                .join("bash.exe")
+        ));
+        assert!(!is_wsl_bash_launcher(
+            &PathBuf::from("C:")
+                .join("Program Files")
+                .join("Git")
+                .join("bin")
+                .join("bash.exe")
+        ));
+    }
+
+    /// Empty and relative `PATH` entries are never searched for bash.exe.
+    #[test]
+    fn windows_bash_path_skips_empty_and_relative_entries() {
+        let absolute = std::env::temp_dir();
+        let path = std::env::join_paths([
+            PathBuf::new(),
+            PathBuf::from("."),
+            PathBuf::from("relative").join("bin"),
+            absolute.clone(),
+        ])
+        .expect("joinable PATH");
+        assert_eq!(absolute_path_dirs(&path), vec![absolute]);
+    }
+
+    /// The process environment reader runs on every OS; `PATH` is always
+    /// set for the test process.
+    #[test]
+    fn windows_shell_env_reads_path_from_the_process() {
+        let env = WindowsShellEnv::from_process();
+        assert!(!env.path_dirs.is_empty());
+        let _ = find_windows_bash(&env, Path::is_file);
+    }
+
+    fn find_program(
+        name: &str,
+        path_dirs: &[PathBuf],
+        pathext: Option<&str>,
+        existing: &[PathBuf],
+    ) -> Option<PathBuf> {
+        find_windows_program(name, path_dirs, pathext.map(OsStr::new), |path| {
+            existing.iter().any(|file| file == path)
+        })
+    }
+
+    const DEFAULT_PATHEXT: &str = ".COM;.EXE;.BAT;.CMD;.VBS;.VBE;.JS;.JSE;.WSF;.WSH;.MSC";
+
+    fn nodejs_dir() -> PathBuf {
+        PathBuf::from("C:").join("Program Files").join("nodejs")
+    }
+
+    fn pnpm_dir() -> PathBuf {
+        PathBuf::from("C:")
+            .join("Users")
+            .join("me")
+            .join("AppData")
+            .join("Local")
+            .join("pnpm")
+            .join("bin")
+    }
+
+    /// GH #182: pnpm puts an `npm.exe` shim on `PATH` and no `npm.cmd`.
+    #[test]
+    fn find_windows_program_finds_an_npm_exe_shim() {
+        let dirs = [system32(), pnpm_dir()];
+        let shim = pnpm_dir().join("npm.exe");
+        assert_eq!(
+            find_program(
+                "npm",
+                &dirs,
+                Some(DEFAULT_PATHEXT),
+                std::slice::from_ref(&shim)
+            ),
+            Some(shim)
+        );
+    }
+
+    /// The Node.js installer puts a POSIX `npm` script, `npm.cmd` and
+    /// `npm.ps1` side by side; only the batch wrapper can be started.
+    #[test]
+    fn find_windows_program_takes_the_batch_wrapper_over_the_posix_script() {
+        let existing = [
+            nodejs_dir().join("npm"),
+            nodejs_dir().join("npm.ps1"),
+            nodejs_dir().join("npm.cmd"),
+        ];
+        assert_eq!(
+            find_program("npm", &[nodejs_dir()], Some(DEFAULT_PATHEXT), &existing),
+            Some(nodejs_dir().join("npm.cmd"))
+        );
+        assert_eq!(
+            find_program(
+                "npm",
+                &[nodejs_dir()],
+                Some(DEFAULT_PATHEXT),
+                &existing[..2]
+            ),
+            None,
+            "an extensionless script or a .ps1 is never launched"
+        );
+    }
+
+    /// Like `cmd.exe`, an earlier `PATH` directory wins over a preferred
+    /// extension in a later one, and `PATHEXT` orders extensions within one
+    /// directory (case-insensitively).
+    #[test]
+    fn find_windows_program_honours_path_then_pathext_order() {
+        let existing = [
+            nodejs_dir().join("npm.cmd"),
+            pnpm_dir().join("npm.exe"),
+            pnpm_dir().join("npm.cmd"),
+        ];
+        assert_eq!(
+            find_program(
+                "npm",
+                &[nodejs_dir(), pnpm_dir()],
+                Some(DEFAULT_PATHEXT),
+                &existing
+            ),
+            Some(nodejs_dir().join("npm.cmd"))
+        );
+        assert_eq!(
+            find_program("npm", &[pnpm_dir()], Some(DEFAULT_PATHEXT), &existing),
+            Some(pnpm_dir().join("npm.exe"))
+        );
+        assert_eq!(
+            find_program("npm", &[pnpm_dir()], Some(".Cmd;.exe"), &existing),
+            Some(pnpm_dir().join("npm.cmd"))
+        );
+    }
+
+    /// Script extensions in `PATHEXT` need a host and are skipped; an unset,
+    /// empty or script-only `PATHEXT` falls back to `.COM;.EXE;.BAT;.CMD`.
+    #[test]
+    fn find_windows_program_skips_unlaunchable_pathext_entries() {
+        let js = pnpm_dir().join("npm.js");
+        let cmd = pnpm_dir().join("npm.cmd");
+        let dirs = [pnpm_dir()];
+        assert_eq!(
+            find_program("npm", &dirs, Some(".JS;.CMD"), &[js.clone(), cmd.clone()]),
+            Some(cmd.clone())
+        );
+        assert_eq!(
+            find_program("npm", &dirs, Some(".JS"), std::slice::from_ref(&js)),
+            None
+        );
+        for pathext in [None, Some(""), Some(";;"), Some(".JS;.VBS")] {
+            assert_eq!(
+                find_program("npm", &dirs, pathext, std::slice::from_ref(&cmd)),
+                Some(cmd.clone()),
+                "PATHEXT {pathext:?}"
+            );
+        }
+    }
+
+    /// A name that already carries a launchable extension is looked up as
+    /// written; a name with a directory part is not searched for at all.
+    #[test]
+    fn find_windows_program_takes_explicit_extensions_and_rejects_paths() {
+        let dirs = [pnpm_dir()];
+        let exe = pnpm_dir().join("npm.exe");
+        let cmd = pnpm_dir().join("npm.cmd");
+        assert_eq!(
+            find_program("npm.cmd", &dirs, None, std::slice::from_ref(&exe)),
+            None
+        );
+        let upper = pnpm_dir().join("NPM.CMD");
+        assert_eq!(
+            find_program("NPM.CMD", &dirs, None, &[exe.clone(), upper.clone()]),
+            Some(upper)
+        );
+        assert_eq!(
+            find_program("npm.cmd", &dirs, None, &[exe.clone(), cmd.clone()]),
+            Some(cmd)
+        );
+        for name in ["", "bin\\npm", "bin/npm", "C:npm"] {
+            assert_eq!(
+                find_program(name, &dirs, None, std::slice::from_ref(&exe)),
+                None,
+                "{name:?}"
+            );
+        }
+    }
+
+    /// The process-environment variant runs on every OS.
+    #[test]
+    fn find_windows_program_on_path_reads_the_process_environment() {
+        assert_eq!(
+            find_windows_program_on_path("pi-no-such-program-gh182"),
+            None
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn default_bash_shell_on_unix_is_an_absolute_bash_or_sh() {
+        let shell = default_bash_shell().expect("unix always has a default");
+        assert!(shell == "sh" || shell.ends_with("/bash"), "{shell}");
+    }
+
+    #[cfg(unix)]
+    struct UnixModeGuard {
+        path: PathBuf,
+        original: std::fs::Permissions,
+    }
+
+    #[cfg(unix)]
+    impl UnixModeGuard {
+        fn set(path: &Path, mode: u32) -> Self {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            let original = std::fs::metadata(path)
+                .expect("stat permission fixture")
+                .permissions();
+            let mut restricted = original.clone();
+            restricted.set_mode(mode);
+            std::fs::set_permissions(path, restricted).expect("set permission fixture mode");
+            Self {
+                path: path.to_path_buf(),
+                original,
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for UnixModeGuard {
+        fn drop(&mut self) {
+            if let Err(err) = std::fs::set_permissions(&self.path, self.original.clone()) {
+                eprintln!(
+                    "failed to restore permissions for {}: {err}",
+                    self.path.display()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fsync_refusal_classifies_non_posix_durability_errors() {
+        use std::io::{Error, ErrorKind};
+
+        // EBADF (the exact errno reported against virtiofs in issue #136) and
+        // EINVAL (common for directory fsync on FUSE/network mounts) are
+        // filesystem *refusals* of the durability barrier, not write failures.
+        assert!(is_fsync_refused(&Error::from_raw_os_error(9))); // EBADF
+        assert!(is_fsync_refused(&Error::from_raw_os_error(22))); // EINVAL
+        assert!(is_fsync_refused(&Error::new(
+            ErrorKind::Unsupported,
+            "nope"
+        )));
+
+        // Genuine I/O failures must still propagate so real corruption/space
+        // problems are never silently swallowed.
+        assert!(!is_fsync_refused(&Error::from_raw_os_error(5))); // EIO
+        assert!(!is_fsync_refused(&Error::from_raw_os_error(28))); // ENOSPC
+        assert!(!is_fsync_refused(&Error::new(
+            ErrorKind::PermissionDenied,
+            "no"
+        )));
+    }
+
+    #[test]
+    fn tolerate_fsync_refusal_downgrades_refusals_but_propagates_real_errors() {
+        use std::io::{Error, ErrorKind};
+        use std::path::Path;
+
+        let p = Path::new("/tmp/does-not-matter");
+        // Refusals are downgraded to Ok so an already-written file is not
+        // reported as a failed write.
+        assert!(tolerate_fsync_refusal(Ok(()), "x", p).is_ok());
+        assert!(tolerate_fsync_refusal(Err(Error::from_raw_os_error(9)), "temp file", p).is_ok());
+        // Real I/O errors still surface to the caller.
+        assert!(tolerate_fsync_refusal(Err(Error::from_raw_os_error(5)), "temp file", p).is_err());
+        assert!(
+            tolerate_fsync_refusal(Err(Error::new(ErrorKind::PermissionDenied, "no")), "x", p)
+                .is_err()
+        );
+    }
+
+    #[cfg(all(unix, not(any(target_os = "espidf", target_os = "redox"))))]
+    #[test]
+    fn atomic_replace_parent_swap_cannot_redirect_persistence_outside_cwd() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().expect("atomic replacement fixture");
+        let cwd = tmp.path().join("workspace");
+        let parent = cwd.join("parent");
+        std::fs::create_dir_all(&parent).expect("create replacement parent");
+        let target = parent.join("target.txt");
+        std::fs::write(&target, "original\n").expect("write original target");
+
+        let outside_parent = tmp.path().join("outside");
+        std::fs::create_dir(&outside_parent).expect("create outside parent");
+        let outside_target = outside_parent.join("target.txt");
+        std::fs::write(&outside_target, "outside sentinel\n").expect("write outside sentinel");
+        let displaced_parent = cwd.join("parent-original");
+
+        let result = atomic_replace_file_with(
+            &target,
+            std::slice::from_ref(&cwd),
+            b"replacement\n",
+            None,
+            || {
+                std::fs::rename(&parent, &displaced_parent).expect("displace validated parent");
+                symlink(&outside_parent, &parent).expect("redirect parent path outside cwd");
+            },
+        );
+
+        let error = result.expect_err("a changed parent pathname must be reported");
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            std::fs::read_to_string(&outside_target).expect("read outside sentinel"),
+            "outside sentinel\n",
+            "descriptor-relative rename must not touch the redirected target"
+        );
+        assert_eq!(
+            std::fs::read_to_string(displaced_parent.join("target.txt"))
+                .expect("read unchanged pinned-directory target"),
+            "original\n",
+            "a parent swap observed before rename must abort the mutation"
+        );
+    }
+
+    /// Issue #193: the post-rename fallback for filesystems that do not keep
+    /// inode identity stable across `rename(2)` (virtiofs/FUSE) must accept
+    /// exactly the bytes that were written and nothing else.
+    #[cfg(all(unix, not(any(target_os = "espidf", target_os = "redox"))))]
+    #[test]
+    fn verify_persisted_entry_content_accepts_written_bytes_only() {
+        let tmp = tempfile::tempdir().expect("content verification fixture");
+        let parent_file = std::fs::File::open(tmp.path()).expect("open parent directory");
+        let target_name = OsStr::new("target.txt");
+        std::fs::write(tmp.path().join("target.txt"), b"written bytes\n").expect("write target");
+
+        verify_persisted_entry_content(&parent_file, target_name, b"written bytes\n")
+            .expect("identical content must verify");
+
+        verify_persisted_entry_content(&parent_file, target_name, b"different bytes\n")
+            .expect_err("content mismatch must fail verification");
+        verify_persisted_entry_content(&parent_file, target_name, b"written bytes")
+            .expect_err("length mismatch must fail verification");
+        verify_persisted_entry_content(&parent_file, OsStr::new("missing.txt"), b"anything")
+            .expect_err("a missing entry must fail verification");
+    }
+
+    /// Issue #193: the content fallback opens with `NOFOLLOW` through the
+    /// pinned parent descriptor, so a symlink swapped in at the target name
+    /// cannot satisfy verification even when it points at matching bytes.
+    #[cfg(all(unix, not(any(target_os = "espidf", target_os = "redox"))))]
+    #[test]
+    fn verify_persisted_entry_content_rejects_symlink_and_directory_entries() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().expect("content verification fixture");
+        let parent_file = std::fs::File::open(tmp.path()).expect("open parent directory");
+        std::fs::write(tmp.path().join("real.txt"), b"payload\n").expect("write real file");
+        symlink("real.txt", tmp.path().join("link.txt")).expect("create symlink entry");
+        std::fs::create_dir(tmp.path().join("subdir")).expect("create directory entry");
+
+        verify_persisted_entry_content(&parent_file, OsStr::new("link.txt"), b"payload\n")
+            .expect_err("a symlink entry must fail verification even with matching bytes");
+        verify_persisted_entry_content(&parent_file, OsStr::new("subdir"), b"payload\n")
+            .expect_err("a directory entry must fail verification");
+    }
+
+    #[cfg(all(unix, not(any(target_os = "espidf", target_os = "redox"))))]
+    #[test]
+    fn edit_rejects_same_inode_change_before_persist_and_preserves_concurrent_writer() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        asupersync::test_utils::run_test(|| async {
+            let tmp = tempfile::tempdir().expect("edit CAS fixture");
+            let target = tmp.path().join("target.txt");
+            std::fs::write(&target, "before\nORIGINAL\nafter\n").expect("write edit source");
+            let original_inode = std::fs::metadata(&target).expect("stat edit source").ino();
+            let hook_target = target.clone();
+            let tool = EditTool::with_before_persist_hook(tmp.path(), move || {
+                std::fs::write(&hook_target, "concurrent writer\n")
+                    .expect("same-inode concurrent edit");
+                assert_eq!(
+                    std::fs::metadata(&hook_target)
+                        .expect("stat concurrent edit")
+                        .ino(),
+                    original_inode,
+                    "fixture mutation must preserve the inode"
+                );
+            });
+
+            let error = tool
+                .execute(
+                    "edit-cas",
+                    serde_json::json!({
+                        "path": target,
+                        "oldText": "ORIGINAL",
+                        "newText": "replacement"
+                    }),
+                    None,
+                )
+                .await
+                .expect_err("Edit must reject a same-inode concurrent change");
+
+            assert!(
+                error.to_string().contains("changed since it was read"),
+                "unexpected Edit conflict: {error}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&target).expect("read concurrent Edit result"),
+                "concurrent writer\n",
+                "Edit must not replace the concurrent writer"
+            );
+            assert_eq!(
+                std::fs::metadata(&target)
+                    .expect("stat preserved concurrent Edit result")
+                    .ino(),
+                original_inode
+            );
+        });
+    }
+
+    #[cfg(all(unix, not(any(target_os = "espidf", target_os = "redox"))))]
+    #[test]
+    fn hashline_edit_rejects_same_inode_change_and_preserves_concurrent_writer() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        asupersync::test_utils::run_test(|| async {
+            let tmp = tempfile::tempdir().expect("hashline CAS fixture");
+            let target = tmp.path().join("target.txt");
+            std::fs::write(&target, "before\nORIGINAL\nafter\n").expect("write hashline source");
+            let original_inode = std::fs::metadata(&target)
+                .expect("stat hashline source")
+                .ino();
+            let original_tag = format_hashline_tag(1, "ORIGINAL");
+            let hook_target = target.clone();
+            let tool = HashlineEditTool::with_before_persist_hook(tmp.path(), move || {
+                std::fs::write(&hook_target, "concurrent hashline writer\n")
+                    .expect("same-inode concurrent hashline edit");
+                assert_eq!(
+                    std::fs::metadata(&hook_target)
+                        .expect("stat concurrent hashline edit")
+                        .ino(),
+                    original_inode,
+                    "fixture mutation must preserve the inode"
+                );
+            });
+
+            let error = tool
+                .execute(
+                    "hashline-cas",
+                    serde_json::json!({
+                        "path": target,
+                        "edits": [{
+                            "op": "replace",
+                            "pos": original_tag,
+                            "lines": "replacement"
+                        }]
+                    }),
+                    None,
+                )
+                .await
+                .expect_err("HashlineEdit must reject a same-inode concurrent change");
+
+            assert!(
+                error.to_string().contains("changed since it was read"),
+                "unexpected HashlineEdit conflict: {error}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&target).expect("read concurrent HashlineEdit result"),
+                "concurrent hashline writer\n",
+                "HashlineEdit must not replace the concurrent writer"
+            );
+            assert_eq!(
+                std::fs::metadata(&target)
+                    .expect("stat preserved concurrent HashlineEdit result")
+                    .ino(),
+                original_inode
+            );
+        });
+    }
+
+    #[cfg(all(unix, not(any(target_os = "espidf", target_os = "redox"))))]
+    #[test]
+    fn write_intentionally_overwrites_same_inode_change_before_persist() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        asupersync::test_utils::run_test(|| async {
+            let tmp = tempfile::tempdir().expect("write overwrite fixture");
+            let target = tmp.path().join("target.txt");
+            std::fs::write(&target, "original\n").expect("write initial target");
+            let original_inode = std::fs::metadata(&target)
+                .expect("stat initial target")
+                .ino();
+            let hook_target = target.clone();
+            let tool = WriteTool::with_before_persist_hook(tmp.path(), move || {
+                std::fs::write(&hook_target, "concurrent writer\n")
+                    .expect("same-inode concurrent write");
+                assert_eq!(
+                    std::fs::metadata(&hook_target)
+                        .expect("stat concurrent write")
+                        .ino(),
+                    original_inode,
+                    "fixture mutation must preserve the inode"
+                );
+            });
+
+            tool.execute(
+                "write-overwrite",
+                serde_json::json!({
+                    "path": target,
+                    "content": "requested write\n"
+                }),
+                None,
+            )
+            .await
+            .expect("Write intentionally overwrites concurrent content");
+
+            assert_eq!(
+                std::fs::read_to_string(&target).expect("read final Write result"),
+                "requested write\n"
+            );
+        });
+    }
 
     #[test]
     fn test_truncate_head() {
@@ -8261,6 +20359,550 @@ mod tests {
         });
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn cache_permission_fingerprints_do_not_read_mode_denied_content() {
+        let tmp = tempfile::tempdir().expect("cache permission workspace");
+        let denied_file = tmp.path().join("owner-denied.txt");
+        std::fs::write(&denied_file, "cache secret").expect("write denied cache fixture");
+        let file_guard = UnixModeGuard::set(&denied_file, 0o004);
+        assert!(
+            fingerprint_file_content(&denied_file).is_none(),
+            "file fingerprinting must not borrow other-read for an owner-denied file"
+        );
+        drop(file_guard);
+
+        let denied_dir = tmp.path().join("denied-tree");
+        std::fs::create_dir(&denied_dir).expect("create denied cache directory");
+        std::fs::write(denied_dir.join("secret.txt"), "recursive cache secret")
+            .expect("write recursive cache fixture");
+        let dir_guard = UnixModeGuard::set(&denied_dir, 0o000);
+        assert!(
+            fingerprint_directory_recursive(tmp.path()).is_none(),
+            "recursive fingerprinting must stop before a mode-denied subtree"
+        );
+        drop(dir_guard);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn global_git_ignore_resolution_short_circuits_xdg_after_home_match() {
+        let tmp = tempfile::tempdir().expect("global git config fixture");
+        let home = tmp.path().join("home");
+        let xdg = tmp.path().join("xdg");
+        std::fs::create_dir_all(xdg.join("git")).expect("create xdg git config directory");
+        std::fs::create_dir(&home).expect("create home directory");
+        let home_config = home.join(".gitconfig");
+        std::fs::write(
+            &home_config,
+            "[core]\n    excludesFile = ~/home-global-ignore\n",
+        )
+        .expect("write home git config");
+        let xdg_config = xdg.join("git").join("config");
+        std::fs::write(
+            &xdg_config,
+            "[core]\n    excludesFile = /must-not-be-consumed\n",
+        )
+        .expect("write xdg git config");
+        let _xdg_mode_guard = UnixModeGuard::set(&xdg_config, 0o000);
+        let locations = GitGlobalConfigLocations {
+            home_dir: Some(home.clone()),
+            xdg_config_home: Some(xdg),
+        };
+        let access_context = EffectiveModeAccessContext::current().expect("effective identity");
+
+        let controls = resolve_git_global_ignore_controls(
+            &locations,
+            &access_context,
+            "global git config test",
+        )
+        .expect("a home match must short-circuit the denied xdg config");
+        assert_eq!(controls.consumed_config_paths, vec![home_config]);
+        assert_eq!(controls.ignore_path, Some(home.join("home-global-ignore")));
+    }
+
+    #[test]
+    fn global_git_ignore_parser_matches_broad_tilde_expansion_with_a_bound() {
+        let home = Path::new("/synthetic/home");
+        let candidate = "prefix~middle~suffix";
+        let config = format!("[core]\n    excludesFile = {candidate}\n");
+        let parsed = parse_gitconfig_excludes_path(config.as_bytes(), Some(home))
+            .expect("bounded tilde expansion")
+            .expect("configured excludesFile");
+        assert_eq!(
+            parsed,
+            PathBuf::from(candidate.replace('~', &home.to_string_lossy()))
+        );
+
+        let expansion_unit = "h".repeat(128);
+        let tilde_count = GIT_GLOBAL_IGNORE_PATH_MAX_BYTES / expansion_unit.len() + 1;
+        let oversized = format!("[core]\n    excludesFile = {}\n", "~".repeat(tilde_count));
+        let error =
+            parse_gitconfig_excludes_path(oversized.as_bytes(), Some(Path::new(&expansion_unit)))
+                .expect_err("broad replacement must not amplify beyond the path bound");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("expanded"));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn fd_global_ignore_resolution_uses_xdg_strategy_on_unix_and_macos() {
+        let locations = GitGlobalConfigLocations {
+            home_dir: Some(PathBuf::from("/synthetic/home")),
+            xdg_config_home: Some(PathBuf::from("/synthetic/xdg")),
+        };
+        assert_eq!(
+            fd_global_ignore_path_from_locations(&locations),
+            Some(PathBuf::from("/synthetic/xdg/fd/ignore"))
+        );
+
+        let fallback = GitGlobalConfigLocations {
+            home_dir: Some(PathBuf::from("/synthetic/home")),
+            xdg_config_home: Some(PathBuf::from("/synthetic/home/.config")),
+        };
+        assert_eq!(
+            fd_global_ignore_path_from_locations(&fallback),
+            Some(PathBuf::from("/synthetic/home/.config/fd/ignore"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn global_git_ignore_resolution_rejects_mode_denied_consumed_configs() {
+        let tmp = tempfile::tempdir().expect("denied global git config fixture");
+        let home = tmp.path().join("home");
+        let xdg = tmp.path().join("xdg");
+        std::fs::create_dir_all(xdg.join("git")).expect("create xdg git config directory");
+        std::fs::create_dir(&home).expect("create home directory");
+        let locations = GitGlobalConfigLocations {
+            home_dir: Some(home.clone()),
+            xdg_config_home: Some(xdg.clone()),
+        };
+        let access_context = EffectiveModeAccessContext::current().expect("effective identity");
+
+        let home_config = home.join(".gitconfig");
+        std::fs::write(&home_config, "[core]\n").expect("write home git config");
+        let home_guard = UnixModeGuard::set(&home_config, 0o004);
+        let error = resolve_git_global_ignore_controls(
+            &locations,
+            &access_context,
+            "global git config test",
+        )
+        .expect_err("the selected owner class must reject a denied home config");
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        drop(home_guard);
+
+        let xdg_config = xdg.join("git").join("config");
+        std::fs::write(
+            &xdg_config,
+            "[core]\n    excludesFile = /xdg-global-ignore\n",
+        )
+        .expect("write xdg git config");
+        let _xdg_guard = UnixModeGuard::set(&xdg_config, 0o004);
+        let error = resolve_git_global_ignore_controls(
+            &locations,
+            &access_context,
+            "global git config test",
+        )
+        .expect_err("xdg is consumed when home has no excludesFile and must be mode-checked");
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn global_git_ignore_resolution_rejects_oversized_consumed_config() {
+        let tmp = tempfile::tempdir().expect("oversized global git config fixture");
+        let home = tmp.path().join("home");
+        std::fs::create_dir(&home).expect("create home directory");
+        let config = home.join(".gitconfig");
+        let oversized_len = usize::try_from(GIT_GLOBAL_CONFIG_MAX_BYTES)
+            .expect("global config limit fits usize")
+            .saturating_add(1);
+        std::fs::write(&config, vec![b'x'; oversized_len])
+            .expect("write oversized global git config");
+        let access_context = EffectiveModeAccessContext::current().expect("effective identity");
+
+        let error = resolve_git_global_ignore_controls(
+            &GitGlobalConfigLocations {
+                home_dir: Some(home),
+                xdg_config_home: None,
+            },
+            &access_context,
+            "global git config test",
+        )
+        .expect_err("an oversized consumed config must not be read without a bound");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("exceeds"));
+        assert!(error.to_string().contains(&config.display().to_string()));
+    }
+
+    #[test]
+    fn recursive_scan_rejects_oversized_ignore_control_before_walking() {
+        let tmp = tempfile::tempdir().expect("oversized ignore-control fixture");
+        let control = tmp.path().join(".gitignore");
+        let file = std::fs::File::create(&control).expect("create sparse ignore control");
+        file.set_len(RECURSIVE_SCAN_IGNORE_CONTROL_MAX_BYTES.saturating_add(1))
+            .expect("size sparse ignore control");
+        let access_context = EffectiveModeAccessContext::current().expect("effective identity");
+
+        let error =
+            ensure_ignore_control_readable_sync(&control, &access_context, "recursive scan test")
+                .expect_err("the in-process ignore parser must have an explicit input bound");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("exceeds"));
+        assert!(error.to_string().contains(&control.display().to_string()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recursive_scan_applies_relative_global_git_ignore_from_command_cwd() {
+        let tmp = tempfile::tempdir().expect("relative global ignore fixture");
+        let cwd = tmp.path().join("workspace");
+        let home = tmp.path().join("home");
+        let search_root = cwd.join("scan-root");
+        let ignored = search_root.join("ignored-vault");
+        std::fs::create_dir_all(&ignored).expect("create ignored directory");
+        std::fs::create_dir(&home).expect("create home directory");
+        std::fs::create_dir(cwd.join("config")).expect("create relative ignore directory");
+        std::fs::write(search_root.join("visible.txt"), "needle\n").expect("write visible file");
+        std::fs::write(ignored.join("secret.txt"), "needle\n").expect("write ignored file");
+        std::fs::write(
+            home.join(".gitconfig"),
+            "[core]\n    excludesFile = config/global.ignore\n",
+        )
+        .expect("write relative global git config");
+        std::fs::write(
+            cwd.join("config").join("global.ignore"),
+            "scan-root/ignored-vault/\n",
+        )
+        .expect("write relative global ignore file");
+
+        let access_context = EffectiveModeAccessContext::current().expect("effective identity");
+        let controls = resolve_git_global_ignore_controls(
+            &GitGlobalConfigLocations {
+                home_dir: Some(home),
+                xdg_config_home: None,
+            },
+            &access_context,
+            "relative global ignore test",
+        )
+        .expect("resolve relative global ignore");
+        let global_ignore = ignore_control_path_from_command_cwd(
+            controls.ignore_path.expect("configured global ignore"),
+            &cwd,
+        );
+        ensure_ignore_control_readable_sync(
+            &global_ignore,
+            &access_context,
+            "relative global ignore test",
+        )
+        .expect("validate relative global ignore");
+
+        let walker = recursive_scan_walk_builder(
+            &search_root,
+            &cwd,
+            RecursiveScanAccess::ReadableFiles,
+            None,
+            Some(&global_ignore),
+            true,
+        )
+        .expect("build recursive walker")
+        .build();
+        let visited = walker
+            .map(|entry| entry.expect("walk entry").into_path())
+            .collect::<Vec<_>>();
+
+        assert!(visited.contains(&search_root.join("visible.txt")));
+        assert!(!visited.contains(&ignored));
+        assert!(!visited.contains(&ignored.join("secret.txt")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recursive_scan_accepts_linked_worktree_git_file() {
+        let tmp = tempfile::tempdir().expect("linked worktree fixture");
+        let worktree = tmp.path().join("worktree");
+        std::fs::create_dir(&worktree).expect("create linked worktree");
+        std::fs::write(
+            worktree.join(".git"),
+            "gitdir: /tmp/example-git-common-dir/worktrees/example\n",
+        )
+        .expect("write linked-worktree .git file");
+        std::fs::write(worktree.join("visible.txt"), "needle\n").expect("write visible file");
+
+        for access in [
+            RecursiveScanAccess::ReadableFiles,
+            RecursiveScanAccess::DirectoriesOnly,
+        ] {
+            ensure_recursive_scan_access_sync(
+                &worktree,
+                tmp.path(),
+                "linked worktree scan",
+                access,
+                None,
+            )
+            .expect("a regular .git file must not make .git/info/exclude an ENOTDIR failure");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recursive_grep_glob_is_rooted_at_command_cwd() {
+        let tmp = tempfile::tempdir().expect("grep glob fixture");
+        let search_root = tmp.path().join("scan-root");
+        let nested = search_root.join("a");
+        std::fs::create_dir_all(&nested).expect("create nested scan root");
+        let denied = nested.join("owner-denied.txt");
+        std::fs::write(&denied, "needle\n").expect("write denied glob fixture");
+        let _mode_guard = UnixModeGuard::set(&denied, 0o004);
+
+        let error = ensure_recursive_scan_access_sync(
+            &search_root,
+            tmp.path(),
+            "recursive content scanning",
+            RecursiveScanAccess::ReadableFiles,
+            Some("scan-root/a/*.txt"),
+        )
+        .expect_err("cwd-relative rg glob includes the owner-denied file");
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+
+        ensure_recursive_scan_access_sync(
+            &search_root,
+            tmp.path(),
+            "recursive content scanning",
+            RecursiveScanAccess::ReadableFiles,
+            Some("a/*.txt"),
+        )
+        .expect("a slash glob that rg evaluates outside its cwd-relative surface must not deny");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recursive_scan_applies_explicit_root_ignore_from_command_cwd() {
+        let tmp = tempfile::tempdir().expect("explicit ignore fixture");
+        let search_root = tmp.path().join("scan-root");
+        let ignored = search_root.join("ignored-vault");
+        std::fs::create_dir_all(&ignored).expect("create ignored directory");
+        std::fs::write(ignored.join("secret.txt"), "needle\n").expect("write ignored file");
+        std::fs::write(search_root.join(".gitignore"), "scan-root/ignored-vault/\n")
+            .expect("write cwd-relative explicit ignore rule");
+        let _mode_guard = UnixModeGuard::set(&ignored, 0o000);
+
+        ensure_recursive_scan_access_sync(
+            &search_root,
+            tmp.path(),
+            "recursive content scanning",
+            RecursiveScanAccess::ReadableFiles,
+            None,
+        )
+        .expect("the preflight must honor the same explicit --ignore-file surface as rg");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recursive_grep_validates_ignore_control_hidden_by_positive_glob() {
+        let tmp = tempfile::tempdir().expect("nested ignore control fixture");
+        let search_root = tmp.path().join("scan-root");
+        let nested = search_root.join("nested");
+        std::fs::create_dir_all(&nested).expect("create nested directory");
+        std::fs::write(nested.join("visible.txt"), "needle\n").expect("write visible file");
+        let ignore_control = nested.join(".gitignore");
+        std::fs::write(&ignore_control, "ignored.txt\n").expect("write nested ignore control");
+        let _mode_guard = UnixModeGuard::set(&ignore_control, 0o004);
+
+        let error = ensure_recursive_scan_access_sync(
+            &search_root,
+            tmp.path(),
+            "recursive content scanning",
+            RecursiveScanAccess::ReadableFiles,
+            Some("scan-root/**/*.txt"),
+        )
+        .expect_err("rg consumes a nested ignore control even when its positive glob hides it");
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn permission_scan_path_checks_lexical_parent_erased_by_terminal_symlink() {
+        use std::os::unix::fs::symlink;
+
+        asupersync::test_utils::run_test(|| async {
+            let tmp = tempfile::tempdir().expect("terminal symlink fixture");
+            let target = tmp.path().join("target");
+            std::fs::create_dir(&target).expect("create accessible target");
+            let blocked_parent = tmp.path().join("blocked-parent");
+            std::fs::create_dir(&blocked_parent).expect("create blocked lexical parent");
+            let lexical_path = blocked_parent.join("scan-link");
+            symlink(&target, &lexical_path).expect("create terminal symlink");
+            let canonical_path = std::fs::canonicalize(&lexical_path).expect("canonical target");
+            let _mode_guard = UnixModeGuard::set(&blocked_parent, 0o000);
+
+            let error = ensure_scan_path_ancestors_searchable(&lexical_path, &canonical_path)
+                .await
+                .expect_err("a mode-denied lexical parent must survive canonical scope checks");
+            assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+            assert!(
+                error
+                    .to_string()
+                    .contains(&blocked_parent.display().to_string()),
+                "permission error must identify the denied lexical ancestor: {error}"
+            );
+        });
+    }
+
+    fn office_read_fixture(presentation: bool, text: &str) -> Vec<u8> {
+        use zip::write::SimpleFileOptions;
+
+        let office_rel = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+        let package_rel = "http://schemas.openxmlformats.org/package/2006/relationships";
+        let main = if presentation {
+            "ppt/presentation.xml"
+        } else {
+            "word/document.xml"
+        };
+        let relationships = format!(
+            "<Relationships xmlns='{package_rel}'><Relationship Id='main' Type='{office_rel}/officeDocument' Target='{main}'/></Relationships>"
+        );
+        let mut entries = vec![("_rels/.rels", relationships)];
+        if presentation {
+            let presentation_ns = "http://schemas.openxmlformats.org/presentationml/2006/main";
+            let drawing_ns = "http://schemas.openxmlformats.org/drawingml/2006/main";
+            entries.push((main, format!(
+                "<p:presentation xmlns:p='{presentation_ns}' xmlns:r='{office_rel}'><p:sldIdLst><p:sldId id='256' r:id='slide'/></p:sldIdLst></p:presentation>"
+            )));
+            entries.push(("ppt/_rels/presentation.xml.rels", format!(
+                "<Relationships xmlns='{package_rel}'><Relationship Id='slide' Type='{office_rel}/slide' Target='slides/slide1.xml'/></Relationships>"
+            )));
+            entries.push(("ppt/slides/slide1.xml", format!(
+                "<p:sld xmlns:p='{presentation_ns}' xmlns:a='{drawing_ns}'><p:cSld><p:spTree><p:sp><p:txBody><a:p><a:r><a:t>{text}</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:cSld></p:sld>"
+            )));
+        } else {
+            entries.push((main, format!(
+                "<w:document xmlns:w='http://schemas.openxmlformats.org/wordprocessingml/2006/main'><w:body><w:p><w:r><w:t>Document heading</w:t></w:r></w:p><w:p><w:r><w:t>{text}</w:t></w:r></w:p></w:body></w:document>"
+            )));
+        }
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let options =
+            SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        for (name, content) in entries {
+            writer
+                .start_file(name, options)
+                .expect("start Office fixture member");
+            writer
+                .write_all(content.as_bytes())
+                .expect("write Office fixture XML");
+        }
+        writer
+            .finish()
+            .expect("finish Office fixture ZIP")
+            .into_inner()
+    }
+
+    #[test]
+    fn read_office_documents_render_local_and_downloaded_bytes_consistently() {
+        asupersync::test_utils::run_test(|| async {
+            let tmp = tempfile::tempdir().expect("Office read fixtures");
+            let tool = ReadTool::new(tmp.path());
+            for (name, presentation, kind) in [
+                ("report.DOCX", false, "docx"),
+                ("slides.pptx", true, "pptx"),
+            ] {
+                let bytes = office_read_fixture(presentation, "Saved text 世界");
+                let path = tmp.path().join(name);
+                std::fs::write(&path, &bytes).unwrap();
+                let output = tool
+                    .execute(name, serde_json::json!({"path": name}), None)
+                    .await
+                    .expect("read native document");
+                let details = output.details.as_ref().unwrap();
+                assert_eq!(details["contentType"], kind);
+                assert_eq!(details["extractor"], kind);
+                assert_eq!(details["rendered"], true);
+                assert_eq!(details["totalLines"], 3);
+                assert!(first_text(&output).contains("Saved text 世界"));
+
+                let downloaded = crate::url_read::convert_bytes(
+                    &format!("https://example.test/{name}?download=1"),
+                    "application/octet-stream",
+                    &bytes,
+                    false,
+                )
+                .expect("convert downloaded Office bytes");
+                let numbered: Vec<_> = first_text(&output)
+                    .lines()
+                    .map(|line| line.split_once('→').unwrap().1)
+                    .collect();
+                assert_eq!(numbered, downloaded.content.lines().collect::<Vec<_>>());
+
+                let page = tool
+                    .execute(
+                        "office-page",
+                        serde_json::json!({"path": name, "offset": 3, "limit": 1}),
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(first_text(&page), "    3→Saved text 世界");
+                assert_eq!(page.details.as_ref().unwrap()["truncated"], false);
+                let error = tool
+                    .execute(
+                        "office-edit-anchor",
+                        serde_json::json!({"path": name, "hashline": true}),
+                        None,
+                    )
+                    .await
+                    .expect_err("rendered lines are not binary edit locations");
+                assert!(error.to_string().contains("DOCUMENT_HASHLINE"));
+                assert_eq!(
+                    std::fs::read(path).unwrap(),
+                    bytes,
+                    "read must not rewrite the package"
+                );
+            }
+            let error = tool.execute(
+                "url-edit-anchor",
+                serde_json::json!({"path": "https://example.invalid/report.docx", "hashline": true}),
+                None,
+            ).await.expect_err("invalid anchor request must fail before a network lookup");
+            assert!(error.to_string().contains("DOCUMENT_HASHLINE"));
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_office_document_uses_admitted_inode_and_does_not_cache_replacement() {
+        asupersync::test_utils::run_test(|| async {
+            let tmp = tempfile::tempdir().expect("Office descriptor fixture");
+            let target = tmp.path().join("report.docx");
+            let retained = tmp.path().join("opened-report.docx");
+            std::fs::write(&target, office_read_fixture(false, "admitted content")).unwrap();
+            let swapped_path = target.clone();
+            let tool = ReadTool::with_after_open_hook(tmp.path(), move || {
+                std::fs::rename(&swapped_path, &retained).unwrap();
+                std::fs::write(
+                    &swapped_path,
+                    office_read_fixture(false, "replacement content"),
+                )
+                .unwrap();
+            });
+            let input = serde_json::json!({"path": "report.docx"});
+            let opened = tool
+                .execute("office-opened", input.clone(), None)
+                .await
+                .unwrap();
+            assert!(first_text(&opened).contains("admitted content"));
+            assert!(!first_text(&opened).contains("replacement content"));
+            let replacement = ReadTool::new(tmp.path())
+                .execute("office-replacement", input, None)
+                .await
+                .unwrap();
+            assert!(first_text(&replacement).contains("replacement content"));
+            assert!(!first_text(&replacement).contains("admitted content"));
+        });
+    }
+
     async fn assert_read_cache_hit_and_stale(tmp: &Path) {
         let note = tmp.join("note.txt");
         std::fs::write(&note, "alpha\n").expect("write note");
@@ -8273,13 +20915,14 @@ mod tests {
             .expect("first read");
         assert!(first_text(&first).contains("alpha"));
 
-        let hits_before = tool_output_cache_stats_for_tests().hits;
-        let second = read_tool
-            .execute("read-2", read_input.clone(), None)
-            .await
-            .expect("cached read");
-        assert_eq!(first_text(&first), first_text(&second));
-        assert!(tool_output_cache_stats_for_tests().hits > hits_before);
+        assert_eventual_cache_hit(
+            &read_tool,
+            "read-2",
+            &read_input,
+            first_text(&first),
+            "read",
+        )
+        .await;
 
         let invalidations_before = tool_output_cache_stats_for_tests().invalidations;
         std::fs::write(&note, "beta\n").expect("rewrite note");
@@ -8292,6 +20935,363 @@ mod tests {
         assert!(tool_output_cache_stats_for_tests().invalidations > invalidations_before);
     }
 
+    #[cfg(unix)]
+    async fn assert_read_cache_does_not_bind_opened_inode_to_replacement_path(tmp: &Path) {
+        let target = tmp.join("read-cache-race.txt");
+        let retained_original = tmp.join("read-cache-race-opened-original.txt");
+        std::fs::write(&target, "opened inode payload\n").expect("write original read target");
+
+        let target_for_hook = target.clone();
+        let retained_for_hook = retained_original.clone();
+        let raced_tool = ReadTool::with_after_open_hook(tmp, move || {
+            std::fs::rename(&target_for_hook, &retained_for_hook)
+                .expect("retain the already-open read target");
+            std::fs::write(&target_for_hook, "replacement path payload\n")
+                .expect("install replacement read target");
+        });
+        let input = serde_json::json!({ "path": "read-cache-race.txt" });
+        let opened_output = raced_tool
+            .execute("read-cache-race-opened", input.clone(), None)
+            .await
+            .expect("read the already-open inode");
+        assert!(first_text(&opened_output).contains("opened inode payload"));
+        assert!(!first_text(&opened_output).contains("replacement path payload"));
+
+        let replacement_output = ReadTool::new(tmp)
+            .execute("read-cache-race-replacement", input, None)
+            .await
+            .expect("read the replacement pathname");
+        assert!(first_text(&replacement_output).contains("replacement path payload"));
+        assert!(!first_text(&replacement_output).contains("opened inode payload"));
+        assert_eq!(
+            std::fs::read_to_string(&retained_original).expect("read retained original"),
+            "opened inode payload\n"
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[allow(clippy::too_many_lines)]
+    async fn assert_scoped_scan_roots_survive_after_open_replacement(tmp: &Path) {
+        use std::os::unix::fs::symlink;
+
+        let outside = tempfile::tempdir().expect("create outside scan fixture");
+
+        if find_rg_binary().is_some() {
+            let cwd_root = tmp.join("grep-pinned-cwd");
+            let retained_cwd = tmp.join("grep-pinned-cwd-retained");
+            std::fs::create_dir_all(cwd_root.join("src")).expect("create pinned grep cwd");
+            std::fs::write(
+                cwd_root.join("src").join("context.txt"),
+                "before context\ninside cwd sentinel\nafter context\n",
+            )
+            .expect("write pinned cwd grep fixture");
+            let outside_cwd = outside.path().join("grep-cwd-outside");
+            std::fs::create_dir_all(outside_cwd.join("src")).expect("create replacement grep cwd");
+            std::fs::write(outside_cwd.join(".gitignore"), "src/\n")
+                .expect("write replacement cwd ignore control");
+            std::fs::write(
+                outside_cwd.join("src").join("outside.txt"),
+                "outside cwd sentinel\n",
+            )
+            .expect("write replacement cwd grep fixture");
+
+            let root_for_hook = cwd_root.clone();
+            let retained_for_hook = retained_cwd.clone();
+            let outside_for_hook = outside_cwd.clone();
+            let grep = GrepTool::with_after_scope_hook(&cwd_root, move || {
+                std::fs::rename(&root_for_hook, &retained_for_hook)
+                    .expect("retain pinned grep cwd");
+                symlink(&outside_for_hook, &root_for_hook)
+                    .expect("replace grep cwd with outside symlink");
+            });
+            let output = grep
+                .execute(
+                    "grep-pinned-cwd-race",
+                    serde_json::json!({
+                        "pattern": "cwd sentinel",
+                        "glob": "src/**/*.txt",
+                        "context": 1
+                    }),
+                    None,
+                )
+                .await
+                .expect("grep pinned default cwd");
+            let text = first_text(&output);
+            assert!(text.contains("before context"), "{text}");
+            assert!(text.contains("inside cwd sentinel"), "{text}");
+            assert!(text.contains("after context"), "{text}");
+            assert!(!text.contains("outside cwd sentinel"), "{text}");
+            assert!(!text.contains("unable to read file"), "{text}");
+            assert!(!text.contains("/proc/self/fd"), "{text}");
+            assert!(!text.contains("/dev/fd"), "{text}");
+        }
+
+        if find_fd_binary().is_some() {
+            let cwd_root = tmp.join("find-pinned-cwd");
+            let retained_cwd = tmp.join("find-pinned-cwd-retained");
+            std::fs::create_dir_all(cwd_root.join("src")).expect("create pinned find cwd");
+            std::fs::write(cwd_root.join("src").join("inside.txt"), "inside\n")
+                .expect("write pinned cwd find fixture");
+            let outside_cwd = outside.path().join("find-cwd-outside");
+            std::fs::create_dir_all(outside_cwd.join("src")).expect("create replacement find cwd");
+            std::fs::write(outside_cwd.join(".gitignore"), "src/\n")
+                .expect("write replacement find ignore control");
+            std::fs::write(outside_cwd.join("src").join("outside.txt"), "outside\n")
+                .expect("write replacement cwd find fixture");
+
+            let root_for_hook = cwd_root.clone();
+            let retained_for_hook = retained_cwd.clone();
+            let outside_for_hook = outside_cwd.clone();
+            let find = FindTool::with_after_scope_hook(&cwd_root, move || {
+                std::fs::rename(&root_for_hook, &retained_for_hook)
+                    .expect("retain pinned find cwd");
+                symlink(&outside_for_hook, &root_for_hook)
+                    .expect("replace find cwd with outside symlink");
+            });
+            let output = find
+                .execute(
+                    "find-pinned-cwd-race",
+                    serde_json::json!({ "pattern": "src/**/*.txt" }),
+                    None,
+                )
+                .await
+                .expect("find pinned default cwd");
+            let text = first_text(&output);
+            assert!(text.contains("src/inside.txt"), "{text}");
+            assert!(!text.contains("outside.txt"), "{text}");
+            assert!(!text.contains("/proc/self/fd"), "{text}");
+            assert!(!text.contains("/dev/fd"), "{text}");
+        }
+
+        {
+            let cwd_root = tmp.join("ls-pinned-cwd");
+            let retained_cwd = tmp.join("ls-pinned-cwd-retained");
+            std::fs::create_dir(&cwd_root).expect("create pinned ls cwd");
+            std::fs::write(cwd_root.join("inside.txt"), "inside\n")
+                .expect("write pinned cwd ls fixture");
+            let outside_cwd = outside.path().join("ls-cwd-outside");
+            std::fs::create_dir(&outside_cwd).expect("create replacement ls cwd");
+            std::fs::write(outside_cwd.join("outside.txt"), "outside\n")
+                .expect("write replacement cwd ls fixture");
+
+            let root_for_hook = cwd_root.clone();
+            let retained_for_hook = retained_cwd.clone();
+            let outside_for_hook = outside_cwd.clone();
+            let ls = LsTool::with_after_scope_hook(&cwd_root, move || {
+                std::fs::rename(&root_for_hook, &retained_for_hook).expect("retain pinned ls cwd");
+                symlink(&outside_for_hook, &root_for_hook)
+                    .expect("replace ls cwd with outside symlink");
+            });
+            let output = ls
+                .execute("ls-pinned-cwd-race", serde_json::json!({}), None)
+                .await
+                .expect("list pinned default cwd");
+            let text = first_text(&output);
+            assert!(text.contains("inside.txt"), "{text}");
+            assert!(!text.contains("outside.txt"), "{text}");
+        }
+
+        if find_rg_binary().is_some() {
+            let grep_root = tmp.join("grep-pinned-root");
+            let retained_grep_root = tmp.join("grep-pinned-root-retained");
+            std::fs::create_dir(&grep_root).expect("create grep root");
+            std::fs::write(grep_root.join("inside.txt"), "inside grep sentinel\n")
+                .expect("write inside grep fixture");
+            let outside_grep = outside.path().join("grep-outside");
+            std::fs::create_dir(&outside_grep).expect("create outside grep root");
+            std::fs::write(outside_grep.join("outside.txt"), "outside grep sentinel\n")
+                .expect("write outside grep fixture");
+
+            let root_for_hook = grep_root.clone();
+            let retained_for_hook = retained_grep_root.clone();
+            let outside_for_hook = outside_grep.clone();
+            let grep = GrepTool::with_after_scope_hook(tmp, move || {
+                std::fs::rename(&root_for_hook, &retained_for_hook)
+                    .expect("retain pinned grep root");
+                symlink(&outside_for_hook, &root_for_hook)
+                    .expect("replace grep path with outside symlink");
+            });
+            let output = grep
+                .execute(
+                    "grep-pinned-root-race",
+                    serde_json::json!({
+                        "pattern": "sentinel",
+                        "path": "grep-pinned-root"
+                    }),
+                    None,
+                )
+                .await
+                .expect("grep pinned directory root");
+            let text = first_text(&output);
+            assert!(text.contains("inside grep sentinel"), "{text}");
+            assert!(!text.contains("outside grep sentinel"), "{text}");
+            assert!(!text.contains("/proc/self/fd"), "{text}");
+            assert!(!text.contains("/dev/fd"), "{text}");
+
+            let grep_file = tmp.join("grep-pinned-file.txt");
+            let retained_grep_file = tmp.join("grep-pinned-file-retained.txt");
+            let outside_grep_file = outside.path().join("grep-outside-file.txt");
+            std::fs::write(&grep_file, "inside file sentinel\n").expect("write inside grep file");
+            std::fs::write(&outside_grep_file, "outside file sentinel\n")
+                .expect("write outside grep file");
+            let file_for_hook = grep_file.clone();
+            let retained_file_for_hook = retained_grep_file.clone();
+            let outside_file_for_hook = outside_grep_file.clone();
+            let grep = GrepTool::with_after_scope_hook(tmp, move || {
+                std::fs::rename(&file_for_hook, &retained_file_for_hook)
+                    .expect("retain pinned grep file");
+                symlink(&outside_file_for_hook, &file_for_hook)
+                    .expect("replace grep file with outside symlink");
+            });
+            let output = grep
+                .execute(
+                    "grep-pinned-file-race",
+                    serde_json::json!({
+                        "pattern": "sentinel",
+                        "path": "grep-pinned-file.txt"
+                    }),
+                    None,
+                )
+                .await
+                .expect("grep pinned file root");
+            let text = first_text(&output);
+            assert!(text.contains("inside file sentinel"), "{text}");
+            assert!(!text.contains("outside file sentinel"), "{text}");
+            assert!(!text.contains("/proc/self/fd"), "{text}");
+            assert!(!text.contains("/dev/fd"), "{text}");
+        }
+
+        if find_fd_binary().is_some() {
+            let find_root = tmp.join("find-pinned-root");
+            let retained_find_root = tmp.join("find-pinned-root-retained");
+            std::fs::create_dir(&find_root).expect("create find root");
+            std::fs::write(find_root.join("inside-find.txt"), "inside\n")
+                .expect("write inside find fixture");
+            let outside_find = outside.path().join("find-outside");
+            std::fs::create_dir(&outside_find).expect("create outside find root");
+            std::fs::write(outside_find.join("outside-find.txt"), "outside\n")
+                .expect("write outside find fixture");
+
+            let root_for_hook = find_root.clone();
+            let retained_for_hook = retained_find_root.clone();
+            let outside_for_hook = outside_find.clone();
+            let find = FindTool::with_after_scope_hook(tmp, move || {
+                std::fs::rename(&root_for_hook, &retained_for_hook)
+                    .expect("retain pinned find root");
+                symlink(&outside_for_hook, &root_for_hook)
+                    .expect("replace find path with outside symlink");
+            });
+            let output = find
+                .execute(
+                    "find-pinned-root-race",
+                    serde_json::json!({
+                        "pattern": "*.txt",
+                        "path": "find-pinned-root"
+                    }),
+                    None,
+                )
+                .await
+                .expect("find pinned directory root");
+            let text = first_text(&output);
+            assert!(text.contains("inside-find.txt"), "{text}");
+            assert!(!text.contains("outside-find.txt"), "{text}");
+            assert!(!text.contains("/proc/self/fd"), "{text}");
+            assert!(!text.contains("/dev/fd"), "{text}");
+        }
+
+        let ls_root = tmp.join("ls-pinned-root");
+        let retained_ls_root = tmp.join("ls-pinned-root-retained");
+        std::fs::create_dir(&ls_root).expect("create ls root");
+        std::fs::write(ls_root.join("inside-ls.txt"), "inside\n").expect("write inside ls fixture");
+        let outside_ls = outside.path().join("ls-outside");
+        std::fs::create_dir(&outside_ls).expect("create outside ls root");
+        std::fs::write(outside_ls.join("outside-ls.txt"), "outside\n")
+            .expect("write outside ls fixture");
+
+        let root_for_hook = ls_root.clone();
+        let retained_for_hook = retained_ls_root.clone();
+        let outside_for_hook = outside_ls.clone();
+        let ls = LsTool::with_after_scope_hook(tmp, move || {
+            std::fs::rename(&root_for_hook, &retained_for_hook).expect("retain pinned ls root");
+            symlink(&outside_for_hook, &root_for_hook)
+                .expect("replace ls path with outside symlink");
+        });
+        let output = ls
+            .execute(
+                "ls-pinned-root-race",
+                serde_json::json!({ "path": "ls-pinned-root" }),
+                None,
+            )
+            .await
+            .expect("list pinned directory root");
+        let text = first_text(&output);
+        assert!(text.contains("inside-ls.txt"), "{text}");
+        assert!(!text.contains("outside-ls.txt"), "{text}");
+    }
+
+    async fn assert_find_selects_globally_newest_match(tmp: &Path) {
+        if find_fd_binary().is_none() {
+            return;
+        }
+        let root = tmp.join("find-newest-complete-root");
+        std::fs::create_dir(&root).expect("create complete find fixture");
+        let old_time = filetime::FileTime::from_unix_time(1_600_000_000, 0);
+        for index in 0..64 {
+            let old = root.join(format!("a-old-{index:03}.txt"));
+            std::fs::write(&old, "old\n").expect("write old find candidate");
+            filetime::set_file_mtime(&old, old_time).expect("set old candidate mtime");
+        }
+        let newest = root.join("z-newest.txt");
+        std::fs::write(&newest, "newest\n").expect("write newest find candidate");
+        filetime::set_file_mtime(
+            &newest,
+            filetime::FileTime::from_unix_time(1_700_000_000, 0),
+        )
+        .expect("set newest candidate mtime");
+
+        let output = FindTool::new(tmp)
+            .execute(
+                "find-global-newest",
+                serde_json::json!({
+                    "pattern": "*.txt",
+                    "path": "find-newest-complete-root",
+                    "limit": 1
+                }),
+                None,
+            )
+            .await
+            .expect("find globally newest result");
+        let text = first_text(&output);
+        assert!(text.contains("z-newest.txt"), "{text}");
+        assert!(!text.contains("a-old-"), "{text}");
+    }
+
+    /// Execute `tool` repeatedly until the process-global output cache reports
+    /// a hit. The cache is shared across the whole test binary with a bounded
+    /// LRU, so concurrently running tests can evict the freshly inserted entry
+    /// between two calls; a miss re-inserts the entry, so a bounded retry
+    /// converges unless caching is actually broken.
+    async fn assert_eventual_cache_hit(
+        tool: &dyn Tool,
+        tool_call_id: &str,
+        input: &serde_json::Value,
+        expected_text: &str,
+        label: &str,
+    ) {
+        for _attempt in 0..8 {
+            let hits_before = tool_output_cache_stats_for_tests().hits;
+            let output = tool
+                .execute(tool_call_id, input.clone(), None)
+                .await
+                .unwrap_or_else(|err| panic!("{label}: cached execute failed: {err}"));
+            assert_eq!(expected_text, first_text(&output), "{label}");
+            if tool_output_cache_stats_for_tests().hits > hits_before {
+                return;
+            }
+        }
+        panic!("{label}: output was never served from the cache");
+    }
+
     async fn assert_ls_cache_hit_and_stale(tmp: &Path) {
         let ls_tool = LsTool::new(tmp);
         let ls_input = serde_json::json!({ "path": "." });
@@ -8301,13 +21301,7 @@ mod tests {
             .expect("first ls");
         assert!(first_text(&ls_first).contains("note.txt"));
 
-        let hits_before = tool_output_cache_stats_for_tests().hits;
-        let ls_second = ls_tool
-            .execute("ls-2", ls_input.clone(), None)
-            .await
-            .expect("cached ls");
-        assert_eq!(first_text(&ls_first), first_text(&ls_second));
-        assert!(tool_output_cache_stats_for_tests().hits > hits_before);
+        assert_eventual_cache_hit(&ls_tool, "ls-2", &ls_input, first_text(&ls_first), "ls").await;
 
         let invalidations_before = tool_output_cache_stats_for_tests().invalidations;
         std::fs::write(tmp.join("new.txt"), "new\n").expect("write new file");
@@ -8334,13 +21328,14 @@ mod tests {
             .expect("first grep");
         assert!(first_text(&grep_first).contains("a.txt"));
 
-        let hits_before = tool_output_cache_stats_for_tests().hits;
-        let grep_second = grep_tool
-            .execute("grep-2", grep_input.clone(), None)
-            .await
-            .expect("cached grep");
-        assert_eq!(first_text(&grep_first), first_text(&grep_second));
-        assert!(tool_output_cache_stats_for_tests().hits > hits_before);
+        assert_eventual_cache_hit(
+            &grep_tool,
+            "grep-2",
+            &grep_input,
+            first_text(&grep_first),
+            "grep",
+        )
+        .await;
 
         let invalidations_before = tool_output_cache_stats_for_tests().invalidations;
         std::fs::write(tmp.join("b.txt"), "needle\n").expect("write new match");
@@ -8367,13 +21362,14 @@ mod tests {
             .expect("first find");
         assert!(first_text(&find_first).contains("find-a.txt"));
 
-        let hits_before = tool_output_cache_stats_for_tests().hits;
-        let find_second = find_tool
-            .execute("find-2", find_input.clone(), None)
-            .await
-            .expect("cached find");
-        assert_eq!(first_text(&find_first), first_text(&find_second));
-        assert!(tool_output_cache_stats_for_tests().hits > hits_before);
+        assert_eventual_cache_hit(
+            &find_tool,
+            "find-2",
+            &find_input,
+            first_text(&find_first),
+            "find",
+        )
+        .await;
 
         let invalidations_before = tool_output_cache_stats_for_tests().invalidations;
         std::fs::write(tmp.join("find-b.txt"), "find\n").expect("write second find file");
@@ -8383,6 +21379,182 @@ mod tests {
             .expect("invalidated find");
         assert!(first_text(&find_third).contains("find-b.txt"));
         assert!(tool_output_cache_stats_for_tests().invalidations > invalidations_before);
+    }
+
+    async fn assert_scan_caches_track_parent_ignore_control(tmp: &Path) {
+        let have_rg = find_rg_binary().is_some();
+        let have_fd = find_fd_binary().is_some();
+        if !have_rg && !have_fd {
+            return;
+        }
+
+        let search_root = tmp.join("parent-ignore-cache-root");
+        std::fs::create_dir(&search_root).expect("create parent-ignore search root");
+        std::fs::write(search_root.join("parent-grep.txt"), "parent cache needle\n")
+            .expect("write parent-ignore grep fixture");
+        std::fs::write(search_root.join("parent-find.txt"), "find fixture\n")
+            .expect("write parent-ignore find fixture");
+        let parent_ignore = tmp.join(".gitignore");
+        std::fs::write(
+            &parent_ignore,
+            "parent-ignore-cache-root/parent-grep.txt\n\
+             parent-ignore-cache-root/parent-find.txt\n",
+        )
+        .expect("write parent ignore control");
+
+        let grep_tool = GrepTool::new(tmp);
+        let grep_input = serde_json::json!({
+            "pattern": "parent cache needle",
+            "path": "parent-ignore-cache-root"
+        });
+        if have_rg {
+            let first = grep_tool
+                .execute("grep-parent-ignore-1", grep_input.clone(), None)
+                .await
+                .expect("first parent-ignore grep");
+            assert!(!first_text(&first).contains("parent-grep.txt"));
+            assert_eventual_cache_hit(
+                &grep_tool,
+                "grep-parent-ignore-2",
+                &grep_input,
+                first_text(&first),
+                "parent-ignore grep",
+            )
+            .await;
+        }
+
+        let find_tool = FindTool::new(tmp);
+        let find_input = serde_json::json!({
+            "pattern": "parent-find.txt",
+            "path": "parent-ignore-cache-root"
+        });
+        if have_fd {
+            let first = find_tool
+                .execute("find-parent-ignore-1", find_input.clone(), None)
+                .await
+                .expect("first parent-ignore find");
+            assert!(!first_text(&first).contains("parent-find.txt"));
+            assert_eventual_cache_hit(
+                &find_tool,
+                "find-parent-ignore-2",
+                &find_input,
+                first_text(&first),
+                "parent-ignore find",
+            )
+            .await;
+        }
+
+        std::fs::write(&parent_ignore, "").expect("clear parent ignore control");
+        if have_rg {
+            let invalidations_before = tool_output_cache_stats_for_tests().invalidations;
+            let third = grep_tool
+                .execute("grep-parent-ignore-3", grep_input, None)
+                .await
+                .expect("invalidated parent-ignore grep");
+            assert!(first_text(&third).contains("parent-grep.txt"));
+            assert!(tool_output_cache_stats_for_tests().invalidations > invalidations_before);
+        }
+        if have_fd {
+            let invalidations_before = tool_output_cache_stats_for_tests().invalidations;
+            let third = find_tool
+                .execute("find-parent-ignore-3", find_input, None)
+                .await
+                .expect("invalidated parent-ignore find");
+            assert!(first_text(&third).contains("parent-find.txt"));
+            assert!(tool_output_cache_stats_for_tests().invalidations > invalidations_before);
+        }
+    }
+
+    #[cfg(unix)]
+    async fn assert_scan_caches_track_symlinked_ignore_target(tmp: &Path) {
+        use std::os::unix::fs::symlink;
+
+        let have_rg = find_rg_binary().is_some();
+        let have_fd = find_fd_binary().is_some();
+        if !have_rg && !have_fd {
+            return;
+        }
+
+        let workspace = tmp.join("symlink-ignore-workspace");
+        let search_root = workspace.join("scan-root");
+        std::fs::create_dir_all(&search_root).expect("create symlink-ignore search root");
+        std::fs::write(
+            search_root.join("symlink-grep.txt"),
+            "symlink cache needle\n",
+        )
+        .expect("write symlink-ignore grep fixture");
+        std::fs::write(search_root.join("symlink-find.txt"), "find fixture\n")
+            .expect("write symlink-ignore find fixture");
+        let ignore_target = tmp.join("symlink-ignore-target");
+        std::fs::write(
+            &ignore_target,
+            "scan-root/symlink-grep.txt\nscan-root/symlink-find.txt\n",
+        )
+        .expect("write symlinked ignore target");
+        symlink(&ignore_target, workspace.join(".gitignore"))
+            .expect("create symlinked ignore control");
+
+        let grep_tool = GrepTool::new(&workspace);
+        let grep_input = serde_json::json!({
+            "pattern": "symlink cache needle",
+            "path": "scan-root"
+        });
+        if have_rg {
+            let first = grep_tool
+                .execute("grep-symlink-ignore-1", grep_input.clone(), None)
+                .await
+                .expect("first symlink-ignore grep");
+            assert!(!first_text(&first).contains("symlink-grep.txt"));
+            assert_eventual_cache_hit(
+                &grep_tool,
+                "grep-symlink-ignore-2",
+                &grep_input,
+                first_text(&first),
+                "symlink-ignore grep",
+            )
+            .await;
+        }
+
+        let find_tool = FindTool::new(&workspace);
+        let find_input = serde_json::json!({
+            "pattern": "symlink-find.txt",
+            "path": "scan-root"
+        });
+        if have_fd {
+            let first = find_tool
+                .execute("find-symlink-ignore-1", find_input.clone(), None)
+                .await
+                .expect("first symlink-ignore find");
+            assert!(!first_text(&first).contains("symlink-find.txt"));
+            assert_eventual_cache_hit(
+                &find_tool,
+                "find-symlink-ignore-2",
+                &find_input,
+                first_text(&first),
+                "symlink-ignore find",
+            )
+            .await;
+        }
+
+        std::fs::write(&ignore_target, "").expect("clear symlinked ignore target");
+        if have_rg {
+            let invalidations_before = tool_output_cache_stats_for_tests().invalidations;
+            let third = grep_tool
+                .execute("grep-symlink-ignore-3", grep_input, None)
+                .await
+                .expect("invalidated symlink-ignore grep");
+            assert!(first_text(&third).contains("symlink-grep.txt"));
+            assert!(tool_output_cache_stats_for_tests().invalidations > invalidations_before);
+        }
+        if have_fd {
+            let invalidations_before = tool_output_cache_stats_for_tests().invalidations;
+            let third = find_tool
+                .execute("find-symlink-ignore-3", find_input, None)
+                .await
+                .expect("invalidated symlink-ignore find");
+            assert!(first_text(&third).contains("symlink-find.txt"));
+            assert!(tool_output_cache_stats_for_tests().invalidations > invalidations_before);
+        }
     }
 
     async fn assert_side_effect_tools_remain_uncached(tmp: &Path) {
@@ -8448,9 +21620,20 @@ mod tests {
 
             let tmp = tempfile::tempdir().expect("create temp dir");
             assert_read_cache_hit_and_stale(tmp.path()).await;
+            #[cfg(unix)]
+            assert_read_cache_does_not_bind_opened_inode_to_replacement_path(tmp.path()).await;
+            // Root-swap survival needs fd-path traversal (procfs); macOS/BSD
+            // /dev/fd nodes are dup-only, so those platforms scan by logical
+            // path (Windows posture) and cannot hold this guarantee.
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            assert_scoped_scan_roots_survive_after_open_replacement(tmp.path()).await;
+            assert_find_selects_globally_newest_match(tmp.path()).await;
             assert_ls_cache_hit_and_stale(tmp.path()).await;
             assert_grep_cache_hit_and_stale_when_available(tmp.path()).await;
             assert_find_cache_hit_and_stale_when_available(tmp.path()).await;
+            assert_scan_caches_track_parent_ignore_control(tmp.path()).await;
+            #[cfg(unix)]
+            assert_scan_caches_track_symlinked_ignore_target(tmp.path()).await;
             assert_side_effect_tools_remain_uncached(tmp.path()).await;
         });
     }
@@ -8557,7 +21740,7 @@ mod tests {
     }
 
     #[test]
-    fn test_rg_match_requires_path_and_line_number() {
+    fn test_rg_match_rejects_missing_or_malformed_required_fields() {
         let mut matches = Vec::new();
         let mut match_count = 0usize;
         let mut match_limit_reached = false;
@@ -8565,12 +21748,43 @@ mod tests {
 
         let missing_line =
             Ok(r#"{"type":"match","data":{"path":{"text":"file.txt"}}}"#.to_string());
-        process_rg_json_match_line(
+        let missing_line_error = process_rg_json_match_line(
             missing_line,
             &mut matches,
             &mut match_count,
             &mut match_limit_reached,
             scan_limit,
+        )
+        .expect_err("a match without line_number must fail closed");
+        assert!(missing_line_error.to_string().contains("line_number"));
+
+        let zero_line = Ok(
+            r#"{"type":"match","data":{"path":{"text":"file.txt"},"line_number":0}}"#.to_string(),
+        );
+        let zero_line_error = process_rg_json_match_line(
+            zero_line,
+            &mut matches,
+            &mut match_count,
+            &mut match_limit_reached,
+            scan_limit,
+        )
+        .expect_err("line_number zero must fail closed before context arithmetic");
+        assert!(zero_line_error.to_string().contains("line_number"));
+
+        let malformed_bytes =
+            Ok(r#"{"type":"match","data":{"path":{"bytes":"%%%"},"line_number":2}}"#.to_string());
+        let malformed_path_error = process_rg_json_match_line(
+            malformed_bytes,
+            &mut matches,
+            &mut match_count,
+            &mut match_limit_reached,
+            scan_limit,
+        )
+        .expect_err("invalid path.bytes base64 must fail closed");
+        assert!(
+            malformed_path_error
+                .to_string()
+                .contains("invalid path.bytes base64")
         );
         assert!(matches.is_empty());
         assert_eq!(match_count, 0);
@@ -8585,11 +21799,24 @@ mod tests {
             &mut match_count,
             &mut match_limit_reached,
             scan_limit,
-        );
+        )
+        .expect("valid match event");
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].1, 3);
         assert_eq!(match_count, 1);
         assert!(match_limit_reached);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn signaled_ripgrep_status_is_never_classified_as_success() {
+        let status = std::process::Command::new("sh")
+            .args(["-c", "kill -TERM $$"])
+            .status()
+            .expect("run signaled ripgrep-status fixture");
+        assert!(status.code().is_none(), "fixture must terminate by signal");
+        let error = rg_exit_failure(status, "").expect("signal termination must be an error");
+        assert!(error.contains("signal"), "{error}");
     }
 
     #[test]
@@ -8703,20 +21930,103 @@ mod tests {
     #[test]
     fn test_get_file_lines_async_unreadable_file_returns_empty() {
         asupersync::test_utils::run_test(|| async {
-            use std::os::unix::fs::PermissionsExt;
-
             let tmp = tempfile::tempdir().unwrap();
             let path = tmp.path().join("secret.txt");
             std::fs::write(&path, "secret\n").unwrap();
+            let _mode_guard = UnixModeGuard::set(&path, 0o000);
 
-            let mut perms = std::fs::metadata(&path).unwrap().permissions();
-            perms.set_mode(0o000);
-            std::fs::set_permissions(&path, perms).unwrap();
+            let metadata = std::fs::metadata(&path).expect("stat unreadable fixture");
+            let permission_error =
+                ensure_effective_mode_access(&metadata, &path, UNIX_ACCESS_READ, "file reading")
+                    .expect_err("mode invariant must reject an unreadable file");
+            assert_eq!(
+                permission_error.kind(),
+                std::io::ErrorKind::PermissionDenied
+            );
 
-            let mut cache = HashMap::new();
-            let lines = get_file_lines_async(&path, &mut cache).await;
+            let lines = get_file_lines_async(&path, tmp.path()).await;
             assert!(lines.is_empty());
         });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_get_file_lines_async_unsearchable_parent_returns_empty() {
+        asupersync::test_utils::run_test(|| async {
+            let tmp = tempfile::tempdir().expect("create temp dir");
+            let locked_dir = tmp.path().join("locked");
+            std::fs::create_dir(&locked_dir).expect("create locked directory");
+            let path = locked_dir.join("secret.txt");
+            std::fs::write(&path, "secret\n").expect("write secret fixture");
+            let _mode_guard = UnixModeGuard::set(&locked_dir, 0o000);
+
+            let permission_error = ensure_ancestors_searchable(&path)
+                .await
+                .expect_err("mode invariant must reject an unsearchable parent");
+            assert_eq!(
+                permission_error.kind(),
+                std::io::ErrorKind::PermissionDenied
+            );
+
+            let lines = get_file_lines_async(&path, tmp.path()).await;
+            assert!(lines.is_empty());
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_scoped_grep_read_rejects_terminal_symlink_swap() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir(&workspace).expect("create workspace");
+        let path = workspace.join("match.txt");
+        let displaced = workspace.join("match-original.txt");
+        std::fs::write(&path, "public match\n").expect("write original result");
+        let outside = tmp.path().join("outside-secret.txt");
+        std::fs::write(&outside, "outside secret\n").expect("write outside fixture");
+
+        let result = open_scoped_regular_file_for_read_with(&path, &workspace, || {
+            std::fs::rename(&path, &displaced).expect("displace original result");
+            symlink(&outside, &path).expect("replace result with outside symlink");
+        });
+
+        assert!(
+            result.is_err(),
+            "a terminal symlink swap must never return an outside descriptor"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_scoped_grep_read_rejects_ancestor_symlink_swap() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let workspace = tmp.path().join("workspace");
+        let result_parent = workspace.join("tree");
+        std::fs::create_dir_all(&result_parent).expect("create result parent");
+        let path = result_parent.join("match.txt");
+        std::fs::write(&path, "public match\n").expect("write original result");
+
+        let outside_parent = tmp.path().join("outside-tree");
+        std::fs::create_dir(&outside_parent).expect("create outside parent");
+        std::fs::write(outside_parent.join("match.txt"), "outside secret\n")
+            .expect("write outside fixture");
+        let displaced_parent = workspace.join("tree-original");
+
+        let result = open_scoped_regular_file_for_read_with(&path, &workspace, || {
+            std::fs::rename(&result_parent, &displaced_parent)
+                .expect("displace original result parent");
+            symlink(&outside_parent, &result_parent)
+                .expect("replace result parent with outside symlink");
+        });
+
+        assert!(
+            result.is_err(),
+            "an ancestor symlink swap must never return an outside descriptor"
+        );
     }
 
     #[test]
@@ -8819,6 +22129,116 @@ mod tests {
     // ========================================================================
 
     #[test]
+    fn read_video_respects_image_policy_before_decoder_dispatch() {
+        asupersync::test_utils::run_test(|| async {
+            let workspace = tempfile::tempdir().expect("workspace");
+            std::fs::write(workspace.path().join("clip.mp4"), b"not decoded")
+                .expect("video placeholder");
+            let tool = ReadTool::with_settings(workspace.path(), true, true);
+            for path in ["clip.mp4", "clip.mp4:42", "clip.mp4:00:00:01"] {
+                let error = tool
+                    .execute("blocked-video", serde_json::json!({"path": path}), None)
+                    .await
+                    .expect_err("blocked images must not invoke a decoder");
+                assert!(
+                    error
+                        .to_string()
+                        .contains("Images are blocked by configuration"),
+                    "{error}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn read_video_rejects_text_windows_and_edit_anchors() {
+        asupersync::test_utils::run_test(|| async {
+            let workspace = tempfile::tempdir().expect("workspace");
+            std::fs::write(workspace.path().join("clip.mp4"), b"not decoded")
+                .expect("video placeholder");
+            let tool = ReadTool::new(workspace.path());
+            for args in [
+                serde_json::json!({"path": "clip.mp4", "hashline": true}),
+                serde_json::json!({"path": "clip.mp4:1m2s", "offset": 1}),
+                serde_json::json!({"path": "clip.mp4:42", "limit": 10}),
+            ] {
+                let error = tool
+                    .execute("video-text-options", args, None)
+                    .await
+                    .expect_err("visual results do not have source lines");
+                assert!(error.to_string().contains("VIDEO_READ_OPTIONS"), "{error}");
+            }
+        });
+    }
+
+    #[test]
+    fn read_video_raw_mode_preserves_source_text_behavior() {
+        asupersync::test_utils::run_test(|| async {
+            let workspace = tempfile::tempdir().expect("workspace");
+            std::fs::write(workspace.path().join("clip.mp4"), "literal source\n")
+                .expect("source placeholder");
+            let output = ReadTool::new(workspace.path())
+                .execute(
+                    "video-raw",
+                    serde_json::json!({"path": "clip.mp4", "raw": true, "hashline": true}),
+                    None,
+                )
+                .await
+                .expect("raw source read");
+            let text = get_text(&output.content);
+            assert!(text.contains("literal source"), "{text}");
+            assert!(text.starts_with("1#"), "{text}");
+            assert!(
+                output
+                    .content
+                    .iter()
+                    .all(|part| matches!(part, ContentBlock::Text(_)))
+            );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_video_preserves_existing_literal_colon_filenames() {
+        asupersync::test_utils::run_test(|| async {
+            let workspace = tempfile::tempdir().expect("workspace");
+            for name in ["clip.mp4:42", "clip.mp4:not-a-selector"] {
+                std::fs::write(workspace.path().join(name), "literal colon file\n")
+                    .expect("colon filename");
+                let output = ReadTool::new(workspace.path())
+                    .execute("literal-colon", serde_json::json!({"path": name}), None)
+                    .await
+                    .expect("literal file takes precedence over selector parsing");
+                assert!(get_text(&output.content).contains("literal colon file"));
+            }
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_video_selector_cannot_escape_workspace_through_symlink() {
+        asupersync::test_utils::run_test(|| async {
+            let workspace = tempfile::tempdir().expect("workspace");
+            let outside = tempfile::tempdir().expect("outside workspace");
+            let secret = outside.path().join("secret.mp4");
+            std::fs::write(&secret, b"must not reach a decoder").expect("outside video");
+            std::os::unix::fs::symlink(&secret, workspace.path().join("clip.mp4"))
+                .expect("video symlink");
+            let tool = ReadTool::new(workspace.path());
+            for path in ["clip.mp4", "clip.mp4:42", "clip.mp4:00:00:01"] {
+                let error = tool
+                    .execute("video-scope", serde_json::json!({"path": path}), None)
+                    .await
+                    .expect_err("video source must pass the ordinary read scope");
+                assert!(
+                    error.to_string().contains("outside the working directory"),
+                    "{error}"
+                );
+            }
+        });
+    }
+
+    #[test]
     fn test_read_valid_file() {
         asupersync::test_utils::run_test(|| async {
             let tmp = tempfile::tempdir().unwrap();
@@ -8892,8 +22312,13 @@ mod tests {
         let skill_path = skill_dir.join("SKILL.md");
         std::fs::write(&skill_path, "---\nname: test\n---\n# body\n").unwrap();
 
-        let resolved =
-            enforce_read_scope_with_roots(&skill_path, cwd.path(), agent_dir.path()).unwrap();
+        let resolved = enforce_read_scope_with_roots(
+            &skill_path,
+            cwd.path(),
+            agent_dir.path(),
+            &WorkspaceHandle::default(),
+        )
+        .unwrap();
         assert!(
             resolved.starts_with(
                 agent_dir
@@ -8914,8 +22339,13 @@ mod tests {
         std::fs::write(unrelated.path().join("secret.txt"), "secret").unwrap();
         let secret_path = unrelated.path().join("secret.txt");
 
-        let err =
-            enforce_read_scope_with_roots(&secret_path, cwd.path(), agent_dir.path()).unwrap_err();
+        let err = enforce_read_scope_with_roots(
+            &secret_path,
+            cwd.path(),
+            agent_dir.path(),
+            &WorkspaceHandle::default(),
+        )
+        .unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("outside the working directory") && msg.contains("agent dir"),
@@ -8931,9 +22361,13 @@ mod tests {
         let agent_dir = tempfile::tempdir().unwrap();
         std::fs::write(cwd.path().join("a.txt"), "in cwd").unwrap();
 
-        let resolved =
-            enforce_read_scope_with_roots(&cwd.path().join("a.txt"), cwd.path(), agent_dir.path())
-                .unwrap();
+        let resolved = enforce_read_scope_with_roots(
+            &cwd.path().join("a.txt"),
+            cwd.path(),
+            agent_dir.path(),
+            &WorkspaceHandle::default(),
+        )
+        .unwrap();
         assert!(
             resolved.starts_with(
                 cwd.path()
@@ -8964,6 +22398,212 @@ mod tests {
         });
     }
 
+    #[test]
+    fn positioned_file_read_leaves_the_cursor_where_it_found_it() {
+        // bd-kgkrq / GH #182. Callers treat `positioned_file_read` as
+        // cursor-neutral on every platform: Unix `read_at` never moves the
+        // cursor, but Windows `seek_read` sets it to the end of the read and
+        // the portable fallback seeks a `try_clone()` that shares it. This
+        // asserts the contract itself rather than a platform symptom, so it
+        // passes trivially on Unix and fails on Windows without the restore.
+        let tmp = tempfile::tempdir().expect("cursor fixture");
+        let path = tmp.path().join("cursor.txt");
+        std::fs::write(&path, b"abcdefghij").expect("write cursor fixture");
+
+        let file = std::fs::File::open(&path).expect("open cursor fixture");
+        let mut handle: &std::fs::File = &file;
+        std::io::Seek::seek(&mut handle, std::io::SeekFrom::Start(3)).expect("seek to 3");
+        assert_eq!(
+            std::io::Seek::stream_position(&mut handle).expect("position before"),
+            3
+        );
+
+        let mut buffer = [0_u8; 4];
+        let read = positioned_file_read(&file, &mut buffer, 0).expect("positioned read");
+        assert_eq!(read, 4);
+        assert_eq!(&buffer, b"abcd");
+
+        assert_eq!(
+            std::io::Seek::stream_position(&mut handle).expect("position after"),
+            3,
+            "positioned_file_read must not move the caller's cursor"
+        );
+
+        // The consequence that actually broke `read`: a sequential read after
+        // a positioned read must continue from where the caller was, not EOF.
+        let mut rest = String::new();
+        handle.read_to_string(&mut rest).expect("sequential read");
+        assert_eq!(rest, "defghij");
+    }
+
+    #[test]
+    fn fingerprinting_a_cloned_handle_leaves_the_original_readable() {
+        // The exact shape of ReadTool::execute (bd-kgkrq / GH #182): open the
+        // file once, clone the handle for the tool-output-cache fingerprint,
+        // then read the content through the original. `try_clone` shares the
+        // OS file position, so a fingerprint that moves the clone's cursor
+        // leaves the real read at EOF and returns an empty file with no error.
+        let tmp = tempfile::tempdir().expect("fingerprint fixture");
+        let path = tmp.path().join("shared.txt");
+        let body = b"alpha\nbeta\ngamma\n";
+        std::fs::write(&path, body).expect("write fingerprint fixture");
+
+        let file = std::fs::File::open(&path).expect("open fingerprint fixture");
+        let clone = file.try_clone().expect("clone fingerprint handle");
+        assert!(
+            fingerprint_open_file_content(&clone).is_some(),
+            "fixture must be small enough to fingerprint"
+        );
+
+        let mut contents = Vec::new();
+        let mut handle: &std::fs::File = &file;
+        handle
+            .read_to_end(&mut contents)
+            .expect("read through the original handle");
+        assert_eq!(
+            contents, body,
+            "fingerprinting through a shared clone must not consume the original handle"
+        );
+    }
+
+    #[test]
+    fn write_tool_persists_inside_additional_root() {
+        // /add-dir grants read AND write: the atomic-replace containment
+        // check must accept parents under any workspace root, not only the
+        // primary cwd (regression: every write/edit in an added root failed
+        // with "parent escaped the working directory").
+        let primary = tempfile::tempdir().unwrap();
+        let extra = tempfile::tempdir().unwrap();
+        std::fs::write(extra.path().join("extra.txt"), "before").unwrap();
+
+        let mut handle = crate::workspace::WorkspaceHandle::single(primary.path());
+        let canonical = crate::workspace::validate_new_root(extra.path()).unwrap();
+        handle.add_root(&canonical);
+        let extra_path = extra.path().join("extra.txt").to_string_lossy().to_string();
+
+        asupersync::test_utils::run_test(|| {
+            let tool = WriteTool::new(primary.path()).with_workspace(handle.clone());
+            let extra_path = extra_path.clone();
+            async move {
+                tool.execute(
+                    "t",
+                    serde_json::json!({ "path": extra_path, "content": "after" }),
+                    None,
+                )
+                .await
+                .unwrap();
+            }
+        });
+        assert_eq!(
+            std::fs::read_to_string(extra.path().join("extra.txt")).unwrap(),
+            "after"
+        );
+    }
+
+    #[test]
+    fn edit_tools_modify_files_inside_additional_root() {
+        // The read between the scope check and the atomic replace used to
+        // allow only the primary cwd, so every edit in an /add-dir root failed.
+        let primary = tempfile::tempdir().unwrap();
+        let extra = tempfile::tempdir().unwrap();
+        let file = extra.path().join("extra.txt");
+        std::fs::write(&file, "one\ntwo\n").unwrap();
+
+        let mut handle = crate::workspace::WorkspaceHandle::single(primary.path());
+        let canonical = crate::workspace::validate_new_root(extra.path()).unwrap();
+        handle.add_root(&canonical);
+        let file_path = file.to_string_lossy().to_string();
+
+        asupersync::test_utils::run_test(|| {
+            let edit = EditTool::new(primary.path()).with_workspace(handle.clone());
+            let hashline = HashlineEditTool::new(primary.path()).with_workspace(handle.clone());
+            let file_path = file_path.clone();
+            async move {
+                edit.execute(
+                    "t",
+                    serde_json::json!({ "path": file_path, "oldText": "one", "newText": "uno" }),
+                    None,
+                )
+                .await
+                .unwrap();
+                hashline
+                    .execute(
+                        "t",
+                        serde_json::json!({
+                            "path": file_path,
+                            "edits": [{"op": "replace", "pos": format_hashline_tag(1, "two"), "lines": ["dos"]}],
+                        }),
+                        None,
+                    )
+                    .await
+                    .unwrap();
+            }
+        });
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "uno\ndos\n");
+    }
+
+    #[test]
+    fn read_tool_spans_additional_roots_and_revokes_on_removal() {
+        // Multi-root acceptance (bd-cv653.3.12): read succeeds in the
+        // additional root, paths outside every root fail closed, and
+        // removing the root from the shared handle revokes immediately.
+        let primary = tempfile::tempdir().unwrap();
+        let extra = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(extra.path().join("extra.txt"), "extra-content").unwrap();
+        std::fs::write(outside.path().join("secret.txt"), "outside-content").unwrap();
+
+        let mut handle = crate::workspace::WorkspaceHandle::single(primary.path());
+        let canonical = crate::workspace::validate_new_root(extra.path()).unwrap();
+        handle.add_root(&canonical);
+
+        let extra_path = extra.path().join("extra.txt").to_string_lossy().to_string();
+        let outside_path = outside
+            .path()
+            .join("secret.txt")
+            .to_string_lossy()
+            .to_string();
+
+        // Read inside the additional root succeeds.
+        asupersync::test_utils::run_test(|| {
+            let tool = ReadTool::new(primary.path()).with_workspace(handle.clone());
+            let extra_path = extra_path.clone();
+            async move {
+                let out = tool
+                    .execute("t", serde_json::json!({ "path": extra_path }), None)
+                    .await
+                    .unwrap();
+                assert!(get_text(&out.content).contains("extra-content"));
+            }
+        });
+
+        // Outside every root fails closed with a named denial.
+        asupersync::test_utils::run_test(|| {
+            let tool = ReadTool::new(primary.path()).with_workspace(handle.clone());
+            let outside_path = outside_path.clone();
+            async move {
+                let err = tool
+                    .execute("t", serde_json::json!({ "path": outside_path }), None)
+                    .await
+                    .unwrap_err();
+                assert!(err.to_string().contains("outside the"), "{err}");
+            }
+        });
+
+        // Revoking the additional root denies the previously-allowed path.
+        handle.remove_root(extra.path());
+        asupersync::test_utils::run_test(|| {
+            let tool = ReadTool::new(primary.path()).with_workspace(handle.clone());
+            let extra_path = extra_path.clone();
+            async move {
+                let err = tool
+                    .execute("t", serde_json::json!({ "path": extra_path }), None)
+                    .await
+                    .unwrap_err();
+                assert!(err.to_string().contains("outside the"), "{err}");
+            }
+        });
+    }
     #[test]
     fn test_read_empty_file_positive_offset_errors() {
         asupersync::test_utils::run_test(|| async {
@@ -9328,6 +22968,52 @@ mod tests {
     }
 
     #[test]
+    fn read_byte_limit_shows_whole_lines_and_continues_at_the_cut_line() {
+        // The byte limit used to cut the last shown line mid-way, with no
+        // marker, and point the continue offset past it.
+        asupersync::test_utils::run_test(|| async {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let body = "x".repeat(2995);
+            let content = (0..1000)
+                .map(|i| format!("{i:04}{body}\n"))
+                .collect::<Vec<_>>()
+                .concat();
+            let path = tmp.path().join("wide.txt");
+            std::fs::write(&path, &content).expect("write");
+            let tool = ReadTool::new(tmp.path());
+            for hashline in [false, true] {
+                let out = tool
+                    .execute(
+                        "t",
+                        serde_json::json!({ "path": path.to_string_lossy(), "hashline": hashline }),
+                        None,
+                    )
+                    .await
+                    .expect("read");
+                let text = get_text(&out.content);
+                let notice_at = text.find("\n\n[Showing lines").expect("byte-limit notice");
+                let (shown, notice) = text.split_at(notice_at);
+                let next: usize = notice
+                    .split("offset=")
+                    .nth(1)
+                    .map(|rest| {
+                        rest.chars()
+                            .take_while(char::is_ascii_digit)
+                            .collect::<String>()
+                    })
+                    .and_then(|digits| digits.parse().ok())
+                    .expect("continue offset");
+                // The last shown line is whole and is the one before `next`.
+                let last = shown.lines().last().expect("a shown line");
+                let whole = format!("{:04}{body}", next - 2);
+                assert!(last.ends_with(&whole), "hashline={hashline}: {last:.40}"); // ubs:ignore[rust.panic.assert-macros] -- test assertion
+                let cut = format!("{:04}x", next - 1);
+                assert!(!shown.contains(&cut), "hashline={hashline}"); // ubs:ignore[rust.panic.assert-macros] -- test assertion
+            }
+        });
+    }
+
+    #[test]
     fn test_read_first_line_exceeds_max_bytes() {
         asupersync::test_utils::run_test(|| async {
             let tmp = tempfile::tempdir().unwrap();
@@ -9409,6 +23095,91 @@ mod tests {
         });
     }
 
+    /// bd-cv653.3.13: a recorder attached via the builder observes write
+    /// and edit persistence, and /undo semantics restore prior content.
+    #[test]
+    fn test_mutation_recorder_records_write_and_edit() {
+        asupersync::test_utils::run_test(|| async {
+            let tmp = tempfile::tempdir().unwrap();
+            let recorder = std::sync::Arc::new(crate::undo::FileMutationRecorder::default());
+            let file = tmp.path().join("tracked.txt");
+
+            let write_tool =
+                WriteTool::new(tmp.path()).with_mutation_recorder(Some(recorder.clone()));
+            write_tool
+                .execute(
+                    "w1",
+                    serde_json::json!({
+                        "path": file.to_string_lossy(),
+                        "content": "first\n"
+                    }),
+                    None,
+                )
+                .await
+                .unwrap();
+
+            let edit_tool =
+                EditTool::new(tmp.path()).with_mutation_recorder(Some(recorder.clone()));
+            edit_tool
+                .execute(
+                    "e1",
+                    serde_json::json!({
+                        "path": file.to_string_lossy(),
+                        "oldText": "first",
+                        "newText": "second"
+                    }),
+                    None,
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(recorder.stats().undo_depth, 2);
+
+            let outcome = recorder.undo(1, false);
+            assert_eq!(outcome.applied.len(), 1, "{outcome:?}");
+            assert_eq!(
+                std::fs::read_to_string(&file).unwrap(),
+                "first\n",
+                "undo must restore the pre-edit content"
+            );
+
+            let outcome = recorder.undo(1, false);
+            assert_eq!(outcome.applied.len(), 1, "{outcome:?}");
+            assert!(
+                !file.exists(),
+                "undoing the creating write removes the file"
+            );
+        });
+    }
+
+    /// bd-cv653.3.13: a failed persist aborts the pending unit instead of
+    /// recording a phantom mutation.
+    #[test]
+    fn test_mutation_recorder_skips_failed_edit() {
+        asupersync::test_utils::run_test(|| async {
+            let tmp = tempfile::tempdir().unwrap();
+            let recorder = std::sync::Arc::new(crate::undo::FileMutationRecorder::default());
+            let file = tmp.path().join("tracked.txt");
+            std::fs::write(&file, "content\n").unwrap();
+
+            let edit_tool =
+                EditTool::new(tmp.path()).with_mutation_recorder(Some(recorder.clone()));
+            let result = edit_tool
+                .execute(
+                    "e1",
+                    serde_json::json!({
+                        "path": file.to_string_lossy(),
+                        "oldText": "no such text",
+                        "newText": "irrelevant"
+                    }),
+                    None,
+                )
+                .await;
+            assert!(result.is_err(), "edit with missing oldText must fail");
+            assert_eq!(recorder.stats().undo_depth, 0, "no unit for a failed edit");
+        });
+    }
+
     #[test]
     fn test_write_overwrite_existing() {
         asupersync::test_utils::run_test(|| async {
@@ -9430,6 +23201,63 @@ mod tests {
             assert!(!out.is_error);
             let contents = std::fs::read_to_string(tmp.path().join("exist.txt")).unwrap();
             assert_eq!(contents, "new content");
+        });
+    }
+
+    /// A truncated read written back would cut the file to what was shown.
+    #[test]
+    fn write_refuses_a_truncated_read_that_is_shorter_than_the_file() {
+        async fn write_with(tool: &WriteTool, input: serde_json::Value) -> Result<ToolOutput> {
+            tool.execute("t", input, None).await
+        }
+        asupersync::test_utils::run_test(|| async {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let path = tmp.path().join("big.txt");
+            let lines = |n: usize| {
+                (0..n)
+                    .map(|i| format!("line {i}\n"))
+                    .collect::<Vec<_>>()
+                    .concat()
+            };
+            let original = lines(5000);
+            std::fs::write(&path, &original).expect("write");
+            let tool = WriteTool::new(tmp.path());
+            let write = |content: String| {
+                let input =
+                    serde_json::json!({ "path": path.to_string_lossy(), "content": content });
+                write_with(&tool, input)
+            };
+            let shown = lines(2000);
+            for notice in [
+                "[Showing lines 1-2000 of 5000. Use offset=2001 to continue.]",
+                "[3000 more lines in file. Use offset=2001 to continue.]",
+            ] {
+                let err = write(format!("{shown}\n{notice}\n"))
+                    .await
+                    .expect_err("truncated read refused");
+                assert!(err.to_string().contains("incomplete read"), "{err}"); // ubs:ignore[rust.panic.assert-macros] -- test assertion
+                assert_eq!(std::fs::read_to_string(&path).expect("read"), original);
+            }
+            // A notice-like last line in content as long as the file is the
+            // model's own choice, and a new file has nothing to lose.
+            let longer =
+                format!("{original}[Showing lines 1-2000 of 5000. Use offset=2001 to continue.]\n");
+            write(longer.clone())
+                .await
+                .expect("not shorter than the file");
+            assert_eq!(std::fs::read_to_string(&path).expect("read"), longer);
+            let fresh = tmp.path().join("fresh.txt");
+            WriteTool::new(tmp.path())
+                .execute(
+                    "t",
+                    serde_json::json!({
+                        "path": fresh.to_string_lossy(),
+                        "content": "x\n[2 more lines in file. Use offset=2 to continue.]",
+                    }),
+                    None,
+                )
+                .await
+                .expect("a new file");
         });
     }
 
@@ -9672,6 +23500,34 @@ mod tests {
     }
 
     #[test]
+    fn approximate_edit_refuses_an_ambiguous_match() {
+        asupersync::test_utils::run_test(|| async {
+            let tmp = tempfile::tempdir().unwrap();
+            let path = tmp.path().join("twice.py");
+            let body =
+                "def a():\n    x = 1\n\n    return x\n\ndef b():\n    x = 1\n\n    return x\n";
+            std::fs::write(&path, body).unwrap();
+            let tool = EditTool::new(tmp.path());
+            // The indented blank line only matches approximately, in both functions.
+            let err = tool
+                .execute(
+                    "t",
+                    serde_json::json!({
+                        "path": path.to_string_lossy(),
+                        "oldText": "    x = 1\n    \n    return x",
+                        "newText": "    y = 2",
+                    }),
+                    None,
+                )
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("Found 2 occurrences"), "{err}"); // ubs:ignore[rust.panic.assert-macros] -- test assertion
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), body);
+        });
+    }
+
+    #[test]
     fn test_edit_multi_line_replacement() {
         asupersync::test_utils::run_test(|| async {
             let tmp = tempfile::tempdir().unwrap();
@@ -9778,6 +23634,42 @@ mod tests {
                 Err(err) => Err(err),
             }
         }
+    }
+
+    #[test]
+    fn automatic_bash_rechecks_cancellation_after_session_resolution() {
+        let root = tempfile::tempdir().expect("workspace");
+        let owner = AgentCx::for_request();
+        let resolver_owner = owner.clone();
+        let scope = crate::jobs::JobSessionScope::fixed("resolver-owner");
+        scope.bind(Arc::new(move || {
+            let owner = resolver_owner.clone();
+            let mut suspended = false;
+            Box::pin(std::future::poll_fn(move |task| {
+                if suspended {
+                    owner.cancel_with(
+                        asupersync::types::CancelKind::User,
+                        Some("cancelled while resolving the session"),
+                    );
+                    std::task::Poll::Ready(Some("resolver-owner".to_string()))
+                } else {
+                    suspended = true;
+                    task.waker().wake_by_ref();
+                    std::task::Poll::Pending
+                }
+            }))
+        }));
+        let mut tool = BashTool::new(root.path());
+        tool.bind_job_session_scope(scope);
+        let mut check = Box::pin(tool.still_owns_foreground(&owner, "resolver-owner"));
+        let mut task = std::task::Context::from_waker(futures::task::noop_waker_ref());
+        assert!(check.as_mut().poll(&mut task).is_pending());
+        assert!(!owner.is_cancel_requested());
+        assert!(matches!(
+            check.as_mut().poll(&mut task),
+            std::task::Poll::Ready(Ok(false))
+        ));
+        assert!(owner.is_cancel_requested());
     }
 
     #[test]
@@ -10208,6 +24100,560 @@ mod tests {
     // ========================================================================
     // Grep Tool Tests
     // ========================================================================
+
+    #[test]
+    fn grep_exclusion_lists_preserve_literal_paths_and_validate_all_entries() {
+        let temp = tempfile::tempdir().unwrap();
+        for name in ["!notes.txt", "ordinary;name.txt", "literal;!skip.txt"] {
+            std::fs::write(temp.path().join(name), "needle\n").unwrap();
+            let scope = grep_filesystem_scope(Some(name), temp.path()).unwrap();
+            assert_eq!(scope.path, name);
+            assert!(scope.exclusions.is_empty());
+        }
+        let scope = grep_filesystem_scope(Some("missing;name"), temp.path()).unwrap();
+        assert_eq!(scope.path, "missing;name");
+        assert!(scope.exclusions.is_empty());
+
+        let scope = grep_filesystem_scope(Some("!vendor;!*.test.rs"), temp.path()).unwrap();
+        assert_eq!(scope.path, ".");
+        assert_eq!(scope.exclusions, ["vendor", "*.test.rs"]);
+        let scope = grep_filesystem_scope(Some(r"src;!src\legacy/"), temp.path()).unwrap();
+        assert_eq!(scope.path, "src");
+        assert_eq!(scope.exclusions, ["src/legacy"]);
+        std::fs::write(temp.path().join("gen"), "needle\n").unwrap();
+        let scope = grep_filesystem_scope(Some(".;!vendor/../gen"), temp.path()).unwrap();
+        assert_eq!(scope.path, ".");
+        assert_eq!(scope.exclusions, ["vendor/../gen"]);
+
+        for path in [
+            ".;!",
+            "missing;![",
+            ".;;!vendor",
+            "src;tests;!vendor",
+            ".;local://notes;!vendor",
+            ".;!bad\0name",
+        ] {
+            let error = grep_filesystem_scope(Some(path), temp.path()).unwrap_err();
+            assert!(error.to_string().contains("[GREP_"), "{path:?}: {error}");
+        }
+        let too_many = vec!["!vendor"; MAX_GREP_PATH_ENTRIES + 1].join(";");
+        let error = grep_filesystem_scope(Some(&too_many), temp.path()).unwrap_err();
+        assert!(error.to_string().contains("GREP_PATH_LIMIT"), "{error}");
+        let too_long = format!("!{}", "v".repeat(MAX_GREP_RESOURCE_PATH_BYTES));
+        let error = grep_filesystem_scope(Some(&too_long), temp.path()).unwrap_err();
+        assert!(error.to_string().contains("GREP_PATH_LIMIT"), "{error}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn grep_exclusion_lists_preserve_dangling_literal_symlinks() {
+        let temp = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink("missing", temp.path().join("!dangling")).unwrap();
+        let scope = grep_filesystem_scope(Some("!dangling"), temp.path()).unwrap();
+        assert_eq!(scope.path, "!dangling");
+        assert!(scope.exclusions.is_empty());
+    }
+
+    #[test]
+    fn grep_exclusions_prune_before_regex_limits_in_both_backends() {
+        asupersync::test_utils::run_test(|| async {
+            for backend in [SearchBackend::Inproc, SearchBackend::External] {
+                if backend == SearchBackend::External && !rg_available() {
+                    continue;
+                }
+                let temp = tempfile::tempdir().unwrap();
+                for directory in ["src/vendor", "vendor", "gen"] {
+                    std::fs::create_dir_all(temp.path().join(directory)).unwrap();
+                }
+                for name in [
+                    "vendor/noise.rs",
+                    "src/vendor/noise.rs",
+                    "gen/noise.rs",
+                    "src/main.test.rs",
+                    "src/irrelevant.txt",
+                    "ignored.rs",
+                ] {
+                    std::fs::write(temp.path().join(name), "needle999\n".repeat(64)).unwrap();
+                }
+                std::fs::write(temp.path().join(".gitignore"), "ignored.rs\n").unwrap();
+                std::fs::write(temp.path().join("src/main.rs"), "Needle1\nneedle2\nplain\n")
+                    .unwrap();
+                let tool = GrepTool::with_backend(temp.path(), backend);
+                for path in [".;!vendor;!gen;!*.test.rs", "!vendor;!gen;!*.test.rs"] {
+                    let output = tool
+                        .execute(
+                            "excluded-regex-limit",
+                            serde_json::json!({
+                                "pattern":"^needle[0-9]+$", "ignoreCase":true,
+                                "path":path, "glob":"*.rs", "limit":2,
+                            }),
+                            None,
+                        )
+                        .await
+                        .unwrap();
+                    let text = get_text(&output.content);
+                    assert!(text.contains("main.rs:1: Needle1"), "{text}");
+                    assert!(text.contains("main.rs:2: needle2"), "{text}");
+                    assert_eq!(text.lines().count(), 2, "{text}");
+                    assert!(
+                        output
+                            .details
+                            .as_ref()
+                            .and_then(|details| details.get("matchLimitReached"))
+                            .is_none()
+                    );
+                }
+                let output = tool
+                    .execute(
+                        "included-regex-limit",
+                        serde_json::json!({
+                            "pattern":"^needle[0-9]+$", "ignoreCase":true,
+                            "path":".;!vendor;!gen;!*.test.rs", "glob":"*.rs", "limit":1,
+                        }),
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(output.details.unwrap()["matchLimitReached"], 1);
+            }
+        });
+    }
+
+    #[test]
+    fn grep_exclusions_rebase_from_logical_cwd_and_keep_explicit_roots() {
+        asupersync::test_utils::run_test(|| async {
+            for backend in [SearchBackend::Inproc, SearchBackend::External] {
+                if backend == SearchBackend::External && !rg_available() {
+                    continue;
+                }
+                let temp = tempfile::tempdir().unwrap();
+                let cwd = temp.path().join("tree");
+                for directory in ["gen", "src/legacy", "src/gen"] {
+                    std::fs::create_dir_all(cwd.join(directory)).unwrap();
+                }
+                for name in [
+                    "gen/noise.txt",
+                    "src/legacy/noise.txt",
+                    "src/gen/keep.txt",
+                    "src/main.test.txt",
+                    "src/main.txt",
+                ] {
+                    std::fs::write(cwd.join(name), "needle\n").unwrap();
+                }
+                #[cfg(unix)]
+                let cwd = {
+                    let link = temp.path().join("linked-cwd");
+                    std::os::unix::fs::symlink(&cwd, &link).unwrap();
+                    link
+                };
+                let tool = GrepTool::with_backend(&cwd, backend);
+                for path in [
+                    ".;!./gen;!src/legacy;!*.test.txt",
+                    "src;!./gen;!src/legacy;!*.test.txt",
+                    r"src;!src\legacy;!*.test.txt",
+                ] {
+                    let output = tool
+                        .execute(
+                            "anchored-exclusions",
+                            serde_json::json!({"pattern":"needle", "path":path}),
+                            None,
+                        )
+                        .await
+                        .unwrap();
+                    let text = get_text(&output.content);
+                    assert!(text.contains("keep.txt:1: needle"), "{path}: {text}");
+                    assert!(text.contains("main.txt:1: needle"), "{path}: {text}");
+                    assert_eq!(text.lines().count(), 2, "{path}: {text}");
+                }
+                for (path, expected) in [
+                    ("src/legacy;!src/legacy", "noise.txt:1: needle"),
+                    ("src/main.test.txt;!*.test.txt", "main.test.txt:1: needle"),
+                    ("src;!**/gen;!src/legacy;!*.test.txt", "main.txt:1: needle"),
+                    ("src;!{gen,legacy};!*.test.txt", "main.txt:1: needle"),
+                ] {
+                    let output = tool
+                        .execute(
+                            "explicit-and-glob-exclusions",
+                            serde_json::json!({"pattern":"needle", "path":path}),
+                            None,
+                        )
+                        .await
+                        .unwrap();
+                    let text = get_text(&output.content);
+                    assert!(text.contains(expected), "{path}: {text}");
+                    assert_eq!(text.lines().count(), 1, "{path}: {text}");
+                }
+            }
+        });
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn grep_exclusions_rebase_symlinked_search_roots_without_following_descendants() {
+        asupersync::test_utils::run_test(|| async {
+            for backend in [SearchBackend::Inproc, SearchBackend::External] {
+                if backend == SearchBackend::External && !rg_available() {
+                    continue;
+                }
+                let temp = tempfile::tempdir().unwrap();
+                std::fs::create_dir_all(temp.path().join("actual/vendor")).unwrap();
+                std::fs::write(temp.path().join("actual/vendor/noise.rs"), "needle\n").unwrap();
+                std::fs::write(temp.path().join("actual/main.rs"), "needle\n").unwrap();
+                std::os::unix::fs::symlink("actual", temp.path().join("alias")).unwrap();
+                let outside = tempfile::tempdir().unwrap();
+                std::fs::write(outside.path().join("outside.rs"), "needle\n").unwrap();
+                std::os::unix::fs::symlink(outside.path(), temp.path().join("actual/escape"))
+                    .unwrap();
+                let tool = GrepTool::with_backend(temp.path(), backend);
+                let output = tool
+                    .execute(
+                        "symlink-root-exclusions",
+                        serde_json::json!({"pattern":"needle", "path":"alias;!alias/vendor"}),
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                let text = get_text(&output.content);
+                assert!(text.contains("main.rs:1: needle"), "{text}");
+                assert_eq!(text.lines().count(), 1, "{text}");
+            }
+        });
+    }
+
+    #[test]
+    fn grep_literal_bang_and_semicolon_files_are_searchable_in_both_backends() {
+        asupersync::test_utils::run_test(|| async {
+            for backend in [SearchBackend::Inproc, SearchBackend::External] {
+                if backend == SearchBackend::External && !rg_available() {
+                    continue;
+                }
+                let temp = tempfile::tempdir().unwrap();
+                let tool = GrepTool::with_backend(temp.path(), backend);
+                for name in ["!notes.txt", "ordinary;name.txt", "literal;!skip.txt"] {
+                    std::fs::write(temp.path().join(name), "a+b\n").unwrap();
+                    let output = tool
+                        .execute(
+                            "literal-exclusion-syntax",
+                            serde_json::json!({"pattern":"a+b", "literal":true, "path":name}),
+                            None,
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(get_text(&output.content), format!("{name}:1: a+b"));
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn grep_exclusions_respect_added_roots_and_live_workspace_revocation() {
+        asupersync::test_utils::run_test(|| async {
+            for backend in [SearchBackend::Inproc, SearchBackend::External] {
+                if backend == SearchBackend::External && !rg_available() {
+                    continue;
+                }
+                let temp = tempfile::tempdir().unwrap();
+                let cwd = temp.path().join("primary");
+                let extra = temp.path().join("extra");
+                std::fs::create_dir_all(&cwd).unwrap();
+                std::fs::write(cwd.join(".gitignore"), "*.rs\n").unwrap();
+                for directory in ["vendor", "generated", "src"] {
+                    std::fs::create_dir_all(extra.join(directory)).unwrap();
+                }
+                for name in [
+                    "vendor/noise.rs",
+                    "generated/noise.rs",
+                    "src/main.rs",
+                    "ignored.rs",
+                ] {
+                    std::fs::write(extra.join(name), "needle\n").unwrap();
+                }
+                std::fs::write(extra.join(".gitignore"), "ignored.rs\n").unwrap();
+                let mut workspace = WorkspaceHandle::single(&cwd);
+                workspace.add_root(&extra);
+                let tool = GrepTool::with_backend(&cwd, backend).with_workspace(workspace.clone());
+                let input = serde_json::json!({
+                    "pattern":"needle",
+                    "path":format!("{};!vendor;!../extra/generated", extra.display()),
+                });
+                let output = tool
+                    .execute("extra-root-exclusions", input.clone(), None)
+                    .await
+                    .unwrap();
+                let text = get_text(&output.content);
+                assert!(text.contains("main.rs:1: needle"), "{text}");
+                assert_eq!(text.lines().count(), 1, "{text}");
+                assert!(workspace.remove_root(&extra));
+                let error = tool
+                    .execute("revoked-root-exclusions", input, None)
+                    .await
+                    .unwrap_err();
+                assert!(
+                    error.to_string().contains("outside the working directory"),
+                    "{error}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn grep_exclusions_prune_permissions_without_weakening_included_path_checks() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        asupersync::test_utils::run_test(|| async {
+            for backend in [SearchBackend::Inproc, SearchBackend::External] {
+                if backend == SearchBackend::External && !rg_available() {
+                    continue;
+                }
+                let temp = tempfile::tempdir().unwrap();
+                std::fs::create_dir(temp.path().join("secret")).unwrap();
+                std::fs::write(temp.path().join("secret/hidden.rs"), "needle\n").unwrap();
+                std::fs::write(temp.path().join("secret/.gitignore"), "").unwrap();
+                std::fs::write(temp.path().join("visible.rs"), "needle\n").unwrap();
+                let tool = GrepTool::with_backend(temp.path(), backend);
+                for name in ["secret", "secret/hidden.rs", "secret/.gitignore"] {
+                    let unreadable = temp.path().join(name);
+                    let original = std::fs::metadata(&unreadable).unwrap().permissions();
+                    std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o0))
+                        .unwrap();
+                    let excluded = tool
+                        .execute(
+                            "excluded-permissions",
+                            serde_json::json!({
+                                "pattern":"needle", "path":".;!secret", "limit":1,
+                            }),
+                            None,
+                        )
+                        .await;
+                    let included = tool
+                        .execute(
+                            "included-permissions",
+                            serde_json::json!({
+                                "pattern":"needle", "path":".;!elsewhere", "limit":1,
+                            }),
+                            None,
+                        )
+                        .await;
+                    std::fs::set_permissions(&unreadable, original).unwrap();
+                    let output = excluded.unwrap();
+                    assert_eq!(get_text(&output.content), "visible.rs:1: needle");
+                    let error = included.unwrap_err();
+                    assert!(
+                        error.to_string().contains("Permission denied"),
+                        "{name}: {error}"
+                    );
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn grep_agent_resources_use_accepted_results_and_reject_provisional_output() {
+        asupersync::test_utils::run_test(|| async {
+            use crate::agent_hub::ChildStatus;
+
+            let temp = tempfile::tempdir().unwrap();
+            let prefix = format!("grep-agent-{}", uuid::Uuid::new_v4());
+            let (accepted, pending, rejected) = {
+                let mut hub = crate::agent_hub::registry().lock().unwrap();
+                let accepted = hub
+                    .register(&format!("{prefix}-accepted"), "accepted fixture")
+                    .unwrap();
+                let pending = hub
+                    .register(&format!("{prefix}-pending"), "pending fixture")
+                    .unwrap();
+                let rejected = hub
+                    .register(&format!("{prefix}-rejected"), "cancelled fixture")
+                    .unwrap();
+                hub.settle(&accepted.id, ChildStatus::Done);
+                hub.settle(&rejected.id, ChildStatus::Cancelled);
+                (
+                    hub.get(&accepted.id).unwrap(),
+                    pending,
+                    hub.get(&rejected.id).unwrap(),
+                )
+            };
+            crate::url_router::agent::publish(
+                &accepted,
+                "accepted prose",
+                Some(&serde_json::json!({"findings":[{"path":"src/needle.rs"}]})),
+                Some(true),
+                None,
+            );
+            crate::url_router::agent::publish(
+                &rejected,
+                "provisional src/needle.rs",
+                None,
+                None,
+                Some("cancelled"),
+            );
+            let tool = GrepTool::new(temp.path());
+            let path = format!("agent://{}/findings/0/path", accepted.id);
+            let output = tool
+                .execute(
+                    "accepted-result",
+                    serde_json::json!({
+                        "pattern":"src/needle.rs", "literal":true, "path":path,
+                    }),
+                    None,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                get_text(&output.content),
+                format!("{path}:1: src/needle.rs")
+            );
+            for (entry, code) in [
+                (pending, "PI_URL_AGENT_OUTPUT_PENDING"),
+                (rejected, "PI_URL_AGENT_OUTPUT_REJECTED"),
+            ] {
+                let error = tool.execute("unaccepted-result", serde_json::json!({
+                    "pattern":"needle", "path":format!("agent://{}/findings/0/path", entry.id),
+                }), None).await.unwrap_err();
+                assert!(error.to_string().contains(code), "{error}");
+            }
+        });
+    }
+
+    #[test]
+    fn grep_virtual_search_is_native_even_when_the_filesystem_backend_is_external() {
+        asupersync::test_utils::run_test(|| async {
+            let temp = tempfile::tempdir().unwrap();
+            let name = format!("grep-external-{}", uuid::Uuid::new_v4());
+            crate::url_router::write_local(&name, "prefix\0is still text\nneedle\n").unwrap();
+            let output = GrepTool::with_backend(temp.path(), SearchBackend::External)
+                .execute(
+                    "virtual-native",
+                    serde_json::json!({
+                        "pattern":"needle", "path":format!("local://{name}"),
+                    }),
+                    None,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                get_text(&output.content),
+                format!("local://{name}:2: needle")
+            );
+        });
+    }
+
+    #[test]
+    fn grep_resource_cancellation_is_checked_before_resolution() {
+        asupersync::test_utils::run_test(|| async {
+            let temp = tempfile::tempdir().unwrap();
+            let owner = AgentCx::for_request();
+            owner.cx().set_cancel_requested(true);
+            let tool = GrepTool::new(temp.path());
+            let error = owner
+                .with_current(tool.execute(
+                    "cancelled-resource",
+                    serde_json::json!({
+                        "pattern":"needle", "path":"local://must-not-resolve-after-cancel",
+                    }),
+                    None,
+                ))
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("cancelled"), "{error}");
+            assert!(!error.to_string().contains("PI_URL_UNRESOLVABLE"));
+        });
+    }
+
+    #[test]
+    fn grep_remote_resources_cannot_use_the_polling_callers_spawn_authority() {
+        asupersync::test_utils::run_test(|| async {
+            type WithoutSpawn = asupersync::cx::cap::CapSet<false, true, true, true, true>;
+            let temp = tempfile::tempdir().unwrap();
+            let tool = GrepTool::new(temp.path());
+            let owner = {
+                let restricted = asupersync::Cx::for_request().restrict::<WithoutSpawn>();
+                let _guard = restricted.set_current_restricted();
+                AgentCx::for_current_or_request()
+            };
+            assert!(owner.capabilities().io);
+            assert!(!owner.capabilities().spawn);
+            for path in [
+                "pr://1/diff",
+                "issue://owner/repo/1",
+                "ssh://must-not-connect/tmp/file",
+                "conflict://*",
+            ] {
+                let error = owner
+                    .with_current(tool.execute(
+                        "spawn-denied",
+                        serde_json::json!({"pattern":"needle","path":path}),
+                        None,
+                    ))
+                    .await
+                    .unwrap_err();
+                assert!(
+                    error.to_string().contains("GREP_RESOURCE_PERMISSION"),
+                    "{path}: {error}"
+                );
+            }
+        });
+    }
+
+    /// bd-cv653.1.5: the in-process and external search backends must render
+    /// byte-identical tool output for the same corpus. Skips silently when
+    /// the external binaries are not installed (the escape hatch is optional;
+    /// the in-process default carries the suite).
+    #[test]
+    fn search_backends_render_identical_output() {
+        asupersync::test_utils::run_test(|| async {
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(tmp.path().join("src/nested")).unwrap();
+            std::fs::write(
+                tmp.path().join("src/alpha.txt"),
+                "needle one\nplain line\nneedle two\n",
+            )
+            .unwrap();
+            std::fs::write(tmp.path().join("src/nested/beta.txt"), "needle three\n").unwrap();
+            std::fs::write(tmp.path().join("skip.log"), "needle ignored\n").unwrap();
+            std::fs::write(tmp.path().join(".gitignore"), "*.log\n").unwrap();
+
+            if rg_available() {
+                let grep_input = serde_json::json!({ "pattern": "needle", "context": 1 });
+                let inproc = GrepTool::with_backend(tmp.path(), SearchBackend::Inproc)
+                    .execute("grep-parity-inproc", grep_input.clone(), None)
+                    .await
+                    .expect("inproc grep");
+                reset_tool_output_cache_for_tests();
+                let external = GrepTool::with_backend(tmp.path(), SearchBackend::External)
+                    .execute("grep-parity-external", grep_input, None)
+                    .await
+                    .expect("external grep");
+                // rg's multi-file result order is traversal-dependent, so
+                // compare per-line content rather than byte order.
+                let sorted_lines = |text: String| {
+                    let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+                    lines.sort();
+                    lines
+                };
+                assert_eq!(
+                    sorted_lines(get_text(&inproc.content)),
+                    sorted_lines(get_text(&external.content))
+                );
+            }
+
+            if find_fd_binary().is_some() {
+                let find_input = serde_json::json!({ "pattern": "*.txt" });
+                reset_tool_output_cache_for_tests();
+                let inproc = FindTool::with_backend(tmp.path(), SearchBackend::Inproc)
+                    .execute("find-parity-inproc", find_input.clone(), None)
+                    .await
+                    .expect("inproc find");
+                reset_tool_output_cache_for_tests();
+                let external = FindTool::with_backend(tmp.path(), SearchBackend::External)
+                    .execute("find-parity-external", find_input, None)
+                    .await
+                    .expect("external find");
+                assert_eq!(get_text(&inproc.content), get_text(&external.content));
+            }
+        });
+    }
 
     #[test]
     fn test_grep_basic_pattern() {
@@ -11414,6 +25860,35 @@ mod tests {
         assert!(!result.to_string_lossy().starts_with("~/"));
     }
 
+    /// Windows models write `~\Documents\x`; that must reach the home
+    /// directory there, while on Unix `~\x` stays a literal relative name.
+    #[test]
+    fn test_home_relative_rest_accepts_backslash_only_where_it_separates() {
+        assert_eq!(home_relative_rest("~/a/b.txt", false), Some("a/b.txt"));
+        assert_eq!(home_relative_rest("~/a/b.txt", true), Some("a/b.txt"));
+        assert_eq!(
+            home_relative_rest("~\\Documents\\b.txt", true),
+            Some("Documents\\b.txt")
+        );
+        assert_eq!(home_relative_rest("~\\Documents\\b.txt", false), None);
+        assert_eq!(home_relative_rest("~user/b.txt", true), None);
+        assert_eq!(home_relative_rest("a/~/b.txt", true), None);
+        assert_eq!(home_relative_rest("~", true), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_resolve_path_backslash_tilde_expands_on_windows() {
+        let Some(home) = dirs::home_dir() else {
+            return;
+        };
+        let cwd = PathBuf::from(r"C:\work\project");
+        assert_eq!(
+            resolve_path(r"~\notes\todo.txt", &cwd),
+            home.join("notes").join("todo.txt")
+        );
+    }
+
     fn arbitrary_text() -> impl Strategy<Value = String> {
         prop::collection::vec(any::<u8>(), 0..512)
             .prop_map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
@@ -12074,6 +26549,113 @@ mod tests {
     }
 
     #[test]
+    fn crlf_edit_starting_with_a_newline_takes_the_whole_line_ending() {
+        // "\nfoo" matches the LF half of "\r\n"; a replacement that kept the
+        // CR wrote "a\r\r\nbar" (or "a\r\r\n" for a deletion).
+        asupersync::test_utils::run_test(|| async {
+            let tmp = tempfile::tempdir().unwrap();
+            let path = tmp.path().join("crlf.txt");
+            let tool = EditTool::new(tmp.path());
+            for (old_text, new_text, expected) in [
+                ("\nfoo", "\nbar", "a\r\nbar\r\nz\r\n"),
+                ("\nfoo", "", "a\r\nz\r\n"),
+                ("\nfoo  \n", "\n", "a\r\nz\r\n"),
+            ] {
+                std::fs::write(&path, "a\r\nfoo\r\nz\r\n").unwrap();
+                tool.execute(
+                    "t",
+                    serde_json::json!({
+                        "path": path.to_string_lossy(),
+                        "oldText": old_text,
+                        "newText": new_text,
+                    }),
+                    None,
+                )
+                .await
+                .unwrap();
+                assert_eq!(
+                    std::fs::read_to_string(&path).unwrap(),
+                    expected,
+                    "{old_text:?}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn crlf_edit_keeps_the_needles_trailing_whitespace_once() {
+        // A multi-line needle only matched a CRLF file fuzzily, which trims
+        // each line's trailing whitespace: whitespace ending the needle fell
+        // outside the matched span and the replacement doubled it.
+        asupersync::test_utils::run_test(|| async {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let path = tmp.path().join("crlf.rs");
+            let tool = EditTool::new(tmp.path());
+            for (content, old_text, new_text, expected) in [
+                (
+                    "fn a() {\r\n    x();\r\n    y();\r\n}\r\n",
+                    "    x();\n    ",
+                    "    x2();\n    ",
+                    "fn a() {\r\n    x2();\r\n    y();\r\n}\r\n",
+                ),
+                (
+                    "a\r\nfoo  \r\nz\r\n",
+                    "a\nfoo  ",
+                    "a\nbar  ",
+                    "a\r\nbar  \r\nz\r\n",
+                ),
+            ] {
+                std::fs::write(&path, content).expect("write");
+                tool.execute(
+                    "t",
+                    serde_json::json!({
+                        "path": path.to_string_lossy(),
+                        "oldText": old_text,
+                        "newText": new_text,
+                    }),
+                    None,
+                )
+                .await
+                .expect("edit");
+                assert_eq!(
+                    std::fs::read_to_string(&path).expect("read"),
+                    expected,
+                    "{old_text:?}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn a_lone_cr_before_the_first_lf_does_not_make_the_file_cr_terminated() {
+        assert_eq!(detect_line_ending("print('a\rb')\nx = 1\n"), "\n");
+        assert_eq!(detect_line_ending("a\r\r\nb\r\r\n"), "\r\n");
+        assert_eq!(detect_line_ending("\nfirst line empty"), "\n");
+        // The edit used to write the inserted line break as a bare CR.
+        asupersync::test_utils::run_test(|| async {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let path = tmp.path().join("cr_in_string.py");
+            std::fs::write(&path, "print('a\rb')\nx = 1\n").expect("write");
+            EditTool::new(tmp.path())
+                .execute(
+                    "t",
+                    serde_json::json!({
+                        "path": path.to_string_lossy(),
+                        "oldText": "x = 1",
+                        "newText": "x = 1\ny = 2",
+                    }),
+                    None,
+                )
+                .await
+                .expect("edit");
+            assert_eq!(
+                std::fs::read_to_string(&path).expect("read"),
+                "print('a\rb')\nx = 1\ny = 2\n"
+            );
+        });
+    }
+
+    #[test]
     fn test_edit_cr_content_correctness() {
         asupersync::test_utils::run_test(|| async {
             let tmp = tempfile::tempdir().unwrap();
@@ -12436,6 +27018,83 @@ mod tests {
     }
 
     #[test]
+    fn test_hashline_edit_rejects_operations_that_cancel_each_other_out() {
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let file = dir.path().join("test.txt");
+            let original = "a\na\n";
+            std::fs::write(&file, original).unwrap();
+            let tool = HashlineEditTool::new(dir.path());
+            let input = serde_json::json!({
+                "path": file,
+                "edits": [
+                    {"op":"replace", "pos":format_hashline_tag(0, "a"), "lines":[]},
+                    {"op":"append", "pos":format_hashline_tag(1, "a"), "lines":["a"]}
+                ]
+            });
+            let error = tool
+                .execute("net-zero-edit", input, None)
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("leaving identical content"));
+            assert_eq!(std::fs::read_to_string(&file).unwrap(), original);
+        });
+    }
+
+    #[test]
+    fn test_notebook_marker_aliases_do_not_report_successful_native_edits() {
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let file = dir.path().join("analysis.ipynb");
+            let source = serde_json::json!({
+                "nbformat":4, "nbformat_minor":5, "metadata":{},
+                "cells":[{
+                    "id":"code", "cell_type":"code", "metadata":{},
+                    "source":["value = 1\n"], "execution_count":null, "outputs":[]
+                }]
+            })
+            .to_string();
+            let notebook = crate::notebook::Notebook::parse(&source, "analysis.ipynb").unwrap();
+            // Start with canonical JSON so a formatting-only rewrite cannot
+            // hide that both marker spellings denote exactly the same cell.
+            let original = notebook
+                .serialize_edited(&notebook.editable_text().unwrap())
+                .unwrap();
+            std::fs::write(&file, &original).unwrap();
+            let tools = ToolRegistry::new(&["edit", "hashline_edit"], dir.path(), None);
+            for (name, input) in [
+                (
+                    "edit",
+                    serde_json::json!({
+                        "path":file, "oldText":"# %% [code] cell:0", "newText":"# %% [code] cell:00"
+                    }),
+                ),
+                (
+                    "hashline_edit",
+                    serde_json::json!({
+                        "path":file, "edits":[{
+                            "op":"replace", "pos":format_hashline_tag(0, "# %% [code] cell:0"),
+                            "lines":["# %% [code] cell:00"]
+                        }]
+                    }),
+                ),
+            ] {
+                let error = tools
+                    .get(name)
+                    .unwrap()
+                    .execute("marker-alias", input, None)
+                    .await
+                    .unwrap_err();
+                assert!(
+                    error.to_string().contains("identical notebook JSON"),
+                    "{name}: {error}"
+                );
+                assert_eq!(std::fs::read_to_string(&file).unwrap(), original);
+            }
+        });
+    }
+
+    #[test]
     fn test_hashline_read_output_format() {
         asupersync::test_utils::run_test(|| async {
             let dir = tempfile::tempdir().unwrap();
@@ -12607,7 +27266,7 @@ mod tests {
             assert!(!out.is_error);
 
             let content = std::fs::read_to_string(&file).unwrap();
-            assert!(content.contains("new_line"));
+            assert_eq!(content, "new_line");
         });
     }
 
@@ -12811,6 +27470,1264 @@ mod tests {
 
             let content = std::fs::read_to_string(&file).unwrap();
             assert_eq!(content, "line1\nchanged\n");
+        });
+    }
+
+    #[test]
+    fn hub_wait_dependency_result_explains_the_cycle_and_preserves_details() {
+        let result: crate::agent_hub::InboxWaitResult = serde_json::from_value(serde_json::json!({
+            "id": "worker-1",
+            "status": "peerBlocked",
+            "messages": [],
+            "nextCursor": 17,
+            "hasMore": false,
+            "oldestCursor": 0,
+            "droppedThroughCursor": 0,
+            "peerStatus": null,
+            "pendingReplies": [{
+                "peer": "parent",
+                "sentCursor": 17,
+                "peerStatus": null,
+                "canReply": false,
+                "blockedOnCaller": true
+            }],
+            "blockedPeers": ["parent"]
+        }))
+        .unwrap();
+        let (text, details) = HubTool::format_wait_reply(&result);
+        assert!(text.contains("dependency cycle"));
+        assert!(text.contains("waiting on your result"));
+        assert_eq!(details["schema"], "pi.agent-hub.wait/v1");
+        assert_eq!(details["status"], "peerBlocked");
+        assert_eq!(details["nextCursor"], 17);
+        assert_eq!(details["blockedPeers"], serde_json::json!(["parent"]));
+        assert_eq!(details["pendingReplies"][0]["blockedOnCaller"], true);
+    }
+
+    #[test]
+    fn hub_agent_requires_name_for_child_ops() {
+        // bd-cv653.5.3: child-targeting actions must refuse without a run id.
+        asupersync::test_utils::run_test(|| async {
+            let tool = HubTool::new(Path::new("."));
+            let input = serde_json::json!({ "op": "agent", "action": "transcript" });
+            let out = tool.execute("t", input, None).await.unwrap();
+            assert!(out.is_error);
+            assert!(get_text(&out.content).contains("requires name"));
+        });
+    }
+
+    #[test]
+    fn hub_agent_unknown_child_is_named_refusal() {
+        asupersync::test_utils::run_test(|| async {
+            let tool = HubTool::new(Path::new("."));
+            let input = serde_json::json!({
+                "op": "agent",
+                "action": "transcript",
+                "name": "no-such-child-zzz"
+            });
+            let out = tool.execute("t", input, None).await.unwrap();
+            assert!(out.is_error);
+            assert!(get_text(&out.content).contains("unknown child"));
+        });
+    }
+
+    #[test]
+    fn hub_agent_steer_requires_text() {
+        asupersync::test_utils::run_test(|| async {
+            let tool = HubTool::new(Path::new("."));
+            let input = serde_json::json!({
+                "op": "agent",
+                "action": "steer",
+                "name": "any-child"
+            });
+            let out = tool.execute("t", input, None).await.unwrap();
+            assert!(out.is_error);
+            assert!(get_text(&out.content).contains("requires text"));
+        });
+    }
+
+    #[test]
+    fn hub_agent_rejects_unknown_action() {
+        asupersync::test_utils::run_test(|| async {
+            let tool = HubTool::new(Path::new("."));
+            let input = serde_json::json!({ "op": "agent", "action": "frobnicate" });
+            let out = tool.execute("t", input, None).await.unwrap();
+            assert!(out.is_error);
+            assert!(get_text(&out.content).contains("Unknown agent action"));
+        });
+    }
+
+    // === current_time (#207): registry membership of the essential-tier clock tool ===
+
+    #[test]
+    fn current_time_is_registered_and_in_the_live_schema() {
+        let tmp = tempfile::tempdir().unwrap();
+        let registry = ToolRegistry::new(&["read", "current_time"], tmp.path(), None);
+        assert!(registry.get("current_time").is_some());
+        assert!(
+            !registry.is_discoverable("current_time"),
+            "current_time must be essential-tier (directly callable)"
+        );
+    }
+}
+
+#[cfg(test)]
+mod known_tool_name_tests {
+    use super::*;
+    use serde_json::Value;
+
+    fn get_text(content: &[ContentBlock]) -> String {
+        content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::Text(text) => Some(text.text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    struct CatalogTool {
+        name: &'static str,
+        description: &'static str,
+        origin: ToolOrigin,
+    }
+
+    #[async_trait]
+    impl Tool for CatalogTool {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn label(&self) -> &str {
+            self.name
+        }
+
+        fn description(&self) -> &str {
+            self.description
+        }
+
+        fn parameters(&self) -> Value {
+            serde_json::json!({
+                "type":"object", "properties":{"version":{"const":self.description}}
+            })
+        }
+
+        fn origin(&self) -> ToolOrigin {
+            self.origin
+        }
+
+        async fn execute(
+            &self,
+            _tool_call_id: &str,
+            _input: Value,
+            _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+        ) -> Result<ToolOutput> {
+            Ok(ToolOutput {
+                content: vec![ContentBlock::Text(TextContent::new(self.description))],
+                details: None,
+                is_error: false,
+            })
+        }
+    }
+
+    fn catalog_tool(
+        name: &'static str,
+        description: &'static str,
+        origin: ToolOrigin,
+    ) -> Box<dyn Tool> {
+        Box::new(CatalogTool {
+            name,
+            description,
+            origin,
+        })
+    }
+
+    fn describe_catalog_tool(registry: &ToolRegistry, name: &str) -> Value {
+        let output = futures::executor::block_on(
+            registry.get("xdev").expect("generated dispatcher").execute(
+                "describe-catalog",
+                serde_json::json!({"action":"describe", "name":name}),
+                None,
+            ),
+        )
+        .expect("describe current catalog");
+        assert!(!output.is_error);
+        let ContentBlock::Text(text) = &output.content[0] else {
+            panic!("discovery must return JSON text");
+        };
+        serde_json::from_str(&text.text).expect("discovery description")
+    }
+
+    #[test]
+    fn imported_factories_use_native_tools_after_overrides_and_share_undo() {
+        asupersync::test_utils::run_test(|| async {
+            let root = tempfile::tempdir().unwrap();
+            let sub = root.path().join("sub");
+            std::fs::create_dir(&sub).unwrap();
+            std::fs::write(root.path().join("note.txt"), "root stays intact\n").unwrap();
+            std::fs::write(sub.join("note.txt"), "original\n").unwrap();
+            let recorder = Arc::new(crate::undo::FileMutationRecorder::default());
+            let mut registry = ToolRegistry::with_mutation_recorder(
+                &["read", "write", "edit", "grep", "find", "ls"],
+                root.path(),
+                None,
+                Some(Arc::clone(&recorder)),
+                None,
+            );
+            for name in ["read", "write", "edit", "grep", "find", "ls"] {
+                registry.push(catalog_tool(
+                    name,
+                    "extension wrapper",
+                    ToolOrigin::Extension,
+                ));
+            }
+            let registry = registry.clone_shallow();
+            assert_eq!(
+                registry.get("read").unwrap().origin(),
+                ToolOrigin::Extension
+            );
+            let options = serde_json::json!({});
+            let cwd = sub.to_str();
+            registry
+                .get_factory_tool("write")
+                .unwrap()
+                .execute_from_factory(
+                    "factory-write",
+                    serde_json::json!({"path":"note.txt", "content":"alpha\nbeta\n"}),
+                    cwd,
+                    &options,
+                    None,
+                )
+                .await
+                .unwrap();
+            let read = registry
+                .get_factory_tool("read")
+                .unwrap()
+                .execute_from_factory(
+                    "factory-read",
+                    serde_json::json!({"path":"note.txt", "offset":2, "limit":1}),
+                    cwd,
+                    &serde_json::json!({"autoResizeImages":false}),
+                    None,
+                )
+                .await
+                .unwrap();
+            assert!(get_text(&read.content).contains("beta"));
+            assert!(!get_text(&read.content).contains("alpha"));
+            registry
+                .get_factory_tool("edit")
+                .unwrap()
+                .execute_from_factory(
+                    "factory-edit",
+                    serde_json::json!({"path":"note.txt", "oldText":"alpha", "newText":"changed"}),
+                    cwd,
+                    &options,
+                    None,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                std::fs::read_to_string(sub.join("note.txt")).unwrap(),
+                "changed\nbeta\n"
+            );
+            assert_eq!(
+                std::fs::read_to_string(root.path().join("note.txt")).unwrap(),
+                "root stays intact\n"
+            );
+            for (name, input) in [
+                ("grep", serde_json::json!({"pattern":"changed"})),
+                ("find", serde_json::json!({"pattern":"*.txt"})),
+                ("ls", serde_json::json!({})),
+            ] {
+                let output = registry
+                    .get_factory_tool(name)
+                    .unwrap()
+                    .execute_from_factory(name, input, cwd, &options, None)
+                    .await
+                    .unwrap();
+                assert!(
+                    get_text(&output.content).contains("note.txt"),
+                    "{name}: {output:?}"
+                );
+            }
+            assert_eq!(recorder.stats().undo_depth, 2);
+            assert_eq!(recorder.undo(1, false).applied.len(), 1);
+            assert_eq!(
+                std::fs::read_to_string(sub.join("note.txt")).unwrap(),
+                "alpha\nbeta\n"
+            );
+            assert_eq!(recorder.undo(1, false).applied.len(), 1);
+            assert_eq!(
+                std::fs::read_to_string(sub.join("note.txt")).unwrap(),
+                "original\n"
+            );
+        });
+    }
+
+    #[test]
+    fn imported_factories_preserve_disabled_tools_and_live_workspace_revocation() {
+        asupersync::test_utils::run_test(|| async {
+            let root = tempfile::tempdir().unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            std::fs::write(outside.path().join("secret.txt"), "outside\n").unwrap();
+            let mut workspace = WorkspaceHandle::single(root.path());
+            workspace.add_root(outside.path());
+            let registry = ToolRegistry::with_mutation_recorder(
+                &["read"],
+                root.path(),
+                None,
+                None,
+                Some(&workspace),
+            );
+            let read = registry.get_factory_tool("read").unwrap();
+            let input = serde_json::json!({"path":"secret.txt"});
+            let options = serde_json::json!({});
+            read.execute_from_factory(
+                "allowed",
+                input.clone(),
+                outside.path().to_str(),
+                &options,
+                None,
+            )
+            .await
+            .unwrap();
+            assert!(workspace.remove_root(outside.path()));
+            assert!(
+                read.execute_from_factory(
+                    "revoked",
+                    input,
+                    outside.path().to_str(),
+                    &options,
+                    None
+                )
+                .await
+                .is_err()
+            );
+            assert!(registry.get_factory_tool("write").is_none());
+            let mut disabled = ToolRegistry::without_builtins(None);
+            disabled.push(Box::new(ReadTool::new(root.path())));
+            assert!(disabled.get_factory_tool("read").is_none());
+            assert!(
+                read.execute_from_factory(
+                    "unsupported",
+                    serde_json::json!({"path":"missing.txt"}),
+                    None,
+                    &serde_json::json!({"operations":{}}),
+                    None,
+                )
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("not supported")
+            );
+        });
+    }
+
+    #[test]
+    fn imported_factory_default_cwd_resolves_relative_registry_paths_once() {
+        asupersync::test_utils::run_test(|| async {
+            let current = std::env::current_dir().unwrap();
+            let root = tempfile::Builder::new()
+                .prefix("factory-relative-")
+                .tempdir_in(&current)
+                .unwrap();
+            let relative = Path::new(".").join(root.path().file_name().unwrap());
+            std::fs::write(root.path().join("note.txt"), "relative cwd works\n").unwrap();
+            let registry = ToolRegistry::new(&["read"], &relative, None);
+            let output = registry
+                .get_factory_tool("read")
+                .unwrap()
+                .execute_from_factory(
+                    "relative-read",
+                    serde_json::json!({"path":"note.txt"}),
+                    None,
+                    &serde_json::json!({}),
+                    None,
+                )
+                .await
+                .unwrap();
+            assert!(get_text(&output.content).contains("relative cwd works"));
+            assert_eq!(std::env::current_dir().unwrap(), current);
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn imported_bash_factory_executes_prefix_in_cwd_and_preserves_failures() {
+        asupersync::test_utils::run_test(|| async {
+            let root = tempfile::tempdir().unwrap();
+            let sub = root.path().join("sub");
+            std::fs::create_dir(&sub).unwrap();
+            let config: Config = serde_json::from_value(serde_json::json!({
+                "bash":{"persistent":false, "pty":"off"}
+            }))
+            .unwrap();
+            let mut registry = ToolRegistry::new(&["bash"], root.path(), Some(&config));
+            registry.push(catalog_tool(
+                "bash",
+                "extension wrapper",
+                ToolOrigin::Extension,
+            ));
+            let bash = registry.get_factory_tool("bash").unwrap();
+            let result = bash.execute_from_factory(
+                "shell", serde_json::json!({"command":"printf '%s\\n' \"$PI_FACTORY_VALUE\"; pwd", "timeout":5}),
+                sub.to_str(), &serde_json::json!({"commandPrefix":"export PI_FACTORY_VALUE=factory-executed"}), None,
+            ).await.unwrap();
+            assert!(!result.is_error, "{result:?}");
+            let text = get_text(&result.content);
+            assert!(text.contains("factory-executed"), "{text}");
+            assert!(
+                text.contains(std::fs::canonicalize(&sub).unwrap().to_str().unwrap()),
+                "{text}"
+            );
+            assert!(
+                !text.contains("printf"),
+                "A factory must execute, not echo its command"
+            );
+            let failed = bash
+                .execute_from_factory(
+                    "shell-error",
+                    serde_json::json!({"command":"exit 7", "timeout":5}),
+                    None,
+                    &serde_json::json!({}),
+                    None,
+                )
+                .await
+                .unwrap();
+            assert!(failed.is_error, "{failed:?}");
+            let outside = tempfile::tempdir().unwrap();
+            assert!(
+                bash.execute_from_factory(
+                    "outside",
+                    serde_json::json!({"command":"pwd"}),
+                    outside.path().to_str(),
+                    &serde_json::json!({}),
+                    None,
+                )
+                .await
+                .is_err()
+            );
+        });
+    }
+
+    #[test]
+    fn late_tool_modes_and_discovery_remain_coherent_across_snapshot_replacement() {
+        let root = tempfile::tempdir().unwrap();
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "tools":{"loadMode":{"denied":"off", "late":"discoverable", "direct":"essential"}}
+        }))
+        .unwrap();
+        let shared = SharedToolRegistry::new(ToolRegistry::with_builtin_tool_policy(
+            &["read"],
+            root.path(),
+            Some(&config),
+            None,
+            None,
+            false,
+            None,
+            false,
+        ));
+        assert!(shared.snapshot().get("xdev").is_none());
+        shared.update(|registry| {
+            registry.extend(vec![
+                catalog_tool("denied", "Must stay excluded", ToolOrigin::BuiltIn),
+                catalog_tool("late", "First catalog version", ToolOrigin::BuiltIn),
+                catalog_tool("direct", "Directly available", ToolOrigin::BuiltIn),
+                catalog_tool(
+                    "unconfigured",
+                    "Existing essential default",
+                    ToolOrigin::BuiltIn,
+                ),
+            ]);
+        });
+        let original = shared.snapshot();
+        assert!(original.get("denied").is_none());
+        assert!(original.get("late").is_some());
+        assert!(original.is_discoverable("late"));
+        for name in ["read", "direct", "unconfigured", "xdev"] {
+            assert!(original.get(name).is_some(), "{name}");
+            assert!(!original.is_discoverable(name), "{name}");
+        }
+        let first = describe_catalog_tool(&original, "late");
+        assert_eq!(first["description"], "First catalog version");
+        assert_eq!(
+            first["parameters"]["properties"]["version"]["const"],
+            "First catalog version"
+        );
+
+        shared.update(|registry| {
+            registry.push(catalog_tool(
+                "late",
+                "Replacement catalog version",
+                ToolOrigin::BuiltIn,
+            ));
+        });
+        let replacement = shared.snapshot();
+        let second = describe_catalog_tool(&replacement, "late");
+        assert_eq!(second["description"], "Replacement catalog version");
+        assert_eq!(
+            second["parameters"]["properties"]["version"]["const"],
+            "Replacement catalog version"
+        );
+        assert_eq!(
+            describe_catalog_tool(&original, "late"),
+            first,
+            "retained readers must keep matching tool and discovery metadata"
+        );
+
+        shared.update(|registry| registry.mark_promoted("late"));
+        shared.update(|registry| {
+            registry.push(catalog_tool(
+                "late",
+                "Refreshed promoted tool",
+                ToolOrigin::BuiltIn,
+            ));
+        });
+        let promoted = shared.snapshot();
+        assert!(promoted.get("late").is_some());
+        assert!(!promoted.is_discoverable("late"));
+        assert!(
+            promoted.get("xdev").is_none(),
+            "no ghost catalog after final promotion"
+        );
+        assert!(replacement.is_discoverable("late"));
+
+        // A host-controlled registry with no configured policy retains its
+        // existing essential exposure and never invents a dispatcher.
+        let mut host = ToolRegistry::from_tools(Vec::new());
+        host.push(catalog_tool(
+            "late",
+            "Host controls exposure",
+            ToolOrigin::BuiltIn,
+        ));
+        assert!(!host.is_discoverable("late"));
+        assert!(host.get("xdev").is_none());
+    }
+
+    #[test]
+    fn extension_mode_refresh_preserves_exact_owners_and_foreign_dispatchers() {
+        let root = tempfile::tempdir().unwrap();
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "tools":{"load_mode":{"denied":"off", "late":"discoverable"}}
+        }))
+        .unwrap();
+        let shared = SharedToolRegistry::new(ToolRegistry::with_builtin_tool_policy(
+            &["read"],
+            root.path(),
+            Some(&config),
+            None,
+            None,
+            false,
+            None,
+            false,
+        ));
+        let tools = || {
+            vec![
+                catalog_tool("late", "Extension catalog", ToolOrigin::Extension),
+                catalog_tool("denied", "Excluded extension", ToolOrigin::Extension),
+            ]
+        };
+        let mut owned = shared.reconcile_extension_tools(&[], tools(), None, true);
+        assert_eq!(
+            owned.len(),
+            1,
+            "excluded tools cannot enter inactive ownership"
+        );
+        let original = shared.snapshot();
+        assert_eq!(
+            describe_catalog_tool(&original, "late")["description"],
+            "Extension catalog"
+        );
+        let version = shared.version();
+        owned = shared.reconcile_extension_tools(&owned, tools(), None, false);
+        assert_eq!(
+            shared.version(),
+            version,
+            "unchanged exposure keeps the provider cache"
+        );
+
+        shared.update(|registry| registry.set_active_extension_tools(&["denied".to_string()]));
+        let shelved = shared.snapshot();
+        assert!(shelved.get("late").is_none());
+        assert!(shelved.get("denied").is_none());
+        assert!(shelved.get("xdev").is_none());
+        assert!(shelved.discoverable_index().is_empty());
+        assert_eq!(shelved.inactive_tools().len(), 1);
+        owned = shared.reconcile_extension_tools(
+            &owned,
+            tools(),
+            Some(&["late".to_string(), "denied".to_string()]),
+            false,
+        );
+        assert!(shared.snapshot().get("denied").is_none());
+        assert_eq!(
+            describe_catalog_tool(&shared.snapshot(), "late")["description"],
+            "Extension catalog"
+        );
+
+        // Same-name replacements belong to the host immediately, including
+        // when setActiveTools runs before the old catalog refreshes again.
+        shared.update(|registry| {
+            registry.set_active_extension_tools(&[]);
+            registry.push(catalog_tool(
+                "late",
+                "Host replacement",
+                ToolOrigin::BuiltIn,
+            ));
+            registry.set_active_extension_tools(&["late".to_string()]);
+        });
+        assert!(shared.snapshot().inactive_tools().is_empty());
+        assert_eq!(
+            shared
+                .snapshot()
+                .tools()
+                .iter()
+                .filter(|tool| tool.name() == "late")
+                .count(),
+            1
+        );
+        let released = shared.reconcile_extension_tools(&owned, Vec::new(), None, false);
+        assert!(released.is_empty());
+        assert_eq!(
+            shared.snapshot().get("late").unwrap().origin(),
+            ToolOrigin::BuiltIn
+        );
+        assert_eq!(
+            describe_catalog_tool(&shared.snapshot(), "late")["description"],
+            "Host replacement"
+        );
+
+        shared.update(|registry| {
+            registry.push(catalog_tool(
+                "xdev",
+                "Foreign dispatcher",
+                ToolOrigin::BuiltIn,
+            ));
+        });
+        let foreign = shared.snapshot();
+        shared.update(|registry| {
+            registry.push(catalog_tool(
+                "late",
+                "Changed after dispatcher replacement",
+                ToolOrigin::BuiltIn,
+            ));
+        });
+        let current = shared.snapshot();
+        let before = foreign
+            .tools()
+            .iter()
+            .find(|tool| tool.name() == "xdev")
+            .unwrap();
+        let after = current
+            .tools()
+            .iter()
+            .find(|tool| tool.name() == "xdev")
+            .unwrap();
+        assert!(
+            Arc::ptr_eq(before, after),
+            "refresh must not replace a foreign dispatcher"
+        );
+        assert_eq!(after.description(), "Foreign dispatcher");
+        assert_eq!(
+            describe_catalog_tool(&original, "late")["description"],
+            "Extension catalog"
+        );
+    }
+
+    #[test]
+    fn builtin_tool_ceiling_keeps_only_declared_tools_and_their_dispatcher() {
+        let dir = tempfile::tempdir().expect("workspace");
+        let cases: &[(&[&str], &[&str])] = &[
+            (&[], &[]),
+            (
+                &["read", "grep", "find", "ls"],
+                &["read", "grep", "find", "ls"],
+            ),
+            (&["read", "hub"], &["read", "hub", "xdev"]),
+        ];
+        for &(selected, expected) in cases {
+            let registry = ToolRegistry::with_builtin_tool_policy(
+                selected,
+                dir.path(),
+                None,
+                None,
+                None,
+                false,
+                None,
+                false,
+            );
+            let mut actual = registry
+                .tools()
+                .iter()
+                .map(|tool| tool.name())
+                .collect::<Vec<_>>();
+            actual.sort_unstable();
+            let mut expected = expected.to_vec();
+            expected.sort_unstable();
+            assert_eq!(actual, expected, "selection: {selected:?}");
+            assert!(registry.get("manage_skill").is_none());
+            assert!(
+                registry
+                    .discoverable_index()
+                    .iter()
+                    .all(|(name, _)| selected.contains(&name.as_str()))
+            );
+            assert_eq!(registry.builtins_disabled(), selected.is_empty());
+            assert_eq!(
+                registry.clone_shallow().builtins_disabled(),
+                selected.is_empty()
+            );
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn builtin_tool_ceiling_gates_configured_extras_before_memory_open() {
+        const PROBE: &str = "PI_TEST_BUILTIN_TOOL_POLICY_ROOT";
+        let Some(root) = std::env::var_os(PROBE) else {
+            let fixture = tempfile::tempdir().expect("isolated tool policy fixture");
+            let output = std::process::Command::new(
+                std::env::current_exe().expect("test executable"),
+            )
+            .args([
+                "--exact",
+                "tools::known_tool_name_tests::builtin_tool_ceiling_gates_configured_extras_before_memory_open",
+                "--nocapture",
+            ])
+            .env(PROBE, fixture.path())
+            .env("PI_CODING_AGENT_DIR", fixture.path().join("global"))
+            .output()
+            .expect("run isolated registry fixture");
+            assert!(
+                output.status.success(),
+                "isolated registry fixture failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(fixture.path().join("completed").is_file());
+            return;
+        };
+        let root = PathBuf::from(root);
+        let cwd = root.join("workspace");
+        let global = root.join("global");
+        std::fs::create_dir_all(&cwd).expect("workspace directory");
+        assert_eq!(Config::global_dir(), global);
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "tools": {
+                "enableEval": true,
+                "enableGithub": true,
+                "enableSecurityScan": true,
+                "enableSubagent": true
+            },
+            "memory": { "backend": "local" },
+            "browser": { "enableBrowser": true },
+            "computer": { "enableComputer": true },
+            "media": {
+                "enableInspectImage": true,
+                "enableReadMedia": true,
+                "enableGenerateImage": true,
+                "enableTts": true
+            }
+        }))
+        .expect("all automatic tools enabled");
+        let names = |registry: &ToolRegistry| {
+            let mut names = registry
+                .tools()
+                .iter()
+                .map(|tool| tool.name().to_string())
+                .collect::<Vec<_>>();
+            names.sort();
+            names
+        };
+        for selected in [&[][..], &["read"][..]] {
+            let registry = ToolRegistry::with_builtin_tool_policy(
+                selected,
+                &cwd,
+                Some(&config),
+                None,
+                None,
+                false,
+                None,
+                false,
+            );
+            assert_eq!(
+                names(&registry),
+                selected
+                    .iter()
+                    .map(|name| (*name).to_string())
+                    .collect::<Vec<_>>()
+            );
+            assert!(!global.join("memory").exists());
+        }
+
+        let selected = [
+            "read",
+            "eval",
+            "github",
+            "security_scan",
+            "subagent",
+            "browser",
+            "computer",
+            "inspect_image",
+            "read_media",
+            "generate_image",
+            "tts",
+            "manage_skill",
+        ];
+        let registry = ToolRegistry::with_builtin_tool_policy(
+            &selected,
+            &cwd,
+            Some(&config),
+            None,
+            None,
+            false,
+            None,
+            false,
+        );
+        let mut expected = selected
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect::<Vec<_>>();
+        expected.push("xdev".to_string());
+        expected.sort();
+        assert_eq!(names(&registry), expected);
+        assert!(
+            registry
+                .discoverable_index()
+                .iter()
+                .all(|(name, _)| selected.contains(&name.as_str()))
+        );
+        assert!(!global.join("memory").exists());
+
+        let mut backend_off = config.clone();
+        backend_off.memory = None;
+        let unavailable = ToolRegistry::with_builtin_tool_policy(
+            &["recall"],
+            &cwd,
+            Some(&backend_off),
+            None,
+            None,
+            false,
+            None,
+            false,
+        );
+        assert!(unavailable.tools().is_empty());
+        assert!(!global.join("memory").exists());
+        let recalled = ToolRegistry::with_builtin_tool_policy(
+            &["recall"],
+            &cwd,
+            Some(&config),
+            None,
+            None,
+            false,
+            None,
+            false,
+        );
+        assert_eq!(names(&recalled), ["recall", "xdev"]);
+        assert_eq!(
+            recalled
+                .discoverable_index()
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>(),
+            ["recall"]
+        );
+        assert!(global.join("memory").is_dir());
+
+        // Ordinary operator invocations keep their established automatic tools.
+        let legacy = ToolRegistry::new(&["read"], &cwd, Some(&config));
+        for name in [
+            "retain",
+            "recall",
+            "reflect",
+            "memory_edit",
+            "learn",
+            "browser",
+            "computer",
+            "inspect_image",
+            "read_media",
+            "generate_image",
+            "tts",
+            "manage_skill",
+        ] {
+            assert!(legacy.get(name).is_some(), "legacy automatic tool: {name}");
+        }
+        for name in ["eval", "github", "security_scan", "subagent"] {
+            assert!(
+                legacy.get(name).is_none(),
+                "unselected optional tool: {name}"
+            );
+        }
+        std::fs::write(root.join("completed"), "ok").expect("fixture completion marker");
+    }
+
+    #[test]
+    fn configured_off_excludes_automatic_tools_before_discovery() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut config: Config = serde_json::from_value(serde_json::json!({
+            "browser": { "enableBrowser": true },
+            "computer": { "enableComputer": true },
+            "media": {
+                "enableInspectImage": true,
+                "enableReadMedia": true,
+                "enableGenerateImage": true,
+                "enableTts": true
+            }
+        }))
+        .expect("automatic tool settings");
+        let automatic = [
+            "browser",
+            "computer",
+            "inspect_image",
+            "read_media",
+            "generate_image",
+            "tts",
+            "manage_skill",
+        ];
+        let baseline = ToolRegistry::new(&["read"], dir.path(), Some(&config));
+        for name in automatic {
+            assert!(
+                baseline.get(name).is_some(),
+                "{name} must be present before denial"
+            );
+        }
+
+        config.tools = Some(crate::config::ToolSettings {
+            load_mode: Some(
+                automatic
+                    .into_iter()
+                    .map(|name| (name.to_string(), "off".to_string()))
+                    .collect(),
+            ),
+            ..Default::default()
+        });
+        let registry = ToolRegistry::new(&["read"], dir.path(), Some(&config));
+        assert!(registry.get("read").is_some());
+        assert_eq!(registry.tools().len(), 1);
+        assert!(registry.discoverable_index().is_empty());
+        for name in automatic {
+            assert!(registry.get(name).is_none(), "{name} must not be callable");
+            assert!(
+                !registry.is_discoverable(name),
+                "{name} must not be discoverable"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_names_override_configured_off_without_filtering_default_tiers() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let opted_in = ToolRegistry::new(&["subagent"], dir.path(), None);
+        assert_eq!(
+            crate::xdev::default_tier("subagent"),
+            crate::xdev::LoadMode::Off
+        );
+        assert!(opted_in.get("subagent").is_some());
+
+        let selected = [
+            "eval",
+            "github",
+            "security_scan",
+            "subagent",
+            "browser",
+            "computer",
+            "inspect_image",
+            "read_media",
+            "generate_image",
+            "tts",
+            "manage_skill",
+        ];
+        let config = Config {
+            tools: Some(crate::config::ToolSettings {
+                load_mode: Some(
+                    selected
+                        .into_iter()
+                        .map(|name| (name.to_string(), "off".to_string()))
+                        .collect(),
+                ),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let registry = ToolRegistry::new(&selected, dir.path(), Some(&config));
+        for name in selected {
+            assert!(
+                registry.get(name).is_some(),
+                "{name} explicit selection must win"
+            );
+            assert_eq!(
+                registry
+                    .tools()
+                    .iter()
+                    .filter(|tool| tool.name() == name)
+                    .count(),
+                1,
+                "{name} must be registered once"
+            );
+        }
+    }
+
+    /// Joined after construction by the session host, so the registry builds
+    /// nothing for them and neither does this test.
+    const HOST_COUPLED: &[&str] = &["ask", "todo", "submit_plan"];
+
+    /// What the registry holds for a request naming nothing at all.
+    ///
+    /// Not necessarily zero — some tools join regardless of `--tools` — so
+    /// "this name built something" has to be measured as a difference.
+    fn baseline_tool_count(dir: &std::path::Path) -> usize {
+        ToolRegistry::new(&[], dir, None).tools().len()
+    }
+
+    #[test]
+    fn tool_registry_builds_every_listed_name() {
+        // The direction that matters: a name in KNOWN_TOOL_NAMES that builds
+        // nothing is pi promising a tool it will then drop in silence, which
+        // is the whole defect the list exists to report.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let baseline = baseline_tool_count(dir.path());
+        let mut built_nothing = Vec::new();
+        for name in ToolRegistry::KNOWN_TOOL_NAMES {
+            if HOST_COUPLED.contains(name) {
+                continue;
+            }
+            if ToolRegistry::new(&[name], dir.path(), None).tools().len() <= baseline {
+                built_nothing.push(*name);
+            }
+        }
+        assert!(
+            built_nothing.is_empty(),
+            "listed but built nothing beyond the {baseline}-tool baseline: \
+             {built_nothing:?} — either the arm went away or the name is \
+             misspelled in KNOWN_TOOL_NAMES"
+        );
+    }
+
+    #[test]
+    fn every_registerable_tool_is_named_in_one_of_the_two_lists() {
+        // The direction `tool_registry_builds_every_listed_name` leaves open,
+        // and the one that shipped a false warning: a tool the registry really
+        // does build, named in neither list, is reported to the user as "not a
+        // tool pi provides". Seven were in that state — xdev, manage_skill and
+        // the five memory-bank tools — because they join outside the --tools
+        // match and nothing measured that.
+        //
+        // Build with everything the config can switch on, so config-gated
+        // tools are present rather than silently skipped.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "memory": {"backend": "local"},
+            "browser": {"enableBrowser": true},
+            "computer": {"enableComputer": true},
+            "media": {
+                "enableInspectImage": true,
+                "enableGenerateImage": true,
+                "enableTts": true,
+                "enableReadMedia": true
+            }
+        }))
+        .expect("config");
+        let enabled: Vec<&str> = ToolRegistry::KNOWN_TOOL_NAMES.to_vec();
+        let registry = ToolRegistry::new(&enabled, dir.path(), Some(&config));
+
+        let unnamed: Vec<String> = registry
+            .tools()
+            .iter()
+            .map(|tool| tool.name().to_string())
+            .filter(|name| {
+                !ToolRegistry::KNOWN_TOOL_NAMES.contains(&name.as_str())
+                    && !ToolRegistry::TOOLS_NOT_SELECTED_BY_FLAG
+                        .iter()
+                        .any(|(listed, _)| listed == name)
+            })
+            .collect();
+        assert!(
+            unnamed.is_empty(),
+            "the registry builds {unnamed:?}, which appears in neither \
+             KNOWN_TOOL_NAMES nor TOOLS_NOT_SELECTED_BY_FLAG — `--tools` will \
+             tell a user these are not tools pi provides"
+        );
+
+        // And the converse for the new list: a name here that the registry
+        // never produces would be advice pointing at nothing.
+        let built: Vec<String> = registry
+            .tools()
+            .iter()
+            .map(|tool| tool.name().to_string())
+            .collect();
+        let phantom: Vec<&str> = ToolRegistry::TOOLS_NOT_SELECTED_BY_FLAG
+            .iter()
+            .map(|(name, _)| *name)
+            .filter(|name| !built.iter().any(|b| b == name))
+            .collect();
+        assert!(
+            phantom.is_empty(),
+            "listed as provided-but-unselectable yet never registered: {phantom:?}"
+        );
+    }
+
+    #[test]
+    fn a_real_tool_the_flag_cannot_select_is_not_called_unknown() {
+        for name in [
+            "xdev",
+            "manage_skill",
+            "retain",
+            "recall",
+            "reflect",
+            "memory_edit",
+            "learn",
+        ] {
+            assert!(
+                unknown_tool_names(&[name]).is_empty(),
+                "{name} is a tool pi provides; --tools must not call it unknown"
+            );
+            let advice = unselectable_tool_names(&[name]);
+            assert_eq!(advice.len(), 1, "{name} should be explained, not ignored");
+            assert!(
+                !advice[0].1.is_empty(),
+                "{name} needs advice a user can act on"
+            );
+        }
+        // A genuine typo is still a typo.
+        assert_eq!(unknown_tool_names(&["bsah"]), vec!["bsah".to_string()]);
+        assert!(unselectable_tool_names(&["bsah"]).is_empty());
+    }
+
+    #[test]
+    fn host_coupled_names_are_listed_and_build_nothing_here() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let baseline = baseline_tool_count(dir.path());
+        for name in HOST_COUPLED {
+            assert!(
+                ToolRegistry::KNOWN_TOOL_NAMES.contains(name),
+                "{name} would be reported as a typo"
+            );
+            assert_eq!(
+                ToolRegistry::new(&[name], dir.path(), None).tools().len(),
+                baseline,
+                "{name} now builds in the registry; move it out of HOST_COUPLED"
+            );
+        }
+    }
+
+    #[test]
+    fn a_misspelled_tool_name_is_reported_and_a_real_one_is_not() {
+        assert_eq!(
+            unknown_tool_names(&["read", "bsah", "edit"]),
+            vec!["bsah".to_string()]
+        );
+        assert!(unknown_tool_names(&["read", "ask", "todo", "submit_plan"]).is_empty());
+        assert_eq!(
+            unknown_tool_names(&["completely_made_up"]),
+            vec!["completely_made_up".to_string()]
+        );
+        assert!(unknown_tool_names(&[]).is_empty());
+    }
+
+    #[test]
+    fn the_default_tool_set_is_entirely_honoured() {
+        // `--tools`' own default must not contain a name pi drops.
+        use clap::Parser as _;
+        let cli = crate::cli::Cli::parse_from(["pi"]);
+        let requested = cli.enabled_tools(&Config::default());
+        assert!(!requested.is_empty(), "the default set should not be empty");
+        assert!(
+            unknown_tool_names(&requested).is_empty(),
+            "pi's own default --tools names something it drops: {:?}",
+            unknown_tool_names(&requested)
+        );
+    }
+}
+
+#[cfg(test)]
+mod host_picker_registry_tests {
+    use super::*;
+
+    #[test]
+    fn host_picker_survives_shallow_registry_clones_without_model_ask() {
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let registry = ToolRegistry::new(&["read"], dir.path(), None);
+            assert!(registry.get("ask").is_none());
+            let picker = registry.host_ask_tool();
+            picker.set_handler(std::sync::Arc::new(|request| {
+                Box::pin(async move {
+                    Ok(crate::ask::AskResponse {
+                        answers: vec![crate::ask::AskAnswer {
+                            question_id: request.questions[0]
+                                .id
+                                .clone()
+                                .unwrap_or_else(|| "q".into()),
+                            selected: vec!["Allow once".into()],
+                            other: None,
+                        }],
+                        dismissed: false,
+                    })
+                })
+            }));
+            let clone = registry.clone_shallow().host_ask_tool();
+            let response = clone
+                .prompt_installed(crate::ask::AskRequest {
+                    questions: vec![crate::ask::AskQuestion {
+                        id: Some("q".into()),
+                        header: None,
+                        question: "Host decision?".into(),
+                        options: vec![
+                            crate::ask::AskOption {
+                                label: "Deny".into(),
+                                description: None,
+                            },
+                            crate::ask::AskOption {
+                                label: "Allow once".into(),
+                                description: None,
+                            },
+                        ],
+                        recommended: None,
+                        multi: false,
+                    }],
+                })
+                .await
+                .unwrap();
+            assert_eq!(response.answers[0].selected, ["Allow once"]);
+        });
+    }
+
+    #[test]
+    fn default_registry_computer_uses_host_picker_before_native_input() {
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let config: Config = serde_json::from_value(serde_json::json!({
+                "computer": { "enableComputer": true, "requireApproval": true }
+            }))
+            .unwrap();
+            let registry = ToolRegistry::new(&["computer"], dir.path(), Some(&config));
+            let picker = registry.host_ask_tool();
+            picker.set_handler(std::sync::Arc::new(|request| {
+                Box::pin(async move {
+                    Ok(crate::ask::AskResponse {
+                        answers: vec![crate::ask::AskAnswer {
+                            question_id: request.questions[0].id.clone().unwrap(),
+                            selected: vec!["Deny".into()],
+                            other: None,
+                        }],
+                        dismissed: false,
+                    })
+                })
+            }));
+            let error = registry
+                .get("computer")
+                .unwrap()
+                .execute(
+                    "host-picker",
+                    serde_json::json!({"action":"key_type","text":"must-not-reach-native"}),
+                    None,
+                )
+                .await
+                .expect_err("host denial must stop before native input");
+            let message = error.to_string();
+            assert!(message.contains("not approved"), "{message}");
+            assert!(!message.contains("no approval handler"), "{message}");
         });
     }
 }

@@ -1,6 +1,9 @@
 use super::*;
 
-use crate::models::{ModelEntry, model_requires_configured_credential, normalize_api_key_opt};
+use crate::models::{
+    ExtensionProviderBinding, ModelEntry, ModelRole, extension_provider_bindings, find_model_entry,
+    model_requires_configured_credential, normalize_api_key_opt, resolve_model_entry,
+};
 use crate::provider_metadata::{
     ProviderMetadata, ProviderOnboardingMode, provider_ids_match, provider_metadata,
     split_provider_model_spec,
@@ -9,7 +12,141 @@ use crate::provider_metadata::{
 #[cfg(feature = "clipboard")]
 use arboard::Clipboard as ArboardClipboard;
 
-/// Available slash commands.
+const BASH_COMPLETION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BashPersistenceOutcome {
+    Saved,
+    Disabled,
+    NotConfirmed {
+        pending_mutations: Option<usize>,
+        failed_flushes: Option<u64>,
+    },
+}
+
+impl BashPersistenceOutcome {
+    fn warning_text(self) -> Option<String> {
+        let Self::NotConfirmed {
+            pending_mutations,
+            failed_flushes,
+        } = self
+        else {
+            return None;
+        };
+
+        let pending =
+            pending_mutations.map_or_else(|| "unavailable".to_string(), |count| count.to_string());
+        let failed =
+            failed_flushes.map_or_else(|| "unavailable".to_string(), |count| count.to_string());
+        Some(format!(
+            "[Persistence warning]\n\
+- Execution ended and may have performed side effects; do not rerun it to repair this save problem.\n\
+- Session record: not confirmed saved.\n\
+- Pending mutation slots (bounded/coalescing): {pending}\n\
+- Total failed save attempts: {failed}"
+        ))
+    }
+}
+
+async fn persist_bash_execution(
+    session: Arc<Mutex<Session>>,
+    message: SessionMessage,
+    save_enabled: bool,
+    cx: &Cx,
+) -> BashPersistenceOutcome {
+    let mut session_guard = match OwnedMutexGuard::lock(session, cx).await {
+        Ok(guard) => guard,
+        Err(err) => {
+            tracing::error!(
+                error = %err,
+                "completed `!` bash command could not lock its session for recording"
+            );
+            return BashPersistenceOutcome::NotConfirmed {
+                pending_mutations: None,
+                failed_flushes: None,
+            };
+        }
+    };
+
+    session_guard.append_message(message);
+    if !save_enabled {
+        return BashPersistenceOutcome::Disabled;
+    }
+
+    if let Err(err) = session_guard.save().await {
+        let metrics = session_guard.autosave_metrics();
+        tracing::error!(
+            error = %err,
+            pending_mutations = metrics.pending_mutations,
+            failed_flushes = metrics.flush_failed,
+            "completed `!` bash command was retained in memory but its session save was not confirmed"
+        );
+        return BashPersistenceOutcome::NotConfirmed {
+            pending_mutations: Some(metrics.pending_mutations),
+            failed_flushes: Some(metrics.flush_failed),
+        };
+    }
+
+    BashPersistenceOutcome::Saved
+}
+
+async fn persist_bash_execution_bounded(
+    session: Arc<Mutex<Session>>,
+    message: SessionMessage,
+    save_enabled: bool,
+    cx: &Cx,
+) -> BashPersistenceOutcome {
+    asupersync::time::timeout(
+        asupersync::time::wall_now(),
+        BASH_COMPLETION_TIMEOUT,
+        persist_bash_execution(session, message, save_enabled, cx),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        tracing::error!("completed `!` bash command exceeded its persistence cleanup budget");
+        BashPersistenceOutcome::NotConfirmed {
+            pending_mutations: None,
+            failed_flushes: None,
+        }
+    })
+}
+
+async fn deliver_bash_result(
+    event_tx: &asupersync::channel::mpsc::Sender<PiMsg>,
+    cx: &Cx,
+    message: PiMsg,
+) {
+    if !crate::interactive::enqueue_pi_event(event_tx, cx, message).await {
+        tracing::error!("terminal bash result was not delivered before runtime shutdown");
+    }
+}
+
+fn spawn_bash_completion(
+    runtime_handle: &asupersync::runtime::RuntimeHandle,
+    event_tx: asupersync::channel::mpsc::Sender<PiMsg>,
+    persistence: Option<(Arc<Mutex<Session>>, SessionMessage, bool)>,
+    mut display: String,
+) {
+    if let Err(err) = runtime_handle.try_spawn_with_cx(move |completion_cx| async move {
+        if let Some((session, message, save_enabled)) = persistence {
+            let persistence =
+                persist_bash_execution_bounded(session, message, save_enabled, &completion_cx)
+                    .await;
+            if let Some(warning) = persistence.warning_text() {
+                display.push_str("\n\n");
+                display.push_str(&warning);
+            }
+        }
+        deliver_bash_result(&event_tx, &completion_cx, PiMsg::BashResult { display }).await;
+    }) {
+        tracing::error!(
+            error = %err,
+            "terminal bash completion could not be admitted by the runtime"
+        );
+    }
+}
+
+/// Commands handled by classic, including guidance for FrankenTUI-only features.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SlashCommand {
     Help,
@@ -18,6 +155,7 @@ pub enum SlashCommand {
     Clear,
     Model,
     Thinking,
+    Fast,
     ScopedModels,
     Exit,
     History,
@@ -37,9 +175,158 @@ pub enum SlashCommand {
     Reload,
     Template,
     Share,
+    Mcp,
+    Plan,
+    Goal,
+    Prewalk,
+    Advisor,
+    Checkpoint,
+    Rewind,
+    Fresh,
+    Retry,
+    Undo,
+    Redo,
+    Usage,
+    Approval,
+    Handoff,
+    Rules,
+    Omfg,
+    Commit,
+    Review,
+    AddDir,
+    RemoveDir,
+    Crash,
+    Btw,
+    Tan,
 }
 
 impl SlashCommand {
+    /// The spelling this command is written as in the help text and the
+    /// completion menu — the first alternative [`Self::parse`] accepts.
+    ///
+    /// Exhaustive on purpose. A new variant will not compile until it is named
+    /// here, and the tests below then force it into `/help` and the completion
+    /// menu. Four commands had reached users without either (`/checkpoint`,
+    /// `/rewind`, `/fresh`, `/retry`) and three more without a completion
+    /// (`/add-dir`, `/remove-dir`, `/crash`), because nothing connected the
+    /// parser to the two lists that advertise it.
+    ///
+    /// Adding a variant means adding it here AND to [`Self::ALL`].
+    #[must_use]
+    pub const fn canonical(self) -> &'static str {
+        match self {
+            Self::Help => "/help",
+            Self::Login => "/login",
+            Self::Logout => "/logout",
+            Self::Clear => "/clear",
+            Self::Model => "/model",
+            Self::Thinking => "/thinking",
+            Self::Fast => "/fast",
+            Self::ScopedModels => "/scoped-models",
+            Self::Exit => "/exit",
+            Self::History => "/history",
+            Self::Export => "/export",
+            Self::Session => "/session",
+            Self::Settings => "/settings",
+            Self::Theme => "/theme",
+            Self::Resume => "/resume",
+            Self::New => "/new",
+            Self::Copy => "/copy",
+            Self::Name => "/name",
+            Self::Hotkeys => "/hotkeys",
+            Self::Changelog => "/changelog",
+            Self::Tree => "/tree",
+            Self::Fork => "/fork",
+            Self::Compact => "/compact",
+            Self::Reload => "/reload",
+            Self::Template => "/template",
+            Self::Share => "/share",
+            Self::Mcp => "/mcp",
+            Self::Plan => "/plan",
+            Self::Goal => "/goal",
+            Self::Prewalk => "/prewalk",
+            Self::Advisor => "/advisor",
+            Self::Checkpoint => "/checkpoint",
+            Self::Rewind => "/rewind",
+            Self::Fresh => "/fresh",
+            Self::Retry => "/retry",
+            Self::Undo => "/undo",
+            Self::Redo => "/redo",
+            Self::Usage => "/usage",
+            Self::Approval => "/approval",
+            Self::Handoff => "/handoff",
+            Self::Review => "/review",
+            Self::Rules => "/rules",
+            Self::AddDir => "/add-dir",
+            Self::RemoveDir => "/remove-dir",
+            Self::Btw => "/btw",
+            Self::Tan => "/tan",
+            Self::Crash => "/crash",
+            Self::Omfg => "/omfg",
+            Self::Commit => "/commit",
+        }
+    }
+
+    /// Every slash command, so the help text and the completion menu can be
+    /// checked against the parser rather than against each other.
+    ///
+    /// Hand-kept, unavoidably: Rust cannot enumerate a plain enum. The
+    /// mitigation is that [`Self::canonical`] is exhaustive, so a new variant
+    /// stops the build at a doc comment that says to add it here too; and
+    /// `every_listed_command_parses_back_to_itself` catches a wrong entry.
+    /// A forgotten entry is the one mistake that still slips.
+    pub const ALL: &'static [Self] = &[
+        Self::Help,
+        Self::Login,
+        Self::Logout,
+        Self::Clear,
+        Self::Model,
+        Self::Thinking,
+        Self::Fast,
+        Self::ScopedModels,
+        Self::Exit,
+        Self::History,
+        Self::Export,
+        Self::Session,
+        Self::Settings,
+        Self::Theme,
+        Self::Resume,
+        Self::New,
+        Self::Copy,
+        Self::Name,
+        Self::Hotkeys,
+        Self::Changelog,
+        Self::Tree,
+        Self::Fork,
+        Self::Compact,
+        Self::Reload,
+        Self::Template,
+        Self::Share,
+        Self::Mcp,
+        Self::Plan,
+        Self::Goal,
+        Self::Prewalk,
+        Self::Advisor,
+        Self::Checkpoint,
+        Self::Rewind,
+        Self::Fresh,
+        Self::Retry,
+        Self::Undo,
+        Self::Redo,
+        Self::Usage,
+        Self::Approval,
+        Self::Handoff,
+        Self::Review,
+        Self::Rules,
+        Self::AddDir,
+        Self::RemoveDir,
+        Self::Btw,
+        Self::Tan,
+        Self::Crash,
+        Self::Omfg,
+        Self::Commit,
+    ];
+
     /// Parse a slash command from input.
     pub fn parse(input: &str) -> Option<(Self, &str)> {
         let input = input.trim();
@@ -54,8 +341,10 @@ impl SlashCommand {
             "/login" => Self::Login,
             "/logout" => Self::Logout,
             "/clear" | "/cls" => Self::Clear,
-            "/model" | "/m" => Self::Model,
-            "/thinking" | "/think" | "/t" => Self::Thinking,
+            // `/models` and `/effort` are OMP's spellings.
+            "/model" | "/m" | "/models" => Self::Model,
+            "/thinking" | "/think" | "/t" | "/effort" => Self::Thinking,
+            "/fast" => Self::Fast,
             "/scoped-models" | "/scoped" => Self::ScopedModels,
             "/exit" | "/quit" | "/q" => Self::Exit,
             "/history" | "/hist" => Self::History,
@@ -75,6 +364,29 @@ impl SlashCommand {
             "/reload" => Self::Reload,
             "/template" => Self::Template,
             "/share" => Self::Share,
+            "/mcp" => Self::Mcp,
+            "/plan" => Self::Plan,
+            "/goal" => Self::Goal,
+            "/prewalk" => Self::Prewalk,
+            "/advisor" => Self::Advisor,
+            "/checkpoint" | "/cp2" => Self::Checkpoint,
+            "/rewind" => Self::Rewind,
+            "/fresh" => Self::Fresh,
+            "/retry" => Self::Retry,
+            "/undo" => Self::Undo,
+            "/redo" => Self::Redo,
+            "/usage" => Self::Usage,
+            "/approval" => Self::Approval,
+            "/handoff" => Self::Handoff,
+            "/review" => Self::Review,
+            "/rules" => Self::Rules,
+            "/add-dir" => Self::AddDir,
+            "/remove-dir" => Self::RemoveDir,
+            "/btw" => Self::Btw,
+            "/tan" => Self::Tan,
+            "/crash" => Self::Crash,
+            "/omfg" => Self::Omfg,
+            "/commit" => Self::Commit,
             _ => return None,
         };
 
@@ -89,13 +401,14 @@ impl SlashCommand {
   /logout [provider] - Remove stored credentials
   /clear, /cls       - Clear conversation history
   /model, /m [id|provider/id] - Open model selector or switch directly
-  /thinking, /t [level] - Set thinking level (off/minimal/low/medium/high/xhigh)
+  /thinking, /t [level] - Set thinking level (off/minimal/low/medium/high/xhigh/max)
+  /fast [on|off|status|default|flex|scale|priority|ultrafast] - Select a supported serving tier
   /scoped-models [patterns|clear] - Show or set scoped models for cycling
   /history, /hist    - Show input history
   /export [path]     - Export conversation to HTML
   /session, /info    - Show session info (path, tokens, cost)
   /settings          - Open settings selector
-  /theme [name]      - List or switch themes (dark/light/custom)
+  /theme [name]      - List or switch themes (dark/light/auto/custom)
   /resume, /r        - Pick and resume a previous session
   /new               - Start a new session
   /copy, /cp         - Copy last assistant message to clipboard
@@ -104,10 +417,34 @@ impl SlashCommand {
   /changelog         - Show changelog entries
   /tree              - Show session branch tree summary
   /fork [id|index]   - Fork from a user message (default: last on current path)
-  /compact [notes]   - Compact older context with optional instructions
+  /compact [shake|aggressive] [notes] - Compact older context (shake: instant no-LLM tool-result dropping)
   /reload            - Reload skills/prompts from disk
   /template <name> [args] - Expand a prompt template by name
-  /share             - Upload session HTML to a secret GitHub gist and show URL
+  /share             - Upload current branch to an unlisted gist (not private; inspect sensitive context)
+  /mcp               - Manage MCP servers: list, add, remove, test, trust, reauth, unauth
+  /plan [approve|reject|off|status] - Enter plan mode / review a submitted plan
+  /goal              - Show goal-mode guidance (FrankenTUI only; unavailable in classic)
+  /prewalk [into]    - Arm a model handoff; restart [from] [into], status, off
+  /approval [always-ask|write|yolo|status] - Set or show tool approval mode
+  /handoff [focus]   - Compact context into a continuation brief in this session
+  /handoff --report [to] [path] - Generate or deliver a local session report
+  /rules [list|remove|toggle] - Manage time-traveling stream rules (TTSR)
+  /add-dir <dir>     - Grant access to an additional workspace root
+  /remove-dir <dir>  - Revoke an additional workspace root immediately
+  /crash [show|delete] - Inspect or clear redacted crash bundles
+  /btw <question>    - Ephemeral side question on the smol role (never persisted)
+  /tan <work>        - Run tangential work in a background task-role child
+  /omfg <complaint>  - Record user grievance and draft a candidate stream rule
+  /commit [dry-run|all|bead] - Create dependency-ordered atomic commits from changes
+  /review [target]   - Run prioritized code review on changes with ship verdict card
+  /advisor [status|pause|resume] - Manage the turn-review advisor model
+  /checkpoint, /cp2 [name] [note] - Mark a restore point on the current branch
+  /rewind [name]     - Collapse everything since a checkpoint into a summary
+  /fresh             - Reset provider stream state; the transcript is untouched
+  /retry             - Re-send the last user turn as a sibling branch
+  /undo [n] [force]  - Roll back the last n agent file edits (force: skip external-change guard)
+  /redo [n] [force]  - Re-apply previously undone file edits
+  /usage [refresh]   - Show provider usage/quota state
   /exit, /quit, /q   - Exit Pi
 
   Tips:
@@ -183,22 +520,18 @@ fn provider_has_dedicated_login_flow(provider: &str) -> bool {
 /// the callback server bound on this host. `PI_COPILOT_FORCE_DEVICE_FLOW=1`
 /// opts in unconditionally.
 ///
-/// Note: when `GITHUB_COPILOT_CLIENT_ID` is unset, *both* flows fail with the
-/// same actionable "set GITHUB_COPILOT_CLIENT_ID" error message (the device
-/// flow's error text is slightly better, but neither flow can succeed). We
-/// still route to device flow in that case so the user sees the more explicit
-/// hint, but the only real fix is to set the env var.
-fn should_use_copilot_device_flow() -> bool {
+/// When `GITHUB_COPILOT_CLIENT_ID` is unset we fall back to the well-known
+/// public Copilot client id (`crate::auth::DEFAULT_COPILOT_CLIENT_ID`), so both
+/// flows now succeed out of the box (#97). We still prefer the device flow when
+/// no client id is explicitly configured, since that path is the most robust on
+/// headless/SSH sessions where a localhost OAuth redirect can't be reached.
+pub(super) fn should_use_copilot_device_flow() -> bool {
     if std::env::var("PI_COPILOT_FORCE_DEVICE_FLOW")
-        .map(|v| matches!(v.as_str(), "1" | "true" | "yes"))
-        .unwrap_or(false)
+        .is_ok_and(|v| matches!(v.as_str(), "1" | "true" | "yes"))
     {
         return true;
     }
-    if std::env::var("GITHUB_COPILOT_CLIENT_ID")
-        .map(|v| v.trim().is_empty())
-        .unwrap_or(true)
-    {
+    if std::env::var("GITHUB_COPILOT_CLIENT_ID").map_or(true, |v| v.trim().is_empty()) {
         return true;
     }
     std::env::var_os("SSH_CONNECTION").is_some() || std::env::var_os("SSH_TTY").is_some()
@@ -282,6 +615,45 @@ pub(super) fn save_provider_credential(
     auth.set(canonical.clone(), credential);
 }
 
+/// Recheck the source session and cancellation after the network exchange.
+/// Keep the session guard in the blocking transaction so a newer login or
+/// session replacement cannot overtake a save that has already been admitted.
+async fn persist_login_credential(
+    session: Arc<Mutex<Session>>,
+    session_id: String,
+    auth_path: PathBuf,
+    provider: String,
+    credential: crate::auth::AuthCredential,
+    control: LoginAttemptControl,
+    cx: &Cx,
+) -> crate::error::Result<bool> {
+    let signal = control.signal();
+    let session_guard = match futures::future::select(
+        Box::pin(signal.wait()),
+        Box::pin(OwnedMutexGuard::lock(session, cx)),
+    )
+    .await
+    {
+        futures::future::Either::Left(_) => return Ok(false),
+        futures::future::Either::Right((result, _)) => result?,
+    };
+    asupersync::runtime::spawn_blocking(move || {
+        if session_guard.header.id != session_id || signal.is_aborted() {
+            return Ok(false);
+        }
+        // Read the latest store here, never before awaiting the provider.
+        let mut auth = crate::auth::AuthStorage::load(auth_path)?;
+        if !control.admit_save() {
+            return Ok(false);
+        }
+        save_provider_credential(&mut auth, &provider, credential);
+        let result = auth.save().map(|()| true);
+        drop(session_guard);
+        result
+    })
+    .await
+}
+
 pub(super) fn remove_provider_credentials(
     auth: &mut crate::auth::AuthStorage,
     requested_provider: &str,
@@ -358,17 +730,31 @@ fn format_provider_status(auth: &crate::auth::AuthStorage, provider: &str) -> St
     format_credential_status(&status)
 }
 
-fn collect_extension_oauth_providers(available_models: &[ModelEntry]) -> Vec<String> {
-    let mut providers: Vec<String> = available_models
+fn collect_extension_oauth_providers(
+    available_models: &[ModelEntry],
+    registered_extension_bindings: &[ExtensionProviderBinding],
+) -> Vec<String> {
+    let mut providers = registered_extension_bindings
         .iter()
-        .filter(|entry| entry.oauth_config.is_some())
-        .map(|entry| {
-            let provider = entry.model.provider.as_str();
+        .filter(|binding| binding.oauth_config.is_some())
+        .map(|binding| {
+            let provider = binding.provider.as_str();
             crate::provider_metadata::canonical_provider_id(provider)
                 .unwrap_or(provider)
                 .to_string()
         })
-        .collect();
+        .collect::<Vec<_>>();
+    providers.extend(
+        available_models
+            .iter()
+            .filter(|entry| entry.oauth_config.is_some())
+            .map(|entry| {
+                let provider = entry.model.provider.as_str();
+                crate::provider_metadata::canonical_provider_id(provider)
+                    .unwrap_or(provider)
+                    .to_string()
+            }),
+    );
 
     providers.retain(|provider| {
         !BUILTIN_LOGIN_PROVIDERS
@@ -380,20 +766,44 @@ fn collect_extension_oauth_providers(available_models: &[ModelEntry]) -> Vec<Str
     providers
 }
 
-fn extension_oauth_config_for_provider(
+pub(super) fn extension_oauth_config_for_provider(
     available_models: &[ModelEntry],
+    registered_extension_bindings: &[ExtensionProviderBinding],
     provider: &str,
 ) -> Option<crate::models::OAuthConfig> {
-    available_models.iter().find_map(|entry| {
-        let model_provider = entry.model.provider.as_str();
-        let canonical = crate::provider_metadata::canonical_provider_id(model_provider)
-            .unwrap_or(model_provider);
-        if canonical.eq_ignore_ascii_case(provider) {
-            entry.oauth_config.clone()
-        } else {
-            None
-        }
-    })
+    registered_extension_bindings
+        .iter()
+        .find_map(|binding| {
+            let registered_provider = binding.provider.as_str();
+            let canonical = crate::provider_metadata::canonical_provider_id(registered_provider)
+                .unwrap_or(registered_provider);
+            if canonical.eq_ignore_ascii_case(provider) {
+                binding.oauth_config.clone()
+            } else {
+                None
+            }
+        })
+        .or_else(|| {
+            available_models.iter().find_map(|entry| {
+                let model_provider = entry.model.provider.as_str();
+                let canonical = crate::provider_metadata::canonical_provider_id(model_provider)
+                    .unwrap_or(model_provider);
+                if canonical.eq_ignore_ascii_case(provider) {
+                    entry.oauth_config.clone()
+                } else {
+                    None
+                }
+            })
+        })
+}
+
+pub(super) fn registered_extension_provider_bindings(
+    extensions: Option<&ExtensionManager>,
+) -> crate::error::Result<Vec<ExtensionProviderBinding>> {
+    extensions.map_or_else(
+        || Ok(Vec::new()),
+        |manager| extension_provider_bindings(&manager.extension_providers()),
+    )
 }
 
 fn append_provider_rows(output: &mut String, heading: &str, rows: &[(String, String, String)]) {
@@ -427,6 +837,7 @@ fn append_provider_rows(output: &mut String, heading: &str, rows: &[(String, Str
 pub(super) fn format_login_provider_listing(
     auth: &crate::auth::AuthStorage,
     available_models: &[ModelEntry],
+    registered_extension_bindings: &[ExtensionProviderBinding],
 ) -> String {
     let mut output = String::from("Available login providers:\n\n");
 
@@ -457,7 +868,8 @@ pub(super) fn format_login_provider_listing(
     built_in_rows.extend(api_key_rows);
     append_provider_rows(&mut output, "Built-in", &built_in_rows);
 
-    let extension_providers = collect_extension_oauth_providers(available_models);
+    let extension_providers =
+        collect_extension_oauth_providers(available_models, registered_extension_bindings);
     if !extension_providers.is_empty() {
         let extension_rows: Vec<(String, String, String)> = extension_providers
             .iter()
@@ -517,8 +929,118 @@ pub fn strip_thinking_level_suffix(pattern: &str) -> &str {
         return pattern;
     };
     match suffix.to_ascii_lowercase().as_str() {
-        "off" | "minimal" | "low" | "medium" | "high" | "xhigh" => prefix,
+        "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" => prefix,
         _ => pattern,
+    }
+}
+
+/// Put `text` on the system clipboard, falling back to a private temp file,
+/// and return the sentence describing what happened.
+///
+/// Free rather than a `PiApp` method because the ftui stack runs the same
+/// `/copy` (bd-cv653): the feature gating, the 0600 fallback file and the
+/// exact wording of each outcome must not exist twice. The wording is the
+/// charmed stack's, unchanged, so the two stacks report a copy identically.
+pub fn copy_text_to_clipboard(text: &str) -> String {
+    fn write_fallback(text: &str) -> std::io::Result<std::path::PathBuf> {
+        use std::io::Write;
+        let dir = std::env::temp_dir();
+        let filename = format!("pi_copy_{}.txt", Utc::now().timestamp_millis());
+        // ubs:ignore filename is a literal plus a timestamp, never external input
+        let path = dir.join(filename);
+
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+
+        let mut file = options.open(&path)?;
+        file.write_all(text.as_bytes())?;
+
+        Ok(path)
+    }
+
+    // GH #242: under WSL without WSLg there is no display for arboard, but
+    // WSL puts Windows' clip.exe on PATH.
+    if running_under_wsl() && copy_via_clip_exe(text).is_ok() {
+        return String::from("Copied to clipboard");
+    }
+
+    #[cfg(feature = "clipboard")]
+    {
+        match ArboardClipboard::new().and_then(|mut clipboard| clipboard.set_text(text.to_string()))
+        {
+            Ok(()) => String::from("Copied to clipboard"),
+            Err(err) => match write_fallback(text) {
+                Ok(path) => format!(
+                    "Clipboard support is disabled or unavailable ({err}). Wrote to {}",
+                    path.display()
+                ),
+                Err(io_err) => format!(
+                    "Clipboard support is disabled or unavailable ({err}); also failed to write fallback file: {io_err}"
+                ),
+            },
+        }
+    }
+
+    #[cfg(not(feature = "clipboard"))]
+    {
+        match write_fallback(text) {
+            Ok(path) => format!("Clipboard support is disabled. Wrote to {}", path.display()),
+            Err(err) => {
+                format!("Clipboard support is disabled; failed to write fallback file: {err}")
+            }
+        }
+    }
+}
+
+/// Whether this process runs inside WSL (GH #242).
+pub fn running_under_wsl() -> bool {
+    wsl_detected(
+        std::env::var_os("WSL_DISTRO_NAME").is_some() || std::env::var_os("WSL_INTEROP").is_some(),
+        std::fs::read_to_string("/proc/sys/kernel/osrelease")
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn wsl_detected(wsl_env: bool, kernel_release: Option<&str>) -> bool {
+    wsl_env
+        || kernel_release.is_some_and(|release| release.to_ascii_lowercase().contains("microsoft"))
+}
+
+/// What `clip.exe` is fed: UTF-16LE with a byte-order mark. Plain UTF-8 is
+/// read in the console code page and garbles anything non-ASCII.
+fn clip_exe_payload(text: &str) -> Vec<u8> {
+    let mut bytes = vec![0xFF, 0xFE];
+    for unit in text.encode_utf16() {
+        bytes.extend_from_slice(&unit.to_le_bytes());
+    }
+    bytes
+}
+
+/// Put `text` on the Windows clipboard from inside WSL.
+pub fn copy_via_clip_exe(text: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let mut child = Command::new("clip.exe")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(&clip_exe_payload(text))?;
+    }
+    let status = child.wait()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!(
+            "clip.exe exited with {status}"
+        )))
     }
 }
 
@@ -531,12 +1053,12 @@ pub fn parse_scoped_model_patterns(args: &str) -> Vec<String> {
 }
 
 pub fn model_entry_matches(left: &ModelEntry, right: &ModelEntry) -> bool {
-    let left_provider = crate::provider_metadata::canonical_provider_id(&left.model.provider)
-        .unwrap_or(&left.model.provider);
-    let right_provider = crate::provider_metadata::canonical_provider_id(&right.model.provider)
-        .unwrap_or(&right.model.provider);
-
-    left_provider.eq_ignore_ascii_case(right_provider)
+    // Entries already carry their resolved provider identity. Canonicalizing
+    // them here hides separately declared providers from switching/cycling.
+    left.model
+        .provider
+        .trim()
+        .eq_ignore_ascii_case(right.model.provider.trim())
         && left.model.id.eq_ignore_ascii_case(&right.model.id)
 }
 
@@ -548,9 +1070,33 @@ pub(super) fn resolve_model_key_with_auth(
         .or_else(|| normalize_api_key_opt(entry.api_key.clone()))
 }
 
-pub(super) fn resolve_model_key_from_default_auth(entry: &ModelEntry) -> Option<String> {
+pub(super) fn load_runtime_auth(
+    cwd: &std::path::Path,
+) -> crate::error::Result<crate::auth::AuthStorage> {
     let auth_path = crate::config::Config::auth_path();
-    crate::auth::AuthStorage::load(auth_path)
+    let mut auth = crate::auth::AuthStorage::load(auth_path)?;
+    auth.set_command_working_directory(cwd)?;
+    Ok(auth)
+}
+
+pub(super) fn create_runtime_provider(
+    entry: &ModelEntry,
+    extensions: Option<&crate::extensions::ExtensionManager>,
+    cwd: &std::path::Path,
+) -> crate::error::Result<std::sync::Arc<dyn crate::provider::Provider>> {
+    // Match load_runtime_auth's file identity without requiring a successful
+    // read now. A provider-owned reload must retain the workspace even if the
+    // file was unavailable during model selection and becomes readable later.
+    let mut auth = crate::auth::AuthStorage::empty_at(crate::config::Config::auth_path());
+    auth.set_command_working_directory(cwd)?;
+    providers::create_provider_with_auth(entry, extensions, Some(&auth))
+}
+
+pub(super) fn resolve_model_key_from_default_auth(
+    entry: &ModelEntry,
+    cwd: &std::path::Path,
+) -> Option<String> {
+    load_runtime_auth(cwd)
         .ok()
         .and_then(|auth| resolve_model_key_with_auth(&auth, entry))
         .or_else(|| normalize_api_key_opt(entry.api_key.clone()))
@@ -613,63 +1159,6 @@ fn plan_session_thinking_sync(
         thinking_changed,
         persist_needed,
     }
-}
-
-fn parse_user_bash_event_result(value: &Value) -> Option<crate::tools::BashRunResult> {
-    let result = value
-        .as_object()
-        .map_or(value, |obj| obj.get("result").unwrap_or(value));
-    let obj = result.as_object()?;
-
-    let output = obj
-        .get("output")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
-    let exit_code = obj
-        .get("exitCode")
-        .and_then(Value::as_i64)
-        .or_else(|| obj.get("exit_code").and_then(Value::as_i64))
-        .unwrap_or(0);
-    let cancelled = obj
-        .get("cancelled")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let truncated = obj
-        .get("truncated")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let full_output_path = obj
-        .get("fullOutputPath")
-        .or_else(|| obj.get("full_output_path"))
-        .and_then(Value::as_str)
-        .map(ToString::to_string);
-    let cancellation = obj.get("cancellation").and_then(Value::as_object);
-    let cancellation_reason = cancellation
-        .and_then(|details| details.get("reason"))
-        .and_then(Value::as_str)
-        .and_then(|reason| match reason {
-            "timeout" => Some(crate::tools::BashCancellationReason::Timeout),
-            "ambient_cancellation" => {
-                Some(crate::tools::BashCancellationReason::AmbientCancellation)
-            }
-            _ => None,
-        });
-    let timeout_ms = cancellation
-        .and_then(|details| details.get("timeoutMs"))
-        .or_else(|| obj.get("timeoutMs"))
-        .and_then(Value::as_u64);
-
-    Some(crate::tools::BashRunResult {
-        output,
-        exit_code: i32::try_from(exit_code).unwrap_or(0),
-        cancelled,
-        cancellation_reason,
-        timeout_ms,
-        truncated,
-        full_output_path,
-        truncation: None,
-    })
 }
 
 pub fn resolve_scoped_model_entries(
@@ -819,10 +1308,41 @@ fn build_reload_diagnostics(
     }
 }
 
+/// Expand a leading `~`/`~/` to `$HOME` for /add-dir and /remove-dir.
+/// `Path::join` on an absolute component replaces the base, so the slash
+/// must be stripped before joining.
+fn expand_home_path(raw: &str) -> std::path::PathBuf {
+    let Ok(home) = std::env::var("HOME") else {
+        return std::path::PathBuf::from(raw);
+    };
+    if raw == "~" {
+        return std::path::PathBuf::from(home);
+    }
+    raw.strip_prefix("~/").map_or_else(
+        || std::path::PathBuf::from(raw),
+        |rest| std::path::PathBuf::from(home).join(rest),
+    )
+}
+
 impl PiApp {
+    /// Thinking level for a session started with `/new`: the configured
+    /// default clamped to the current model, exactly as launch resolution
+    /// does (issue #197 — this used to be hard-coded to `Off`, so a
+    /// `defaultThinkingLevel: max` setup showed "[thinking: off]" after
+    /// every `/new` even though thinking still ran).
+    pub(super) fn new_session_thinking_level(&self) -> ThinkingLevel {
+        let configured = self
+            .config
+            .default_thinking_level
+            .as_deref()
+            .and_then(|level| level.parse::<ThinkingLevel>().ok());
+        self.model_entry
+            .clamp_thinking_level(configured.unwrap_or(ThinkingLevel::XHigh))
+    }
+
     pub(super) fn sync_active_provider_credentials(&mut self, changed_provider: &str) {
         let changed_canonical = normalize_auth_provider_input(changed_provider);
-        let auth = match crate::auth::AuthStorage::load(crate::config::Config::auth_path()) {
+        let auth = match load_runtime_auth(&self.cwd) {
             Ok(auth) => auth,
             Err(err) => {
                 tracing::warn!(
@@ -834,6 +1354,10 @@ impl PiApp {
                 return;
             }
         };
+        let adopted_runtime_key = self.agent.try_lock().ok().map(|mut agent| {
+            agent.handle.adopt_auth_storage(auth.clone());
+            agent.stream_options().api_key.clone()
+        });
 
         let provider_matches_changed =
             |provider: &str| normalize_auth_provider_input(provider) == changed_canonical;
@@ -852,16 +1376,10 @@ impl PiApp {
             .and_then(|entry| normalize_api_key_opt(entry.api_key.clone()))
             .or_else(|| normalize_api_key_opt(self.model_entry.api_key.clone()));
 
-        let resolved_key_opt =
+        let resolved_key_opt = adopted_runtime_key.unwrap_or_else(|| {
             normalize_api_key_opt(auth.resolve_api_key(&changed_canonical, None))
-                .or(fallback_inline_key);
-
-        if let Ok(mut agent_guard) = self.agent.try_lock() {
-            agent_guard
-                .stream_options_mut()
-                .api_key
-                .clone_from(&resolved_key_opt);
-        }
+                .or(fallback_inline_key)
+        });
 
         self.model_entry.api_key.clone_from(&resolved_key_opt);
         if let Ok(mut shared_entry) = self.model_entry_shared.lock() {
@@ -940,8 +1458,11 @@ impl PiApp {
         }
 
         let resolved_key_opt = resolved_key_for(&next);
-        let provider_impl = match crate::providers::create_provider(&next, self.extensions.as_ref())
-        {
+        let provider_impl = match crate::providers::create_provider_with_auth(
+            &next,
+            self.extensions.as_ref(),
+            Some(auth),
+        ) {
             Ok(p) => p,
             Err(err) => {
                 self.status_message = Some(format!("Auto-switch failed: {err}"));
@@ -982,6 +1503,11 @@ impl PiApp {
         let Ok(mut agent_guard) = self.agent.try_lock() else {
             return Err("Agent busy; try again".to_string());
         };
+        agent_guard
+            .handle
+            .session()
+            .ensure_provider_reentry_allowed()
+            .map_err(|error| error.to_string())?;
         let Ok(mut session_guard) = self.session.try_lock() else {
             return Err("Session busy; try again".to_string());
         };
@@ -994,11 +1520,36 @@ impl PiApp {
         let next_thinking = next.clamp_thinking_level(current_thinking);
         let previous_thinking = session_thinking_level(&session_guard);
 
+        agent_guard
+            .handle
+            .session_mut()
+            .invalidate_background_compaction();
         agent_guard.set_provider(provider_impl);
+        agent_guard.set_tool_call_dialect(next.tool_call_dialect());
+        agent_guard.set_keyword_model(next);
+        agent_guard.set_model_accepts_images(
+            next.model
+                .input
+                .contains(&crate::provider::InputType::Image),
+        );
         let stream_options = agent_guard.stream_options_mut();
         stream_options.api_key.clone_from(&resolved_key_opt);
         stream_options.headers.clone_from(&next.headers);
+        // Pick up the new model's configured output cap so an interactive
+        // model switch honors its registry `maxTokens` instead of carrying
+        // over the previous model's limit.
+        stream_options.max_tokens = Some(next.model.max_tokens);
         stream_options.thinking_level = Some(next_thinking);
+        if next.model.context_window > 0 {
+            agent_guard
+                .handle
+                .session_mut()
+                .set_compaction_context_window(next.model.context_window);
+        }
+        agent_guard
+            .handle
+            .session()
+            .refresh_extension_completion_host_state();
 
         session_guard.header.provider = Some(next.model.provider.clone());
         session_guard.header.model_id = Some(next.model.id.clone());
@@ -1030,6 +1581,13 @@ impl PiApp {
         let Some(manager) = self.extensions.clone() else {
             return;
         };
+        // gh #167: bump the ctx generation before dispatching so the
+        // model_select handler (and every later event) sees the fresh
+        // ctx.model instead of a payload cached for the previous model.
+        manager.set_current_model(
+            Some(next.model.provider.clone()),
+            Some(next.model.id.clone()),
+        );
         let runtime_handle = self.runtime_handle.clone();
         let source = match source {
             "selector" | "command" => "set",
@@ -1048,32 +1606,42 @@ impl PiApp {
         });
     }
 
+    #[allow(clippy::too_many_lines)]
     pub(super) fn sync_runtime_selection_from_session_header(&mut self) -> Result<(), String> {
         let previous_entry = self.model_entry.clone();
         let Ok(mut agent_guard) = self.agent.try_lock() else {
             return Err("Agent busy; try again".to_string());
         };
+        agent_guard
+            .handle
+            .session()
+            .ensure_provider_reentry_allowed()
+            .map_err(|error| error.to_string())?;
         let Ok(mut session_guard) = self.session.try_lock() else {
             return Err("Session busy; try again".to_string());
         };
 
         let session_model = session_guard.effective_model_for_current_path();
         let session_thinking = session_guard.effective_thinking_level_for_current_path();
+        let catalog = agent_guard.handle.session().model_registry().map_or(
+            self.available_models.as_slice(),
+            crate::models::ModelRegistry::models,
+        );
 
         let (target_entry, sync_model) = match session_model.as_ref() {
             Some((provider, model_id)) => {
-                if provider_ids_match(&self.model_entry.model.provider, provider)
+                if self
+                    .model_entry
+                    .model
+                    .provider
+                    .trim()
+                    .eq_ignore_ascii_case(provider.trim())
                     && self.model_entry.model.id.eq_ignore_ascii_case(model_id)
                 {
                     (self.model_entry.clone(), true)
                 } else {
                     (
-                        self.available_models
-                            .iter()
-                            .find(|entry| {
-                                provider_ids_match(&entry.model.provider, provider)
-                                    && entry.model.id.eq_ignore_ascii_case(model_id)
-                            })
+                        find_model_entry(catalog, provider, model_id)
                             .cloned()
                             .ok_or_else(|| {
                                 format!("Unable to switch provider/model to {provider}/{model_id}")
@@ -1097,15 +1665,23 @@ impl PiApp {
 
         let provider = agent_guard.provider();
         let runtime_matches_target =
-            provider_ids_match(provider.name(), &target_entry.model.provider)
-                && provider
-                    .model_id()
-                    .eq_ignore_ascii_case(&target_entry.model.id);
+            find_model_entry(catalog, provider.name(), provider.model_id()).map_or_else(
+                || {
+                    provider
+                        .name()
+                        .trim()
+                        .eq_ignore_ascii_case(target_entry.model.provider.trim())
+                        && provider
+                            .model_id()
+                            .eq_ignore_ascii_case(&target_entry.model.id)
+                },
+                |entry| model_entry_matches(entry, &target_entry),
+            );
         if !runtime_matches_target {
             let resolved_key_opt = target_entry
                 .api_key
                 .clone()
-                .or_else(|| resolve_model_key_from_default_auth(&target_entry));
+                .or_else(|| resolve_model_key_from_default_auth(&target_entry, &self.cwd));
             if model_requires_configured_credential(&target_entry) && resolved_key_opt.is_none() {
                 return Err(format!(
                     "Missing credentials for provider {}. Run /login {}.",
@@ -1113,14 +1689,45 @@ impl PiApp {
                 ));
             }
 
-            let provider_impl = providers::create_provider(&target_entry, self.extensions.as_ref())
-                .map_err(|err| err.to_string())?;
+            let provider_impl =
+                create_runtime_provider(&target_entry, self.extensions.as_ref(), &self.cwd)
+                    .map_err(|err| err.to_string())?;
+            agent_guard
+                .handle
+                .session_mut()
+                .invalidate_background_compaction();
             agent_guard.set_provider(provider_impl);
             let stream_options = agent_guard.stream_options_mut();
             stream_options.api_key.clone_from(&resolved_key_opt);
             stream_options.headers.clone_from(&target_entry.headers);
+            // Pick up the new model's configured output cap so an interactive
+            // model switch honors its registry `maxTokens` instead of carrying
+            // over the previous model's limit.
+            stream_options.max_tokens = Some(target_entry.model.max_tokens);
         }
+        agent_guard.set_keyword_model(&target_entry);
+        agent_guard.set_tool_call_dialect(target_entry.tool_call_dialect());
+        agent_guard.set_model_accepts_images(
+            target_entry
+                .model
+                .input
+                .contains(&crate::provider::InputType::Image),
+        );
         agent_guard.stream_options_mut().thinking_level = Some(thinking_sync.effective);
+        if target_entry.model.context_window > 0 {
+            agent_guard
+                .handle
+                .session_mut()
+                .set_compaction_context_window(target_entry.model.context_window);
+        } else {
+            // A catalog refresh can retain the same provider/model identity
+            // while withdrawing its window metadata, without set_provider.
+            agent_guard.set_context_window_tokens(None);
+        }
+        agent_guard
+            .handle
+            .session()
+            .refresh_extension_completion_host_state();
         drop(agent_guard);
 
         let persist_needed = if thinking_sync.persist_needed {
@@ -1159,12 +1766,81 @@ impl PiApp {
         Ok(())
     }
 
+    /// Retiring the UI owner cancels network work and drops the callback
+    /// server. Workers cannot prolong the listener's lifetime.
+    pub(super) fn retire_login(&mut self) -> bool {
+        let attempt = self.login_attempt.take();
+        let pending = self.pending_oauth.take();
+        let retired = attempt.is_some() || pending.is_some();
+        drop(attempt);
+        if retired {
+            self.input.reset();
+            self.input_mode = InputMode::SingleLine;
+            self.set_input_height(3);
+            self.agent_state = AgentState::Idle;
+            self.input.focus();
+        }
+        retired
+    }
+
+    pub(super) fn begin_login_attempt(&mut self, auth_path: &Path) -> Option<String> {
+        self.retire_login();
+        let session_id = if let Ok(session) = self.session.try_lock() {
+            session.header.id.clone()
+        } else {
+            self.status_message = Some("Session busy; try login again".to_string());
+            return None;
+        };
+        let attempt = LoginAttempt::new(session_id, auth_path.to_path_buf());
+        let id = attempt.id.clone();
+        self.login_attempt = Some(attempt);
+        Some(id)
+    }
+
+    pub(super) fn login_callback_poll_cmd(attempt_id: String) -> Cmd {
+        Cmd::blocking(move || {
+            std::thread::sleep(std::time::Duration::from_millis(25));
+            Message::new(PiMsg::OAuthCallbackPoll { attempt_id })
+        })
+    }
+
     #[allow(clippy::too_many_lines)]
     pub(super) fn submit_oauth_code(
         &mut self,
         code_input: &str,
         pending: PendingOAuth,
     ) -> Option<Cmd> {
+        let Some(attempt) = self.login_attempt.as_mut() else {
+            return None;
+        };
+        if attempt.submitting {
+            self.status_message = Some("Login is still running; Escape cancels it".to_string());
+            return None;
+        }
+        let current_session = self
+            .session
+            .try_lock()
+            .ok()
+            .map(|session| session.header.id == attempt.session_id);
+        match current_session {
+            Some(true) => {}
+            Some(false) => {
+                self.retire_login();
+                return None;
+            }
+            None => {
+                self.status_message = Some("Session busy; submit login again".to_string());
+                return None;
+            }
+        }
+        attempt.submitting = true;
+        // A manual code and a browser redirect must never race a second exchange.
+        attempt.callback = None;
+        let attempt_id = attempt.id.clone();
+        let session_id = attempt.session_id.clone();
+        let auth_path = attempt.auth_path.clone();
+        let control = attempt.control.clone();
+        let session = Arc::clone(&self.session);
         // Do not store OAuth codes in history or session.
         self.input.reset();
         self.input_mode = InputMode::SingleLine;
@@ -1174,205 +1850,56 @@ impl PiApp {
         self.scroll_to_bottom();
 
         let event_tx = self.event_tx.clone();
-        let PendingOAuth {
-            provider,
-            kind,
-            verifier,
-            oauth_config,
-            device_code,
-            redirect_uri,
-        } = pending;
         let code_input = code_input.to_string();
 
         let runtime_handle = self.runtime_handle.clone();
         let task_cx = Cx::current().unwrap_or_else(Cx::for_request);
         runtime_handle.spawn(async move {
-            let auth_path = crate::config::Config::auth_path();
-            let mut auth = match crate::auth::AuthStorage::load_async(auth_path).await {
-                Ok(a) => a,
-                Err(e) => {
-                    let _ = crate::interactive::enqueue_pi_event(
-                        &event_tx,
-                        &task_cx,
-                        PiMsg::AgentError(e.to_string()),
-                    )
-                    .await;
-                    return;
-                }
+            let provider = pending.provider.clone();
+            let signal = control.signal();
+            let credential = match futures::future::select(
+                Box::pin(signal.wait()),
+                Box::pin(super::login_flow::obtain_credential(&pending, &code_input)),
+            )
+            .await
+            {
+                futures::future::Either::Left(_) => return,
+                futures::future::Either::Right((result, _)) => result,
             };
-
-            let credential = match kind {
-                PendingLoginKind::ApiKey => normalize_api_key_input(&code_input)
-                    .map(|key| crate::auth::AuthCredential::ApiKey { key })
-                    .map_err(crate::error::Error::auth),
-                PendingLoginKind::OAuth => {
-                    if provider == "anthropic" {
-                        Box::pin(crate::auth::complete_anthropic_oauth(
-                            &code_input,
-                            &verifier,
-                        ))
-                        .await
-                    } else if provider == "openai-codex" {
-                        Box::pin(crate::auth::complete_openai_codex_oauth(
-                            &code_input,
-                            &verifier,
-                        ))
-                        .await
-                    } else if provider == "google-gemini-cli" {
-                        Box::pin(crate::auth::complete_google_gemini_cli_oauth(
-                            &code_input,
-                            &verifier,
-                        ))
-                        .await
-                    } else if provider == "google-antigravity" {
-                        Box::pin(crate::auth::complete_google_antigravity_oauth(
-                            &code_input,
-                            &verifier,
-                        ))
-                        .await
-                    } else if provider == "github-copilot" || provider == "copilot" {
-                        let client_id =
-                            std::env::var("GITHUB_COPILOT_CLIENT_ID").unwrap_or_default();
-                        let copilot_config = crate::auth::CopilotOAuthConfig {
-                            client_id,
-                            ..crate::auth::CopilotOAuthConfig::default()
-                        };
-                        Box::pin(crate::auth::complete_copilot_browser_oauth(
-                            &copilot_config,
-                            &code_input,
-                            &verifier,
-                            redirect_uri.as_deref(),
-                        ))
-                        .await
-                    } else if provider == "gitlab" || provider == "gitlab-duo" {
-                        let client_id = std::env::var("GITLAB_CLIENT_ID").unwrap_or_default();
-                        let base_url = std::env::var("GITLAB_BASE_URL")
-                            .unwrap_or_else(|_| "https://gitlab.com".to_string());
-                        let gitlab_config = crate::auth::GitLabOAuthConfig {
-                            client_id,
-                            base_url,
-                            ..crate::auth::GitLabOAuthConfig::default()
-                        };
-                        let gitlab_redirect_uri = redirect_uri
-                            .clone()
-                            .or_else(|| oauth_config.as_ref().and_then(|c| c.redirect_uri.clone()));
-                        Box::pin(crate::auth::complete_gitlab_oauth(
-                            &gitlab_config,
-                            &code_input,
-                            &verifier,
-                            gitlab_redirect_uri.as_deref(),
-                        ))
-                        .await
-                    } else if let Some(config) = &oauth_config {
-                        Box::pin(crate::auth::complete_extension_oauth(
-                            config,
-                            &code_input,
-                            &verifier,
-                        ))
-                        .await
-                    } else {
-                        Err(crate::error::Error::auth(format!(
-                            "OAuth provider not supported: {provider}"
-                        )))
-                    }
-                }
-                PendingLoginKind::DeviceFlow => match device_code {
-                    Some(dc) => {
-                        let poll_result = if provider == "kimi-for-coding" {
-                            Box::pin(crate::auth::poll_kimi_code_device_flow(&dc)).await
-                        } else if provider == "github-copilot" || provider == "copilot" {
-                            let client_id =
-                                std::env::var("GITHUB_COPILOT_CLIENT_ID").unwrap_or_default();
-                            let copilot_config = crate::auth::CopilotOAuthConfig {
-                                client_id,
-                                ..crate::auth::CopilotOAuthConfig::default()
-                            };
-                            Box::pin(crate::auth::poll_copilot_device_flow(&copilot_config, &dc))
-                                .await
-                        } else {
-                            crate::auth::DeviceFlowPollResult::Error(format!(
-                                "Device flow polling not supported for {provider}"
-                            ))
-                        };
-                        match poll_result {
-                            crate::auth::DeviceFlowPollResult::Success(cred) => Ok(cred),
-                            crate::auth::DeviceFlowPollResult::Error(e) => {
-                                Err(crate::error::Error::auth(e))
-                            }
-                            crate::auth::DeviceFlowPollResult::Expired => {
-                                Err(crate::error::Error::auth(format!(
-                                    "Device code expired for {provider}. Run /login {provider} again."
-                                )))
-                            }
-                            crate::auth::DeviceFlowPollResult::AccessDenied => {
-                                Err(crate::error::Error::auth(format!(
-                                    "Access denied for {provider}."
-                                )))
-                            }
-                            crate::auth::DeviceFlowPollResult::Pending => {
-                                Err(crate::error::Error::auth(format!(
-                                    "Authorization for {provider} is still pending. Complete the browser step and submit again."
-                                )))
-                            }
-                            crate::auth::DeviceFlowPollResult::SlowDown => {
-                                Err(crate::error::Error::auth(format!(
-                                    "Authorization server asked to slow down for {provider}. Wait a few seconds and submit again."
-                                )))
-                            }
-                        }
-                    }
-                    None => Err(crate::error::Error::auth(
-                        "Device flow missing device_code".to_string(),
-                    )),
-                },
-            };
-
             let credential = match credential {
                 Ok(c) => c,
-                Err(e) => {
+                Err((retry, error)) => {
                     let _ = crate::interactive::enqueue_pi_event(
                         &event_tx,
                         &task_cx,
-                        PiMsg::AgentError(e.to_string()),
+                        PiMsg::LoginFinished {
+                            attempt_id,
+                            error: Some(error.to_string()),
+                            retry,
+                        },
                     )
                     .await;
                     return;
                 }
             };
 
-            save_provider_credential(&mut auth, &provider, credential);
-            if let Err(e) = auth.save_async().await {
-                let _ = crate::interactive::enqueue_pi_event(
-                    &event_tx,
-                    &task_cx,
-                    PiMsg::AgentError(e.to_string()),
-                )
-                .await;
-                return;
-            }
-            let _ = crate::interactive::enqueue_pi_event(
-                &event_tx,
-                &task_cx,
-                PiMsg::CredentialUpdated {
-                    provider: provider.clone(),
-                },
+            let error = match persist_login_credential(
+                session, session_id, auth_path, provider, credential, control, &task_cx,
             )
-            .await;
-
-            let status = match kind {
-                PendingLoginKind::ApiKey => {
-                    format!("API key saved for {provider}. Credentials saved to auth.json.")
-                }
-                PendingLoginKind::OAuth | PendingLoginKind::DeviceFlow => {
-                    format!(
-                        "OAuth login successful for {provider}. Credentials saved to auth.json."
-                    )
-                }
+            .await
+            {
+                Ok(true) => None,
+                Ok(false) => return,
+                Err(error) => Some(error.to_string()),
             };
             let _ = crate::interactive::enqueue_pi_event(
                 &event_tx,
                 &task_cx,
-                PiMsg::System(status),
+                PiMsg::LoginFinished {
+                    attempt_id,
+                    error,
+                    retry: false,
+                },
             )
             .await;
         });
@@ -1405,32 +1932,21 @@ impl PiApp {
         let session = Arc::clone(&self.session);
         let save_enabled = self.save_enabled;
         let cwd = self.cwd.clone();
-        let cwd_display = cwd.display().to_string();
         let shell_path = self.config.shell_path.clone();
         let command_prefix = self.config.shell_command_prefix.clone();
         let extensions = self.extensions.clone();
         let runtime_handle = self.runtime_handle.clone();
-        let task_cx = Cx::current().unwrap_or_else(Cx::for_request);
+        let completion_runtime_handle = runtime_handle.clone();
 
-        runtime_handle.spawn(async move {
-            let mut override_result = None;
-            if let Some(manager) = extensions {
-                let response = manager
-                    .dispatch_event_with_response(
-                        ExtensionEventName::UserBash,
-                        Some(json!({
-                            "command": command.clone(),
-                            "excludeFromContext": exclude_from_context,
-                            "cwd": cwd_display,
-                        })),
-                        EXTENSION_EVENT_TIMEOUT_MS,
-                    )
-                    .await
-                    .unwrap_or(None);
-                if let Some(value) = response {
-                    override_result = parse_user_bash_event_result(&value);
+        runtime_handle.spawn_with_cx(move |_command_cx| async move {
+            let override_result = match extensions {
+                Some(manager) => {
+                    manager
+                        .dispatch_user_bash(&command, exclude_from_context, &cwd)
+                        .await
                 }
-            }
+                None => None,
+            };
 
             let result = match override_result {
                 Some(result) => Ok(result),
@@ -1446,10 +1962,9 @@ impl PiApp {
                     .await
                 }
             };
-
             match result {
                 Ok(result) => {
-                    let display = bash_execution_to_text(
+                    let mut display = bash_execution_to_text(
                         &command,
                         &result.output,
                         result.exit_code,
@@ -1458,63 +1973,38 @@ impl PiApp {
                         result.full_output_path.as_deref(),
                     );
 
+                    // OMP's bash runner records the run and starts no turn:
+                    // `!` output reaches the model with the next prompt, and
+                    // `!!` output is kept in the session but never sent.
+                    let mut extra = HashMap::new();
                     if exclude_from_context {
-                        let mut extra = HashMap::new();
                         extra.insert("excludeFromContext".to_string(), Value::Bool(true));
-
-                        let bash_message = SessionMessage::BashExecution {
-                            command: command.clone(),
-                            output: result.output.clone(),
-                            exit_code: result.exit_code,
-                            cancelled: Some(result.cancelled),
-                            truncated: Some(result.truncated),
-                            full_output_path: result.full_output_path.clone(),
-                            timestamp: Some(Utc::now().timestamp_millis()),
-                            extra,
-                        };
-
-                        if let Ok(mut session_guard) = session.lock(&task_cx).await {
-                            session_guard.append_message(bash_message);
-                            if save_enabled {
-                                let _ = session_guard.save().await;
-                            }
-                        }
-
-                        let mut display = display;
                         display.push_str("\n\n[Output excluded from model context]");
-                        let _ = crate::interactive::enqueue_pi_event(
-                            &event_tx,
-                            &task_cx,
-                            PiMsg::BashResult {
-                                display,
-                                content_for_agent: None,
-                            },
-                        )
-                        .await;
-                    } else {
-                        let content_for_agent =
-                            vec![ContentBlock::Text(TextContent::new(display.clone()))];
-                        let _ = crate::interactive::enqueue_pi_event(
-                            &event_tx,
-                            &task_cx,
-                            PiMsg::BashResult {
-                                display,
-                                content_for_agent: Some(content_for_agent),
-                            },
-                        )
-                        .await;
                     }
+                    let bash_message = SessionMessage::BashExecution {
+                        command: command.clone(),
+                        output: result.output,
+                        exit_code: result.exit_code,
+                        cancelled: Some(result.cancelled),
+                        truncated: Some(result.truncated),
+                        full_output_path: result.full_output_path,
+                        timestamp: Some(Utc::now().timestamp_millis()),
+                        extra,
+                    };
+                    spawn_bash_completion(
+                        &completion_runtime_handle,
+                        event_tx.clone(),
+                        Some((Arc::clone(&session), bash_message, save_enabled)),
+                        display,
+                    );
                 }
                 Err(err) => {
-                    let _ = crate::interactive::enqueue_pi_event(
-                        &event_tx,
-                        &task_cx,
-                        PiMsg::BashResult {
-                            display: format!("Bash command failed: {err}"),
-                            content_for_agent: None,
-                        },
-                    )
-                    .await;
+                    spawn_bash_completion(
+                        &completion_runtime_handle,
+                        event_tx,
+                        None,
+                        format!("Bash command failed: {err}"),
+                    );
                 }
             }
         });
@@ -1546,7 +2036,9 @@ impl PiApp {
             };
             let _ = writeln!(output, "{marker}{name}");
         }
-        output.push_str("\nUse /theme <name> to switch");
+        output.push_str(
+            "\nUse /theme <name> to switch, or /theme auto to match the terminal background",
+        );
         output
     }
 
@@ -1646,7 +2138,7 @@ impl PiApp {
         let mut info = format!(
             "Session info:\n  file: {file}\n  id: {id}\n  name: {name}\n  model: {model}\n  thinking: {thinking}\n  messageCount: {message_count}\n  tokens: {total_tokens}\n  cost: {cost_str}",
             id = session.header.id,
-            model = self.model,
+            model = session_model_line(&self.model_entry),
         );
         info.push_str("\n\n");
         info.push_str(&self.frame_timing.summary());
@@ -1658,6 +2150,7 @@ impl PiApp {
     /// Handle a slash command.
     #[allow(clippy::too_many_lines)]
     pub(super) fn handle_slash_command(&mut self, cmd: SlashCommand, args: &str) -> Option<Cmd> {
+        self.retire_login();
         // Clear input
         self.input.reset();
 
@@ -1670,6 +2163,26 @@ impl PiApp {
                     collapsed: false,
                 });
                 self.scroll_to_last_match("Available commands:");
+                None
+            }
+            SlashCommand::Goal => {
+                let guidance = if cfg!(feature = "ftui") {
+                    "Goal mode is unavailable in the classic interface. Quit and start \
+                     `pi --ftui`, then enter `/goal status`."
+                } else {
+                    "Goal mode requires FrankenTUI. This binary was built without \
+                     FrankenTUI; use a Pi build that includes it."
+                };
+                self.messages.push(ConversationMessage {
+                    role: MessageRole::System,
+                    content: format!(
+                        "{guidance}\nGuide: https://github.com/Dicklesworthstone/\
+                         pi_agent_rust/blob/main/docs/goal-mode.md"
+                    ),
+                    thinking: None,
+                    collapsed: false,
+                });
+                self.scroll_to_bottom();
                 None
             }
             SlashCommand::Login => self.handle_slash_login(args),
@@ -1689,6 +2202,7 @@ impl PiApp {
             }
             SlashCommand::Model => self.handle_slash_model(args),
             SlashCommand::Thinking => self.handle_slash_thinking(args),
+            SlashCommand::Fast => self.handle_slash_fast(args),
             SlashCommand::ScopedModels => self.handle_slash_scoped_models(args),
             SlashCommand::Exit => Some(self.quit_cmd()),
             SlashCommand::History => {
@@ -1721,13 +2235,12 @@ impl PiApp {
                     (output_path, html)
                 };
 
-                if let Some(parent) = output_path.parent() {
-                    if !parent.as_os_str().is_empty() {
-                        if let Err(err) = std::fs::create_dir_all(parent) {
-                            self.status_message = Some(format!("Failed to create dir: {err}"));
-                            return None;
-                        }
-                    }
+                if let Some(parent) = output_path.parent()
+                    && !parent.as_os_str().is_empty()
+                    && let Err(err) = std::fs::create_dir_all(parent)
+                {
+                    self.status_message = Some(format!("Failed to create dir: {err}"));
+                    return None;
                 }
                 if let Err(err) = std::fs::write(&output_path, html) {
                     self.status_message = Some(format!("Failed to write export: {err}"));
@@ -1786,12 +2299,17 @@ impl PiApp {
                     return None;
                 }
 
+                let is_auto_spec = name.eq_ignore_ascii_case("light/dark")
+                    || name.eq_ignore_ascii_case("auto")
+                    || name.eq_ignore_ascii_case("system");
                 let theme = if name.eq_ignore_ascii_case("dark") {
                     Theme::dark()
                 } else if name.eq_ignore_ascii_case("light") {
                     Theme::light()
                 } else if name.eq_ignore_ascii_case("solarized") {
                     Theme::solarized()
+                } else if is_auto_spec {
+                    Theme::detected()
                 } else {
                     match Theme::load_by_name(name, &self.cwd) {
                         Ok(theme) => theme,
@@ -1804,22 +2322,34 @@ impl PiApp {
 
                 let theme_name = theme.name.clone();
                 self.apply_theme(theme);
-                self.config.theme = Some(theme_name.clone());
+                // Persist auto specs as typed so future sessions keep
+                // re-detecting instead of pinning today's detected theme.
+                let persisted_spec = if is_auto_spec {
+                    name.to_ascii_lowercase()
+                } else {
+                    theme_name.clone()
+                };
+                self.config.theme = Some(persisted_spec.clone());
+                let display_name = if is_auto_spec {
+                    format!("{persisted_spec} (detected: {theme_name})")
+                } else {
+                    theme_name
+                };
 
-                if let Err(err) = self.persist_project_theme(&theme_name) {
+                if let Err(err) = self.persist_project_theme(&persisted_spec) {
                     tracing::warn!("Failed to persist theme preference: {err}");
                     self.status_message = Some(format!(
-                        "Switched to theme: {theme_name} (not saved: {err})"
+                        "Switched to theme: {display_name} (not saved: {err})"
                     ));
                 } else {
-                    self.status_message = Some(format!("Switched to theme: {theme_name}"));
+                    self.status_message = Some(format!("Switched to theme: {display_name}"));
                 }
 
                 None
             }
             SlashCommand::Resume => {
-                if self.agent_state != AgentState::Idle {
-                    self.status_message = Some("Cannot resume while processing".to_string());
+                if let Some(reason) = self.session_transition_blocker() {
+                    self.status_message = Some(reason.to_string());
                     return None;
                 }
 
@@ -1845,28 +2375,39 @@ impl PiApp {
                 None
             }
             SlashCommand::New => {
-                if self.agent_state != AgentState::Idle {
-                    self.status_message =
-                        Some("Cannot start a new session while processing".to_string());
+                if let Some(reason) = self.session_transition_blocker() {
+                    self.status_message = Some(reason.to_string());
                     return None;
                 }
 
-                let Some(extensions) = self.extensions.clone() else {
+                let extensions = self.extensions.clone();
+                let requires_cost_save = self
+                    .agent
+                    .try_lock()
+                    .map_or(true, |agent| agent.cost_budget().is_some());
+                if extensions.is_none() && !requires_cost_save {
+                    let Ok(mut agent_guard) = self.agent.try_lock() else {
+                        self.status_message = Some("Session busy; try again".to_string());
+                        return None;
+                    };
                     let Ok(mut session_guard) = self.session.try_lock() else {
                         self.status_message = Some("Session busy; try again".to_string());
                         return None;
                     };
+                    let reset_thinking = self.new_session_thinking_level();
                     let session_dir = session_guard.session_dir.clone();
                     *session_guard = Session::create_with_dir(session_dir);
+                    session_guard.header.cwd = self.cwd.display().to_string();
                     session_guard.header.provider = Some(self.model_entry.model.provider.clone());
                     session_guard.header.model_id = Some(self.model_entry.model.id.clone());
-                    session_guard.header.thinking_level = Some(ThinkingLevel::Off.to_string());
+                    session_guard.header.thinking_level = Some(reset_thinking.to_string());
+                    let new_session_id = session_guard.header.id.clone();
+                    agent_guard.replace_messages(Vec::new());
+                    agent_guard.stream_options_mut().thinking_level = Some(reset_thinking);
+                    agent_guard.session_was_replaced(crate::plan::PlanMode::Off);
                     drop(session_guard);
-
-                    if let Ok(mut agent_guard) = self.agent.try_lock() {
-                        agent_guard.replace_messages(Vec::new());
-                        agent_guard.stream_options_mut().thinking_level = Some(ThinkingLevel::Off);
-                    }
+                    drop(agent_guard);
+                    self.session_action_admission.advance_generation();
 
                     self.messages.clear();
                     self.message_render_cache.clear();
@@ -1874,50 +2415,70 @@ impl PiApp {
                     self.current_response.clear();
                     self.current_thinking.clear();
                     self.current_tool = None;
+                    self.current_tool_id = None;
+                    self.current_tool_summary.clear();
+                    self.todo_summary = None;
                     self.pending_tool_output = None;
                     self.abort_handle = None;
-                    self.pending_oauth = None;
+                    self.retire_login();
+                    self.title_cancellation = None;
+                    self.title_requested = false;
+                    self.role_model_overrides.clear();
+                    self.displayed_session_id = Some(new_session_id);
                     self.session_picker = None;
                     self.tree_ui = None;
+                    self.drain_capability_prompts_for_session_reset();
                     self.autocomplete.close();
                     self.message_render_cache.clear();
 
                     self.status_message = Some(format!(
-                        "Started new session\nModel set to {}\nThinking level: off",
+                        "Started new session\nModel set to {}\nThinking level: {reset_thinking}",
                         self.model
                     ));
                     self.scroll_to_bottom();
                     self.input.focus();
                     return None;
-                };
+                }
 
                 let model_provider = self.model_entry.model.provider.clone();
+                let runtime_cwd = self.cwd.clone();
                 let model_id = self.model_entry.model.id.clone();
                 let model_label = self.model.clone();
+                let reset_thinking = self.new_session_thinking_level();
                 let event_tx = self.event_tx.clone();
                 let session = Arc::clone(&self.session);
                 let agent = Arc::clone(&self.agent);
+                let admission = self.session_action_admission.clone();
                 let runtime_handle = self.runtime_handle.clone();
 
-                let previous_session_file = self
-                    .session
-                    .try_lock()
-                    .ok()
-                    .and_then(|guard| guard.path.as_ref().map(|p| p.display().to_string()));
+                let (session_dir, previous_session_file) = {
+                    let Ok(guard) = self.session.try_lock() else {
+                        self.status_message = Some("Session busy; try again".to_string());
+                        return None;
+                    };
+                    (
+                        guard.session_dir.clone(),
+                        guard.path.as_ref().map(|p| p.display().to_string()),
+                    )
+                };
 
                 self.agent_state = AgentState::Processing;
                 self.status_message = Some("Starting new session...".to_string());
 
                 let task_cx = Cx::current().unwrap_or_else(Cx::for_request);
                 runtime_handle.spawn(async move {
-                    let cancelled = extensions
-                        .dispatch_cancellable_event(
-                            ExtensionEventName::SessionBeforeSwitch,
-                            Some(json!({ "reason": "new" })),
-                            EXTENSION_EVENT_TIMEOUT_MS,
-                        )
-                        .await
-                        .unwrap_or(false);
+                    let cancelled = if let Some(extensions) = &extensions {
+                        extensions
+                            .dispatch_cancellable_event(
+                                ExtensionEventName::SessionBeforeSwitch,
+                                Some(json!({ "reason": "new" })),
+                                EXTENSION_EVENT_TIMEOUT_MS,
+                            )
+                            .await
+                            .unwrap_or(false)
+                    } else {
+                        false
+                    };
                     if cancelled {
                         let _ = crate::interactive::enqueue_pi_event(
                             &event_tx,
@@ -1928,69 +2489,58 @@ impl PiApp {
                         return;
                     }
 
-                    let new_session_id = {
-                        let mut guard = match session.lock(&task_cx).await {
-                            Ok(guard) => guard,
-                            Err(err) => {
-                                let _ = crate::interactive::enqueue_pi_event(
-                                    &event_tx,
-                                    &asupersync::Cx::for_request(),
-                                    PiMsg::AgentError(format!("Failed to lock session: {err}")),
-                                )
-                                .await;
-                                return;
-                            }
-                        };
-                        let session_dir = guard.session_dir.clone();
-                        let mut new_session = Session::create_with_dir(session_dir);
-                        new_session.header.provider = Some(model_provider);
-                        new_session.header.model_id = Some(model_id);
-                        new_session.header.thinking_level = Some(ThinkingLevel::Off.to_string());
-                        let new_id = new_session.header.id.clone();
-                        *guard = new_session;
-                        new_id
-                    };
-
+                    let mut new_session = Session::create_with_dir(session_dir);
+                    new_session.header.cwd = runtime_cwd.display().to_string();
+                    new_session.header.provider = Some(model_provider);
+                    new_session.header.model_id = Some(model_id);
+                    new_session.header.thinking_level = Some(reset_thinking.to_string());
+                    let new_session_id = new_session.header.id.clone();
+                    if let Err(err) = Self::try_install_session(
+                        &session,
+                        &agent,
+                        &admission,
+                        new_session,
+                        Vec::new(),
+                        Some(reset_thinking),
+                        false,
+                    )
+                    .await
                     {
-                        let mut agent_guard = match agent.lock(&task_cx).await {
-                            Ok(guard) => guard,
-                            Err(err) => {
-                                let _ = crate::interactive::enqueue_pi_event(
-                                    &event_tx,
-                                    &task_cx,
-                                    PiMsg::AgentError(format!("Failed to lock agent: {err}")),
-                                )
-                                .await;
-                                return;
-                            }
-                        };
-                        agent_guard.replace_messages(Vec::new());
-                        agent_guard.stream_options_mut().thinking_level = Some(ThinkingLevel::Off);
+                        let _ = crate::interactive::enqueue_pi_event(
+                            &event_tx,
+                            &task_cx,
+                            PiMsg::AgentError(err.to_string()),
+                        )
+                        .await;
+                        return;
                     }
 
                     let _ = crate::interactive::enqueue_pi_event(
                         &event_tx,
                         &task_cx,
                         PiMsg::ConversationReset {
+                            session_id: new_session_id.clone(),
                             messages: Vec::new(),
                             usage: Usage::default(),
                             status: Some(format!(
-                                "Started new session\nModel set to {model_label}\nThinking level: off"
+                                "Started new session\nModel set to {model_label}\nThinking level: {reset_thinking}"
                             )),
                         },
                     )
                     .await;
 
-                    let _ = extensions
-                        .dispatch_event(
-                            ExtensionEventName::SessionSwitch,
-                            Some(json!({
-                                "reason": "new",
-                                "previousSessionFile": previous_session_file,
-                                "sessionId": new_session_id,
-                            })),
-                        )
-                        .await;
+                    if let Some(extensions) = extensions {
+                        let _ = extensions
+                            .dispatch_event(
+                                ExtensionEventName::SessionSwitch,
+                                Some(json!({
+                                    "reason": "new",
+                                    "previousSessionFile": previous_session_file,
+                                    "sessionId": new_session_id,
+                                })),
+                            )
+                            .await;
+                    }
                 });
 
                 None
@@ -2013,64 +2563,7 @@ impl PiApp {
                     return None;
                 };
 
-                let write_fallback = |text: &str| -> std::io::Result<std::path::PathBuf> {
-                    use std::io::Write;
-                    let dir = std::env::temp_dir();
-                    let filename = format!("pi_copy_{}.txt", Utc::now().timestamp_millis());
-                    let path = dir.join(filename);
-
-                    let mut options = std::fs::OpenOptions::new();
-                    options.write(true).create_new(true);
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::fs::OpenOptionsExt;
-                        options.mode(0o600);
-                    }
-
-                    let mut file = options.open(&path)?;
-                    file.write_all(text.as_bytes())?;
-
-                    Ok(path)
-                };
-
-                #[cfg(feature = "clipboard")]
-                {
-                    match ArboardClipboard::new()
-                        .and_then(|mut clipboard| clipboard.set_text(text.clone()))
-                    {
-                        Ok(()) => self.status_message = Some("Copied to clipboard".to_string()),
-                        Err(err) => match write_fallback(&text) {
-                            Ok(path) => {
-                                self.status_message = Some(format!(
-                                    "Clipboard support is disabled or unavailable ({err}). Wrote to {}",
-                                    path.display()
-                                ));
-                            }
-                            Err(io_err) => {
-                                self.status_message = Some(format!(
-                                    "Clipboard support is disabled or unavailable ({err}); also failed to write fallback file: {io_err}"
-                                ));
-                            }
-                        },
-                    }
-                }
-
-                #[cfg(not(feature = "clipboard"))]
-                {
-                    match write_fallback(&text) {
-                        Ok(path) => {
-                            self.status_message = Some(format!(
-                                "Clipboard support is disabled. Wrote to {}",
-                                path.display()
-                            ));
-                        }
-                        Err(err) => {
-                            self.status_message = Some(format!(
-                                "Clipboard support is disabled; failed to write fallback file: {err}"
-                            ));
-                        }
-                    }
-                }
+                self.status_message = Some(copy_text_to_clipboard(&text));
 
                 None
             }
@@ -2103,7 +2596,7 @@ impl PiApp {
                 None
             }
             SlashCommand::Changelog => {
-                let content = include_str!("../../CHANGELOG.md").to_string();
+                let content = crate::embedded_assets::changelog().to_string();
                 self.messages.push(ConversationMessage {
                     role: MessageRole::System,
                     content,
@@ -2120,6 +2613,12 @@ impl PiApp {
                 }
 
                 if let Some(extensions) = self.extensions.clone() {
+                    let owner_session_id = if let Ok(session) = self.session.try_lock() {
+                        session.header.id.clone()
+                    } else {
+                        self.status_message = Some("Session busy; try again".to_string());
+                        return None;
+                    };
                     let session = Arc::clone(&self.session);
                     let event_tx = self.event_tx.clone();
                     let runtime_handle = self.runtime_handle.clone();
@@ -2129,8 +2628,12 @@ impl PiApp {
                     runtime_handle.spawn(async move {
                         let cx = Cx::current().unwrap_or_else(Cx::for_request);
                         let (initial_selected_id, branch_count, entry_count) =
-                            match session.lock(&cx).await {
+                            match OwnedMutexGuard::lock(Arc::clone(&session), &cx).await {
                                 Ok(session_guard) => {
+                                    if session_guard.header.id.as_str() != owner_session_id.as_str()
+                                    {
+                                        return;
+                                    }
                                     let initial_selected_id =
                                         resolve_tree_selector_initial_id(&session_guard, &args);
                                     let branch_count = session_guard.list_leaves().len();
@@ -2141,7 +2644,10 @@ impl PiApp {
                                     let _ = crate::interactive::enqueue_pi_event(
                                         &event_tx,
                                         &task_cx,
-                                        PiMsg::AgentError(format!("Failed to lock session: {err}")),
+                                        PiMsg::SessionSystemNote {
+                                            owner_session_id: owner_session_id.clone(),
+                                            message: format!("Failed to lock session: {err}"),
+                                        },
                                     )
                                     .await;
                                     return;
@@ -2152,6 +2658,7 @@ impl PiApp {
                             .dispatch_event_with_response(
                                 ExtensionEventName::SessionBeforeTree,
                                 Some(json!({
+                                    "sessionId": owner_session_id.clone(),
                                     "preparation": {
                                         "branchCount": branch_count,
                                         "entryCount": entry_count,
@@ -2188,7 +2695,10 @@ impl PiApp {
                             let _ = crate::interactive::enqueue_pi_event(
                                 &event_tx,
                                 &task_cx,
-                                PiMsg::System("Session tree cancelled by extension".to_string()),
+                                PiMsg::SessionSystemNote {
+                                    owner_session_id,
+                                    message: "Session tree cancelled by extension".to_string(),
+                                },
                             )
                             .await;
                             return;
@@ -2198,6 +2708,7 @@ impl PiApp {
                             &event_tx,
                             &task_cx,
                             PiMsg::OpenTree {
+                                owner_session_id,
                                 initial_selected_id,
                                 label,
                             },
@@ -2229,11 +2740,43 @@ impl PiApp {
             SlashCommand::Reload => self.handle_slash_reload(),
             SlashCommand::Template => self.handle_slash_template(args),
             SlashCommand::Share => self.handle_slash_share(args),
+            SlashCommand::Mcp => self.handle_slash_mcp(args),
+            SlashCommand::Plan => self.handle_slash_plan(args),
+            SlashCommand::Prewalk => self.handle_slash_prewalk(args),
+            SlashCommand::Advisor => self.handle_slash_advisor(args),
+            SlashCommand::Checkpoint => self.handle_slash_checkpoint(args),
+            SlashCommand::Rewind => self.handle_slash_rewind(args),
+            SlashCommand::Fresh => self.handle_slash_fresh(),
+            SlashCommand::Retry => self.handle_slash_retry(),
+            SlashCommand::Undo => self.handle_slash_undo(args),
+            SlashCommand::Redo => self.handle_slash_redo(args),
+            SlashCommand::Usage => self.handle_slash_usage(args),
+            SlashCommand::Approval => self.handle_slash_approval(args),
+            SlashCommand::Handoff => self.handle_slash_handoff(args),
+            SlashCommand::Rules => self.handle_slash_rules(args),
+            SlashCommand::AddDir => self.handle_slash_add_dir(args),
+            SlashCommand::RemoveDir => self.handle_slash_remove_dir(args),
+            SlashCommand::Crash => self.handle_slash_crash(args),
+            SlashCommand::Btw => self.handle_slash_btw(args),
+            SlashCommand::Tan => self.handle_slash_tan(args),
+            SlashCommand::Omfg => self.handle_slash_omfg(args),
+            SlashCommand::Commit => self.handle_slash_commit(args),
+            SlashCommand::Review => self.handle_slash_review(args),
         }
     }
 
-    #[allow(clippy::too_many_lines)]
     pub(super) fn handle_slash_login(&mut self, args: &str) -> Option<Cmd> {
+        let auth_path = crate::config::Config::auth_path();
+        self.handle_slash_login_with_auth_path(args, &auth_path)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn handle_slash_login_with_auth_path(
+        &mut self,
+        args: &str,
+        auth_path: &std::path::Path,
+    ) -> Option<Cmd> {
+        self.retire_login();
         if self.agent_state != AgentState::Idle {
             self.status_message = Some("Cannot login while processing".to_string());
             return None;
@@ -2241,10 +2784,23 @@ impl PiApp {
 
         let args = args.trim();
         if args.is_empty() {
-            let auth_path = crate::config::Config::auth_path();
-            match crate::auth::AuthStorage::load(auth_path) {
+            match crate::auth::AuthStorage::load(auth_path.to_path_buf()) {
                 Ok(auth) => {
-                    let listing = format_login_provider_listing(&auth, &self.available_models);
+                    let registered_extension_bindings =
+                        match registered_extension_provider_bindings(self.extensions.as_ref()) {
+                            Ok(bindings) => bindings,
+                            Err(err) => {
+                                self.status_message = Some(format!(
+                                    "Unable to load extension login providers: {err}"
+                                ));
+                                return None;
+                            }
+                        };
+                    let listing = format_login_provider_listing(
+                        &auth,
+                        &self.available_models,
+                        &registered_extension_bindings,
+                    );
                     self.messages.push(ConversationMessage {
                         role: MessageRole::System,
                         content: listing,
@@ -2262,21 +2818,34 @@ impl PiApp {
 
         let requested_provider = args.split_whitespace().next().unwrap_or(args).to_string();
         let provider = normalize_auth_provider_input(&requested_provider);
+        let attempt_id = self.begin_login_attempt(auth_path)?;
+        let signal = self.login_attempt.as_ref()?.control.signal();
 
         if provider == "kimi-for-coding" {
             self.status_message = Some("Starting Kimi Code login...".to_string());
+            self.agent_state = AgentState::Processing;
             let event_tx = self.event_tx.clone();
             let provider_clone = provider;
             let runtime_handle = self.runtime_handle.clone();
             let cx = asupersync::Cx::current().unwrap_or_else(asupersync::Cx::for_request);
 
             runtime_handle.spawn(async move {
-                match crate::auth::start_kimi_code_device_flow().await {
+                let result = match futures::future::select(
+                    Box::pin(signal.wait()),
+                    Box::pin(crate::auth::start_kimi_code_device_flow()),
+                )
+                .await
+                {
+                    futures::future::Either::Left(_) => return,
+                    futures::future::Either::Right((result, _)) => result,
+                };
+                match result {
                     Ok(device) => {
                         let _ = crate::interactive::enqueue_pi_event(
                             &event_tx,
                             &cx,
                             PiMsg::OAuthDeviceFlowStarted {
+                                attempt_id,
                                 provider: provider_clone,
                                 device_code: device.device_code,
                                 user_code: device.user_code,
@@ -2292,7 +2861,11 @@ impl PiApp {
                         let _ = crate::interactive::enqueue_pi_event(
                             &event_tx,
                             &cx,
-                            PiMsg::AgentError(format!("OAuth login failed: {err}")),
+                            PiMsg::LoginFinished {
+                                attempt_id,
+                                error: Some(format!("OAuth login failed: {err}")),
+                                retry: false,
+                            },
                         )
                         .await;
                     }
@@ -2305,23 +2878,34 @@ impl PiApp {
             && should_use_copilot_device_flow()
         {
             self.status_message = Some("Starting GitHub Copilot device flow login...".to_string());
+            self.agent_state = AgentState::Processing;
             let event_tx = self.event_tx.clone();
             let provider_clone = provider;
             let runtime_handle = self.runtime_handle.clone();
             let cx = asupersync::Cx::current().unwrap_or_else(asupersync::Cx::for_request);
-            let client_id = std::env::var("GITHUB_COPILOT_CLIENT_ID").unwrap_or_default();
+            let client_id = crate::auth::resolved_copilot_client_id();
             let copilot_config = crate::auth::CopilotOAuthConfig {
                 client_id,
                 ..crate::auth::CopilotOAuthConfig::default()
             };
 
             runtime_handle.spawn(async move {
-                match crate::auth::start_copilot_device_flow(&copilot_config).await {
+                let result = match futures::future::select(
+                    Box::pin(signal.wait()),
+                    Box::pin(crate::auth::start_copilot_device_flow(&copilot_config)),
+                )
+                .await
+                {
+                    futures::future::Either::Left(_) => return,
+                    futures::future::Either::Right((result, _)) => result,
+                };
+                match result {
                     Ok(device) => {
                         let _ = crate::interactive::enqueue_pi_event(
                             &event_tx,
                             &cx,
                             PiMsg::OAuthDeviceFlowStarted {
+                                attempt_id,
                                 provider: provider_clone,
                                 device_code: device.device_code,
                                 user_code: device.user_code,
@@ -2337,7 +2921,11 @@ impl PiApp {
                         let _ = crate::interactive::enqueue_pi_event(
                             &event_tx,
                             &cx,
-                            PiMsg::AgentError(format!("OAuth login failed: {err}")),
+                            PiMsg::LoginFinished {
+                                attempt_id,
+                                error: Some(format!("OAuth login failed: {err}")),
+                                retry: false,
+                            },
                         )
                         .await;
                     }
@@ -2378,7 +2966,7 @@ impl PiApp {
         } else if provider == "google-antigravity" {
             crate::auth::start_google_antigravity_oauth().map(|info| (info, None))
         } else if provider == "github-copilot" || provider == "copilot" {
-            let client_id = std::env::var("GITHUB_COPILOT_CLIENT_ID").unwrap_or_default();
+            let client_id = crate::auth::resolved_copilot_client_id();
             let copilot_config = crate::auth::CopilotOAuthConfig {
                 client_id,
                 ..crate::auth::CopilotOAuthConfig::default()
@@ -2396,11 +2984,26 @@ impl PiApp {
             crate::auth::start_gitlab_oauth(&gitlab_config).map(|info| (info, None))
         } else {
             // Check extension providers for OAuth config.
-            let ext_oauth = extension_oauth_config_for_provider(&self.available_models, &provider);
+            let registered_extension_bindings =
+                match registered_extension_provider_bindings(self.extensions.as_ref()) {
+                    Ok(bindings) => bindings,
+                    Err(err) => {
+                        self.retire_login();
+                        self.status_message =
+                            Some(format!("Unable to load extension login providers: {err}"));
+                        return None;
+                    }
+                };
+            let ext_oauth = extension_oauth_config_for_provider(
+                &self.available_models,
+                &registered_extension_bindings,
+                &provider,
+            );
             if let Some(config) = ext_oauth {
                 crate::auth::start_extension_oauth(&provider, &config)
                     .map(|info| (info, Some(config)))
             } else {
+                self.retire_login();
                 self.status_message = Some(format!(
                     "Login not supported for {provider} (no built-in flow or OAuth config)"
                 ));
@@ -2449,24 +3052,11 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
                     );
                 }
 
-                // Spawn a thread to wait for the callback and inject the code
-                // via the event channel when the browser redirect arrives.
-                if let Some(server) = callback_server {
-                    let event_tx = self.event_tx.clone();
-                    std::thread::spawn(move || {
-                        // Block until the callback arrives or the sender is dropped.
-                        if let Ok(path) = server.rx.recv() {
-                            let full_url = format!("http://localhost{path}");
-                            let mut send_result =
-                                event_tx.try_send(PiMsg::OAuthCallbackReceived(full_url));
-                            while let Err(asupersync::channel::mpsc::SendError::Full(unsent)) =
-                                send_result
-                            {
-                                std::thread::sleep(std::time::Duration::from_millis(50));
-                                send_result = event_tx.try_send(unsent);
-                            }
-                        }
-                    });
+                let poll = callback_server
+                    .as_ref()
+                    .map(|_| Self::login_callback_poll_cmd(attempt_id));
+                if let Some(attempt) = self.login_attempt.as_mut() {
+                    attempt.callback = callback_server;
                 }
 
                 self.messages.push(ConversationMessage {
@@ -2487,9 +3077,10 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
                 self.input_mode = InputMode::SingleLine;
                 self.set_input_height(3);
                 self.input.focus();
-                None
+                poll
             }
             Err(err) => {
+                self.retire_login();
                 self.status_message = Some(format!("OAuth login failed: {err}"));
                 None
             }
@@ -2497,6 +3088,7 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
     }
 
     pub(super) fn handle_slash_logout(&mut self, args: &str) -> Option<Cmd> {
+        self.retire_login();
         if self.agent_state != AgentState::Idle {
             self.status_message = Some("Cannot logout while processing".to_string());
             return None;
@@ -2533,8 +3125,67 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
         None
     }
 
+    /// Resolve explicit commands against the complete runtime catalog. The
+    /// picker list may omit unready providers, but their names remain owned.
+    fn requested_model_entry(
+        &self,
+        provider: &str,
+        model_id: &str,
+        allow_unlisted_native_model: bool,
+    ) -> Result<Option<ModelEntry>, String> {
+        let agent = self
+            .agent
+            .try_lock()
+            .map_err(|_| "Agent busy; try again".to_string())?;
+        let catalog = agent.handle.session().model_registry().map_or(
+            self.available_models.as_slice(),
+            crate::models::ModelRegistry::models,
+        );
+        Ok(if allow_unlisted_native_model {
+            resolve_model_entry(catalog, provider, model_id)
+        } else {
+            find_model_entry(catalog, provider, model_id).cloned()
+        })
+    }
+
     #[allow(clippy::too_many_lines)]
     pub(super) fn handle_slash_model(&mut self, args: &str) -> Option<Cmd> {
+        // Role targeting (bd-cv653.3.1): `/model <role>` shows the role's
+        // assignment; `/model <role> <pattern>` assigns a model to the role
+        // for this session. Non-role first tokens fall through to the classic
+        // selector flow below.
+        {
+            let trimmed = args.trim();
+            let mut parts = trimmed.splitn(2, char::is_whitespace);
+            let first = parts.next().unwrap_or("");
+            let rest = parts.next().unwrap_or("").trim();
+            if !first.is_empty()
+                && let Some(role) = ModelRole::from_name(first)
+            {
+                if rest.is_empty() {
+                    let current = self
+                        .role_model_overrides
+                        .get(&role)
+                        .map(|(p, m)| format!("{p}/{m}"))
+                        .or_else(|| {
+                            self.config
+                                .model_roles
+                                .as_ref()
+                                .and_then(|roles| crate::app::role_spec_from_settings(roles, role))
+                                .map(str::to_string)
+                        })
+                        .unwrap_or_else(|| "(inherits default)".to_string());
+                    self.status_message = Some(format!("Role {role}: {current}"));
+                    return None;
+                }
+                if self.agent_state != AgentState::Idle {
+                    self.status_message = Some("Cannot switch models while processing".to_string());
+                    return None;
+                }
+                return self.assign_model_to_role(role, rest);
+            }
+        }
+
         if args.trim().is_empty() {
             self.open_model_selector_configured_only();
             return None;
@@ -2549,21 +3200,29 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
         let pattern_lower = pattern.to_ascii_lowercase();
         let provider_scoped_pattern = split_provider_model_spec(pattern);
 
-        let mut exact_matches = Vec::new();
-        for entry in &self.available_models {
-            let full = format!("{}/{}", entry.model.provider, entry.model.id);
-            if full.eq_ignore_ascii_case(pattern)
-                || entry.model.id.eq_ignore_ascii_case(pattern)
-                || provider_scoped_pattern.is_some_and(|(provider, model_id)| {
-                    provider_ids_match(&entry.model.provider, provider)
-                        && entry.model.id.eq_ignore_ascii_case(model_id)
-                })
-            {
-                exact_matches.push(entry.clone());
+        let qualified = match provider_scoped_pattern {
+            Some((provider, model_id)) => {
+                match self.requested_model_entry(provider, model_id, false) {
+                    Ok(entry) => entry,
+                    Err(error) => {
+                        self.status_message = Some(error);
+                        return None;
+                    }
+                }
             }
+            None => None,
+        };
+        let mut exact_matches: Vec<_> = qualified.into_iter().collect();
+        if exact_matches.is_empty() {
+            exact_matches.extend(
+                self.available_models
+                    .iter()
+                    .filter(|entry| entry.model.id.eq_ignore_ascii_case(pattern))
+                    .cloned(),
+            );
         }
 
-        let mut matches = if exact_matches.is_empty() {
+        let mut matches = if exact_matches.is_empty() && provider_scoped_pattern.is_none() {
             let mut fuzzy = Vec::new();
             for entry in &self.available_models {
                 let full = format!("{}/{}", entry.model.provider, entry.model.id);
@@ -2587,20 +3246,21 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
         matches.dedup_by(|a, b| model_entry_matches(a, b));
 
         if matches.is_empty()
-            && let Some((provider, model_id)) = pattern.split_once('/')
+            && let Some((provider, model_id)) = provider_scoped_pattern
         {
-            let provider = normalize_auth_provider_input(provider);
-            let model_id = model_id.trim();
-            if !provider.is_empty()
-                && !model_id.is_empty()
-                && let Some(entry) = crate::models::ad_hoc_model_entry(&provider, model_id)
-            {
-                matches.push(entry);
+            match self.requested_model_entry(provider, model_id, true) {
+                Ok(entry) => matches.extend(entry),
+                Err(error) => {
+                    self.status_message = Some(error);
+                    return None;
+                }
             }
         }
 
         if matches.is_empty() {
-            self.status_message = Some(format!("Model not found: {pattern}"));
+            self.status_message = Some(format!(
+                "Model not found: {pattern}. Use /model to inspect registered provider/model pairs."
+            ));
             return None;
         }
         if matches.len() > 1 {
@@ -2624,7 +3284,7 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
 
         let next = matches.pop().expect("matches is exactly length 1 here");
 
-        let resolved_key_opt = resolve_model_key_from_default_auth(&next);
+        let resolved_key_opt = resolve_model_key_from_default_auth(&next, &self.cwd);
         if model_requires_configured_credential(&next) && resolved_key_opt.is_none() {
             self.status_message = Some(format!(
                 "Missing credentials for provider {}. Run /login {}.",
@@ -2634,17 +3294,21 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
         }
 
         if model_entry_matches(&next, &self.model_entry) {
-            self.status_message = Some(format!("Current model: {}", self.model));
+            self.status_message = Some(format!(
+                "Current model: {}",
+                session_model_line(&self.model_entry)
+            ));
             return None;
         }
 
-        let provider_impl = match providers::create_provider(&next, self.extensions.as_ref()) {
-            Ok(provider_impl) => provider_impl,
-            Err(err) => {
-                self.status_message = Some(err.to_string());
-                return None;
-            }
-        };
+        let provider_impl =
+            match create_runtime_provider(&next, self.extensions.as_ref(), &self.cwd) {
+                Ok(provider_impl) => provider_impl,
+                Err(err) => {
+                    self.status_message = Some(err.to_string());
+                    return None;
+                }
+            };
 
         if let Err(message) =
             self.switch_active_model(&next, provider_impl, resolved_key_opt.as_deref(), "command")
@@ -2661,7 +3325,991 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
             self.available_models.push(next.clone());
         }
 
-        self.status_message = Some(format!("Switched model: {}", self.model));
+        self.status_message = Some(format!("Switched model: {}", next.model.display_label()));
+        None
+    }
+
+    /// Assign a model to a role for this session (`/model <role> <pattern>`,
+    /// bd-cv653.3.1). Records the override in app state and appends a
+    /// role-tagged `ModelChange` entry so the assignment replays.
+    fn assign_model_to_role(&mut self, role: ModelRole, pattern: &str) -> Option<Cmd> {
+        let qualified = match split_provider_model_spec(pattern) {
+            Some((provider, model_id)) => {
+                match self.requested_model_entry(provider, model_id, false) {
+                    Ok(entry) => entry,
+                    Err(error) => {
+                        self.status_message = Some(error);
+                        return None;
+                    }
+                }
+            }
+            None => None,
+        };
+        let mut found = qualified.or_else(|| {
+            self.available_models
+                .iter()
+                .find(|entry| entry.model.id.eq_ignore_ascii_case(pattern))
+                .cloned()
+        });
+        if found.is_none()
+            && let Some((provider, model_id)) = split_provider_model_spec(pattern)
+        {
+            match self.requested_model_entry(provider, model_id, true) {
+                Ok(entry) => found = entry,
+                Err(error) => {
+                    self.status_message = Some(error);
+                    return None;
+                }
+            }
+        }
+        let Some(entry) = found else {
+            self.status_message = Some(format!("Model not found: {pattern}"));
+            return None;
+        };
+        // Borrow for the /btw rebinding decision BEFORE `entry.model.id`
+        // moves out below (E0382, bd-9jgrt).
+        let btw_rebinding = self.rebuild_btw_client(&entry);
+        let provider = entry.model.provider.clone();
+        let model_id = entry.model.id;
+        self.role_model_overrides
+            .insert(role, (provider.clone(), model_id.clone()));
+        if let Ok(mut session_guard) = self.session.try_lock() {
+            session_guard.append_model_change_with_role(
+                provider.clone(),
+                model_id.clone(),
+                Some(role.as_str().to_string()),
+            );
+        }
+        // Rebind the /btw smol-role client when the role changes (bd-9jgrt).
+        // Without the factory (non-startup surfaces) disclose the stale bind
+        // instead of silently serving questions through the old provider.
+        self.status_message = Some(if role == ModelRole::Smol {
+            match btw_rebinding {
+                Some(true) => {
+                    format!("Role {role} set to {provider}/{model_id} (/btw rebound)")
+                }
+                Some(false) => format!(
+                    "Role {role} set to {provider}/{model_id} (/btw rebinding failed; \
+                     keeping previous binding)"
+                ),
+                None => format!(
+                    "Role {role} set to {provider}/{model_id} (/btw keeps its \
+                     startup binding until restart)"
+                ),
+            }
+        } else {
+            format!("Role {role} set to {provider}/{model_id}")
+        });
+        None
+    }
+
+    fn handle_slash_prewalk(&mut self, args: &str) -> Option<Cmd> {
+        if self.agent_state != AgentState::Idle {
+            self.status_message =
+                Some("Wait for the current turn before changing prewalk".to_string());
+            return None;
+        }
+        if let Err(usage) = crate::prewalk::PrewalkCommand::parse(args) {
+            self.status_message = Some(usage.to_string());
+            return None;
+        }
+        let Ok(agent) = self.agent.try_lock() else {
+            self.status_message = Some("Agent busy; try again".to_string());
+            return None;
+        };
+        let owner = self.displayed_session_id.clone();
+        drop(agent);
+        let command = args.to_string();
+        let restarting = matches!(
+            crate::prewalk::PrewalkCommand::parse(args),
+            Ok(crate::prewalk::PrewalkCommand::Restart { .. })
+        );
+        let config = self.config.clone();
+        let cwd = self.cwd.clone();
+        let roles = self.role_model_overrides.clone();
+        let agent = Arc::clone(&self.agent);
+        let event_tx = self.event_tx.clone();
+        self.runtime_handle.spawn(async move {
+            let cx = Cx::for_request();
+            let message = match OwnedMutexGuard::lock(agent, &cx).await {
+                Ok(mut agent) => {
+                    let Ok(current) = agent
+                        .handle
+                        .with_session(|session| session.header.id.clone())
+                        .await
+                    else {
+                        return;
+                    };
+                    if Some(&current) != owner.as_ref() {
+                        return;
+                    }
+                    match crate::app::run_prewalk_command(
+                        &mut agent.handle,
+                        &command,
+                        &config,
+                        &cwd,
+                        |role| {
+                            roles
+                                .get(&role)
+                                .map(|(provider, model)| format!("{provider}/{model}"))
+                        },
+                    )
+                    .await
+                    {
+                        Ok(note) if restarting => {
+                            agent.plan_state().take_previous_model();
+                            PiMsg::SessionModelChanged {
+                                owner_session_id: current,
+                                message: note,
+                            }
+                        }
+                        Ok(note) => PiMsg::SessionSystemNote {
+                            owner_session_id: current,
+                            message: note,
+                        },
+                        Err(error) => PiMsg::SessionSystemNote {
+                            owner_session_id: current,
+                            message: format!("Prewalk: {error}"),
+                        },
+                    }
+                }
+                Err(error) => PiMsg::SystemNote(format!("Prewalk: {error}")),
+            };
+            let _ = enqueue_pi_event(&event_tx, &cx, message).await;
+        });
+        self.status_message = Some("Updating prewalk...".to_string());
+        None
+    }
+
+    fn handle_slash_plan(&mut self, args: &str) -> Option<Cmd> {
+        let sub = args.trim().to_ascii_lowercase();
+        let (plan_state, builtins_disabled) = {
+            let Ok(agent_guard) = self.agent.try_lock() else {
+                self.status_message = Some("Agent busy; try again".to_string());
+                return None;
+            };
+            (
+                agent_guard.plan_state(),
+                agent_guard.shared_tools().snapshot().builtins_disabled(),
+            )
+        };
+        if builtins_disabled && matches!(sub.as_str(), "" | "on" | "start") {
+            self.status_message = Some(
+                "[PLAN_TOOLS_DISABLED] Plan mode is unavailable while built-in tools are disabled"
+                    .to_string(),
+            );
+            return None;
+        }
+        match sub.as_str() {
+            "" | "on" | "start" => self.enter_plan_mode(&plan_state),
+            "status" => {
+                self.status_message = Some(format!("Plan mode: {}", plan_state.mode().as_str()));
+            }
+            "approve" => self.approve_plan_mode(&plan_state),
+            "reject" => {
+                if plan_state.reject() {
+                    Self::log_plan_transition(&self.session, "rejected");
+                    self.status_message =
+                        Some("Plan rejected — still planning; revise and resubmit".to_string());
+                } else {
+                    self.status_message = Some("No submitted plan to reject".to_string());
+                }
+            }
+            "off" | "exit" => {
+                plan_state.exit();
+                Self::log_plan_transition(&self.session, "off");
+                self.status_message = Some("Plan mode off".to_string());
+            }
+            other => {
+                self.status_message = Some(format!(
+                    "Unknown /plan subcommand {other:?}: use /plan [approve|reject|off|status]"
+                ));
+            }
+        }
+        None
+    }
+
+    fn log_plan_transition(session: &Arc<Mutex<crate::session::Session>>, mode: &str) {
+        if let Ok(mut guard) = session.try_lock() {
+            guard.append_custom_entry(
+                "plan_mode".to_string(),
+                Some(serde_json::json!({"mode": mode})),
+            );
+        }
+    }
+
+    fn handle_slash_approval(&mut self, args: &str) -> Option<Cmd> {
+        let approval_state = {
+            let Ok(agent_guard) = self.agent.try_lock() else {
+                self.status_message = Some("Agent is busy".to_string());
+                return None;
+            };
+            agent_guard.approval_state()
+        };
+
+        let Some(state) = approval_state else {
+            self.status_message = Some("Tool approval state not configured".to_string());
+            return None;
+        };
+
+        let (report, changed) = super::workspace_reports::approval(&state, args);
+        if let Some(mode) = changed {
+            Self::log_approval_transition(&self.session, mode);
+        }
+        self.show_workspace_report(report);
+        None
+    }
+
+    fn log_approval_transition(
+        session: &Arc<Mutex<crate::session::Session>>,
+        mode: crate::approval::ApprovalMode,
+    ) {
+        if let Ok(mut guard) = session.try_lock() {
+            guard.append_custom_entry(
+                "approval_mode".to_string(),
+                Some(serde_json::json!({"mode": mode.as_str()})),
+            );
+        }
+    }
+
+    pub(super) fn handle_slash_handoff(&mut self, args: &str) -> Option<Cmd> {
+        use super::workspace_reports::HandoffMode;
+        let focus = match super::workspace_reports::handoff_mode(args) {
+            Ok(HandoffMode::InPlace(focus)) => focus.to_string(),
+            Ok(HandoffMode::Report(args)) => {
+                let report = {
+                    let Ok(session_guard) = self.session.try_lock() else {
+                        self.status_message = Some("Session busy; try again".to_string());
+                        return None;
+                    };
+                    super::workspace_reports::handoff(&session_guard, args)
+                };
+                self.show_workspace_report(report);
+                return None;
+            }
+            Ok(HandoffMode::ModelPreview(_)) => {
+                self.status_message = Some(
+                    "Model preview/export is available in the default terminal; use /handoff [focus] here to compact this session".to_string(),
+                );
+                return None;
+            }
+            Ok(HandoffMode::Import(_)) => {
+                self.status_message = Some(
+                    "Handoff bundle import is available in the default terminal with /handoff --import".to_string(),
+                );
+                return None;
+            }
+            Err(error) => {
+                self.status_message = Some(error.to_string());
+                return None;
+            }
+        };
+        if self.agent_state != AgentState::Idle
+            || self.bash_running
+            || self.agent.try_lock().is_err()
+        {
+            self.status_message =
+                Some("Handoff is available after the current request finishes".to_string());
+            return None;
+        }
+        let Some(owner_session_id) = self
+            .session
+            .try_lock()
+            .ok()
+            .map(|session| session.header.id.clone())
+        else {
+            self.status_message = Some("Handoff unavailable: session is busy".to_string());
+            return None;
+        };
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let (abort_handle, abort_signal) = AbortHandle::new();
+        self.handoff_request_id = Some(request_id.clone());
+        self.abort_handle = Some(abort_handle);
+        self.agent_state = AgentState::Processing;
+        self.extension_compacting.store(true, Ordering::SeqCst);
+        self.status_message = Some("Preparing in-place handoff (Esc to cancel)...".to_string());
+        let owner = Arc::clone(&self.agent);
+        let event_tx = self.event_tx.clone();
+        self.runtime_handle.spawn(async move {
+            let cx = Cx::for_request();
+            let event = match OwnedMutexGuard::lock(owner, &cx).await {
+                Ok(mut owner) => {
+                    match owner
+                        .handle
+                        .with_session(|session| session.header.id.clone())
+                        .await
+                    {
+                        Ok(current) if current == owner_session_id => {
+                            super::workspace_reports::run_in_place_handoff(
+                                &mut owner.handle,
+                                &focus,
+                                &abort_signal,
+                            )
+                            .await
+                        }
+                        Ok(_) => PiMsg::AgentError(
+                            "Handoff cancelled: the session changed before it started".to_string(),
+                        ),
+                        Err(error) => PiMsg::AgentError(format!("Handoff unavailable: {error}")),
+                    }
+                }
+                Err(error) => PiMsg::AgentError(format!("Handoff unavailable: {error}")),
+            };
+            // Drop the Agent owner before the UI applies its terminal reset.
+            // Delivery uses a fresh context even after owner cancellation.
+            let _ = enqueue_pi_event(
+                &event_tx,
+                &Cx::for_request(),
+                PiMsg::HandoffFinished {
+                    request_id,
+                    event: Box::new(event),
+                },
+            )
+            .await;
+        });
+        self.scroll_to_bottom();
+        None
+    }
+
+    pub(super) fn handle_slash_rules(&mut self, args: &str) -> Option<Cmd> {
+        let report = super::workspace_reports::rules(&self.cwd, args);
+        self.show_workspace_report(report);
+        None
+    }
+
+    /// Show a shared workspace command's result: its card (if any) in the
+    /// transcript, its status line in the footer.
+    fn show_workspace_report(&mut self, report: super::workspace_reports::Report) {
+        if let Some(card) = report.card {
+            self.messages.push(ConversationMessage {
+                role: MessageRole::System,
+                content: card,
+                thinking: None,
+                collapsed: false,
+            });
+            self.scroll_to_bottom();
+        }
+        self.status_message = Some(report.status);
+    }
+
+    /// /add-dir <dir> — grant access to an additional workspace root
+    /// (bd-cv653.3.12). Validated, canonicalized, added to the shared handle
+    /// every tool consults, and persisted into the session header.
+    pub(super) fn handle_slash_add_dir(&mut self, args: &str) -> Option<Cmd> {
+        let raw = args.trim();
+        if raw.is_empty() {
+            self.status_message = Some("Usage: /add-dir <directory>".to_string());
+            self.scroll_to_bottom();
+            return None;
+        }
+        let expanded = expand_home_path(raw);
+        let canonical = match crate::workspace::validate_new_root(&expanded) {
+            Ok(canonical) => canonical,
+            Err(err) => {
+                self.status_message = Some(err.to_string());
+                self.scroll_to_bottom();
+                return None;
+            }
+        };
+        let already = self
+            .workspace
+            .snapshot_or(&self.cwd)
+            .contains_canonical(&canonical);
+        if !already {
+            self.workspace.add_root(&canonical);
+        }
+        // Persist exactly the live root set: persisting a path the handle
+        // rejected as "already covered" would silently promote it to a real
+        // root on session resume.
+        let roots = self.workspace.additional_roots();
+        let persisted = self.session.try_lock().is_ok_and(|mut guard| {
+            guard.set_additional_roots(&roots);
+            true
+        });
+        let display = canonical.display().to_string();
+        self.status_message = Some(if already {
+            format!("Already a workspace root: {display}")
+        } else if persisted {
+            format!("Workspace root added: {display}")
+        } else {
+            format!("Workspace root added (not persisted; session busy): {display}")
+        });
+        self.scroll_to_bottom();
+        None
+    }
+
+    /// /remove-dir <dir> — revoke an additional workspace root immediately
+    /// (bd-cv653.3.12). Tools snapshot the shared set at execution time, so
+    /// the next read/edit/search in that root fails closed. The primary cwd
+    /// can never be removed.
+    pub(super) fn handle_slash_remove_dir(&mut self, args: &str) -> Option<Cmd> {
+        let raw = args.trim();
+        if raw.is_empty() {
+            self.status_message = Some("Usage: /remove-dir <directory>".to_string());
+            self.scroll_to_bottom();
+            return None;
+        }
+        let canonical = crate::extensions::safe_canonicalize(&expand_home_path(raw));
+        if self.workspace.snapshot_or(&self.cwd).primary() == canonical.as_path() {
+            self.status_message = Some("Cannot remove the primary working directory".to_string());
+            self.scroll_to_bottom();
+            return None;
+        }
+        let removed = self.workspace.remove_root(&canonical);
+        if removed {
+            let remaining: Vec<std::path::PathBuf> = self
+                .workspace
+                .additional_roots()
+                .into_iter()
+                .filter(|root| root != &canonical)
+                .collect();
+            if let Ok(mut guard) = self.session.try_lock() {
+                guard.set_additional_roots(&remaining);
+            }
+            self.status_message = Some(format!("Workspace root removed: {}", canonical.display()));
+        } else {
+            self.status_message = Some(format!("Not a workspace root: {}", canonical.display()));
+        }
+        self.scroll_to_bottom();
+        None
+    }
+
+    /// /crash [show|delete] — inspect or clear redacted crash bundles
+    /// (bd-cv653.7.12). Bare `/crash` lists bundles; `send` is intentionally
+    /// absent from auto-transmission — use the bundle path with your own
+    /// transport after reviewing the preview.
+    /// `/btw <question>` — ephemeral side question on the smol role
+    /// (bd-cv653.3.16). The answer renders as a system card and is never
+    /// written to the session JSONL: the call builds a throwaway message
+    /// list that shares nothing with the session writer.
+    pub(super) fn handle_slash_btw(&mut self, args: &str) -> Option<Cmd> {
+        if self.start_side_question(args, None) {
+            self.history.push(format!("/btw {}", args.trim()));
+            self.clear_side_question_input();
+        }
+        None
+    }
+
+    /// A file command with `side: true` never enters the main input queues,
+    /// even when its side client is unavailable or its expansion is empty.
+    pub(super) fn submit_side_template(&mut self, input: &str) -> bool {
+        let invocation = match SlashCommand::parse(input) {
+            Some((SlashCommand::Template, args)) => {
+                let args = args.trim();
+                let (name, rest) = args.split_once(char::is_whitespace).unwrap_or((args, ""));
+                let name = name.trim_start_matches('/');
+                if name.is_empty() {
+                    return false;
+                }
+                Some(format!("/{name} {rest}"))
+            }
+            Some(_) => return false,
+            None => None,
+        };
+        let command = invocation.as_deref().unwrap_or(input);
+        let name = command
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .trim_start_matches('/');
+        if self
+            .extensions
+            .as_ref()
+            .is_some_and(|manager| manager.has_command(name))
+        {
+            return false;
+        }
+        let Some(question) = self.resources.expand_side_prompt(command) else {
+            return false;
+        };
+        if self.start_side_question(&question, Some(input)) {
+            self.history.push(input.to_string());
+            self.clear_side_question_input();
+        }
+        true
+    }
+
+    fn clear_side_question_input(&mut self) {
+        self.input.reset();
+        self.input_mode = InputMode::SingleLine;
+        self.set_input_height(3);
+        self.input.focus();
+    }
+
+    /// Returns whether a side request was admitted, so refusals retain the
+    /// editor draft. Its title is display-only; the provider sees the expanded
+    /// question and screened context, never another authored main-agent turn.
+    fn start_side_question(&mut self, args: &str, title: Option<&str>) -> bool {
+        let label = title.unwrap_or("/btw").to_string();
+        let Some(client) = self.btw_client.clone() else {
+            self.status_message = Some(format!(
+                "{label} unavailable: no smol role model configured (set --smol or model_roles.smol)"
+            ));
+            self.scroll_to_bottom();
+            return false;
+        };
+        let question = args.trim().to_string();
+        if question.is_empty() {
+            self.status_message = Some(title.map_or_else(
+                || "Usage: /btw <question>".to_string(),
+                |title| format!("{title}: template expansion produced empty output"),
+            ));
+            self.scroll_to_bottom();
+            return false;
+        }
+        if question
+            .len()
+            .saturating_add(pi::btw::BTW_SYSTEM_PROMPT.len())
+            > pi::text_completion::MAX_INPUT_BYTES
+        {
+            self.status_message = Some(format!(
+                "{label} refused: PI_AUXILIARY_INPUT_LIMIT: side question exceeds the privacy scan budget"
+            ));
+            self.scroll_to_bottom();
+            return false;
+        }
+        // Screen complete source fields and the question before clipping;
+        // a busy agent defers preparation until its remembered credentials
+        // are available. Only bounded protected text reaches the provider.
+        let prepared = self
+            .agent
+            .try_lock()
+            .ok()
+            .map(|agent| client.prepare_with_agent(&agent, &question));
+        let agent_busy = prepared.is_none();
+        let request = match prepared {
+            Some(Ok(request)) => Some(request),
+            Some(Err(err)) => {
+                self.status_message = Some(format!("{label} refused: {err}"));
+                self.scroll_to_bottom();
+                return false;
+            }
+            None => None,
+        };
+        // asupersync TryLockError carries the guard, so the match temporary
+        // would pin the immutable borrow across self mutations (bd-9x70g
+        // unblock). Extract an owned decision first, mutate after.
+        let (owner_session_id, session_busy) = self.session.try_lock().map_or_else(
+            |_| (String::new(), true),
+            |session| (session.header.id.clone(), false),
+        );
+        if session_busy {
+            self.status_message = Some(format!("{label} unavailable: session is busy"));
+            self.scroll_to_bottom();
+            return false;
+        }
+        self.messages.push(ConversationMessage {
+            role: MessageRole::System,
+            content: if agent_busy {
+                format!("({label}) {question} — queued until the current turn finishes")
+            } else {
+                format!("({label}) {question}")
+            },
+            thinking: None,
+            collapsed: false,
+        });
+        self.status_message = Some(if agent_busy {
+            format!("({label}) waiting for the current turn...")
+        } else {
+            format!("({label}) thinking...")
+        });
+        let runtime = self.runtime_handle.clone();
+        let event_tx = self.event_tx.clone();
+        let agent = Arc::clone(&self.agent);
+        let session = Arc::clone(&self.session);
+        runtime.spawn(async move {
+            let result = async {
+                let request = if let Some(request) = request {
+                    request
+                } else {
+                    let cx = Cx::for_request();
+                    let agent = OwnedMutexGuard::lock(agent, &cx).await?;
+                    let live_session = OwnedMutexGuard::lock(session, &cx).await?;
+                    if live_session.header.id != owner_session_id {
+                        return Err(pi::error::Error::validation(
+                            "PI_AUXILIARY_SESSION_CHANGED: side question cancelled after session switch",
+                        ));
+                    }
+                    drop(live_session);
+                    client.prepare_with_agent(&agent, &question)?
+                };
+                client.ask_prepared(request).await
+            }
+            .await;
+            // Display-only delivery via the UI event channel; the session
+            // writer never sees this message.
+            // SessionSystemNote is display-only. PiMsg::System/AgentError
+            // reset live agent state (Idle + dropped abort handle), while an
+            // answer landing after a session switch must be discarded.
+            let message = match result {
+                Ok(answer) => format!("({label}) {answer}"),
+                Err(err) => format!("({label}) failed: {err}"),
+            };
+            let msg = PiMsg::SessionSystemNote {
+                owner_session_id,
+                message,
+            };
+            let _ = crate::interactive::enqueue_pi_event(&event_tx, &Cx::for_request(), msg).await;
+        });
+        self.scroll_to_bottom();
+        true
+    }
+
+    fn completed_tan_event(
+        owner_session_id: String,
+        completion: &pi::subagents::TanCompletion,
+    ) -> PiMsg {
+        let card = pi::jobs::push_completion_notice(&owner_session_id, completion.follow_up_text())
+            .map_or_else(
+                |err| format!("(/tan failed to queue follow-up)\n{err}"),
+                |()| completion.card_text(),
+            );
+        PiMsg::SessionSystemNote {
+            owner_session_id,
+            message: card,
+        }
+    }
+
+    /// `/tan <work>` — run tangential work in a background task-role child
+    /// (bd-cv653.3.16). The command returns immediately; the child joins the
+    /// hub roster as `kind=tan`, renders a display-only completion card, and
+    /// queues its summary through the background-jobs follow-up seam for the
+    /// parent agent's next idle turn boundary.
+    pub(super) fn handle_slash_tan(&mut self, args: &str) -> Option<Cmd> {
+        enum TanGate {
+            Enabled(
+                Option<pi::tools::ToolModelSelection>,
+                Option<pi::cost::CostBudget>,
+            ),
+            Disabled,
+            Busy,
+        }
+
+        let work = args.trim().to_string();
+        if work.is_empty() {
+            self.status_message = Some("Usage: /tan <work>".to_string());
+            self.scroll_to_bottom();
+            return None;
+        }
+
+        let gate = self.agent.try_lock().map_or(TanGate::Busy, |agent| {
+            if agent.has_tool("subagent") {
+                let tools = agent.shared_tools().snapshot();
+                TanGate::Enabled(tools.model_scope().current(), tools.cost_scope().current())
+            } else {
+                TanGate::Disabled
+            }
+        });
+        let (parent_model, cost_budget) = match gate {
+            TanGate::Busy => {
+                self.status_message = Some("/tan unavailable: agent session is busy".to_string());
+                self.scroll_to_bottom();
+                return None;
+            }
+            TanGate::Disabled => {
+                self.status_message = Some(
+                    "/tan unavailable: enable the opt-in subagent tool with --tools ...subagent"
+                        .to_string(),
+                );
+                self.scroll_to_bottom();
+                return None;
+            }
+            TanGate::Enabled(model, cost) => (model, cost),
+        };
+
+        // Same TryLockError-guard temporary pattern as /btw (bd-9x70g).
+        let (owner_session_id, session_busy) = self.session.try_lock().map_or_else(
+            |_| (String::new(), true),
+            |session| (session.header.id.clone(), false),
+        );
+        if session_busy {
+            self.status_message = Some("/tan unavailable: session is busy".to_string());
+            self.scroll_to_bottom();
+            return None;
+        }
+
+        let tool = pi::subagents::SubagentTool::new(&self.cwd)
+            .with_role_model_selection(pi::app::subagent_role_selection(&self.config))
+            .with_model_config(Some(self.config.clone()))
+            .with_parent_model(parent_model)
+            .with_cost_budget(cost_budget);
+        let runtime = self.runtime_handle.clone();
+        let event_tx = self.event_tx.clone();
+        let task_cx = Cx::current().unwrap_or_else(Cx::for_request);
+        let display_work = work.clone();
+        runtime.spawn(async move {
+            let event = match tool.run_background_tan(&work).await {
+                Ok(completion) => Self::completed_tan_event(owner_session_id, &completion),
+                Err(err) => PiMsg::SessionSystemNote {
+                    owner_session_id,
+                    message: format!("(/tan failed)\n{err}"),
+                },
+            };
+            let _ = crate::interactive::enqueue_pi_event(&event_tx, &task_cx, event).await;
+        });
+
+        self.messages.push(ConversationMessage {
+            role: MessageRole::System,
+            content: format!("(/tan started) {display_work}"),
+            thinking: None,
+            collapsed: false,
+        });
+        self.status_message = Some("(/tan) running in background".to_string());
+        self.scroll_to_bottom();
+        None
+    }
+
+    pub(super) fn handle_slash_crash(&mut self, args: &str) -> Option<Cmd> {
+        let agent_dir = crate::config::Config::global_dir();
+        match args.trim() {
+            "" => {
+                let bundles = pi::crash::list_bundles(&agent_dir);
+                let message = if bundles.is_empty() {
+                    "No crash bundles recorded.".to_string()
+                } else {
+                    bundles
+                        .iter()
+                        .map(|b| {
+                            format!(
+                                "{} {} {}{}",
+                                b.created_at,
+                                b.kind,
+                                b.dir.display(),
+                                if b.noticed { "" } else { " (new)" }
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                };
+                self.messages.push(ConversationMessage {
+                    role: MessageRole::System,
+                    content: message,
+                    thinking: None,
+                    collapsed: false,
+                });
+                self.scroll_to_bottom();
+            }
+            "show" => {
+                let report = pi::crash::show_latest(&agent_dir)
+                    .unwrap_or_else(|| "No crash bundles recorded.".into());
+                self.messages.push(ConversationMessage {
+                    role: MessageRole::System,
+                    content: report,
+                    thinking: None,
+                    collapsed: false,
+                });
+                self.scroll_to_bottom();
+            }
+            "delete" => {
+                let removed = pi::crash::delete_all(&agent_dir);
+                self.status_message = Some(format!("Deleted {removed} crash bundle(s)"));
+                self.scroll_to_bottom();
+            }
+            other => {
+                self.status_message = Some(format!("Usage: /crash [show|delete] (got: {other})"));
+                self.scroll_to_bottom();
+            }
+        }
+        None
+    }
+
+    pub(super) fn handle_slash_omfg(&mut self, args: &str) -> Option<Cmd> {
+        let report = super::workspace_reports::omfg(&self.cwd, args);
+        self.show_workspace_report(report);
+        None
+    }
+
+    pub(super) fn handle_slash_commit(&mut self, args: &str) -> Option<Cmd> {
+        let report = super::workspace_reports::commit(&self.cwd, args);
+        self.show_workspace_report(report);
+        None
+    }
+
+    pub(super) fn handle_slash_review(&mut self, args: &str) -> Option<Cmd> {
+        if self.agent_state != AgentState::Idle {
+            self.status_message =
+                Some("Review is available after the current request finishes".to_string());
+            return None;
+        }
+        let prepared = self
+            .agent
+            .try_lock()
+            .map_err(|_| pi::error::Error::validation("agent is busy"))
+            .and_then(|agent| super::workspace_reports::prepare_review(&self.cwd, args, &agent));
+        let request = match prepared {
+            Ok(request) => request,
+            Err(error) => {
+                self.status_message = Some(format!("Review failed: {error}"));
+                return None;
+            }
+        };
+        let owner = self
+            .session
+            .try_lock()
+            .ok()
+            .map(|session| session.header.id.clone());
+        let Some(owner_session_id) = owner else {
+            self.status_message = Some("Review unavailable: session is busy".to_string());
+            return None;
+        };
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let (abort_handle, abort_signal) = AbortHandle::new();
+        self.review_request_id = Some(request_id.clone());
+        self.abort_handle = Some(abort_handle);
+        self.agent_state = AgentState::Processing;
+        self.status_message =
+            Some("Reviewing text changes with the current model (Esc to cancel)...".to_string());
+        let event_tx = self.event_tx.clone();
+        self.runtime_handle.spawn(async move {
+            let report = request.run(Some(&abort_signal)).await;
+            let message = report.card.unwrap_or(report.status);
+            let _ = crate::interactive::enqueue_pi_event(
+                &event_tx,
+                &Cx::for_request(),
+                PiMsg::ReviewFinished {
+                    owner_session_id,
+                    request_id,
+                    message,
+                },
+            )
+            .await;
+        });
+        self.scroll_to_bottom();
+        None
+    }
+
+    /// Switch the active model to a role-resolved spec when one is configured.
+    fn switch_to_role_spec(&mut self, spec: &str, source: &str) -> Result<(), String> {
+        let (provider, model_id) = split_provider_model_spec(spec).ok_or_else(|| {
+            format!("Invalid model {spec}. Use /model to choose a provider/model pair")
+        })?;
+        let entry = self
+            .requested_model_entry(provider, model_id, true)?
+            .ok_or_else(|| {
+                format!("Model not found: {spec}. Use /model to inspect registered models")
+            })?;
+        let key = resolve_model_key_from_default_auth(&entry, &self.cwd);
+        if model_requires_configured_credential(&entry) && key.is_none() {
+            return Err(format!(
+                "Missing credentials for provider {}. Run /login {}",
+                entry.model.provider, entry.model.provider
+            ));
+        }
+        let provider_impl = create_runtime_provider(&entry, self.extensions.as_ref(), &self.cwd)
+            .map_err(|error| error.to_string())?;
+        self.switch_active_model(&entry, provider_impl, key.as_deref(), source)
+    }
+
+    fn enter_plan_mode(&mut self, plan_state: &crate::plan::PlanState) {
+        if plan_state.mode() != crate::plan::PlanMode::Off {
+            self.status_message = Some(format!(
+                "Already in plan mode ({})",
+                plan_state.mode().as_str()
+            ));
+            return;
+        }
+        plan_state.enter_planning();
+        plan_state
+            .stash_previous_model(&self.model_entry.model.provider, &self.model_entry.model.id);
+        let model_warning = self
+            .config
+            .model_roles
+            .as_ref()
+            .and_then(|roles| crate::app::role_spec_from_settings(roles, ModelRole::Plan))
+            .map(str::to_string)
+            .and_then(|spec| self.switch_to_role_spec(&spec, "plan-role").err());
+        Self::log_plan_transition(&self.session, "planning");
+        self.messages.push(ConversationMessage {
+            role: MessageRole::System,
+            content: "Plan mode: read-only. Inspect with read/grep/find/ls, then call submit_plan with the full plan for review.".to_string(),
+            thinking: None,
+            collapsed: false,
+        });
+        self.status_message = Some(model_warning.map_or_else(
+            || "Plan mode: planning (read-only)".to_string(),
+            |error| {
+                format!(
+                    "Plan mode: planning (read-only). {error}. Continuing with {}",
+                    session_model_line(&self.model_entry)
+                )
+            },
+        ));
+        self.scroll_to_bottom();
+    }
+
+    fn approve_plan_mode(&mut self, plan_state: &crate::plan::PlanState) {
+        match plan_state.approve() {
+            Some(plan) => {
+                // Pin the plan into the agent's system context for the
+                // execution turns (bd-cv653.3.5).
+                if let Ok(mut agent_guard) = self.agent.try_lock() {
+                    let existing = agent_guard
+                        .system_prompt()
+                        .map(str::to_string)
+                        .unwrap_or_default();
+                    agent_guard.set_system_prompt(Some(format!(
+                        "{existing}\n\n## Approved Plan (execute this)\n\n{plan}"
+                    )));
+                }
+                let model_warning =
+                    plan_state
+                        .take_previous_model()
+                        .and_then(|(provider, model_id)| {
+                            self.switch_to_role_spec(
+                                &format!("{provider}/{model_id}"),
+                                "plan-restore",
+                            )
+                            .err()
+                        });
+                Self::log_plan_transition(&self.session, "approved");
+                self.status_message = Some(model_warning.map_or_else(
+                    || "Plan approved — execute it.".to_string(),
+                    |error| {
+                        format!(
+                            "Plan approved. {error}. Continuing with {}",
+                            session_model_line(&self.model_entry)
+                        )
+                    },
+                ));
+            }
+            None => {
+                self.status_message = Some("No submitted plan to approve".to_string());
+            }
+        }
+    }
+
+    /// `/advisor` (bd-cv653.3.3): status + pause/resume for the turn-review
+    /// second model.
+    fn handle_slash_advisor(&mut self, args: &str) -> Option<Cmd> {
+        let configured = self
+            .config
+            .model_roles
+            .as_ref()
+            .and_then(|roles| crate::app::role_spec_from_settings(roles, ModelRole::Advisor));
+        let report = super::workspace_reports::advisor(configured, args);
+        self.show_workspace_report(report);
+        None
+    }
+
+    fn handle_slash_fast(&mut self, args: &str) -> Option<Cmd> {
+        let Some(request) = crate::provider::ServiceTierCommand::parse(args) else {
+            self.status_message = Some(crate::provider::ServiceTierCommand::USAGE.to_string());
+            return None;
+        };
+        let Ok(mut agent) = self.agent.try_lock() else {
+            self.status_message = Some("Agent busy; try again".to_string());
+            return None;
+        };
+        let entry = agent.handle.session().current_model_entry();
+        let provider = agent.provider();
+        let result = request.apply(
+            &mut agent.stream_options_mut().service_tier,
+            provider.name(),
+            provider.api(),
+            entry.as_ref().and_then(ModelEntry::service_tiers),
+        );
+        drop(agent);
+        self.status_message = Some(result);
         None
     }
 
@@ -2704,6 +4352,7 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
 
         if let Ok(mut agent_guard) = self.agent.try_lock() {
             agent_guard.stream_options_mut().thinking_level = Some(effective_level);
+            agent_guard.clear_retry_keyword_effort();
         }
 
         self.status_message = Some(format!("Thinking level: {effective_level}"));
@@ -2840,6 +4489,8 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
 
         let config = self.config.clone();
         let cli = self.resource_cli.clone();
+        let package_manager = self.package_manager.clone();
+        let workspace_trust_guard = self.workspace_trust_guard.clone();
         let cwd = self.cwd.clone();
         let event_tx = self.event_tx.clone();
         let extensions = self.extensions.clone();
@@ -2847,31 +4498,46 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
         let task_cx = Cx::current().unwrap_or_else(Cx::for_request);
 
         runtime_handle.spawn(async move {
-            let manager = PackageManager::new(cwd.clone());
-            match ResourceLoader::load(&manager, &cwd, &config, &cli).await {
+            let global_dir = workspace_trust_guard
+                .as_ref()
+                .map_or_else(Config::global_dir, |guard| guard.global_dir().to_path_buf());
+            let loaded = async {
+                if let Some(guard) = &workspace_trust_guard {
+                    guard.validate_workspace(&cwd)?;
+                }
+                ResourceLoader::load(&package_manager, &cwd, &config, &cli).await
+            }
+            .await;
+            match loaded {
                 Ok(mut resources) => {
                     if let Some(manager) = extensions {
                         let discovered = manager.discover_resources(&cwd, "reload").await;
-                        if !discovered.is_empty() {
-                            if let Err(err) = resources.extend_with_paths(&cwd, &discovered) {
-                                tracing::warn!(
-                                    event = "pi.resources.reload.extension_paths_failed",
-                                    error = %err,
-                                    "Failed to apply extension-discovered resource paths"
-                                );
-                            }
+                        if !discovered.is_empty()
+                            && let Err(err) = resources.extend_with_paths(&cwd, &discovered)
+                        {
+                            tracing::warn!(
+                                event = "pi.resources.reload.extension_paths_failed",
+                                error = %err,
+                                "Failed to apply extension-discovered resource paths"
+                            );
                         }
                     }
 
-                    let models_error =
-                        match crate::auth::AuthStorage::load_async(Config::auth_path()).await {
-                            Ok(auth) => {
-                                let models_path = default_models_path(&Config::global_dir());
-                                let registry = ModelRegistry::load(&auth, Some(models_path));
-                                registry.error().map(ToString::to_string)
-                            }
-                            Err(err) => Some(format!("Failed to load auth.json: {err}")),
-                        };
+                    let auth_result =
+                        crate::auth::AuthStorage::load_async(global_dir.join("auth.json"))
+                            .await
+                            .and_then(|mut auth| {
+                                auth.set_command_working_directory(&cwd)?;
+                                Ok(auth)
+                            });
+                    let models_error = match auth_result {
+                        Ok(auth) => {
+                            let models_path = default_models_path(&global_dir);
+                            let registry = ModelRegistry::load(&auth, Some(models_path));
+                            registry.error().map(ToString::to_string)
+                        }
+                        Err(err) => Some(format!("Failed to load auth.json: {err}")),
+                    };
 
                     let (diagnostics, diag_count) =
                         build_reload_diagnostics(models_error, &resources);
@@ -2909,6 +4575,324 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
         });
 
         self.status_message = Some("Reloading resources...".to_string());
+        None
+    }
+
+    /// MCP (Model Context Protocol) server management: list, add, remove,
+    /// test, trust lifecycle (bd-cv653.6.1).
+    ///
+    /// One client registry unifies three config sources: native files
+    /// (`.pi/mcp.json`, `.agents/mcp.json`, `~/.pi/agent/mcp.json`,
+    /// `--mcp-config`), foreign files (`.claude/`, `.cursor/`, ...), and
+    /// extension-registered specs. Server processes are capability-equivalent
+    /// to `exec`: they never spawn until acknowledged via `/mcp trust`.
+    pub(super) fn handle_slash_mcp(&mut self, args: &str) -> Option<Cmd> {
+        let Some(manager) = self.mcp_manager.clone() else {
+            self.messages.push(ConversationMessage {
+                role: MessageRole::System,
+                content: "MCP client is unavailable (bootstrap failed at startup).".to_string(),
+                thinking: None,
+                collapsed: false,
+            });
+            return None;
+        };
+        let trimmed = args.trim();
+        if let Some((verb @ ("reauth" | "unauth"), name)) = trimmed.split_once(char::is_whitespace)
+        {
+            return self.mcp_handle_auth(&manager, verb, name.trim());
+        }
+        let mut parts = args.split_whitespace();
+        let subcommand = parts.next().unwrap_or("list");
+        let rest: Vec<&str> = parts.collect();
+        match subcommand {
+            "reauth" | "unauth" => self.mcp_handle_auth(&manager, subcommand, ""),
+            "list" => self.mcp_handle_list(&manager),
+            "add" => self.mcp_handle_add(&rest),
+            "remove" => self.mcp_handle_remove(&rest),
+            "trust" | "deny" | "test" => self.mcp_handle_action(&manager, subcommand, &rest),
+            other => {
+                self.status_message = Some(format!(
+                    "unknown /mcp subcommand {other:?}; expected list|add|remove|test|trust|deny|reauth|unauth"
+                ));
+                None
+            }
+        }
+    }
+
+    /// `/mcp list`: every server with provenance, trust state, and health.
+    fn mcp_handle_list(&mut self, manager: &crate::mcp::McpManager) -> Option<Cmd> {
+        let rows = manager.list();
+        let mut content = String::from("MCP servers (Model Context Protocol)\n");
+        if rows.is_empty() {
+            content.push_str(
+                "\n  No MCP servers configured. Add one with:\n\
+                 \x20   /mcp add <name> <command> [args...]     (stdio server)\n\
+                 \x20   /mcp add <name> --url <https://...>     (HTTP server)\n\
+                 or create .pi/mcp.json. Foreign configs (.claude/mcp.json,\n\
+                 .cursor/mcp.json, ...) are discovered automatically.\n",
+            );
+        } else {
+            let _ = writeln!(content, "\n  {} configured:", rows.len());
+            for row in &rows {
+                let _ = writeln!(
+                    content,
+                    "    • {} — {} [{}; trust: {}; {}]",
+                    row.name, row.target, row.provenance, row.trust, row.health
+                );
+            }
+            if rows.iter().any(|row| row.trust == "pending") {
+                content.push_str(
+                    "\nPending servers never spawn. Acknowledge one with /mcp trust <name>.\n",
+                );
+            }
+        }
+        for warning in manager.warnings() {
+            let _ = writeln!(content, "  ⚠ {warning}");
+        }
+        self.messages.push(ConversationMessage {
+            role: MessageRole::System,
+            content,
+            thinking: None,
+            collapsed: false,
+        });
+        self.scroll_to_last_match("MCP servers");
+        None
+    }
+
+    /// `/mcp add <name> <command...>` or `/mcp add <name> --url <url>`.
+    fn mcp_handle_add(&mut self, rest: &[&str]) -> Option<Cmd> {
+        let Some(name) = rest.first() else {
+            self.status_message = Some(
+                "usage: /mcp add <name> <command...> | /mcp add <name> --url <url>".to_string(),
+            );
+            return None;
+        };
+        let name = (*name).to_string();
+        let entry_value = if rest.get(1) == Some(&"--url") {
+            let Some(url) = rest.get(2) else {
+                self.status_message = Some("/mcp add --url requires a URL".to_string());
+                return None;
+            };
+            serde_json::json!({ "url": url })
+        } else {
+            match rest.get(1) {
+                Some(command) if !command.is_empty() => {
+                    let args: Vec<&str> = rest.iter().skip(2).copied().collect();
+                    serde_json::json!({ "command": command, "args": args })
+                }
+                _ => {
+                    self.status_message = Some("/mcp add requires a command or --url".to_string());
+                    return None;
+                }
+            }
+        };
+        let path = self.cwd.join(".pi/mcp.json");
+        let result = crate::mcp::config::read_project_config(&path).and_then(|mut value| {
+            crate::mcp::config::insert_project_server(&mut value, &name, entry_value)?;
+            crate::mcp::config::write_project_config(&path, &value)
+        });
+        match result {
+            Ok(()) => {
+                self.messages.push(ConversationMessage {
+                    role: MessageRole::System,
+                    content: format!(
+                        "Added MCP server {name:?} to {}. It is pending trust — run /mcp trust {name} to allow spawning it (takes effect next session for tool mounting).",
+                        path.display()
+                    ),
+                    thinking: None,
+                    collapsed: false,
+                });
+            }
+            Err(err) => {
+                self.status_message = Some(format!("/mcp add failed: {err}"));
+            }
+        }
+        None
+    }
+
+    /// `/mcp remove <name>`.
+    fn mcp_handle_remove(&mut self, rest: &[&str]) -> Option<Cmd> {
+        let Some(name) = rest.first() else {
+            self.status_message = Some("usage: /mcp remove <name>".to_string());
+            return None;
+        };
+        let name = (*name).to_string();
+        let path = self.cwd.join(".pi/mcp.json");
+        let result = crate::mcp::config::read_project_config(&path).and_then(|mut value| {
+            if !crate::mcp::config::remove_project_server(&mut value, &name) {
+                return Err(crate::error::Error::tool(
+                    "mcp",
+                    format!("[MCP_UNKNOWN_SERVER] {name:?} is not in {}", path.display()),
+                ));
+            }
+            crate::mcp::config::write_project_config(&path, &value)
+        });
+        match result {
+            Ok(()) => {
+                self.messages.push(ConversationMessage {
+                    role: MessageRole::System,
+                    content: format!(
+                        "Removed MCP server {name:?} from {} (takes effect next session).",
+                        path.display()
+                    ),
+                    thinking: None,
+                    collapsed: false,
+                });
+            }
+            Err(err) => self.status_message = Some(format!("/mcp remove failed: {err}")),
+        }
+        None
+    }
+
+    /// Browser login is an operator action, with the same abort lane as a turn.
+    /// No agent lock is held while the callback waits for the browser.
+    fn mcp_handle_auth(
+        &mut self,
+        manager: &std::sync::Arc<crate::mcp::McpManager>,
+        subcommand: &str,
+        name: &str,
+    ) -> Option<Cmd> {
+        if name.is_empty() || name.contains(['\r', '\n']) {
+            self.status_message = Some(format!("usage: /mcp {subcommand} <name>"));
+            return None;
+        }
+        if self.agent_state != AgentState::Idle || self.bash_running {
+            self.status_message = Some("MCP authentication needs an idle session".to_string());
+            return None;
+        }
+        let name = name.to_string();
+        let subcommand = subcommand.to_string();
+        let manager = Arc::clone(manager);
+        let agent = Arc::clone(&self.agent);
+        let event_tx = self.event_tx.clone();
+        let owner = crate::agent_cx::AgentCx::for_current_or_request();
+        let (abort_handle, abort_signal) = AbortHandle::new();
+        self.abort_handle = Some(abort_handle);
+        self.agent_state = AgentState::Processing;
+        self.status_message = Some(format!("MCP {subcommand} {name:?} (Esc to cancel)…"));
+        let request_id = uuid::Uuid::new_v4().to_string();
+        self.mcp_auth_request_id = Some(request_id.clone());
+        self.runtime_handle.spawn(async move {
+            let output_failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let callback_failed = Arc::clone(&output_failed);
+            let callback_tx = event_tx.clone();
+            let on_url: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(move |url| {
+                if callback_tx.try_send(PiMsg::SystemNote(format!(
+                    "Open this URL to sign in to the MCP server:\n{url}\n"
+                ))).is_err() {
+                    callback_failed.store(true, Ordering::Release);
+                }
+            });
+            let work = owner.with_current(async {
+                if subcommand == "reauth" {
+                    manager.reauthenticate(&name, None, on_url).await
+                } else {
+                    manager.unauthenticate(&name).await
+                }
+            });
+            let cancelled = async {
+                while !abort_signal.is_aborted()
+                    && !owner.is_cancel_requested()
+                    && !output_failed.load(Ordering::Acquire)
+                {
+                    owner.time().sleep(std::time::Duration::from_millis(10)).await;
+                }
+            };
+            let outcome = match futures::future::select(
+                Box::pin(cancelled), Box::pin(work),
+            ).await {
+                futures::future::Either::Left(((), pending)) => {
+                    drop(pending);
+                    Err(crate::error::Error::tool(
+                        "mcp", "[MCP_AUTH_CANCELLED] authentication cancelled or sign-in URL could not be delivered",
+                    ))
+                }
+                futures::future::Either::Right((result, _)) => result,
+            };
+            let cleanup = Cx::for_request();
+            if let Ok(agent) = agent.lock(&cleanup).await {
+                crate::mcp::reconcile_tools(&manager, &agent.shared_tools());
+            }
+            let message = match outcome {
+                Ok(()) if subcommand == "unauth" =>
+                    format!("Removed the managed login for MCP server {name:?}; its connection and tools were retired. Trust is unchanged."),
+                Ok(()) => format!("Signed in to MCP server {name:?}; its tool catalog has been refreshed."),
+                Err(error) => format!("MCP {name:?}: {error}"),
+            };
+            let _ = enqueue_pi_event(
+                &event_tx, &cleanup, PiMsg::McpAuthFinished { request_id, message },
+            ).await;
+        });
+        None
+    }
+
+    /// `/mcp trust|deny|test <name>` — async via the runtime, reporting back
+    /// as a system message; newly available tools mount into the live agent.
+    #[allow(clippy::option_if_let_else)]
+    fn mcp_handle_action(
+        &mut self,
+        manager: &std::sync::Arc<crate::mcp::McpManager>,
+        subcommand: &str,
+        rest: &[&str],
+    ) -> Option<Cmd> {
+        let Some(name) = rest.first() else {
+            self.status_message = Some(format!("usage: /mcp {subcommand} <name>"));
+            return None;
+        };
+        let name = (*name).to_string();
+        let status_label = name.clone();
+        let subcommand = subcommand.to_string();
+        let status_verb = subcommand.clone();
+        let runtime_handle = self.runtime_handle.clone();
+        let event_tx = self.event_tx.clone();
+        let agent = Arc::clone(&self.agent);
+        let manager = manager.clone();
+        let task_cx = Cx::current().unwrap_or_else(Cx::for_request);
+        runtime_handle.spawn(async move {
+            let outcome = match subcommand.as_str() {
+                "deny" => manager.deny(&name).await.map(|()| Vec::new()),
+                "test" => manager.test(&name).await,
+                _ => manager.trust(&name).await,
+            };
+            // A refreshed catalog replaces old definitions and removes tools
+            // no longer admitted, including deny and failed discovery. Take
+            // the Agent lock so publication occurs between its active turns.
+            let changed = if let Ok(agent) = agent.lock(&task_cx).await {
+                crate::mcp::reconcile_tools(&manager, &agent.shared_tools())
+            } else {
+                0
+            };
+            let message = match outcome {
+                Ok(_) if subcommand == "deny" => format!("MCP server {name:?} denied and stopped."),
+                Ok(tools) => {
+                    let verb = if subcommand == "test" {
+                        "tested"
+                    } else {
+                        "trusted"
+                    };
+                    let mut line = format!(
+                        "MCP server {name:?} {verb}: {} tool(s) available.",
+                        tools.len()
+                    );
+                    for tool in tools.iter().take(12) {
+                        let _ = writeln!(line, "  • {} — {}", tool.name, tool.description);
+                    }
+                    if tools.len() > 12 {
+                        let _ = writeln!(line, "  … and {} more", tools.len() - 12);
+                    }
+                    if changed > 0 {
+                        let _ = writeln!(
+                            line,
+                            "Updated {changed} MCP tool definition(s) in the live session."
+                        );
+                    }
+                    line
+                }
+                Err(err) => format!("MCP {name:?}: {err}"),
+            };
+            let _ = enqueue_pi_event(&event_tx, &task_cx, PiMsg::System(message)).await;
+        });
+        self.status_message = Some(format!("MCP {status_verb} {status_label:?} started…"));
         None
     }
 
@@ -2988,7 +4972,12 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
                 .and_then(|images| images.auto_resize)
                 .unwrap_or(true);
 
-            let processed = match process_file_arguments(&file_refs, &self.cwd, auto_resize) {
+            let processed = match process_file_arguments(
+                &file_refs,
+                &self.cwd,
+                auto_resize,
+                self.workspace(),
+            ) {
                 Ok(processed) => processed,
                 Err(err) => {
                     self.status_message = Some(err.to_string());
@@ -2996,6 +4985,7 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
                 }
             };
 
+            let keyword_scan_source = raw_input;
             let mut text = processed.text;
             if !message_for_agent.trim().is_empty() {
                 text.push_str(&message_for_agent);
@@ -3005,9 +4995,7 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
             if !text.trim().is_empty() {
                 content.push(ContentBlock::Text(TextContent::new(text)));
             }
-            for image in processed.images {
-                content.push(ContentBlock::Image(image));
-            }
+            content.extend(processed.attachments);
 
             if content.is_empty() {
                 self.status_message =
@@ -3017,7 +5005,11 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
 
             self.history.push(history_entry);
             let display = super::conversation::content_blocks_to_text(&content);
-            return self.submit_content_with_display(content, &display);
+            return self.submit_content_with_display_and_keyword_source(
+                content,
+                &display,
+                Some(keyword_scan_source),
+            );
         }
 
         if message_for_agent.is_empty() {
@@ -3028,18 +5020,1518 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
         self.history.push(history_entry);
         let content = vec![ContentBlock::Text(TextContent::new(message_for_agent))];
         let display = super::conversation::content_blocks_to_text(&content);
-        self.submit_content_with_display(content, &display)
+        self.submit_content_with_display_and_keyword_source(content, &display, Some(raw_input))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_bash_command, parse_extension_command, should_show_startup_oauth_hint};
+    use super::{
+        AgentState, LoginAttempt, PendingInput, PendingLoginKind, PendingOAuth, PiApp, SlashCommand,
+    };
+    use super::{
+        BashPersistenceOutcome, PiMsg, parse_bash_command, parse_extension_command,
+        persist_bash_execution, should_show_startup_oauth_hint, spawn_bash_completion,
+    };
+    use crate::agent::{Agent, AgentConfig, QueuedAgentMessage};
     use crate::auth::{AuthCredential, AuthStorage};
-    use crate::models::ModelEntry;
+    use crate::config::Config;
+    use crate::extensions::ExtensionManager;
+    use crate::keybindings::{AppAction, KeyBindings};
+    use crate::model::{Message as ModelMessage, StreamEvent, Usage, UserContent, UserMessage};
+    use crate::models::{ExtensionProviderBinding, ModelEntry, ModelRole};
+    use crate::package_manager::PackageManager;
+    use crate::provider::{Context, Provider, StreamOptions};
     use crate::provider::{InputType, Model, ModelCost};
+    use crate::resources::{ResourceCliOptions, ResourceLoader};
+    use crate::session::{Session, SessionEntry, SessionMessage};
+    use crate::tools::ToolRegistry;
+    use asupersync::Cx;
+    use asupersync::runtime::RuntimeBuilder;
+    use asupersync::sync::{Mutex, OwnedMutexGuard};
+    use bubbletea::{KeyMsg, KeyType};
+    use futures::stream;
     use std::collections::{HashMap, HashSet};
+    use std::path::Path;
+    use std::pin::Pin;
+    use std::sync::{Arc, OnceLock};
     use std::time::{SystemTime, UNIX_EPOCH};
+    use tempfile::TempDir;
+
+    struct DummyProvider;
+
+    #[async_trait::async_trait]
+    impl Provider for DummyProvider {
+        fn name(&self) -> &'static str {
+            "dummy"
+        }
+
+        fn api(&self) -> &'static str {
+            "dummy"
+        }
+
+        fn model_id(&self) -> &'static str {
+            "dummy-model"
+        }
+
+        async fn stream(
+            &self,
+            _context: &Context<'_>,
+            _options: &StreamOptions,
+        ) -> crate::error::Result<
+            Pin<Box<dyn futures::Stream<Item = crate::error::Result<StreamEvent>> + Send>>,
+        > {
+            Ok(Box::pin(stream::empty()))
+        }
+    }
+
+    fn runtime() -> &'static asupersync::runtime::Runtime {
+        static RT: OnceLock<asupersync::runtime::Runtime> = OnceLock::new();
+        RT.get_or_init(|| {
+            RuntimeBuilder::multi_thread()
+                .blocking_threads(1, 4)
+                .build()
+                .expect("build runtime")
+        })
+    }
+
+    fn excluded_bash_message(command: &str) -> SessionMessage {
+        SessionMessage::BashExecution {
+            command: command.to_string(),
+            output: "side effect completed".to_string(),
+            exit_code: 0,
+            cancelled: Some(false),
+            truncated: Some(false),
+            full_output_path: None,
+            timestamp: None,
+            extra: HashMap::from([(
+                "excludeFromContext".to_string(),
+                serde_json::Value::Bool(true),
+            )]),
+        }
+    }
+
+    fn assert_exact_excluded_bash_record(
+        session: &Session,
+        expected_command: &str,
+        expected_output: &str,
+        expected_timestamp_range: Option<std::ops::RangeInclusive<i64>>,
+    ) {
+        let records = session
+            .entries
+            .iter()
+            .filter_map(|entry| match entry {
+                SessionEntry::Message(message) => match &message.message {
+                    SessionMessage::BashExecution {
+                        command,
+                        output,
+                        exit_code,
+                        cancelled,
+                        truncated,
+                        full_output_path,
+                        timestamp,
+                        extra,
+                    } => Some((
+                        command,
+                        output,
+                        exit_code,
+                        cancelled,
+                        truncated,
+                        full_output_path,
+                        timestamp,
+                        extra,
+                    )),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(records.len(), 1, "exactly one bash record must exist");
+        let (command, output, exit_code, cancelled, truncated, full_output_path, timestamp, extra) =
+            records[0];
+        assert_eq!(command, expected_command);
+        assert_eq!(output, expected_output);
+        assert_eq!(*exit_code, 0);
+        assert_eq!(*cancelled, Some(false));
+        assert_eq!(*truncated, Some(false));
+        assert!(full_output_path.is_none());
+        match expected_timestamp_range {
+            Some(range) => assert!(
+                timestamp
+                    .as_ref()
+                    .is_some_and(|value| range.contains(value)),
+                "bash timestamp {timestamp:?} must fall inside the submission window {range:?}"
+            ),
+            None => assert!(timestamp.is_none()),
+        }
+        assert_eq!(
+            extra,
+            &HashMap::from([(
+                "excludeFromContext".to_string(),
+                serde_json::Value::Bool(true),
+            )])
+        );
+    }
+
+    /// GH #242: WSL is recognized by its env vars or by the kernel release
+    /// string; a plain Linux or macOS host is not.
+    #[test]
+    fn wsl_is_detected_from_env_or_kernel_release() {
+        use super::wsl_detected;
+        assert!(wsl_detected(true, None));
+        assert!(wsl_detected(
+            false,
+            Some("5.15.153.1-microsoft-standard-WSL2\n")
+        ));
+        assert!(!wsl_detected(false, Some("6.8.0-45-generic\n")));
+        assert!(!wsl_detected(false, None));
+    }
+
+    /// clip.exe gets UTF-16LE with a BOM, so non-ASCII text survives.
+    #[test]
+    fn clip_exe_payload_is_utf16le_with_bom() {
+        let payload = super::clip_exe_payload("é!");
+        assert_eq!(payload, vec![0xFF, 0xFE, 0xE9, 0x00, 0x21, 0x00]);
+    }
+
+    #[test]
+    fn excluded_bash_persistence_success_reopens_exact_record() {
+        let temp = TempDir::new().expect("tempdir");
+        let session = Arc::new(Mutex::new(Session::create_with_dir(Some(
+            temp.path().join("sessions"),
+        ))));
+        let cx = Cx::for_testing();
+
+        let persisted_path = runtime().block_on(async {
+            let outcome = persist_bash_execution(
+                Arc::clone(&session),
+                excluded_bash_message("create-once"),
+                true,
+                &cx,
+            )
+            .await;
+            assert_eq!(outcome, BashPersistenceOutcome::Saved);
+
+            let guard = OwnedMutexGuard::lock(Arc::clone(&session), &cx)
+                .await
+                .expect("lock saved session");
+            guard.path.clone().expect("saved session path")
+        });
+
+        let reopened = runtime()
+            .block_on(Session::open(persisted_path.to_string_lossy().as_ref()))
+            .expect("reopen saved session");
+        assert_exact_excluded_bash_record(&reopened, "create-once", "side effect completed", None);
+    }
+
+    #[test]
+    fn excluded_bash_save_failure_preserves_result_and_warns_against_rerun() {
+        let temp = TempDir::new().expect("tempdir");
+        let blocked_path = temp.path().join("blocked.jsonl");
+        std::fs::create_dir(&blocked_path).expect("create directory at session path");
+
+        let mut raw_session = Session::create_with_dir(Some(temp.path().join("sessions")));
+        raw_session.path = Some(blocked_path.clone());
+        let session = Arc::new(Mutex::new(raw_session));
+        let cx = Cx::for_testing();
+
+        let outcome = runtime().block_on(persist_bash_execution(
+            Arc::clone(&session),
+            excluded_bash_message("charge-card-once"),
+            true,
+            &cx,
+        ));
+        assert_eq!(
+            outcome,
+            BashPersistenceOutcome::NotConfirmed {
+                pending_mutations: Some(1),
+                failed_flushes: Some(1),
+            }
+        );
+
+        let warning = outcome.warning_text().expect("persistence warning");
+        assert!(warning.contains("Execution ended and may have performed side effects"));
+        assert!(warning.contains("do not rerun"));
+        assert!(warning.contains("Pending mutation slots (bounded/coalescing): 1"));
+        assert!(warning.contains("Total failed save attempts: 1"));
+        assert!(
+            !warning.contains(blocked_path.to_string_lossy().as_ref()),
+            "user-facing warning should not leak storage paths"
+        );
+
+        runtime().block_on(async {
+            let guard = OwnedMutexGuard::lock(Arc::clone(&session), &cx)
+                .await
+                .expect("lock failed-save session");
+            assert_exact_excluded_bash_record(
+                &guard,
+                "charge-card-once",
+                "side effect completed",
+                None,
+            );
+            let metrics = guard.autosave_metrics();
+            assert_eq!(metrics.pending_mutations, 1);
+            assert_eq!(metrics.flush_failed, 1);
+        });
+    }
+
+    #[test]
+    fn excluded_bash_completion_survives_cancelled_command_context() {
+        let temp = TempDir::new().expect("tempdir");
+        let blocked_path = temp.path().join("blocked.jsonl");
+        std::fs::create_dir(&blocked_path).expect("create directory at session path");
+
+        let mut raw_session = Session::create_with_dir(Some(temp.path().join("sessions")));
+        raw_session.path = Some(blocked_path);
+        let session = Arc::new(Mutex::new(raw_session));
+        let (event_tx, mut event_rx) = asupersync::channel::mpsc::channel(4);
+        let command_runtime_handle = runtime().handle();
+        let completion_runtime_handle = command_runtime_handle.clone();
+        let session_for_task = Arc::clone(&session);
+
+        command_runtime_handle.spawn_with_cx(move |command_cx| async move {
+            command_cx.set_cancel_requested(true);
+            spawn_bash_completion(
+                &completion_runtime_handle,
+                event_tx,
+                Some((
+                    session_for_task,
+                    excluded_bash_message("side-effect-before-cancellation"),
+                    true,
+                )),
+                "side effect completed\n\n[Output excluded from model context]".to_string(),
+            );
+        });
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let result = loop {
+            match event_rx.try_recv() {
+                Ok(message @ PiMsg::BashResult { .. }) => break message,
+                Ok(_) | Err(_) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Ok(other) => panic!("unexpected event after bash deadline: {other:?}"),
+                Err(err) => panic!("bash completion was not delivered before deadline: {err}"),
+            }
+        };
+        let PiMsg::BashResult { display } = result else {
+            unreachable!("loop only exits with BashResult")
+        };
+        assert!(display.contains("side effect completed"));
+        assert!(display.contains("[Persistence warning]"));
+        assert!(display.contains("do not rerun"));
+
+        let cx = Cx::for_testing();
+        runtime().block_on(async {
+            let guard = OwnedMutexGuard::lock(Arc::clone(&session), &cx)
+                .await
+                .expect("lock completion session");
+            assert_exact_excluded_bash_record(
+                &guard,
+                "side-effect-before-cancellation",
+                "side effect completed",
+                None,
+            );
+            assert_eq!(guard.autosave_metrics().pending_mutations, 1);
+            assert_eq!(guard.autosave_metrics().flush_failed, 1);
+        });
+    }
+
+    #[test]
+    fn bash_completion_waits_for_event_capacity_instead_of_dropping_terminal_result() {
+        let (event_tx, mut event_rx) = asupersync::channel::mpsc::channel(1);
+        event_tx
+            .try_send(PiMsg::System("occupy channel".to_string()))
+            .expect("fill event channel");
+        let runtime_handle = runtime().handle();
+        spawn_bash_completion(
+            &runtime_handle,
+            event_tx,
+            None,
+            "terminal bash result".to_string(),
+        );
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(PiMsg::System(message)) if message == "occupy channel"
+        ));
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            match event_rx.try_recv() {
+                Ok(PiMsg::BashResult { display }) => {
+                    assert_eq!(display, "terminal bash result");
+                    break;
+                }
+                Ok(other) => panic!("unexpected event while awaiting bash result: {other:?}"),
+                Err(_) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(err) => panic!("bash result was not delivered after capacity freed: {err}"),
+            }
+        }
+    }
+
+    fn build_bash_test_app(
+        session: Arc<Mutex<Session>>,
+        cwd: &Path,
+    ) -> (PiApp, asupersync::channel::mpsc::Receiver<PiMsg>) {
+        let current = test_model_entry("dummy", "dummy-model");
+        let agent = Agent::new(
+            Arc::new(DummyProvider),
+            ToolRegistry::new(&[], cwd, None),
+            AgentConfig::default(),
+        );
+        let resources = ResourceLoader::empty(false);
+        let resource_cli = ResourceCliOptions {
+            no_skills: false,
+            no_prompt_templates: false,
+            no_extensions: false,
+            no_themes: false,
+            skill_paths: Vec::new(),
+            prompt_paths: Vec::new(),
+            extension_paths: Vec::new(),
+            theme_paths: Vec::new(),
+        };
+        let (event_tx, event_rx) = asupersync::channel::mpsc::channel(64);
+        let config = Config {
+            last_changelog_version: Some(crate::platform::VERSION.to_string()),
+            ..Config::default()
+        };
+        let app = PiApp::new(
+            agent,
+            session,
+            config,
+            resources,
+            resource_cli,
+            cwd.to_path_buf(),
+            current.clone(),
+            Vec::new(),
+            vec![current],
+            None,
+            Vec::new(),
+            event_tx,
+            runtime().handle(),
+            true,
+            false,
+            None,
+            Some(KeyBindings::new()),
+            Vec::new(),
+            Usage::default(),
+            None,
+        );
+        (app, event_rx)
+    }
+
+    #[test]
+    fn reload_reuses_startup_package_trust_and_keeps_explicit_resources() {
+        let temp = TempDir::new().expect("tempdir");
+        let cwd = temp.path();
+        let project_skill = cwd.join(".pi/skills/project-only/SKILL.md");
+        let explicit_skill = cwd.join("explicit/explicit-only/SKILL.md");
+        std::fs::create_dir_all(project_skill.parent().expect("project skill parent"))
+            .expect("create project skill directory");
+        std::fs::create_dir_all(explicit_skill.parent().expect("explicit skill parent"))
+            .expect("create explicit skill directory");
+        std::fs::write(
+            &project_skill,
+            "---\nname: project-only\ndescription: Project trust sentinel\n---\nProject body.\n",
+        )
+        .expect("write project skill");
+        std::fs::write(cwd.join(".pi/settings.json"), "{}\n")
+            .expect("write project trust sentinel");
+        std::fs::write(
+            &explicit_skill,
+            "---\nname: explicit-only\ndescription: Explicit path sentinel\n---\nExplicit body.\n",
+        )
+        .expect("write explicit skill");
+
+        let session = Arc::new(Mutex::new(Session::in_memory()));
+        let (mut app, mut event_rx) = build_bash_test_app(session, cwd);
+        app.resource_cli.no_prompt_templates = true;
+        app.resource_cli.no_extensions = true;
+        app.resource_cli.no_themes = true;
+        app.resource_cli.skill_paths = vec![explicit_skill.to_string_lossy().to_string()];
+
+        assert!(app.handle_slash_reload().is_none());
+        let untrusted = runtime().block_on(async {
+            let cx = Cx::for_testing();
+            asupersync::time::timeout(
+                asupersync::time::wall_now(),
+                std::time::Duration::from_secs(30),
+                event_rx.recv(&cx),
+            )
+            .await
+            .expect("untrusted reload event before timeout")
+            .expect("untrusted reload event")
+        });
+        let PiMsg::ResourcesReloaded { resources, .. } = untrusted else {
+            panic!("unexpected untrusted reload event: {untrusted:?}");
+        };
+        assert!(
+            resources
+                .skills()
+                .iter()
+                .any(|skill| skill.name == "explicit-only"),
+            "explicit CLI resources remain authorized in an untrusted workspace"
+        );
+        assert!(
+            resources
+                .skills()
+                .iter()
+                .all(|skill| skill.name != "project-only"),
+            "untrusted reload must not rediscover project resources"
+        );
+
+        app.set_reload_package_manager(
+            PackageManager::new(cwd.to_path_buf()).with_project_trust(true),
+            None,
+        );
+        assert!(app.handle_slash_reload().is_none());
+        let trusted = runtime().block_on(async {
+            let cx = Cx::for_testing();
+            asupersync::time::timeout(
+                asupersync::time::wall_now(),
+                std::time::Duration::from_secs(30),
+                event_rx.recv(&cx),
+            )
+            .await
+            .expect("trusted reload event before timeout")
+            .expect("trusted reload event")
+        });
+        let PiMsg::ResourcesReloaded { resources, .. } = trusted else {
+            panic!("unexpected trusted reload event: {trusted:?}");
+        };
+        for expected in ["explicit-only", "project-only"] {
+            assert!(
+                resources
+                    .skills()
+                    .iter()
+                    .any(|skill| skill.name == expected),
+                "trusted reload should include {expected}"
+            );
+        }
+    }
+
+    fn classic_reload_guard(
+        cwd: &Path,
+        global_dir: &Path,
+        trusted: bool,
+    ) -> crate::workspace_trust::WorkspaceTrustGuard {
+        let inputs = crate::workspace_trust::TrustInputs {
+            cli_trust: trusted,
+            trust_all_workspaces: false,
+            env_override: None,
+            interactive: false,
+        };
+        let state = crate::workspace_trust::establish(
+            cwd,
+            &global_dir.join(crate::workspace_trust::TRUST_STORE_FILE),
+            &inputs,
+            |_| Ok(false),
+        )
+        .expect("establish launch trust");
+        assert_eq!(state.trusted, trusted);
+        crate::workspace_trust::WorkspaceTrustGuard::from_established(
+            cwd, &state, &inputs, global_dir, None,
+        )
+    }
+
+    fn receive_reload_event(event_rx: &mut asupersync::channel::mpsc::Receiver<PiMsg>) -> PiMsg {
+        runtime().block_on(async {
+            let cx = Cx::for_testing();
+            asupersync::time::timeout(
+                asupersync::time::wall_now(),
+                std::time::Duration::from_secs(30),
+                event_rx.recv(&cx),
+            )
+            .await
+            .expect("reload event before timeout")
+            .expect("reload event")
+        })
+    }
+
+    #[test]
+    fn classic_reload_rejects_changed_packages_and_preserves_loaded_prompts() {
+        let workspace = TempDir::new().expect("workspace");
+        let global = TempDir::new().expect("global configuration");
+        let cwd = workspace.path();
+        let project_dir = cwd.join(".pi");
+        let prompts = project_dir.join("prompts");
+        std::fs::create_dir_all(&prompts).expect("prompt directory");
+        let settings_path = project_dir.join("settings.json");
+        std::fs::write(&settings_path, r#"{"packages":[]}"#).expect("initial settings");
+        let prompt_path = prompts.join("trust-reload-281.md");
+        std::fs::write(&prompt_path, "Trusted $1").expect("initial prompt");
+        let guard = classic_reload_guard(cwd, global.path(), true);
+        let session = Arc::new(Mutex::new(Session::in_memory()));
+        let (mut app, mut event_rx) = build_bash_test_app(session, cwd);
+        app.resource_cli = ResourceCliOptions {
+            no_skills: true,
+            no_prompt_templates: true,
+            no_extensions: true,
+            no_themes: true,
+            skill_paths: Vec::new(),
+            prompt_paths: vec![prompt_path.to_string_lossy().into_owned()],
+            extension_paths: Vec::new(),
+            theme_paths: Vec::new(),
+        };
+        // Seed an actual loader without resolving any configured packages.
+        app.resources = runtime()
+            .block_on(ResourceLoader::load(
+                &app.package_manager,
+                cwd,
+                &app.config,
+                &app.resource_cli,
+            ))
+            .expect("initial explicit prompt");
+        app.autocomplete.provider.set_catalog(
+            crate::autocomplete::AutocompleteCatalog::from_resources(&app.resources),
+        );
+        app.resource_cli.no_prompt_templates = false;
+        app.set_reload_package_manager(
+            PackageManager::new(cwd.to_path_buf()).with_project_trust(true),
+            Some(guard),
+        );
+        let session_id = current_session_id(&app);
+        std::fs::write(&settings_path, r#"{"packages":["git:./missing-package"]}"#)
+            .expect("changed project package");
+        std::fs::write(&prompt_path, "Changed $1").expect("changed prompt");
+
+        assert!(app.handle_slash_reload().is_none());
+        let event = receive_reload_event(&mut event_rx);
+        assert!(matches!(&event, PiMsg::AgentError(error)
+            if error.contains("PI_WORKSPACE_TRUST_RESTART_REQUIRED")));
+        let _ = app.handle_pi_message(event);
+        assert_eq!(
+            app.resources.expand_input("/trust-reload-281 #281"),
+            "Trusted #281"
+        );
+        assert_eq!(current_session_id(&app), session_id);
+        assert_eq!(app.agent_state, AgentState::Idle);
+        for path in [
+            "git",
+            "npm",
+            "packages.lock.json",
+            "package-trust-audit.jsonl",
+        ] {
+            assert!(
+                !project_dir.join(path).exists(),
+                "created package state: {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn classic_reload_keeps_a_denied_launch_inert_despite_a_trusted_manager() {
+        let workspace = TempDir::new().expect("workspace");
+        let global = TempDir::new().expect("global configuration");
+        let cwd = workspace.path();
+        let project_dir = cwd.join(".pi");
+        let prompts = project_dir.join("prompts");
+        std::fs::create_dir_all(&prompts).expect("prompt directory");
+        let settings_path = project_dir.join("settings.json");
+        let package_settings = r#"{"packages":["git:./missing-package"]}"#;
+        std::fs::write(&settings_path, package_settings).expect("untrusted package");
+        std::fs::write(prompts.join("trust-reload-project-281.md"), "Project $1")
+            .expect("project prompt");
+        let explicit_prompt = cwd.join("trust-reload-explicit-281.md");
+        std::fs::write(&explicit_prompt, "Explicit $1").expect("explicit prompt");
+        let guard = classic_reload_guard(cwd, global.path(), false);
+        let session = Arc::new(Mutex::new(Session::in_memory()));
+        let (mut app, mut event_rx) = build_bash_test_app(session, cwd);
+        app.resource_cli = ResourceCliOptions {
+            no_skills: true,
+            no_prompt_templates: false,
+            no_extensions: true,
+            no_themes: true,
+            skill_paths: Vec::new(),
+            prompt_paths: vec![explicit_prompt.to_string_lossy().into_owned()],
+            extension_paths: Vec::new(),
+            theme_paths: Vec::new(),
+        };
+        app.set_reload_package_manager(
+            PackageManager::new(cwd.to_path_buf()).with_project_trust(true),
+            Some(guard),
+        );
+
+        for settings in [package_settings, "malformed project configuration"] {
+            std::fs::write(&settings_path, settings).expect("update untrusted settings");
+            assert!(app.handle_slash_reload().is_none());
+            let event = receive_reload_event(&mut event_rx);
+            assert!(matches!(&event, PiMsg::ResourcesReloaded { .. }));
+            let _ = app.handle_pi_message(event);
+            assert_eq!(
+                app.resources
+                    .expand_input("/trust-reload-explicit-281 #281"),
+                "Explicit #281"
+            );
+            assert!(
+                app.resources
+                    .prompts()
+                    .iter()
+                    .all(|prompt| prompt.name != "trust-reload-project-281")
+            );
+            for path in [
+                "git",
+                "npm",
+                "packages.lock.json",
+                "package-trust-audit.jsonl",
+            ] {
+                assert!(
+                    !project_dir.join(path).exists(),
+                    "created package state: {path}"
+                );
+            }
+        }
+    }
+
+    fn stage_private_follow_up(app: &PiApp) {
+        let mut agent = app.agent.try_lock().expect("test agent lock");
+        agent.queue_follow_up(ModelMessage::User(UserMessage {
+            content: UserContent::Text("old-session follow-up".to_string()),
+            timestamp: 0,
+        }));
+    }
+
+    fn current_session_id(app: &PiApp) -> String {
+        app.session
+            .try_lock()
+            .expect("test session lock")
+            .header
+            .id
+            .clone()
+    }
+
+    #[test]
+    fn completed_tan_event_keeps_card_and_follow_up_bound_to_the_origin_session() {
+        let temp = TempDir::new().expect("tempdir");
+        let session = Arc::new(Mutex::new(Session::in_memory()));
+        let (mut app, mut event_rx) = build_bash_test_app(session, temp.path());
+        let origin_session_id = current_session_id(&app);
+        let task_marker = "origin-only-tan-task";
+        let output_marker = "origin-only-tan-output";
+        let completion = pi::subagents::TanCompletion {
+            schema: "pi.background-tan.result.v1",
+            hub_id: Some("tan-origin-proof".to_string()),
+            task: task_marker.to_string(),
+            status: "completed".to_string(),
+            output: output_marker.to_string(),
+            error: None,
+            is_error: false,
+        };
+        let expected_card = completion.card_text();
+        let expected_follow_up = completion.follow_up_text();
+        let event = PiApp::completed_tan_event(origin_session_id.clone(), &completion);
+        assert!(matches!(
+            &event,
+            PiMsg::SessionSystemNote {
+                owner_session_id,
+                message,
+            } if owner_session_id == &origin_session_id
+                && message == &expected_card
+        ));
+        assert!(runtime().block_on(async {
+            let cx = Cx::for_testing();
+            crate::interactive::enqueue_pi_event(&app.event_tx, &cx, event).await
+        }));
+
+        let replacement_session = Session::in_memory();
+        let replacement_session_id = replacement_session.header.id.clone();
+        assert_ne!(replacement_session_id, origin_session_id);
+        *app.session.try_lock().expect("replace live session") = replacement_session;
+        let messages_before_delivery = app.messages.len();
+
+        let queued_event = runtime().block_on(async {
+            let cx = Cx::for_testing();
+            asupersync::time::timeout(
+                asupersync::time::wall_now(),
+                std::time::Duration::from_secs(30),
+                event_rx.recv(&cx),
+            )
+            .await
+            .expect("/tan completion event before timeout")
+            .expect("/tan completion event")
+        });
+        let _ = app.handle_pi_message(queued_event);
+        assert_eq!(
+            app.messages.len(),
+            messages_before_delivery,
+            "the replacement transcript must discard the origin-bound /tan card"
+        );
+        assert!(app.messages.iter().all(|message| {
+            !message.content.contains(task_marker) && !message.content.contains(output_marker)
+        }));
+
+        let origin_notices = pi::jobs::take_completion_notices(&origin_session_id);
+        assert_eq!(
+            origin_notices.len(),
+            1,
+            "the production completion helper must queue exactly one origin follow-up"
+        );
+        let ModelMessage::User(UserMessage {
+            content: UserContent::Text(follow_up),
+            ..
+        }) = &origin_notices[0]
+        else {
+            panic!("/tan follow-up must be a user message");
+        };
+        assert_eq!(follow_up, &expected_follow_up);
+        assert!(
+            pi::jobs::take_completion_notices(&replacement_session_id).is_empty(),
+            "the replacement session must not inherit the origin model follow-up"
+        );
+    }
+
+    fn assert_staged_transition_rejected(app: &PiApp, original_session_id: &str) {
+        assert!(matches!(app.agent_state, AgentState::Idle));
+        assert_eq!(current_session_id(app), original_session_id);
+        assert!(
+            app.status_message
+                .as_deref()
+                .is_some_and(|status| status.contains("Queued input is still pending"))
+        );
+    }
+
+    #[test]
+    fn new_session_rejects_staged_old_session_delivery() {
+        let temp = TempDir::new().expect("tempdir");
+        let session = Arc::new(Mutex::new(Session::in_memory()));
+        let (mut app, _event_rx) = build_bash_test_app(session, temp.path());
+        let original_session_id = current_session_id(&app);
+        stage_private_follow_up(&app);
+
+        let _ = app.handle_slash_command(SlashCommand::New, "");
+
+        assert_staged_transition_rejected(&app, &original_session_id);
+        assert_eq!(
+            app.agent
+                .try_lock()
+                .expect("test agent lock")
+                .queued_message_count(),
+            1,
+            "rejected transition must leave the old-session delivery intact"
+        );
+    }
+
+    #[test]
+    fn classic_fork_preserves_a_lazy_sources_attached_workspace() {
+        let temp = TempDir::new().expect("tempdir");
+        let fixture = runtime().block_on(crate::session::fork_tests::workspace_fixture(
+            temp.path(),
+            true,
+        ));
+        let source = Arc::new(Mutex::new(fixture.source.clone()));
+        let (mut app, mut event_rx) = build_bash_test_app(source, &fixture.bound_cwd);
+
+        let _ = app.handle_slash_fork(&fixture.target_id);
+        let terminal = runtime().block_on(async {
+            let cx = Cx::for_testing();
+            asupersync::time::timeout(
+                asupersync::time::wall_now(),
+                std::time::Duration::from_secs(10),
+                event_rx.recv(&cx),
+            )
+            .await
+            .expect("fork event before timeout")
+            .expect("fork event")
+        });
+        assert!(
+            matches!(terminal, PiMsg::ConversationReset { .. }),
+            "unexpected fork event: {terminal:?}"
+        );
+        let _ = app.handle_pi_message(terminal);
+        assert!(matches!(app.agent_state, AgentState::Idle));
+        assert_eq!(app.cwd, fixture.bound_cwd);
+        let fork_path = {
+            let fork = app.session.try_lock().expect("forked session");
+            fixture.assert_workspace(&fork);
+            fixture.assert_selected_context(&fork);
+            fork.path.clone().expect("persisted fork path")
+        };
+        let saved = runtime()
+            .block_on(Session::open(fork_path.to_str().expect("UTF-8 fork path")))
+            .expect("reopen classic fork");
+        fixture.assert_workspace(&saved);
+        fixture.assert_selected_context(&saved);
+        assert_eq!(
+            std::fs::read(&fixture.source_file).expect("unchanged source"),
+            fixture.source_bytes
+        );
+    }
+
+    #[test]
+    fn classic_fork_rejects_a_newer_attachment_outside_its_runtime_workspace() {
+        let temp = TempDir::new().expect("tempdir");
+        // Saving the fixture's source initializes its own `sessions` index
+        // namespace, so build it apart from the store a fork would write to.
+        let fixture_root = temp.path().join("fixture");
+        std::fs::create_dir(&fixture_root).expect("fixture root");
+        let fixture = runtime().block_on(crate::session::fork_tests::workspace_fixture(
+            &fixture_root,
+            true,
+        ));
+        let runtime_cwd = fixture_root
+            .join("previous-workspace")
+            .canonicalize()
+            .expect("runtime workspace");
+        assert_eq!(
+            crate::session_workdir::require_session_workdir(&fixture.source)
+                .expect("lazy active branch still sees its earlier binding"),
+            runtime_cwd
+        );
+        let mut live_source = fixture.source.clone();
+        live_source.session_dir = Some(temp.path().join("sessions"));
+        let source = Arc::new(Mutex::new(live_source));
+        let (mut app, mut event_rx) = build_bash_test_app(source, &runtime_cwd);
+        let source_id = current_session_id(&app);
+
+        let _ = app.handle_slash_fork(&fixture.target_id);
+        let terminal = runtime().block_on(async {
+            let cx = Cx::for_testing();
+            asupersync::time::timeout(
+                asupersync::time::wall_now(),
+                std::time::Duration::from_secs(10),
+                event_rx.recv(&cx),
+            )
+            .await
+            .expect("fork error before timeout")
+            .expect("fork error")
+        });
+        assert!(
+            matches!(&terminal, PiMsg::AgentError(error) if error.contains("PI_SESSION_WORKDIR_MISMATCH")),
+            "unexpected fork event: {terminal:?}"
+        );
+        let _ = app.handle_pi_message(terminal);
+        assert!(matches!(app.agent_state, AgentState::Idle));
+        assert_eq!(current_session_id(&app), source_id);
+        assert_eq!(app.cwd, runtime_cwd);
+        let source = app.session.try_lock().expect("unchanged source session");
+        assert_eq!(source.leaf_id(), fixture.source.leaf_id());
+        assert_eq!(source.entries.len(), fixture.source.entries.len());
+        assert!(!temp.path().join("sessions").exists());
+        assert_eq!(
+            std::fs::read(&fixture.source_file).expect("unchanged source"),
+            fixture.source_bytes
+        );
+    }
+
+    #[test]
+    fn fork_rejects_staged_old_session_delivery() {
+        let temp = TempDir::new().expect("tempdir");
+        let mut raw_session = Session::in_memory();
+        raw_session.append_model_message(ModelMessage::User(UserMessage {
+            content: UserContent::Text("fork source".to_string()),
+            timestamp: 0,
+        }));
+        let session = Arc::new(Mutex::new(raw_session));
+        let (mut app, _event_rx) = build_bash_test_app(session, temp.path());
+        let original_session_id = current_session_id(&app);
+        app.message_queue
+            .lock()
+            .expect("test user queue lock")
+            .push_follow_up(QueuedAgentMessage::generated(ModelMessage::User(
+                UserMessage {
+                    content: UserContent::Text("queued authored delivery".to_string()),
+                    timestamp: 0,
+                },
+            )));
+
+        let _ = app.handle_slash_fork("");
+
+        assert_staged_transition_rejected(&app, &original_session_id);
+        assert_eq!(
+            app.message_queue
+                .lock()
+                .expect("test user queue lock")
+                .follow_up_len(),
+            1
+        );
+    }
+
+    #[test]
+    fn resume_rejects_staged_old_session_delivery() {
+        let temp = TempDir::new().expect("tempdir");
+        let session = Arc::new(Mutex::new(Session::in_memory()));
+        let (mut app, _event_rx) = build_bash_test_app(session, temp.path());
+        let original_session_id = current_session_id(&app);
+        app.injected_queue
+            .lock()
+            .expect("test injected queue lock")
+            .push_follow_up(ModelMessage::User(UserMessage {
+                content: UserContent::Text("queued extension delivery".to_string()),
+                timestamp: 0,
+            }));
+
+        let _ = app.load_session_from_path(
+            temp.path()
+                .join("unused-session.jsonl")
+                .to_string_lossy()
+                .as_ref(),
+        );
+
+        assert_staged_transition_rejected(&app, &original_session_id);
+        assert_eq!(
+            app.injected_queue
+                .lock()
+                .expect("test injected queue lock")
+                .pending_count(),
+            1
+        );
+    }
+
+    #[test]
+    fn new_session_rejects_unconsumed_pending_input() {
+        let temp = TempDir::new().expect("tempdir");
+        let session = Arc::new(Mutex::new(Session::in_memory()));
+        let (mut app, _event_rx) = build_bash_test_app(session, temp.path());
+        let original_session_id = current_session_id(&app);
+        app.pending_inputs
+            .push_back(PendingInput::Text("old-session startup input".to_string()));
+
+        let _ = app.handle_slash_command(SlashCommand::New, "");
+
+        assert_staged_transition_rejected(&app, &original_session_id);
+        assert_eq!(app.pending_inputs.len(), 1);
+    }
+
+    #[test]
+    fn new_session_clears_session_derived_title_and_todo_state() {
+        let temp = TempDir::new().expect("tempdir");
+        let session = Arc::new(Mutex::new(Session::in_memory()));
+        let (mut app, _event_rx) = build_bash_test_app(session, temp.path());
+        let original_session_id = current_session_id(&app);
+        app.title_requested = true;
+        app.todo_summary = Some("1/2 todos complete".to_string());
+        app.role_model_overrides.insert(
+            crate::models::ModelRole::Smol,
+            ("fixture-provider".to_string(), "fixture-model".to_string()),
+        );
+
+        let _ = app.handle_slash_command(SlashCommand::New, "");
+
+        let new_session_id = current_session_id(&app);
+        assert_ne!(new_session_id, original_session_id);
+        assert!(!app.title_requested);
+        assert!(app.todo_summary.is_none());
+        assert!(app.role_model_overrides.is_empty());
+        assert_eq!(
+            app.displayed_session_id.as_deref(),
+            Some(new_session_id.as_str())
+        );
+    }
+
+    #[test]
+    fn session_install_preserves_fork_spend_and_rebinds_new_or_resumed_accounts() {
+        let temp = TempDir::new().unwrap();
+        let session = Arc::new(Mutex::new(Session::in_memory()));
+        let (app, _events) = build_bash_test_app(Arc::clone(&session), temp.path());
+        let original = crate::cost::CostBudget::new(None, Some(2.0), 1.25).unwrap();
+        app.agent
+            .try_lock()
+            .unwrap()
+            .set_cost_budget(Some(original.clone()));
+
+        runtime()
+            .block_on(PiApp::try_install_session(
+                &session,
+                &app.agent,
+                &app.session_action_admission,
+                Session::in_memory(),
+                Vec::new(),
+                None,
+                true,
+            ))
+            .unwrap();
+        assert!(
+            app.agent
+                .try_lock()
+                .unwrap()
+                .cost_budget()
+                .unwrap()
+                .same_tree(&original)
+        );
+        assert!(
+            (crate::cost::recorded_spend(&session.try_lock().unwrap()).unwrap() - 1.25).abs()
+                < f64::EPSILON
+        );
+
+        let same_session = session.try_lock().unwrap().clone();
+        runtime()
+            .block_on(PiApp::try_install_session(
+                &session,
+                &app.agent,
+                &app.session_action_admission,
+                same_session,
+                Vec::new(),
+                None,
+                false,
+            ))
+            .unwrap();
+        assert!(
+            app.agent
+                .try_lock()
+                .unwrap()
+                .cost_budget()
+                .unwrap()
+                .same_tree(&original)
+        );
+
+        let mut resumed = Session::in_memory();
+        crate::cost::CostBudget::new(None, Some(2.0), 0.5)
+            .unwrap()
+            .checkpoint(&mut resumed)
+            .unwrap();
+        runtime()
+            .block_on(PiApp::try_install_session(
+                &session,
+                &app.agent,
+                &app.session_action_admission,
+                resumed,
+                Vec::new(),
+                None,
+                false,
+            ))
+            .unwrap();
+        let resumed_budget = app
+            .agent
+            .try_lock()
+            .unwrap()
+            .cost_budget()
+            .cloned()
+            .unwrap();
+        assert!(!resumed_budget.same_tree(&original));
+        assert!((resumed_budget.spent() - 0.5).abs() < f64::EPSILON);
+        assert!(
+            app.agent
+                .try_lock()
+                .unwrap()
+                .shared_tools()
+                .snapshot()
+                .cost_scope()
+                .current()
+                .unwrap()
+                .same_tree(&resumed_budget)
+        );
+
+        runtime()
+            .block_on(PiApp::try_install_session(
+                &session,
+                &app.agent,
+                &app.session_action_admission,
+                Session::in_memory(),
+                Vec::new(),
+                None,
+                false,
+            ))
+            .unwrap();
+        let fresh = app
+            .agent
+            .try_lock()
+            .unwrap()
+            .cost_budget()
+            .cloned()
+            .unwrap();
+        assert!(!fresh.same_tree(&resumed_budget));
+        assert!(fresh.spent().abs() < f64::EPSILON);
+        assert!((original.spent() - 1.25).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    // The cost-cap error carries the exact configured values, so `==` is intended.
+    #[allow(clippy::float_cmp)]
+    fn saved_fork_install_keeps_late_cost_ancestry_after_the_app_is_dropped() {
+        let temp = TempDir::new().unwrap();
+        let mut initial = Session::create_with_dir(Some(temp.path().join("sessions")));
+        initial.header.cwd = temp.path().display().to_string();
+        let session = Arc::new(Mutex::new(initial));
+        let (app, _events) = build_bash_test_app(Arc::clone(&session), temp.path());
+        let budget = crate::cost::CostBudget::new(None, Some(1.0), 0.0).unwrap();
+        budget.record(0.25).unwrap();
+        let mut outstanding = budget.start_attempt().unwrap();
+        outstanding.observe(0.5).unwrap();
+        app.agent
+            .try_lock()
+            .unwrap()
+            .set_cost_budget(Some(budget.clone()));
+        let mut fork = Session::create_with_dir(Some(temp.path().join("sessions")));
+        fork.header.cwd = temp.path().display().to_string();
+        runtime()
+            .block_on(PiApp::try_install_session(
+                &session,
+                &app.agent,
+                &app.session_action_admission,
+                fork,
+                Vec::new(),
+                None,
+                true,
+            ))
+            .unwrap();
+        let fork_path = session.try_lock().unwrap().path.clone().unwrap();
+        let bytes = std::fs::read(&fork_path).unwrap();
+        drop(app);
+        drop(session);
+        outstanding.finish(0.75).unwrap();
+        drop(outstanding);
+        drop(budget);
+        assert_eq!(std::fs::read(&fork_path).unwrap(), bytes);
+        let reopened = runtime()
+            .block_on(Session::open(fork_path.to_str().unwrap()))
+            .unwrap();
+        let restored = crate::cost::resolve_budget(&reopened, None, None, Some(1.0), None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(restored.spent(), 1.0);
+        assert!(
+            matches!(restored.admit(), Err(crate::error::Error::CostCap { spent, cap })
+            if spent == 1.0 && cap == 1.0)
+        );
+    }
+
+    #[test]
+    fn new_without_extensions_saves_departing_shared_spend_before_reset() {
+        let temp = TempDir::new().unwrap();
+        let mut initial = Session::create_with_dir(Some(temp.path().join("sessions")));
+        initial.header.cwd = temp.path().display().to_string();
+        runtime().block_on(initial.save()).unwrap();
+        let source_path = initial.path.clone().unwrap();
+        let session = Arc::new(Mutex::new(initial));
+        let (mut app, mut events) = build_bash_test_app(session, temp.path());
+        let original_id = current_session_id(&app);
+        let budget = crate::cost::CostBudget::new(None, Some(1.0), 0.75).unwrap();
+        app.agent
+            .try_lock()
+            .unwrap()
+            .set_cost_budget(Some(budget.clone()));
+        let _ = app.handle_slash_command(SlashCommand::New, "");
+        let terminal = runtime().block_on(async {
+            let cx = Cx::for_testing();
+            asupersync::time::timeout(
+                asupersync::time::wall_now(),
+                std::time::Duration::from_secs(10),
+                events.recv(&cx),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+        });
+        assert!(
+            matches!(terminal, PiMsg::ConversationReset { .. }),
+            "{terminal:?}"
+        );
+        let _ = app.handle_pi_message(terminal);
+        assert_ne!(current_session_id(&app), original_id);
+        let active = app
+            .agent
+            .try_lock()
+            .unwrap()
+            .cost_budget()
+            .cloned()
+            .unwrap();
+        assert!(!active.same_tree(&budget));
+        assert!(active.spent().abs() < f64::EPSILON);
+        let saved = runtime()
+            .block_on(Session::open(source_path.to_str().unwrap()))
+            .unwrap();
+        assert!((crate::cost::recorded_spend(&saved).unwrap() - 0.75).abs() < f64::EPSILON);
+        let original_transcript = std::fs::read(&source_path).unwrap();
+        budget.record(0.125).unwrap();
+        let saved = runtime()
+            .block_on(Session::open(source_path.to_str().unwrap()))
+            .unwrap();
+        assert!((crate::cost::recorded_spend(&saved).unwrap() - 0.875).abs() < f64::EPSILON);
+        assert_eq!(std::fs::read(&source_path).unwrap(), original_transcript);
+        assert!(active.spent().abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn atomic_session_install_does_not_mutate_agent_when_session_is_busy() {
+        let temp = TempDir::new().expect("tempdir");
+        let session = Arc::new(Mutex::new(Session::in_memory()));
+        let (app, _event_rx) = build_bash_test_app(Arc::clone(&session), temp.path());
+        let original_session_id = current_session_id(&app);
+        app.agent
+            .try_lock()
+            .expect("test agent lock")
+            .add_message(ModelMessage::User(UserMessage {
+                content: UserContent::Text("old-agent-history".to_string()),
+                timestamp: 0,
+            }));
+        let held_session = session.try_lock().expect("hold session lock");
+        let replacement_message = ModelMessage::User(UserMessage {
+            content: UserContent::Text("replacement-history".to_string()),
+            timestamp: 0,
+        });
+
+        let result = runtime().block_on(PiApp::try_install_session(
+            &session,
+            &app.agent,
+            &app.session_action_admission,
+            Session::in_memory(),
+            vec![replacement_message],
+            None,
+            false,
+        ));
+
+        assert!(result.is_err());
+        drop(held_session);
+        assert_eq!(current_session_id(&app), original_session_id);
+        let agent = app.agent.try_lock().expect("test agent lock");
+        assert_eq!(agent.messages().len(), 1);
+        assert!(matches!(
+            &agent.messages()[0],
+            ModelMessage::User(UserMessage {
+                content: UserContent::Text(text),
+                ..
+            }) if text == "old-agent-history"
+        ));
+    }
+
+    #[test]
+    fn new_session_keeps_the_live_workspace_with_or_without_extensions() {
+        let temp = TempDir::new().expect("tempdir");
+        let process_cwd = std::env::current_dir().expect("process cwd");
+        for with_extensions in [false, true] {
+            let session = Arc::new(Mutex::new(Session::in_memory()));
+            let (mut app, mut event_rx) = build_bash_test_app(session, temp.path());
+            let original_id = current_session_id(&app);
+            if with_extensions {
+                app.extensions = Some(crate::extensions::ExtensionManager::default());
+            }
+            let _ = app.handle_slash_command(SlashCommand::New, "");
+            if with_extensions {
+                let terminal = runtime().block_on(async {
+                    let cx = Cx::for_testing();
+                    asupersync::time::timeout(
+                        asupersync::time::wall_now(),
+                        std::time::Duration::from_secs(10),
+                        event_rx.recv(&cx),
+                    )
+                    .await
+                    .expect("new-session event before timeout")
+                    .expect("new-session event")
+                });
+                assert!(matches!(terminal, PiMsg::ConversationReset { .. }));
+                let _ = app.handle_pi_message(terminal);
+            }
+            assert_ne!(current_session_id(&app), original_id);
+            assert_eq!(
+                app.session.try_lock().expect("session lock").header.cwd,
+                temp.path().display().to_string()
+            );
+            assert_eq!(std::env::current_dir().expect("unchanged cwd"), process_cwd);
+        }
+    }
+
+    #[test]
+    fn resume_rejects_another_workspace_without_replacing_the_active_session() {
+        let temp = TempDir::new().expect("tempdir");
+        let other = temp.path().join("other-workspace");
+        std::fs::create_dir(&other).expect("other workspace");
+        let mut target = Session::create_with_dir(Some(temp.path().join("sessions")));
+        target.header.cwd = other.display().to_string();
+        runtime().block_on(target.save()).expect("save target");
+        let path = target.path.clone().expect("target path");
+        let original_bytes = std::fs::read(&path).expect("original target bytes");
+        let source = Arc::new(Mutex::new(Session::in_memory()));
+        let (mut app, mut event_rx) = build_bash_test_app(source, temp.path());
+        let original_id = current_session_id(&app);
+
+        let _ = app.load_session_from_path(path.to_str().expect("UTF-8 target path"));
+        let terminal = runtime().block_on(async {
+            let cx = Cx::for_testing();
+            asupersync::time::timeout(
+                asupersync::time::wall_now(),
+                std::time::Duration::from_secs(10),
+                event_rx.recv(&cx),
+            )
+            .await
+            .expect("resume event before timeout")
+            .expect("resume event")
+        });
+        assert!(matches!(
+            &terminal,
+            PiMsg::AgentError(message) if message.contains("PI_SESSION_WORKDIR_MISMATCH")
+        ));
+        let _ = app.handle_pi_message(terminal);
+        assert!(matches!(app.agent_state, AgentState::Idle));
+        assert_eq!(current_session_id(&app), original_id);
+        assert_eq!(
+            std::fs::read(&path).expect("unchanged target"),
+            original_bytes
+        );
+    }
+
+    #[test]
+    fn resume_marks_processing_before_async_session_load() {
+        let temp = TempDir::new().expect("tempdir");
+        let session = Arc::new(Mutex::new(Session::in_memory()));
+        let (mut app, mut event_rx) = build_bash_test_app(session, temp.path());
+
+        let _ = app.load_session_from_path(
+            temp.path()
+                .join("missing-session.jsonl")
+                .to_string_lossy()
+                .as_ref(),
+        );
+        assert!(matches!(app.agent_state, AgentState::Processing));
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let terminal = loop {
+            match event_rx.try_recv() {
+                Ok(message @ PiMsg::AgentError(_)) => break message,
+                Ok(other) => panic!("unexpected resume event: {other:?}"),
+                Err(_) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(err) => panic!("resume error was not delivered before deadline: {err}"),
+            }
+        };
+        assert!(
+            matches!(app.agent_state, AgentState::Processing),
+            "background completion must not mutate UI state before its event is handled"
+        );
+        let _ = app.handle_pi_message(terminal);
+        assert!(matches!(app.agent_state, AgentState::Idle));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn excluded_bash_production_path_ignores_cancelled_ambient_context_during_cleanup() {
+        let temp = TempDir::new().expect("tempdir");
+        let blocked_path = temp.path().join("blocked.jsonl");
+        std::fs::create_dir(&blocked_path).expect("create directory at session path");
+
+        let mut raw_session = Session::create_with_dir(Some(temp.path().join("sessions")));
+        raw_session.path = Some(blocked_path.clone());
+        let session = Arc::new(Mutex::new(raw_session));
+        let (mut app, mut event_rx) = build_bash_test_app(Arc::clone(&session), temp.path());
+
+        let cancelled_ambient = Cx::for_testing();
+        cancelled_ambient.set_cancel_requested(true);
+        let _current_cx = Cx::set_current(Some(cancelled_ambient));
+
+        let command = "printf side-effect-output";
+        let submitted_at = chrono::Utc::now().timestamp_millis();
+        let _ = app.submit_bash_command(&format!("! {command}"), command.to_string(), true);
+        assert!(
+            app.bash_running,
+            "command should be marked running until its result is handled"
+        );
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let result_message = loop {
+            match event_rx.try_recv() {
+                Ok(message @ PiMsg::BashResult { .. }) => break message,
+                Ok(_) | Err(_) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Ok(other) => panic!("unexpected event after bash deadline: {other:?}"),
+                Err(err) => panic!("bash result was not delivered before deadline: {err}"),
+            }
+        };
+
+        let PiMsg::BashResult { display } = &result_message else {
+            unreachable!("loop only exits with BashResult")
+        };
+        assert!(display.contains("side-effect-output"));
+        assert!(display.contains("[Output excluded from model context]"));
+        assert!(display.contains("[Persistence warning]"));
+        assert!(display.contains("do not rerun"));
+        let delivered_at = chrono::Utc::now().timestamp_millis();
+        assert!(
+            !display.contains(blocked_path.to_string_lossy().as_ref()),
+            "user-facing result should not leak storage paths"
+        );
+
+        let _ = app.handle_pi_message(result_message);
+        assert!(
+            !app.bash_running,
+            "handling the terminal result must clear running state"
+        );
+        let visible = app.messages.last().expect("visible bash result");
+        assert!(visible.content.contains("side-effect-output"));
+        assert!(visible.content.contains("[Persistence warning]"));
+
+        runtime().block_on(async {
+            let cx = Cx::for_testing();
+            let guard = OwnedMutexGuard::lock(Arc::clone(&session), &cx)
+                .await
+                .expect("lock production session");
+            assert_exact_excluded_bash_record(
+                &guard,
+                command,
+                "side-effect-output",
+                Some(submitted_at..=delivered_at),
+            );
+            let metrics = guard.autosave_metrics();
+            assert_eq!(metrics.pending_mutations, 1);
+            assert_eq!(metrics.flush_failed, 1);
+        });
+    }
+
+    /// `!cmd` used to submit its output as a prompt, so every shell command
+    /// started a model turn. OMP's bash runner records the run instead: the
+    /// output joins the context the next prompt sends, and nothing runs now.
+    #[test]
+    fn bang_command_is_recorded_for_the_next_prompt_without_starting_a_turn() {
+        let temp = TempDir::new().expect("tempdir");
+        let session = Arc::new(Mutex::new(Session::create_with_dir(Some(
+            temp.path().join("sessions"),
+        ))));
+        let (mut app, mut event_rx) = build_bash_test_app(Arc::clone(&session), temp.path());
+
+        let command = "printf bang-output";
+        let _ = app.submit_bash_command(&format!("!{command}"), command.to_string(), false);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let display = loop {
+            match event_rx.try_recv() {
+                Ok(PiMsg::BashResult { display }) => break display,
+                Ok(_) | Err(_) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Ok(other) => panic!("unexpected event after bash deadline: {other:?}"),
+                Err(err) => panic!("bash result was not delivered before deadline: {err}"),
+            }
+        };
+        assert!(display.contains("bang-output"), "{display}");
+        assert!(!display.contains("[Output excluded"), "{display}");
+
+        let follow_up = app.handle_pi_message(PiMsg::BashResult { display });
+        assert!(follow_up.is_none(), "a `!` run must not start a turn");
+        assert_eq!(app.agent_state, AgentState::Idle);
+
+        runtime().block_on(async {
+            let cx = Cx::for_testing();
+            let guard = OwnedMutexGuard::lock(Arc::clone(&session), &cx)
+                .await
+                .expect("lock session");
+            let records = guard
+                .entries
+                .iter()
+                .filter_map(|entry| match entry {
+                    SessionEntry::Message(message) => match &message.message {
+                        SessionMessage::BashExecution {
+                            command,
+                            output,
+                            extra,
+                            ..
+                        } => Some((command.clone(), output.clone(), extra.is_empty())),
+                        _ => None,
+                    },
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                records,
+                vec![(command.to_string(), "bang-output".to_string(), true)]
+            );
+            let context = serde_json::to_string(&guard.to_messages_for_current_path())
+                .expect("serialize context");
+            assert!(context.contains("bang-output"), "{context}");
+        });
+    }
 
     fn empty_auth_storage() -> AuthStorage {
         let nonce = SystemTime::now()
@@ -3061,6 +6553,7 @@ mod tests {
                 reasoning: true,
                 input: vec![InputType::Text],
                 cost: ModelCost {
+                    audio: None,
                     input: 0.0,
                     output: 0.0,
                     cache_read: 0.0,
@@ -3076,6 +6569,333 @@ mod tests {
             compat: None,
             oauth_config: None,
         }
+    }
+
+    #[test]
+    fn classic_fast_uses_current_catalog_and_preserves_selection_across_models() {
+        let temp = TempDir::new().expect("tempdir");
+        let session = Arc::new(Mutex::new(Session::in_memory()));
+        let (mut app, _events) = build_bash_test_app(session, temp.path());
+        app.save_enabled = false;
+        let mut supported = test_model_entry("tier-relay", "supported");
+        supported.compat = Some(crate::models::CompatConfig {
+            service_tiers: Some(vec![crate::provider::ServiceTier::Ultrafast]),
+            ..crate::models::CompatConfig::default()
+        });
+        let plain = test_model_entry("tier-relay", "plain");
+        app.agent
+            .try_lock()
+            .expect("agent")
+            .handle
+            .session_mut()
+            .set_model_registry(crate::models::ModelRegistry::from_entries_for_tests(vec![
+                supported.clone(),
+                plain.clone(),
+            ]));
+
+        for (entry, command, status) in [
+            (&supported, "ultrafast", "service_tier=ultrafast"),
+            (&supported, "on", "service_tier=ultrafast"),
+            (&plain, "status", "omitted"),
+            (&plain, "ultrafast", "unavailable"),
+            (&supported, "status", "service_tier=ultrafast"),
+        ] {
+            let provider = crate::providers::create_provider(entry, None).expect("provider");
+            app.switch_active_model(entry, provider, entry.api_key.as_deref(), "command")
+                .expect("switch model");
+            let (parsed, args) = SlashCommand::parse(&format!("/fast {command}"))
+                .map(|(parsed, args)| (parsed, args.to_string()))
+                .expect("registered command");
+            assert_eq!(parsed, SlashCommand::Fast);
+            assert!(app.handle_slash_command(parsed, &args).is_none());
+            assert!(
+                app.status_message
+                    .as_deref()
+                    .is_some_and(|text| text.contains(status))
+            );
+            assert_eq!(
+                app.agent
+                    .try_lock()
+                    .expect("agent")
+                    .stream_options()
+                    .service_tier
+                    .as_deref(),
+                Some("ultrafast")
+            );
+        }
+        assert!(
+            app.handle_slash_command(SlashCommand::Fast, "off")
+                .is_none()
+        );
+        assert_eq!(
+            app.agent
+                .try_lock()
+                .expect("agent")
+                .stream_options()
+                .service_tier,
+            None
+        );
+    }
+
+    #[test]
+    fn classic_model_switch_restores_catalog_image_capability_and_original_images() {
+        let temp = TempDir::new().expect("tempdir");
+        let session = Arc::new(Mutex::new(Session::in_memory()));
+        let (mut app, _events) = build_bash_test_app(session, temp.path());
+        app.save_enabled = false;
+        let image_message = ModelMessage::User(UserMessage {
+            content: UserContent::Blocks(vec![crate::model::ContentBlock::Image(
+                crate::model::ImageContent {
+                    data: "aW1hZ2U=".to_string(),
+                    mime_type: "image/png".to_string(),
+                },
+            )]),
+            timestamp: 17,
+        });
+        let original = serde_json::to_value(&image_message).expect("native image message");
+        app.agent
+            .try_lock()
+            .expect("agent")
+            .add_message(image_message);
+        let mut vision = test_model_entry("dummy", "vision-model");
+        vision.model.input.push(InputType::Image);
+        let text = test_model_entry("dummy", "text-model");
+
+        for entry in [&vision, &text, &vision] {
+            let provider = crate::providers::create_provider(entry, None).expect("provider");
+            app.switch_active_model(entry, provider, entry.api_key.as_deref(), "command")
+                .expect("switch model");
+            let mut agent = app.agent.try_lock().expect("agent after switch");
+            let accepts_images = entry.model.input.contains(&InputType::Image);
+            assert_eq!(agent.model_accepts_images(), accepts_images);
+            let request = agent.request_context_json();
+            assert_eq!(
+                request["messages"][0]["content"][0]["type"],
+                if accepts_images { "image" } else { "text" },
+            );
+            assert_eq!(
+                serde_json::to_value(&agent.messages()[0]).unwrap(),
+                original,
+                "model switching must preserve the native image for later vision turns",
+            );
+        }
+    }
+
+    #[test]
+    fn classic_session_selection_restores_images_even_when_provider_already_matches() {
+        let temp = TempDir::new().expect("tempdir");
+        let session = Arc::new(Mutex::new(Session::in_memory()));
+        let (mut app, _events) = build_bash_test_app(Arc::clone(&session), temp.path());
+        app.save_enabled = false;
+        let mut vision = test_model_entry("dummy", "vision-model");
+        vision.model.input.push(InputType::Image);
+        let text = test_model_entry("dummy", "text-model");
+        app.available_models = vec![vision.clone(), text.clone()];
+        // Session restores resolve against the session registry that PiApp
+        // seeds at construction, not the later-replaced picker list.
+        app.agent
+            .try_lock()
+            .expect("agent")
+            .handle
+            .session_mut()
+            .set_model_registry(crate::models::ModelRegistry::from_entries_for_tests(
+                app.available_models.clone(),
+            ));
+
+        for entry in [&vision, &text, &vision] {
+            {
+                let mut stored = session.try_lock().expect("session");
+                stored.header.provider = Some(entry.model.provider.clone());
+                stored.header.model_id = Some(entry.model.id.clone());
+            }
+            app.sync_runtime_selection_from_session_header()
+                .expect("restore session selection");
+            let accepts_images = entry.model.input.contains(&InputType::Image);
+            let provider = {
+                let mut agent = app.agent.try_lock().expect("restored agent");
+                assert_eq!(agent.provider().model_id(), entry.model.id);
+                assert_eq!(agent.model_accepts_images(), accepts_images);
+                agent.set_model_accepts_images(!accepts_images);
+                agent.provider()
+            };
+
+            app.sync_runtime_selection_from_session_header()
+                .expect("repair capability without replacing the provider");
+            let agent = app.agent.try_lock().expect("reconciled agent");
+            assert!(Arc::ptr_eq(&provider, &agent.provider()));
+            assert_eq!(agent.model_accepts_images(), accepts_images);
+        }
+    }
+
+    #[test]
+    fn classic_model_commands_switch_declared_aliases_without_losing_the_route() {
+        for reverse in [false, true] {
+            let temp = TempDir::new().expect("tempdir");
+            let session = Arc::new(Mutex::new(Session::in_memory()));
+            let (mut app, _events) = build_bash_test_app(Arc::clone(&session), temp.path());
+            app.save_enabled = false;
+            let mut native = test_model_entry("openrouter", "vendor/shared");
+            native.model.api = "openai-completions".to_string();
+            native
+                .headers
+                .insert("x-route".to_string(), "native".to_string());
+            let mut custom = native.clone();
+            custom.model.provider = "open-router".to_string();
+            custom.model.base_url = "https://declared.example.test/v1".to_string();
+            custom
+                .headers
+                .insert("x-route".to_string(), "declared".to_string());
+            let mut catalog = vec![native.clone(), custom.clone()];
+            if reverse {
+                catalog.reverse();
+            }
+            app.available_models = catalog.clone();
+            app.agent
+                .try_lock()
+                .expect("agent")
+                .handle
+                .session_mut()
+                .set_model_registry(crate::models::ModelRegistry::from_entries_for_tests(
+                    catalog,
+                ));
+            for target in [&native, &custom, &native] {
+                let spec = format!("{}/{}", target.model.provider, target.model.id);
+                let _ = app.handle_slash_model(&spec);
+                assert_eq!(app.model_entry.model.provider, target.model.provider);
+                assert_eq!(app.model_entry.model.base_url, target.model.base_url);
+                assert_eq!(app.model_entry.headers, target.headers);
+                let running = {
+                    let agent = app.agent.try_lock().expect("running agent");
+                    assert_eq!(agent.provider().name(), target.model.provider);
+                    assert_eq!(agent.provider().model_id(), target.model.id);
+                    assert_eq!(agent.stream_options().headers, target.headers);
+                    agent.provider()
+                };
+                let before = session.try_lock().expect("session").entries.len();
+                let _ = app.handle_slash_model(&spec);
+                assert_eq!(session.try_lock().expect("session").entries.len(), before);
+                assert!(Arc::ptr_eq(
+                    &running,
+                    &app.agent.try_lock().expect("agent").provider()
+                ));
+                assert_eq!(
+                    session
+                        .try_lock()
+                        .expect("session")
+                        .effective_model_for_current_path(),
+                    Some((target.model.provider.clone(), target.model.id.clone())),
+                );
+            }
+            let _ = app.handle_slash_model("plan open-router/vendor/shared");
+            assert_eq!(
+                app.role_model_overrides.get(&ModelRole::Plan),
+                Some(&("open-router".to_string(), "vendor/shared".to_string())),
+            );
+            app.switch_to_role_spec("open-router/vendor/shared", "plan-role")
+                .expect("switch to the declared plan model");
+            assert_eq!(app.model_entry.model.provider, "open-router");
+            assert_eq!(app.model_entry.headers, custom.headers);
+
+            // A branch/extension selection must reach the same runtime route.
+            session
+                .try_lock()
+                .expect("session")
+                .append_model_change(native.model.provider.clone(), native.model.id.clone());
+            app.sync_runtime_selection_from_session_header()
+                .expect("restore exact provider");
+            assert_eq!(app.model_entry.model.provider, "openrouter");
+            assert_eq!(
+                app.agent
+                    .try_lock()
+                    .expect("agent")
+                    .stream_options()
+                    .headers,
+                native.headers
+            );
+        }
+    }
+
+    #[test]
+    fn classic_explicit_resolution_keeps_providers_hidden_from_the_ready_picker() {
+        let temp = TempDir::new().expect("tempdir");
+        let session = Arc::new(Mutex::new(Session::in_memory()));
+        let (mut app, _events) = build_bash_test_app(Arc::clone(&session), temp.path());
+        app.save_enabled = false;
+        let native = test_model_entry("openrouter", "vendor/shared");
+        let mut custom = test_model_entry("open-router", "vendor/shared");
+        custom.api_key = None;
+        custom.model.base_url = "https://unready-declared.example.test/v1".to_string();
+        let mut native_only = native.clone();
+        native_only.model.id = "vendor/unlisted".to_string();
+        app.available_models = vec![native.clone(), native_only.clone()];
+        app.agent
+            .try_lock()
+            .expect("agent")
+            .handle
+            .session_mut()
+            .set_model_registry(crate::models::ModelRegistry::from_entries_for_tests(vec![
+                native,
+                native_only,
+                custom,
+            ]));
+        let resolved = app
+            .requested_model_entry("open-router", "vendor/shared", true)
+            .expect("catalog lookup")
+            .expect("unready declared entry");
+        assert_eq!(resolved.model.provider, "open-router");
+        assert_eq!(
+            resolved.model.base_url,
+            "https://unready-declared.example.test/v1"
+        );
+        assert!(resolved.api_key.is_none());
+        let before = session.try_lock().expect("session").entries.len();
+        let _ = app.handle_slash_model("open-router/vendor/unlisted");
+        assert!(
+            app.status_message
+                .as_deref()
+                .expect("diagnostic")
+                .contains("Model not found")
+        );
+        assert_eq!(app.model_entry.model.provider, "dummy");
+        assert_eq!(session.try_lock().expect("session").entries.len(), before);
+        let error = app
+            .switch_to_role_spec("open-router/vendor/unlisted", "plan-role")
+            .expect_err("a missing role model must return an actionable failure");
+        assert!(error.contains("open-router/vendor/unlisted"));
+        assert!(error.contains("/model"));
+        assert_eq!(app.model_entry.model.provider, "dummy");
+        assert_eq!(session.try_lock().expect("session").entries.len(), before);
+    }
+
+    #[test]
+    fn classic_undeclared_native_alias_is_an_idempotent_command() {
+        let temp = TempDir::new().expect("tempdir");
+        let session = Arc::new(Mutex::new(Session::in_memory()));
+        let (mut app, _events) = build_bash_test_app(Arc::clone(&session), temp.path());
+        app.save_enabled = false;
+        let mut native = test_model_entry("openrouter", "vendor/shared");
+        native.model.api = "openai-completions".to_string();
+        app.available_models = vec![native.clone()];
+        // Explicit commands resolve against the session registry that PiApp
+        // seeds at construction, not the later-replaced picker list.
+        app.agent
+            .try_lock()
+            .expect("agent")
+            .handle
+            .session_mut()
+            .set_model_registry(crate::models::ModelRegistry::from_entries_for_tests(vec![
+                native,
+            ]));
+        let _ = app.handle_slash_model("openrouter/vendor/shared");
+        let before = session.try_lock().expect("session").entries.len();
+        let running = app.agent.try_lock().expect("agent").provider();
+        let _ = app.handle_slash_model("open-router/vendor/shared");
+        assert_eq!(app.model_entry.model.provider, "openrouter");
+        assert_eq!(session.try_lock().expect("session").entries.len(), before);
+        assert!(Arc::ptr_eq(
+            &running,
+            &app.agent.try_lock().expect("agent").provider()
+        ));
     }
 
     #[test]
@@ -3108,6 +6928,88 @@ mod tests {
     }
 
     #[test]
+    fn classic_goal_explains_its_interface_without_starting_agent_work() {
+        let temp = TempDir::new().expect("tempdir");
+        let session = Arc::new(Mutex::new(Session::in_memory()));
+        let (mut app, _events) = build_bash_test_app(Arc::clone(&session), temp.path());
+        app.save_enabled = false;
+        let entries_before = session.try_lock().expect("session").entries.len();
+
+        assert!(app.submit_message("/GoAl status").is_none());
+        assert_eq!(app.agent_state, AgentState::Idle);
+        assert_eq!(
+            session.try_lock().expect("session").entries.len(),
+            entries_before,
+            "classic /goal only displays guidance"
+        );
+        let message = &app.messages.last().expect("goal guidance").content;
+        assert!(message.contains("FrankenTUI"));
+        assert!(message.contains("docs/goal-mode.md"));
+        if cfg!(feature = "ftui") {
+            assert!(message.contains("pi --ftui"));
+            assert!(message.contains("/goal status"));
+        } else {
+            assert!(message.contains("built without"));
+        }
+
+        let help_line = SlashCommand::help_text()
+            .lines()
+            .find(|line| line.trim_start().starts_with("/goal"))
+            .expect("/goal is discoverable in classic help");
+        assert!(help_line.contains("unavailable in classic"));
+        assert_eq!(
+            parse_extension_command("/goalkeeper status"),
+            Some(("goalkeeper".to_string(), "status")),
+            "the guidance command must not claim extension prefixes"
+        );
+    }
+
+    #[test]
+    fn every_listed_command_parses_back_to_itself() {
+        // Catches a wrong entry in ALL or a canonical spelling the parser does
+        // not actually accept. It cannot catch a variant missing from ALL —
+        // see the note there.
+        for command in SlashCommand::ALL {
+            let spelling = command.canonical();
+            let parsed = SlashCommand::parse(spelling)
+                .unwrap_or_else(|| panic!("{spelling} is listed but the parser rejects it"));
+            assert_eq!(
+                parsed.0, *command,
+                "{spelling} parses as a different command than the one that claims it"
+            );
+        }
+    }
+
+    #[test]
+    fn no_two_commands_claim_the_same_spelling() {
+        let mut spellings: Vec<&str> = SlashCommand::ALL
+            .iter()
+            .map(|command| command.canonical())
+            .collect();
+        let before = spellings.len();
+        spellings.sort_unstable();
+        spellings.dedup();
+        assert_eq!(before, spellings.len(), "duplicate canonical spelling");
+    }
+
+    #[test]
+    fn every_command_the_parser_knows_is_in_the_help_text() {
+        // `/checkpoint`, `/rewind`, `/fresh` and `/retry` shipped as working
+        // commands that `/help` never mentioned. The help text is the only
+        // place a user who does not know a command's name can find it.
+        let help = SlashCommand::help_text();
+        let missing: Vec<&str> = SlashCommand::ALL
+            .iter()
+            .map(|command| command.canonical())
+            .filter(|spelling| !help.contains(*spelling))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "the parser accepts these and /help never names them: {missing:?}"
+        );
+    }
+
+    #[test]
     fn parse_ext_cmd_basic() {
         let result = parse_extension_command("/deploy");
         assert_eq!(result, Some(("deploy".to_string(), "")));
@@ -3126,6 +7028,19 @@ mod tests {
         assert!(parse_extension_command("/model").is_none());
         assert!(parse_extension_command("/exit").is_none());
         assert!(parse_extension_command("/compact").is_none());
+        assert!(matches!(
+            super::SlashCommand::parse("/undo 3 force"),
+            Some((super::SlashCommand::Undo, "3 force"))
+        ));
+        assert!(matches!(
+            super::SlashCommand::parse("/redo"),
+            Some((super::SlashCommand::Redo, ""))
+        ));
+        assert!(matches!(
+            super::SlashCommand::parse("/tan update the changelog"),
+            Some((super::SlashCommand::Tan, "update the changelog"))
+        ));
+        assert!(parse_extension_command("/tan inspect this").is_none());
     }
 
     #[test]
@@ -3277,17 +7192,19 @@ mod tests {
     #[test]
     fn login_provider_listing_includes_metadata_backed_api_key_providers() {
         let auth = empty_auth_storage();
-        let listing = super::format_login_provider_listing(&auth, &[]);
+        let listing = super::format_login_provider_listing(&auth, &[], &[]);
         assert!(listing.contains("openrouter"));
         assert!(listing.contains("cohere"));
         assert!(listing.contains("API key"));
     }
 
     #[test]
-    fn model_entry_matches_provider_aliases_case_insensitively() {
+    fn resolved_model_entries_keep_declared_aliases_distinct() {
         let left = test_model_entry("openrouter", "openai/gpt-4o-mini");
         let right = test_model_entry("open-router", "openai/gpt-4o-mini");
-        assert!(super::model_entry_matches(&left, &right));
+        assert!(!super::model_entry_matches(&left, &right));
+        let same = test_model_entry(" OpenRouter ", "OPENAI/GPT-4O-MINI");
+        assert!(super::model_entry_matches(&left, &same));
     }
 
     #[test]
@@ -3307,7 +7224,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_scoped_model_entries_dedupes_provider_alias_variants() {
+    fn resolve_scoped_model_entries_preserves_separately_declared_aliases() {
         let available = vec![
             test_model_entry("openrouter", "openai/gpt-4o-mini"),
             test_model_entry("open-router", "openai/gpt-4o-mini"),
@@ -3316,7 +7233,11 @@ mod tests {
         let resolved = super::resolve_scoped_model_entries(&patterns, &available)
             .expect("resolve scoped models");
         assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].model.provider, "openrouter");
         assert_eq!(resolved[0].model.id, "openai/gpt-4o-mini");
+        let resolved = super::resolve_scoped_model_entries(&["*".to_string()], &available)
+            .expect("both declared providers remain in the scope");
+        assert_eq!(resolved.len(), 2);
     }
 
     #[test]
@@ -3402,8 +7323,15 @@ mod tests {
             redirect_uri: Some("http://localhost/callback".to_string()),
         });
 
-        let selected =
-            super::extension_oauth_config_for_provider(&[no_oauth, with_oauth], "ext-provider");
+        let registered_extension_bindings = [ExtensionProviderBinding {
+            provider: with_oauth.model.provider.clone(),
+            oauth_config: with_oauth.oauth_config,
+        }];
+        let selected = super::extension_oauth_config_for_provider(
+            &[no_oauth],
+            &registered_extension_bindings,
+            "ext-provider",
+        );
         let selected = selected.expect("expected oauth config");
         assert_eq!(selected.auth_url, "https://example.test/oauth/authorize");
         assert_eq!(selected.token_url, "https://example.test/oauth/token");
@@ -3413,5 +7341,375 @@ mod tests {
             selected.redirect_uri.as_deref(),
             Some("http://localhost/callback")
         );
+
+        let auth = empty_auth_storage();
+        let listing =
+            super::format_login_provider_listing(&auth, &[], &registered_extension_bindings);
+        assert!(listing.contains("Extension providers"));
+        assert!(listing.contains("ext-provider"));
+        assert!(listing.contains("OAuth"));
+    }
+
+    fn install_callback_login(
+        app: &mut PiApp,
+        auth_path: &Path,
+    ) -> (String, u16, crate::agent::AbortSignal) {
+        let attempt_id = app.begin_login_attempt(auth_path).expect("login attempt");
+        let (server, redirect_uri) =
+            crate::auth::start_oauth_callback_server_random_port().expect("callback listener");
+        let port = server.port;
+        let attempt = app.login_attempt.as_mut().expect("login owner");
+        let signal = attempt.control.signal();
+        attempt.callback = Some(server);
+        app.pending_oauth = Some(PendingOAuth {
+            provider: "fixture-oauth".to_string(),
+            kind: PendingLoginKind::OAuth,
+            verifier: "fixture-verifier".to_string(),
+            oauth_config: None,
+            device_code: None,
+            redirect_uri: Some(redirect_uri),
+        });
+        (attempt_id, port, signal)
+    }
+
+    #[test]
+    fn retired_browser_callback_cannot_supply_a_new_api_key_or_oauth_attempt() {
+        use std::io::{Read as _, Write as _};
+
+        for provider in ["openai", "anthropic"] {
+            let temp = TempDir::new().expect("tempdir");
+            let auth_path = temp.path().join("auth.json");
+            let session = Arc::new(Mutex::new(Session::in_memory()));
+            let (mut app, _events) = build_bash_test_app(session, temp.path());
+            let (old_id, port, old_signal) = install_callback_login(&mut app, &auth_path);
+            let mut browser = std::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port))
+                .expect("browser connection");
+            browser
+                .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                .expect("browser timeout");
+            browser
+                .write_all(b"GET /oauth/callback?code=old-code&state=old-state HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                .expect("browser redirect");
+            let mut response = String::new();
+            browser
+                .read_to_string(&mut response)
+                .expect("callback acknowledgement");
+            assert!(response.starts_with("HTTP/1.1 200"));
+
+            let _ = app.handle_slash_login_with_auth_path(provider, &auth_path);
+            let new_id = app
+                .login_attempt
+                .as_ref()
+                .expect("replacement login")
+                .id
+                .clone();
+            assert_ne!(old_id, new_id);
+            assert!(old_signal.is_aborted());
+            let pending = app.pending_oauth.clone().expect("replacement prompt");
+            let messages_before = app.messages.len();
+            for stale_event in [
+                PiMsg::OAuthCallbackPoll {
+                    attempt_id: old_id.clone(),
+                },
+                PiMsg::OAuthCallbackReceived {
+                    attempt_id: old_id.clone(),
+                    callback_url: format!(
+                        "http://localhost:{port}/oauth/callback?code=old-code&state=old-state"
+                    ),
+                },
+                PiMsg::OAuthDeviceFlowStarted {
+                    attempt_id: old_id.clone(),
+                    provider: "stale-device".to_string(),
+                    device_code: "stale-device-code".to_string(),
+                    user_code: "stale-user-code".to_string(),
+                    verification_uri: "https://example.test/device".to_string(),
+                    expires_in: 300,
+                },
+                PiMsg::LoginFinished {
+                    attempt_id: old_id,
+                    error: Some("stale exchange failure".to_string()),
+                    retry: false,
+                },
+            ] {
+                assert!(app.handle_pi_message(stale_event).is_none());
+            }
+            let retained = app.pending_oauth.as_ref().expect("new prompt retained");
+            assert_eq!(retained.provider, pending.provider);
+            assert_eq!(retained.kind, pending.kind);
+            assert_eq!(retained.verifier, pending.verifier);
+            assert_eq!(app.login_attempt.as_ref().expect("new owner").id, new_id);
+            assert_eq!(app.agent_state, AgentState::Idle);
+            assert_eq!(app.messages.len(), messages_before);
+            assert!(
+                !auth_path.exists(),
+                "an old callback must never be stored as an API key"
+            );
+        }
+    }
+
+    #[test]
+    fn login_cancel_command_quit_and_drop_release_the_callback_owner() {
+        for action in ["escape", "ctrl-c", "command", "new", "busy", "quit", "drop"] {
+            let temp = TempDir::new().expect("tempdir");
+            let session = Arc::new(Mutex::new(Session::in_memory()));
+            let (mut app, _events) = build_bash_test_app(session, temp.path());
+            let (attempt_id, port, signal) =
+                install_callback_login(&mut app, &temp.path().join("auth.json"));
+            app.input.set_value("private credential draft");
+            match action {
+                "escape" => {
+                    let _ =
+                        app.handle_action(AppAction::Interrupt, &KeyMsg::from_type(KeyType::Esc));
+                }
+                "ctrl-c" => {
+                    let _ = app.handle_action(AppAction::Clear, &KeyMsg::from_type(KeyType::CtrlC));
+                }
+                "command" => {
+                    let _ = app.submit_message("/help");
+                }
+                "new" => {
+                    let _ = app.submit_message("/new");
+                }
+                "busy" => {
+                    let session = Arc::clone(&app.session);
+                    let _guard = session.try_lock().expect("hold source session");
+                    let _ = app.handle_pi_message(PiMsg::SessionEventRetry {
+                        event: Box::new(PiMsg::OAuthCallbackPoll { attempt_id }),
+                        attempts_remaining: 0,
+                    });
+                    assert_eq!(
+                        app.status_message.as_deref(),
+                        Some("Login cancelled because the session remained busy; run /login again")
+                    );
+                }
+                "quit" => {
+                    let _ = app.quit_cmd();
+                }
+                "drop" => {}
+                _ => unreachable!(),
+            }
+            if action != "drop" {
+                assert!(app.pending_oauth.is_none());
+                assert!(app.login_attempt.is_none());
+                assert!(app.input.value().is_empty());
+            }
+            drop(app);
+            assert!(signal.is_aborted(), "{action} cancels its network exchange");
+            let _rebound = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))
+                .expect("retiring login immediately releases callback port");
+        }
+    }
+
+    #[test]
+    fn device_login_accepts_empty_enter_and_preserves_retryable_authorization() {
+        let temp = TempDir::new().expect("tempdir");
+        let session = Arc::new(Mutex::new(Session::in_memory()));
+        let (mut app, mut events) = build_bash_test_app(session, temp.path());
+        let id = app
+            .begin_login_attempt(&temp.path().join("auth.json"))
+            .expect("login owner");
+        let _ = app.handle_pi_message(PiMsg::OAuthDeviceFlowStarted {
+            attempt_id: id.clone(),
+            provider: "fixture-device".to_string(),
+            device_code: "private-device-code".to_string(),
+            user_code: "public-user-code".to_string(),
+            verification_uri: "https://example.test/device".to_string(),
+            expires_in: 300,
+        });
+        assert!(app.input.value().is_empty());
+        let _ = app.handle_action(AppAction::Submit, &KeyMsg::from_type(KeyType::Enter));
+        assert!(app.login_attempt.as_ref().expect("login owner").submitting);
+        assert_eq!(app.agent_state, AgentState::Processing);
+        assert!(
+            app.pending_inputs.is_empty(),
+            "Enter must not queue an agent prompt"
+        );
+        // The fixture provider fails locally, making the exchange deterministic
+        // without contacting a real OAuth service. Exercise retry delivery with
+        // the same request id while retaining the original device code.
+        let event = runtime().block_on(async {
+            let cx = Cx::for_testing();
+            asupersync::time::timeout(
+                asupersync::time::wall_now(),
+                std::time::Duration::from_secs(2),
+                events.recv(&cx),
+            )
+            .await
+            .expect("exchange event before timeout")
+            .expect("exchange event")
+        });
+        assert!(matches!(event, PiMsg::LoginFinished { attempt_id, .. } if attempt_id == id));
+        app.input.set_value("private retry draft");
+        let _ = app.handle_pi_message(PiMsg::LoginFinished {
+            attempt_id: id.clone(),
+            error: Some("Authorization is still pending".to_string()),
+            retry: true,
+        });
+        assert_eq!(app.agent_state, AgentState::Idle);
+        assert!(
+            !app.login_attempt
+                .as_ref()
+                .expect("retained owner")
+                .submitting
+        );
+        assert_eq!(app.input.value(), "private retry draft");
+        assert_eq!(
+            app.pending_oauth
+                .as_ref()
+                .expect("retained device prompt")
+                .device_code
+                .as_deref(),
+            Some("private-device-code")
+        );
+        let _ = app.handle_action(AppAction::Interrupt, &KeyMsg::from_type(KeyType::Esc));
+        let _ = app.handle_pi_message(PiMsg::LoginFinished {
+            attempt_id: id,
+            error: None,
+            retry: false,
+        });
+        assert!(app.pending_oauth.is_none());
+        assert!(app.input.value().is_empty());
+        assert_eq!(app.status_message.as_deref(), Some("Login cancelled"));
+    }
+
+    #[test]
+    fn cancelled_or_replaced_login_cannot_persist_a_delayed_credential() {
+        let temp = TempDir::new().expect("tempdir");
+        let auth_path = temp.path().join("auth.json");
+        let mut existing = AuthStorage::empty_at(auth_path.clone());
+        existing.set(
+            "other-provider",
+            AuthCredential::ApiKey {
+                key: "keep-me".to_string(),
+            },
+        );
+        existing.save().expect("existing credential");
+        let session = Arc::new(Mutex::new(Session::in_memory()));
+        runtime().block_on(async {
+            let cx = Cx::for_testing();
+            let guard = OwnedMutexGuard::lock(Arc::clone(&session), &cx)
+                .await
+                .expect("hold session");
+            let session_id = guard.header.id.clone();
+            let attempt = LoginAttempt::new(session_id.clone(), auth_path.clone());
+            let mut save = Box::pin(super::persist_login_credential(
+                Arc::clone(&session),
+                session_id.clone(),
+                auth_path.clone(),
+                "openai".to_string(),
+                AuthCredential::ApiKey {
+                    key: "cancelled-key".to_string(),
+                },
+                attempt.control.clone(),
+                &cx,
+            ));
+            assert!(futures::poll!(save.as_mut()).is_pending());
+            drop(attempt);
+            assert!(!save.await.expect("cancelled save"));
+            drop(guard);
+
+            let stale = LoginAttempt::new("retired-session".to_string(), auth_path.clone());
+            assert!(
+                !super::persist_login_credential(
+                    Arc::clone(&session),
+                    stale.session_id.clone(),
+                    auth_path.clone(),
+                    "openai".to_string(),
+                    AuthCredential::ApiKey {
+                        key: "stale-session-key".to_string()
+                    },
+                    stale.control.clone(),
+                    &cx,
+                )
+                .await
+                .expect("stale save")
+            );
+            let current = LoginAttempt::new(session_id.clone(), auth_path.clone());
+            assert!(
+                super::persist_login_credential(
+                    Arc::clone(&session),
+                    session_id,
+                    auth_path.clone(),
+                    "openai".to_string(),
+                    AuthCredential::ApiKey {
+                        key: "current-key".to_string()
+                    },
+                    current.control.clone(),
+                    &cx,
+                )
+                .await
+                .expect("live save")
+            );
+        });
+        let saved = AuthStorage::load(auth_path).expect("saved credentials");
+        assert!(
+            matches!(saved.get("openai"), Some(AuthCredential::ApiKey { key }) if key == "current-key")
+        );
+        assert!(
+            matches!(saved.get("other-provider"), Some(AuthCredential::ApiKey { key }) if key == "keep-me")
+        );
+    }
+
+    #[test]
+    fn zero_model_extension_oauth_is_reachable_through_actual_login_command() {
+        let temp = TempDir::new().expect("tempdir");
+        let session = Arc::new(Mutex::new(Session::in_memory()));
+        let (mut app, _event_rx) = build_bash_test_app(session, temp.path());
+        let manager = ExtensionManager::new();
+        manager.register_provider(serde_json::json!({
+            "id": "Acme",
+            "models": [],
+            "hasStreamSimple": false,
+            "oauth": {
+                "authUrl": "https://auth.example.test/authorize",
+                "tokenUrl": "https://auth.example.test/token",
+                "clientId": "zero-model-client",
+                "scopes": ["models:use"]
+            }
+        }));
+        app.extensions = Some(manager);
+        app.available_models.clear();
+
+        let invalid_auth_path = temp.path().join("auth-as-directory");
+        std::fs::create_dir_all(&invalid_auth_path).expect("create invalid auth-path directory");
+        let messages_before_invalid_path = app.messages.len();
+        assert!(
+            app.handle_slash_login_with_auth_path("", &invalid_auth_path)
+                .is_none()
+        );
+        assert_eq!(app.messages.len(), messages_before_invalid_path);
+        assert!(
+            app.status_message
+                .as_deref()
+                .is_some_and(|message| message.starts_with("Unable to load auth status:"))
+        );
+
+        app.status_message = None;
+        let auth_path = temp.path().join("auth.json");
+        assert!(
+            app.handle_slash_login_with_auth_path("", &auth_path)
+                .is_none()
+        );
+        let listing = &app.messages.last().expect("login listing message").content;
+        assert!(listing.contains("Extension providers"));
+        assert!(listing.contains("Acme"));
+        assert!(listing.contains("OAuth"));
+
+        assert!(
+            app.handle_slash_login_with_auth_path("acme", &auth_path)
+                .is_none()
+        );
+        let pending = app
+            .pending_oauth
+            .as_ref()
+            .expect("extension OAuth flow should be pending");
+        assert_eq!(pending.provider, "acme");
+        assert!(matches!(pending.kind, PendingLoginKind::OAuth));
+        let oauth = pending
+            .oauth_config
+            .as_ref()
+            .expect("extension OAuth metadata should reach the command");
+        assert_eq!(oauth.client_id, "zero-model-client");
+        assert_eq!(oauth.token_url, "https://auth.example.test/token");
     }
 }

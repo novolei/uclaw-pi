@@ -176,6 +176,10 @@ pub struct HostResourceSample {
 
 impl HostResourceSample {
     /// Sample the current process/host state.
+    // Const-eligible only where the probe functions are cfg'd to const stubs
+    // (non-Linux); on Linux they do real /proc IO, so `const fn` cannot apply
+    // uniformly.
+    #[allow(clippy::missing_const_for_fn)]
     #[must_use]
     pub fn current() -> Self {
         Self {
@@ -2278,14 +2282,14 @@ pub fn replay_swarm_admission_from_jsonl(
             sample.live_load,
         );
 
-        if let Some(expected) = expected_action {
-            if !admission_actions_match(expected, decision.action) {
-                event_markers.push(replay_marker(
-                    SwarmAdmissionReplayDivergenceKind::ExpectedActionMismatch,
-                    entry,
-                    format!("expected {:?}, replayed {:?}", expected, decision.action),
-                ));
-            }
+        if let Some(expected) = expected_action
+            && !admission_actions_match(expected, decision.action)
+        {
+            event_markers.push(replay_marker(
+                SwarmAdmissionReplayDivergenceKind::ExpectedActionMismatch,
+                entry,
+                format!("expected {:?}, replayed {:?}", expected, decision.action),
+            ));
         }
 
         divergence_markers.extend(event_markers.clone());

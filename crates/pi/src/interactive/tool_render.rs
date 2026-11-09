@@ -1,8 +1,124 @@
 use crate::model::ContentBlock;
 use crate::theme::TuiStyles;
 use serde_json::Value;
+use std::borrow::Cow;
 
 use super::conversation::tool_content_blocks_to_text;
+
+/// Strip ANSI escape sequences and non-printing control characters from
+/// terminal-bound tool output (bd-p45xh). Commands that emit color codes,
+/// cursor movement, alt-screen switches, or `\r`-rewritten progress bars
+/// would otherwise be painted straight into the transcript and corrupt the
+/// frame. `\n` and `\t` survive; CRLF collapses to LF; a bare CR (progress
+/// frame rewrite) becomes LF so successive frames stay readable.
+pub(super) fn sanitize_terminal_text(input: &str) -> Cow<'_, str> {
+    let needs_work = input
+        .bytes()
+        .any(|b| b == 0x1b || b == 0x7f || (b < 0x20 && b != b'\n' && b != b'\t'))
+        || input
+            .chars()
+            .any(|ch| ('\u{0080}'..='\u{009f}').contains(&ch));
+    if !needs_work {
+        return Cow::Borrowed(input);
+    }
+
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\u{1b}' => match chars.peek() {
+                // CSI: ESC '[' params/intermediates then a final byte @..~.
+                Some('[') => {
+                    chars.next();
+                    while let Some(&c) = chars.peek() {
+                        chars.next();
+                        if ('\u{40}'..='\u{7e}').contains(&c) {
+                            break;
+                        }
+                    }
+                }
+                // String-payload sequences whose body must be consumed too:
+                // OSC (ESC ']'), DCS (ESC 'P', e.g. sixel), SOS (ESC 'X'),
+                // PM (ESC '^'), APC (ESC '_', e.g. tmux passthrough).
+                // Terminated by ST (ESC '\'); OSC also accepts BEL.
+                Some(']' | 'P' | 'X' | '^' | '_') => {
+                    let accepts_bel = chars.peek() == Some(&']');
+                    chars.next();
+                    while let Some(c) = chars.next() {
+                        if accepts_bel && c == '\u{07}' {
+                            break;
+                        }
+                        if c == '\u{009c}' {
+                            break;
+                        }
+                        if c == '\u{1b}' {
+                            if chars.peek() == Some(&'\\') {
+                                chars.next();
+                            }
+                            break;
+                        }
+                    }
+                }
+                // Two-character escape (ESC c, ESC 7, ...) or dangling ESC.
+                Some(_) => {
+                    chars.next();
+                }
+                None => {}
+            },
+            // Single-codepoint C1 CSI.
+            '\u{009b}' => {
+                while let Some(&c) = chars.peek() {
+                    chars.next();
+                    if ('\u{40}'..='\u{7e}').contains(&c) {
+                        break;
+                    }
+                }
+            }
+            // Single-codepoint C1 string controls: DCS, SOS, OSC, PM, APC.
+            c @ ('\u{0090}' | '\u{0098}' | '\u{009d}' | '\u{009e}' | '\u{009f}') => {
+                let accepts_bel = c == '\u{009d}';
+                while let Some(c) = chars.next() {
+                    if c == '\u{009c}' || (accepts_bel && c == '\u{07}') {
+                        break;
+                    }
+                    if c == '\u{1b}' && chars.peek() == Some(&'\\') {
+                        chars.next();
+                        break;
+                    }
+                }
+            }
+            '\r' => {
+                if chars.peek() != Some(&'\n') {
+                    out.push('\n');
+                }
+            }
+            c if ('\u{0080}'..='\u{009f}').contains(&c) => {}
+            c if c == '\u{7f}' || (c < '\u{20}' && c != '\n' && c != '\t') => {}
+            c => out.push(c),
+        }
+    }
+    Cow::Owned(out)
+}
+
+/// Sanitize a terminal-bound value that must remain on one visual line.
+///
+/// This applies the full escape/control filter above, then replaces the
+/// otherwise-preserved newline and tab characters with spaces. Use it for
+/// identities, titles, and option labels; use [`sanitize_terminal_text`] for
+/// deliberately multiline transcript content.
+pub(super) fn sanitize_terminal_line(input: &str) -> Cow<'_, str> {
+    let sanitized = sanitize_terminal_text(input);
+    if !sanitized.chars().any(|ch| matches!(ch, '\n' | '\t')) {
+        return sanitized;
+    }
+
+    Cow::Owned(
+        sanitized
+            .chars()
+            .map(|ch| if matches!(ch, '\n' | '\t') { ' ' } else { ch })
+            .collect(),
+    )
+}
 
 pub(super) fn format_tool_output(
     content: &[ContentBlock],
@@ -31,7 +147,10 @@ pub(super) fn format_tool_output(
     if output.trim().is_empty() {
         None
     } else {
-        Some(output)
+        Some(match sanitize_terminal_text(&output) {
+            Cow::Borrowed(_) => output,
+            Cow::Owned(clean) => clean,
+        })
     }
 }
 
@@ -42,7 +161,7 @@ const DIFF_TRUNCATE_HEAD: usize = 20;
 /// Lines to show at the end of a truncated diff.
 const DIFF_TRUNCATE_TAIL: usize = 10;
 
-pub(super) fn render_tool_message(text: &str, styles: &TuiStyles) -> String {
+pub(super) fn render_tool_message(text: &str, styles: &TuiStyles, max_width: usize) -> String {
     let mut out = String::new();
     let mut diff_lines: Vec<&str> = Vec::new();
 
@@ -59,12 +178,17 @@ pub(super) fn render_tool_message(text: &str, styles: &TuiStyles) -> String {
         }
     }
 
-    // Render pre-diff content (tool name, success message, etc.)
-    for (idx, line) in pre_diff_lines.iter().enumerate() {
-        if idx > 0 {
-            out.push('\n');
+    // Render pre-diff content (tool name, success message, etc.), hard-
+    // wrapped so logical rows match physical rows (bd-06s4y).
+    let mut emitted = false;
+    for line in &pre_diff_lines {
+        for segment in super::view::wrapped_line_segments(line, max_width.max(10)) {
+            if emitted {
+                out.push('\n');
+            }
+            emitted = true;
+            out.push_str(&styles.muted.render(segment));
         }
-        out.push_str(&styles.muted.render(line));
     }
 
     if !found_diff_header {
@@ -111,10 +235,33 @@ pub(super) fn render_tool_message(text: &str, styles: &TuiStyles) -> String {
         diff_lines
     };
 
-    // Collect diff lines for word-level highlighting.
-    render_diff_lines(&visible_lines, truncated, styles, &mut out);
+    // Collect diff lines for word-level highlighting. Long diff lines are
+    // clamped (not wrapped) so pairing and highlighting stay line-aligned
+    // while one logical line still occupies exactly one physical row.
+    let clamped: Vec<String> = visible_lines
+        .iter()
+        .map(|line| clamp_display_width(line, max_width.max(10)))
+        .collect();
+    let clamped_refs: Vec<&str> = clamped.iter().map(String::as_str).collect();
+    render_diff_lines(&clamped_refs, truncated, styles, &mut out);
 
     out
+}
+
+/// Clamp a line to `max_width` display cells, appending `…` when cut.
+fn clamp_display_width(line: &str, max_width: usize) -> String {
+    use unicode_width::UnicodeWidthChar;
+    let mut width = 0usize;
+    for (idx, ch) in line.char_indices() {
+        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if width + ch_width > max_width.saturating_sub(1) {
+            let mut clipped = line[..idx].to_string();
+            clipped.push('\u{2026}');
+            return clipped;
+        }
+        width += ch_width;
+    }
+    line.to_string()
 }
 
 /// Render diff lines with word-level highlighting for paired -/+ lines.
@@ -210,7 +357,7 @@ fn render_word_diff_pair(removed: &str, added: &str, styles: &TuiStyles, out: &m
 }
 
 /// Split a diff line like `"-  3 content here"` into prefix `"-  3 "` and content `"content here"`.
-pub(super) fn split_diff_prefix(line: &str) -> (&str, &str) {
+pub(super) const fn split_diff_prefix(line: &str) -> (&str, &str) {
     // Format: [+-] then line number with spaces, then a space, then content.
     // E.g., "+  3 let x = 1;" => prefix "+  3 ", content "let x = 1;"
     // Or "- 12 old text"    => prefix "- 12 ", content "old text"
@@ -248,6 +395,169 @@ pub(super) fn pretty_json(value: &Value) -> String {
 mod tests {
     use super::*;
     use crate::model::TextContent;
+
+    // ── width wrapping / clamping (bd-06s4y) ───────────────────────────
+
+    fn strip_ansi(text: &str) -> String {
+        let mut out = String::new();
+        let mut in_escape = false;
+        for ch in text.chars() {
+            if in_escape {
+                if ch.is_ascii_alphabetic() {
+                    in_escape = false;
+                }
+            } else if ch == '\u{1b}' {
+                in_escape = true;
+            } else {
+                out.push(ch);
+            }
+        }
+        out
+    }
+
+    fn max_visible_line_width(rendered: &str) -> usize {
+        strip_ansi(rendered)
+            .lines()
+            .map(|line| {
+                line.chars()
+                    .map(|ch| unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0))
+                    .sum::<usize>()
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn tool_pre_diff_lines_wrap_to_width() {
+        let styles = crate::theme::Theme::dark().tui_styles();
+        let long = format!("Tool ran with a very long single line {}", "x".repeat(400));
+        let rendered = render_tool_message(&long, &styles, 40);
+        assert!(
+            max_visible_line_width(&rendered) <= 40,
+            "line overflows: {}",
+            max_visible_line_width(&rendered)
+        );
+        // Nothing lost: total visible chars preserved (wrap, not clamp).
+        assert!(
+            strip_ansi(&rendered)
+                .replace('\n', "")
+                .contains(&"x".repeat(100))
+        );
+    }
+
+    #[test]
+    fn tool_diff_lines_clamp_to_width_with_ellipsis() {
+        let styles = crate::theme::Theme::dark().tui_styles();
+        let text = format!(
+            "Successfully replaced text in src/foo.rs.\nDiff:\n-{}\n+{}",
+            "old ".repeat(200),
+            "new ".repeat(200)
+        );
+        let rendered = render_tool_message(&text, &styles, 50);
+        assert!(
+            max_visible_line_width(&rendered) <= 50,
+            "diff line overflows: {}",
+            max_visible_line_width(&rendered)
+        );
+        assert!(
+            strip_ansi(&rendered).contains('\u{2026}'),
+            "no ellipsis marker"
+        );
+    }
+
+    #[test]
+    fn clamp_display_width_boundaries() {
+        assert_eq!(clamp_display_width("short", 40), "short");
+        let clamped = clamp_display_width(&"a".repeat(100), 10);
+        assert!(clamped.ends_with('\u{2026}'));
+        assert!(clamped.chars().count() <= 10);
+    }
+
+    // ── sanitize_terminal_text (bd-p45xh) ───────────────────────────────
+
+    #[test]
+    fn sanitize_passes_clean_text_through_borrowed() {
+        let input = "plain output\nwith lines\tand tabs";
+        assert!(matches!(
+            sanitize_terminal_text(input),
+            Cow::Borrowed(text) if text == input
+        ));
+    }
+
+    #[test]
+    fn sanitize_strips_csi_color_and_cursor_sequences() {
+        let input = "\u{1b}[31mred\u{1b}[0m and \u{1b}[2J\u{1b}[Hcleared";
+        assert_eq!(sanitize_terminal_text(input), "red and cleared");
+    }
+
+    #[test]
+    fn sanitize_strips_osc_title_sequences() {
+        // BEL-terminated and ST-terminated OSC.
+        let input = "\u{1b}]0;window title\u{07}before \u{1b}]8;;http://x\u{1b}\\after";
+        assert_eq!(sanitize_terminal_text(input), "before after");
+    }
+
+    #[test]
+    fn sanitize_consumes_dcs_and_apc_payloads() {
+        // DCS (sixel-style) and APC (tmux passthrough) payloads must be
+        // consumed to their ST terminator, not leaked as text.
+        let input =
+            "before \u{1b}Pq#0;2;0;0;0-payload\u{1b}\\middle \u{1b}_Gtmux-blob\u{1b}\\after";
+        assert_eq!(sanitize_terminal_text(input), "before middle after");
+        // Unterminated DCS swallows to end of input rather than leaking.
+        assert_eq!(sanitize_terminal_text("x\u{1b}Pdangling"), "x");
+        // BEL does NOT terminate DCS (it is data there); only ST does.
+        assert_eq!(
+            sanitize_terminal_text("a\u{1b}Pdata\u{7}more\u{1b}\\b"),
+            "ab"
+        );
+    }
+
+    #[test]
+    fn sanitize_normalizes_carriage_returns() {
+        // CRLF collapses to LF; bare CR (progress rewrite) becomes LF.
+        assert_eq!(sanitize_terminal_text("a\r\nb"), "a\nb");
+        assert_eq!(sanitize_terminal_text("10%\r50%\r100%"), "10%\n50%\n100%");
+    }
+
+    #[test]
+    fn sanitize_drops_other_control_chars_and_dangling_escape() {
+        assert_eq!(sanitize_terminal_text("a\u{08}b\u{07}c\u{7f}d"), "abcd");
+        assert_eq!(sanitize_terminal_text("tail\u{1b}"), "tail");
+        // Two-character escapes (ESC 7 / ESC c) are consumed entirely.
+        assert_eq!(sanitize_terminal_text("x\u{1b}7y\u{1b}cz"), "xyz");
+    }
+
+    #[test]
+    fn sanitizes_single_codepoint_c1_sequences() {
+        assert_eq!(sanitize_terminal_text("\u{009b}31mred\u{009b}0m"), "red");
+        assert_eq!(
+            sanitize_terminal_text("a\u{009d}0;forged title\u{009c}b"),
+            "ab"
+        );
+        assert_eq!(
+            sanitize_terminal_text("a\u{0090}terminal payload\u{009c}b"),
+            "ab"
+        );
+    }
+
+    #[test]
+    fn terminal_line_sanitizer_prevents_multiline_layout_spoofing() {
+        assert_eq!(
+            sanitize_terminal_line("trusted\n[Allow Always]\tlabel"),
+            "trusted [Allow Always] label"
+        );
+        assert_eq!(sanitize_terminal_line("safe\u{009b}2Jname"), "safename");
+    }
+
+    #[test]
+    fn format_tool_output_sanitizes_content() {
+        let content = vec![ContentBlock::Text(TextContent::new(
+            "\u{1b}[1;32mok\u{1b}[0m: 3 passed\r\ndone",
+        ))];
+        let output = format_tool_output(&content, None, false).expect("output");
+        assert_eq!(output, "ok: 3 passed\ndone");
+    }
 
     // ── split_diff_prefix ───────────────────────────────────────────────
 

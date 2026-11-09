@@ -2,6 +2,7 @@
 //!
 //! When invoked without a path, checks config, directories, auth, shell tools,
 //! and sessions. When invoked with a path, runs extension preflight analysis.
+//! Swarm coordination checks run only when explicitly selected with `--only swarm`.
 //! With `--fix`, automatically repairs safe issues (missing dirs, permissions).
 
 use crate::auth::{AuthStorage, CredentialStatus};
@@ -66,6 +67,7 @@ const SWARM_RESOURCE_PREFLIGHT_RCH_QUEUE_JSON_ENV: &str = "PI_DOCTOR_RCH_QUEUE_J
 const SWARM_RESOURCE_PREFLIGHT_RCH_QUEUE_JSON_PATH_ENV: &str = "PI_DOCTOR_RCH_QUEUE_JSON_PATH";
 const SWARM_RESOURCE_PREFLIGHT_LOCAL_BUILD_PROCESS_COUNT_ENV: &str =
     "PI_DOCTOR_LOCAL_BUILD_PROCESS_COUNT";
+const SWARM_RESOURCE_PREFLIGHT_LOGICAL_CPU_CORES_ENV: &str = "PI_DOCTOR_LOGICAL_CPU_CORES";
 const SWARM_VALIDATION_BROKER_STORE_ENV: &str = "PI_VALIDATION_BROKER_STORE";
 const SWARM_PROGRESS_SLO_JSON_ENV: &str = "PI_SWARM_PROGRESS_SLO_JSON";
 const SWARM_BUILD_SLOT_SOON_EXPIRING_MINUTES: i64 = 30;
@@ -423,7 +425,11 @@ pub fn run_doctor(opts: &DoctorOptions<'_>) -> Result<DoctorReport> {
         if extension_only_default {
             return false;
         }
-        opts.only.as_ref().is_none_or(|set| set.contains(&cat))
+        // Swarm readiness is a development/operator preflight, not a requirement
+        // for a healthy consumer installation. Explicit selections stay strict.
+        opts.only
+            .as_ref()
+            .map_or(cat != CheckCategory::Swarm, |set| set.contains(&cat))
     };
 
     if let Some(ext_path) = opts.extension_path {
@@ -460,7 +466,7 @@ pub fn run_doctor(opts: &DoctorOptions<'_>) -> Result<DoctorReport> {
         check_auth(opts.fix, &mut findings);
     }
     if should_run(CheckCategory::Shell) {
-        check_shell(&mut findings);
+        check_shell(opts.cwd, &mut findings);
     }
     if should_run(CheckCategory::Sessions) {
         check_sessions(&mut findings);
@@ -476,6 +482,12 @@ pub fn run_doctor(opts: &DoctorOptions<'_>) -> Result<DoctorReport> {
 
 fn check_config(cwd: &Path, findings: &mut Vec<Finding>) {
     let cat = CheckCategory::Config;
+
+    // An explicit config override replaces both settings layers at startup.
+    if let Some(path) = Config::config_path_override_from_env(cwd) {
+        check_settings_file(cat, &path, "Settings override (PI_CONFIG_PATH)", findings);
+        return;
+    }
 
     // Global settings
     let global_path = Config::global_dir().join("settings.json");
@@ -502,6 +514,14 @@ fn check_settings_file(cat: CheckCategory, path: &Path, label: &str, findings: &
     }
     match std::fs::read_to_string(path) {
         Ok(content) => {
+            // Startup treats an empty settings file as the default configuration.
+            if content.trim().is_empty() {
+                findings.push(Finding::pass(
+                    cat,
+                    format!("{label}: empty (using defaults)"),
+                ));
+                return;
+            }
             let value: serde_json::Value = match serde_json::from_str(&content) {
                 Ok(value) => value,
                 Err(e) => {
@@ -514,7 +534,7 @@ fn check_settings_file(cat: CheckCategory, path: &Path, label: &str, findings: &
                 }
             };
 
-            let serde_json::Value::Object(map) = value else {
+            let serde_json::Value::Object(_) = value else {
                 findings.push(
                     Finding::fail(
                         cat,
@@ -526,20 +546,34 @@ fn check_settings_file(cat: CheckCategory, path: &Path, label: &str, findings: &
                 return;
             };
 
-            let unknown: Vec<&String> = map.keys().filter(|k| !is_known_config_key(k)).collect();
+            // Validate typed settings from the original text, preserving duplicate
+            // fields that a Value round trip would silently discard. Never print
+            // serde's error text: it may contain sensitive user-provided values.
+            if let Err(err) = serde_json::from_str::<Config>(&content) {
+                findings.push(
+                    Finding::fail(cat, format!("{label}: invalid settings values"))
+                        .with_detail(format!(
+                            "Settings cannot be loaded at line {}, column {} (values omitted)",
+                            err.line(),
+                            err.column(),
+                        ))
+                        .with_remediation("Correct invalid setting types or duplicate fields"),
+                );
+                return;
+            }
+
+            // The same walk pi runs at startup, so the two surfaces cannot
+            // disagree about what counts as a typo. It reaches inside settings
+            // objects — `bash.mediatoin` is reported as such — and it leaves
+            // `$schema`, explicit nulls, and the keys of map-valued settings
+            // alone.
+            let unknown = crate::config::unrecognised_setting_keys(&content);
             if unknown.is_empty() {
                 findings.push(Finding::pass(cat, label.to_string()));
             } else {
                 findings.push(
                     Finding::warn(cat, format!("{label}: unknown keys"))
-                        .with_detail(format!(
-                            "Unknown keys: {}",
-                            unknown
-                                .iter()
-                                .map(|k| k.as_str())
-                                .collect::<Vec<_>>()
-                                .join(", ")
-                        ))
+                        .with_detail(format!("Unknown keys: {}", unknown.join(", ")))
                         .with_remediation("Check for typos in settings key names"),
                 );
             }
@@ -554,78 +588,68 @@ fn check_settings_file(cat: CheckCategory, path: &Path, label: &str, findings: &
     }
 }
 
-/// Known top-level config keys (from `Config` struct fields + their camelCase aliases).
+#[cfg(test)]
+mod doctor_typed_settings_regressions {
+    use super::{CheckCategory, DoctorReport, Severity, check_settings_file};
+
+    #[test]
+    fn invalid_typed_settings_fail_without_leaking_values() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("settings.json");
+        for content in [
+            r#"{"hideThinkingBlock":"private-invalid-value"}"#,
+            r#"{"hideThinkingBlock":true,"hideThinkingBlock":false}"#,
+            r#"{"retry":{"maxRetries":"not-an-integer"}}"#,
+        ] {
+            std::fs::write(&path, content).unwrap();
+            let mut findings = Vec::new();
+            check_settings_file(CheckCategory::Config, &path, "Settings", &mut findings);
+            let report = DoctorReport::from_findings(findings);
+            assert_eq!(report.overall, Severity::Fail);
+            assert_eq!(report.summary.fail, 1);
+            for rendered in [
+                report.render_text(),
+                report.render_markdown(),
+                report.to_json().unwrap(),
+            ] {
+                assert!(!rendered.contains("private-invalid-value"));
+                assert!(!rendered.contains("not-an-integer"));
+            }
+        }
+    }
+
+    #[test]
+    fn empty_settings_and_unknown_keys_remain_nonfatal() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("settings.json");
+        for (content, expected) in [
+            ("", Severity::Pass),
+            ("  \n", Severity::Pass),
+            (r#"{"hideThinkngBlock":true}"#, Severity::Warn),
+        ] {
+            std::fs::write(&path, content).unwrap();
+            let mut findings = Vec::new();
+            check_settings_file(CheckCategory::Config, &path, "Settings", &mut findings);
+            assert_eq!(DoctorReport::from_findings(findings).overall, expected);
+        }
+    }
+}
+
+/// Known top-level config keys.
+///
+/// This used to be a hand-written list of names, and it had drifted badly: it
+/// held 67 of the 108 spellings `Config` accepts, so `pi doctor` reported 41
+/// perfectly valid settings as "unknown keys" — `approval`, `http`, `lsp`,
+/// `tools`, `memory`, `plan`, `secrets`, `trustAllWorkspaces`,
+/// `requestTimeoutSecs`, `modelRoles`, `disabledProviders` among them. Telling
+/// someone to fix a setting that is already correct is worse than saying
+/// nothing, and a list like that drifts every time a field is added, in
+/// exactly this direction.
+///
+/// So the question is put to serde instead, which cannot drift.
+#[cfg(test)]
 fn is_known_config_key(key: &str) -> bool {
-    matches!(
-        key,
-        "theme"
-            | "hideThinkingBlock"
-            | "hide_thinking_block"
-            | "showHardwareCursor"
-            | "show_hardware_cursor"
-            | "defaultProvider"
-            | "default_provider"
-            | "defaultModel"
-            | "default_model"
-            | "defaultThinkingLevel"
-            | "default_thinking_level"
-            | "enabledModels"
-            | "enabled_models"
-            | "steeringMode"
-            | "steering_mode"
-            | "followUpMode"
-            | "follow_up_mode"
-            | "quietStartup"
-            | "quiet_startup"
-            | "collapseChangelog"
-            | "collapse_changelog"
-            | "lastChangelogVersion"
-            | "last_changelog_version"
-            | "doubleEscapeAction"
-            | "double_escape_action"
-            | "editorPaddingX"
-            | "editor_padding_x"
-            | "autocompleteMaxVisible"
-            | "autocomplete_max_visible"
-            | "sessionPickerInput"
-            | "session_picker_input"
-            | "sessionStore"
-            | "sessionBackend"
-            | "session_store"
-            | "compaction"
-            | "branchSummary"
-            | "branch_summary"
-            | "retry"
-            | "shellPath"
-            | "shell_path"
-            | "shellCommandPrefix"
-            | "shell_command_prefix"
-            | "ghPath"
-            | "gh_path"
-            | "images"
-            | "terminal"
-            | "thinkingBudgets"
-            | "thinking_budgets"
-            | "packages"
-            | "extensions"
-            | "skills"
-            | "prompts"
-            | "themes"
-            | "enableSkillCommands"
-            | "enable_skill_commands"
-            | "extensionPolicy"
-            | "extension_policy"
-            | "repairPolicy"
-            | "repair_policy"
-            | "extensionRisk"
-            | "extension_risk"
-            | "checkForUpdates"
-            | "check_for_updates"
-            | "sessionDurability"
-            | "session_durability"
-            | "markdown"
-            | "queueMode"
-    )
+    crate::config::recognises_setting_key(key)
 }
 
 // ── Check: Dirs ─────────────────────────────────────────────────────
@@ -695,7 +719,9 @@ fn check_dir(cat: CheckCategory, label: &str, dir: &Path, fix: bool, findings: &
 // ── Check: Auth ─────────────────────────────────────────────────────
 
 #[allow(clippy::too_many_lines)]
-#[cfg_attr(not(unix), allow(unused_variables))]
+// `auth_path` is consumed by the load below and then re-read by the Unix-only
+// permission check, so the clone is redundant only where that check is absent.
+#[cfg_attr(not(unix), allow(unused_variables, clippy::redundant_clone))]
 fn check_auth(fix: bool, findings: &mut Vec<Finding>) {
     let cat = CheckCategory::Auth;
     let auth_path = Config::auth_path();
@@ -711,8 +737,11 @@ fn check_auth(fix: bool, findings: &mut Vec<Finding>) {
         return;
     }
 
-    // Check if auth.json parses
-    let auth = match AuthStorage::load(auth_path.clone()) {
+    // Check if auth.json parses. The tolerant load would discard a corrupt
+    // store (and back it up), so parse strictly before loading it.
+    let auth = match AuthStorage::check_parse(&auth_path)
+        .and_then(|()| AuthStorage::load(auth_path.clone()))
+    {
         Ok(auth) => {
             findings.push(Finding::pass(cat, "auth.json parses correctly"));
             Some(auth)
@@ -850,18 +879,25 @@ fn check_auth_env_vars(cat: CheckCategory, findings: &mut Vec<Finding>) {
 
 // ── Check: Shell ────────────────────────────────────────────────────
 
-fn check_shell(findings: &mut Vec<Finding>) {
+fn check_shell(cwd: &Path, findings: &mut Vec<Finding>) {
     let cat = CheckCategory::Shell;
+    let config_path = Config::config_path_override_from_env(cwd);
+    let config = Config::load_with_roots(config_path.as_deref(), &Config::global_dir(), cwd).ok();
 
-    // Required tools (Fail if missing)
-    check_tool(
-        cat,
-        "bash",
-        &["--version"],
-        Severity::Fail,
-        ToolCheckMode::PresenceOnly,
-        findings,
-    );
+    // The shell the bash tool actually runs (GH #182): `shell_path`, else
+    // what `default_bash_shell` resolves. Probing `bash` on PATH passed on
+    // Windows even when the tool could not find a shell at all.
+    let configured = config
+        .as_ref()
+        .and_then(|config| config.shell_path.clone())
+        .filter(|path| !path.trim().is_empty());
+    findings.push(bash_shell_finding(
+        configured.as_deref(),
+        crate::tools::resolve_default_bash_shell().map_err(|err| err.to_string()),
+        Path::exists,
+    ));
+    // `sh` is only the Unix fallback when no bash exists; Windows never uses it.
+    #[cfg(unix)]
     check_tool(
         cat,
         "sh",
@@ -880,11 +916,20 @@ fn check_shell(findings: &mut Vec<Finding>) {
         ToolCheckMode::PresenceOnly,
         findings,
     );
+    // grep and find search in-process by default; rg and fd matter only
+    // with `search_backend: "external"`.
+    let external_search = crate::tools::search_backend_from_config(config.as_ref())
+        == crate::tools::SearchBackend::External;
+    let search_severity = if external_search {
+        Severity::Warn
+    } else {
+        Severity::Info
+    };
     check_tool(
         cat,
         "rg",
         &["--version"],
-        Severity::Warn,
+        search_severity,
         ToolCheckMode::PresenceOnly,
         findings,
     );
@@ -898,7 +943,7 @@ fn check_shell(findings: &mut Vec<Finding>) {
         cat,
         fd_bin,
         &["--version"],
-        Severity::Warn,
+        search_severity,
         ToolCheckMode::PresenceOnly,
         findings,
     );
@@ -912,6 +957,51 @@ fn check_shell(findings: &mut Vec<Finding>) {
         ToolCheckMode::PresenceOnly,
         findings,
     );
+}
+
+/// The finding for the shell the bash tool will run. `configured` is
+/// `shell_path`; `resolved` is `default_bash_shell()`; `exists` checks a
+/// path (injected so tests stay off the real filesystem).
+fn bash_shell_finding(
+    configured: Option<&str>,
+    resolved: std::result::Result<String, String>,
+    exists: impl Fn(&Path) -> bool,
+) -> Finding {
+    let cat = CheckCategory::Shell;
+    if let Some(path) = configured {
+        let looks_like_path = path.contains('/') || path.contains('\\');
+        if looks_like_path && !exists(Path::new(path)) {
+            return Finding::fail(cat, format!("bash: shell_path not found ({path})"))
+                .with_remediation("Point shell_path in settings.json at an existing bash");
+        }
+        return shell_path_finding(path, "shell_path");
+    }
+    match resolved {
+        Ok(path) if path == "sh" => Finding::warn(cat, "bash: not found; commands run with sh")
+            .with_remediation("Install bash, or set shell_path in settings.json"),
+        Ok(path) => shell_path_finding(&path, "auto-detected"),
+        Err(err) => Finding::fail(cat, "bash: no shell found for the bash tool")
+            .with_detail(err)
+            .with_remediation(
+                "Install Git for Windows (Git Bash), or set shell_path in settings.json",
+            ),
+    }
+}
+
+fn shell_path_finding(path: &str, source: &str) -> Finding {
+    let cat = CheckCategory::Shell;
+    if crate::tools::is_wsl_bash_launcher(Path::new(path)) {
+        Finding::warn(cat, format!("bash: {path} ({source}, WSL)"))
+            .with_detail(
+                "Commands run inside the WSL Linux distro: Windows paths appear as /mnt/c/... \
+                 and Windows tools are not on its PATH",
+            )
+            .with_remediation(
+                "Install Git for Windows for a native bash, or set shell_path to the one you want",
+            )
+    } else {
+        Finding::pass(cat, format!("bash ({path}, {source})"))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1107,21 +1197,19 @@ fn resolve_executable_in_dir(dir: &Path, tool: &str) -> Option<PathBuf> {
 }
 
 fn is_executable(path: &Path) -> bool {
-    if !path.is_file() {
-        return false;
-    }
-
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
-        std::fs::metadata(path)
-            .ok()
-            .is_some_and(|metadata| metadata.permissions().mode() & 0o111 != 0)
+        path.is_file()
+            && std::fs::metadata(path)
+                .is_ok_and(|metadata| metadata.permissions().mode() & 0o111 != 0)
     }
 
+    // Windows carries no executable bit; being a regular file is all that can
+    // be checked here, and PATHEXT decides the rest at spawn time.
     #[cfg(not(unix))]
     {
-        true
+        path.is_file()
     }
 }
 
@@ -1840,9 +1928,13 @@ fn build_swarm_resource_preflight_snapshot(
     sample: &HostResourceSample,
 ) -> SwarmResourcePreflightSnapshot {
     let mut source_errors = Vec::new();
-    let logical_cpu_cores = std::thread::available_parallelism()
-        .ok()
-        .and_then(|value| u64::try_from(value.get()).ok())
+    let logical_cpu_cores = env_u64(SWARM_RESOURCE_PREFLIGHT_LOGICAL_CPU_CORES_ENV)
+        .filter(|cores| *cores > 0)
+        .or_else(|| {
+            std::thread::available_parallelism()
+                .ok()
+                .and_then(|value| u64::try_from(value.get()).ok())
+        })
         .unwrap_or(1);
     let cpu_quota = read_cgroup_cpu_quota(&mut source_errors);
     let cpuset = read_cpuset_snapshot(&mut source_errors);
@@ -8614,7 +8706,7 @@ fn reservation_patterns_overlap(left: &str, right: &str) -> bool {
     left == right || simple_glob_match(left, right) || simple_glob_match(right, left)
 }
 
-fn simple_glob_match(pattern: &str, text: &str) -> bool {
+const fn simple_glob_match(pattern: &str, text: &str) -> bool {
     let pattern = pattern.as_bytes();
     let text = text.as_bytes();
     let mut pattern_index = 0;
@@ -10354,17 +10446,19 @@ fn swarm_temp_dir_finding(
     let cat = CheckCategory::Swarm;
     let data = swarm_temp_dir_data(env_name, Some(path), true, available_kb);
 
-    if let Some(available_kb) = available_kb {
-        if available_kb < SWARM_DISK_WARN_AVAILABLE_KB {
-            return Finding::warn(cat, format!("{env_name} has low free space"))
-                .with_detail(format!(
-                    "{} available at {}",
-                    format_available_kb(available_kb),
-                    path.display()
-                ))
-                .with_remediation("Switch to a larger /data/tmp target or wait for cleanup before heavy cargo checks")
-                .with_data(data);
-        }
+    if let Some(available_kb) = available_kb
+        && available_kb < SWARM_DISK_WARN_AVAILABLE_KB
+    {
+        return Finding::warn(cat, format!("{env_name} has low free space"))
+            .with_detail(format!(
+                "{} available at {}",
+                format_available_kb(available_kb),
+                path.display()
+            ))
+            .with_remediation(
+                "Switch to a larger /data/tmp target or wait for cleanup before heavy cargo checks",
+            )
+            .with_data(data);
     }
 
     if !path_under_swarm_scratch_root(path) {
@@ -10730,7 +10824,20 @@ fn check_sessions(findings: &mut Vec<Finding>) {
         findings.push(
             Finding::warn(cat, format!("{total} sessions, {corrupt} corrupt"))
                 .with_detail("Some session files are empty or have invalid headers")
-                .with_remediation("Corrupt sessions can be safely deleted"),
+                .with_remediation(
+                    "Move corrupt sessions aside with `pi gc` (trash + grace period) rather than deleting them",
+                ),
+        );
+    }
+
+    let pressure = crate::gc::check_storage_pressure(&sessions_dir, 30);
+    if pressure.is_elevated
+        && let Some(rec) = pressure.recommendation
+    {
+        findings.push(
+            Finding::warn(cat, "Storage pressure detected in sessions store")
+                .with_detail(rec)
+                .with_remediation("Run `pi gc --yes` to prune aged sessions and free disk space"),
         );
     }
 }
@@ -11093,6 +11200,82 @@ mod tests {
         assert!(is_known_config_key("defaultModel"));
         assert!(is_known_config_key("extensionPolicy"));
         assert!(!is_known_config_key("nonexistent_key_xyz"));
+    }
+
+    #[test]
+    fn every_key_config_accepts_is_known_to_doctor() {
+        // The list this replaced held 67 of 108 spellings, so doctor called 41
+        // valid settings typos. Generating the expected set from a serialized
+        // `Config` rather than typing it out is the point: a written list is
+        // what drifted, and it drifted silently in the direction of accusing
+        // correct configuration.
+        let serialized = serde_json::to_value(Config::default()).expect("serialize config");
+        let canonical = serialized.as_object().expect("config is an object");
+        assert!(
+            canonical.len() >= 60,
+            "expected the full field set, got {} keys",
+            canonical.len()
+        );
+
+        let unknown: Vec<&String> = canonical
+            .keys()
+            .filter(|key| !is_known_config_key(key))
+            .collect();
+        assert!(
+            unknown.is_empty(),
+            "doctor would report these valid settings as unknown: {unknown:?}"
+        );
+    }
+
+    #[test]
+    fn doctor_reports_a_typo_inside_a_settings_object() {
+        // Doctor used to look only at top-level names, so the costly half of
+        // the mistake — `bash.mediatoin`, which is no command-mediation policy
+        // at all — read as PASS.
+        let unknown = crate::config::unrecognised_setting_keys(
+            r#"{
+                "bash": { "mediation": "block-high", "mediatoin": "block-high" },
+                "retry": {
+                    "maxRetries": 5,
+                    "fallbackChains": { "whatever the user calls it": ["openai/gpt-5"] }
+                }
+            }"#,
+        );
+        assert_eq!(unknown, vec!["bash.mediatoin".to_string()]);
+    }
+
+    #[test]
+    fn settings_doctor_once_missed_these_whole_subsystems() {
+        // A sample of the 41, named so the regression reads as what it was
+        // rather than as a count. Aliases are included because doctor sees
+        // whichever spelling the user wrote.
+        for key in [
+            "approval",
+            "askPolicy",
+            "ask_policy",
+            "bash",
+            "browser",
+            "computer",
+            "disabledProviders",
+            "http",
+            "keywords",
+            "lsp",
+            "media",
+            "memory",
+            "modelRoles",
+            "plan",
+            "requestTimeoutSecs",
+            "secrets",
+            "titling",
+            "tools",
+            "trustAllWorkspaces",
+            "turn_recovery",
+        ] {
+            assert!(
+                is_known_config_key(key),
+                "doctor still calls the valid setting {key:?} unknown"
+            );
+        }
     }
 
     #[test]
@@ -13843,7 +14026,7 @@ fn doctor_swarm_context_intelligence_json_reports_posture() {
             ..SessionHeader::default()
         };
         futures::executor::block_on(async {
-            crate::session_sqlite::save_session(&path, &header, &[])
+            crate::session_sqlite::save_session(&path, &header, &[], true)
                 .await
                 .expect("save sqlite session");
         });
@@ -13860,7 +14043,7 @@ fn doctor_swarm_context_intelligence_json_reports_posture() {
             ..SessionHeader::default()
         };
         futures::executor::block_on(async {
-            crate::session_sqlite::save_session(&path, &header, &[])
+            crate::session_sqlite::save_session(&path, &header, &[], true)
                 .await
                 .expect("save sqlite session");
         });
@@ -13870,13 +14053,17 @@ fn doctor_swarm_context_intelligence_json_reports_posture() {
         };
         let invalid_json =
             serde_json::to_string(&invalid_header).expect("serialize invalid session header");
-        let config = sqlmodel_sqlite::SqliteConfig::file(path.to_string_lossy())
-            .flags(sqlmodel_sqlite::OpenFlags::create_read_write());
-        let conn = sqlmodel_sqlite::SqliteConnection::open(&config).expect("open sqlite db");
-        conn.execute_sync(
-            "UPDATE pi_session_header SET json = ?1",
-            &[sqlmodel_core::Value::Text(invalid_json)],
-        )
+        crate::session_sqlite::run_on_sqlite_thread(|| {
+            let conn = crate::session_sqlite::SqliteConnection::open_read_write(&path)
+                .map_err(|err| crate::error::Error::session(err.to_string()))?;
+            conn.execute_sync(
+                "UPDATE pi_session_header SET json = ?1",
+                &[fsqlite::SqliteValue::from(invalid_json)],
+            )
+            .map_err(|err| crate::error::Error::session(err.to_string()))?;
+            conn.close()
+                .map_err(|err| crate::error::Error::session(err.to_string()))
+        })
         .expect("corrupt sqlite header row");
         assert!(!is_session_healthy(&path));
     }
@@ -13903,6 +14090,67 @@ fn doctor_swarm_context_intelligence_json_reports_posture() {
         assert_eq!(findings[0].severity, Severity::Warn);
         assert_eq!(findings[0].fixability, Fixability::AutoFixable);
         assert!(!missing.exists());
+    }
+
+    /// GH #182: the bash finding reflects the shell the tool will run, not
+    /// whether some `bash` is on PATH.
+    #[test]
+    fn bash_shell_finding_reports_the_shell_the_tool_runs() {
+        let none = |_: &Path| false;
+        let all = |_: &Path| true;
+
+        let found = bash_shell_finding(None, Ok("/bin/bash".to_string()), none);
+        assert_eq!(found.severity, Severity::Pass);
+        assert!(found.title.contains("/bin/bash") && found.title.contains("auto-detected"));
+
+        let missing = bash_shell_finding(None, Err("no bash".to_string()), none);
+        assert_eq!(missing.severity, Severity::Fail);
+
+        let sh = bash_shell_finding(None, Ok("sh".to_string()), none);
+        assert_eq!(sh.severity, Severity::Warn);
+
+        // Joined, not a `\` literal: backslashes only separate paths on Windows.
+        let wsl_launcher = Path::new("C:")
+            .join("Windows")
+            .join("System32")
+            .join("bash.exe")
+            .display()
+            .to_string();
+        let wsl = bash_shell_finding(None, Ok(wsl_launcher), none);
+        assert_eq!(wsl.severity, Severity::Warn, "{}", wsl.title);
+
+        let bad_config = bash_shell_finding(
+            Some(r"C:\Program Files\Git\bin\bash.exe"),
+            Ok("/bin/bash".to_string()),
+            none,
+        );
+        assert_eq!(bad_config.severity, Severity::Fail);
+        assert!(bad_config.title.contains("shell_path not found"));
+
+        let good_config = bash_shell_finding(
+            Some(r"C:\Program Files\Git\bin\bash.exe"),
+            Err("unused".to_string()),
+            all,
+        );
+        assert_eq!(good_config.severity, Severity::Pass);
+        assert!(good_config.title.contains("shell_path"));
+    }
+
+    /// grep and find search in-process by default, so missing rg/fd is
+    /// informational, never a warning, without `search_backend: "external"`.
+    #[test]
+    fn missing_search_binaries_are_informational_by_default() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut findings = Vec::new();
+        check_shell(dir.path(), &mut findings);
+        for finding in &findings {
+            let about_search = ["rg", "fd", "fdfind"]
+                .iter()
+                .any(|tool| finding.title.starts_with(*tool));
+            if about_search {
+                assert_ne!(finding.severity, Severity::Warn, "{}", finding.title);
+            }
+        }
     }
 
     #[test]

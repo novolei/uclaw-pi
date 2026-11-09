@@ -17,7 +17,7 @@ use crate::extensions::JsExtensionRuntimeHandle;
 use crate::extensions::WasmExtensionHandle;
 use crate::extensions::{ExtensionManager, ExtensionRuntimeHandle};
 use crate::extensions_js::ExtensionToolDef;
-use crate::tools::{Tool, ToolOutput, ToolUpdate};
+use crate::tools::{SharedToolRegistry, Tool, ToolOutput, ToolUpdate};
 #[cfg(feature = "wasm-host")]
 use asupersync::time::{timeout, wall_now};
 
@@ -101,20 +101,79 @@ pub async fn collect_extension_tool_wrappers(
     manager: &ExtensionManager,
     ctx_payload: Value,
 ) -> Result<Vec<Box<dyn Tool>>> {
-    let shared_ctx_payload = Arc::new(ctx_payload);
     let active = manager
         .active_tools()
         .map(|tools| tools.into_iter().collect::<HashSet<_>>());
+    let mut wrappers =
+        collect_all_extension_tool_wrappers(manager, manager.runtime(), ctx_payload).await?;
+    if let Some(active) = active {
+        wrappers.retain(|tool| active.contains(tool.name()));
+    }
+    Ok(wrappers)
+}
+
+/// Agent-owned publication state for deferred extension tool registration.
+/// Exact Arc identities distinguish our mounts from later same-name host
+/// overrides without adding a manager/runtime ownership cycle.
+pub(crate) struct ExtensionToolCatalog {
+    ctx_payload: Value,
+    published: Vec<Arc<dyn Tool>>,
+    initialized: bool,
+}
+
+impl ExtensionToolCatalog {
+    pub(crate) const fn new(ctx_payload: Value) -> Self {
+        Self {
+            ctx_payload,
+            published: Vec::new(),
+            initialized: false,
+        }
+    }
+
+    pub(crate) async fn refresh(
+        &mut self,
+        manager: &ExtensionManager,
+        tools: &SharedToolRegistry,
+    ) -> Result<()> {
+        // Collection asks the runtime for its authoritative, owner-validated
+        // snapshot. Errors leave the published registry untouched.
+        let replacements = collect_all_extension_tool_wrappers(
+            manager,
+            manager.runtime_for_tools(),
+            self.ctx_payload.clone(),
+        )
+        .await?;
+        let active = manager.active_tools();
+        self.published = tools.reconcile_extension_tools(
+            &self.published,
+            replacements,
+            active.as_deref(),
+            !self.initialized,
+        );
+        self.initialized = true;
+        Ok(())
+    }
+
+    pub(crate) fn clear(&mut self, tools: &SharedToolRegistry) {
+        self.published = tools.reconcile_extension_tools(&self.published, Vec::new(), None, false);
+        self.initialized = false;
+    }
+}
+
+async fn collect_all_extension_tool_wrappers(
+    manager: &ExtensionManager,
+    runtime: Option<ExtensionRuntimeHandle>,
+    ctx_payload: Value,
+) -> Result<Vec<Box<dyn Tool>>> {
+    #[cfg(not(feature = "wasm-host"))]
+    let _ = manager;
+    let shared_ctx_payload = Arc::new(ctx_payload);
 
     let mut wrappers: Vec<Box<dyn Tool>> = Vec::new();
     let mut seen = HashSet::new();
 
-    if let Some(runtime) = manager.runtime() {
+    if let Some(runtime) = runtime {
         let mut defs = runtime.get_registered_tools().await?;
-        if let Some(active) = active.as_ref() {
-            defs.retain(|def| active.contains(&def.name));
-        }
-
         defs.sort_by(|a, b| a.name.cmp(&b.name));
         for def in defs {
             if !seen.insert(def.name.clone()) {
@@ -140,11 +199,6 @@ pub async fn collect_extension_tool_wrappers(
 
         wasm_defs.sort_by(|a, b| a.0.name.cmp(&b.0.name));
         for (def, handle) in wasm_defs {
-            if let Some(active) = active.as_ref() {
-                if !active.contains(&def.name) {
-                    continue;
-                }
-            }
             if !seen.insert(def.name.clone()) {
                 tracing::warn!(tool = %def.name, "Duplicate extension tool name; ignoring");
                 continue;
@@ -175,20 +229,25 @@ impl Tool for ExtensionToolWrapper {
         self.def.parameters.clone()
     }
 
+    fn origin(&self) -> crate::tools::ToolOrigin {
+        crate::tools::ToolOrigin::Extension
+    }
+
     async fn execute(
         &self,
         tool_call_id: &str,
         input: Value,
-        _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+        on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
     ) -> Result<ToolOutput> {
         let result = self
             .runtime
-            .execute_tool_ref(
+            .execute_tool_with_updates_ref(
                 &self.def.name,
                 tool_call_id,
                 input,
                 Arc::clone(&self.ctx_payload),
                 self.timeout_ms,
+                on_update,
             )
             .await
             .map_err(|err| Error::tool(self.name(), err.to_string()))?;
@@ -219,6 +278,10 @@ impl Tool for WasmExtensionToolWrapper {
 
     fn parameters(&self) -> Value {
         self.def.parameters.clone()
+    }
+
+    fn origin(&self) -> crate::tools::ToolOrigin {
+        crate::tools::ToolOrigin::Extension
     }
 
     async fn execute(
@@ -267,8 +330,11 @@ mod tests {
     use super::*;
 
     use crate::agent::{Agent, AgentConfig, AgentEvent, AgentSession};
-    use crate::extensions::{ExtensionManager, JsExtensionLoadSpec};
-    use crate::extensions_js::PiJsRuntimeConfig;
+    use crate::extensions::{
+        ExtensionManager, JsExtensionLoadSpec, NativeRustExtensionLoadSpec,
+        NativeRustExtensionRuntimeHandle,
+    };
+    use crate::extensions_js::{PiJsRuntimeConfig, PiJsRuntimeLimits};
     use crate::model::{
         AssistantMessage, ContentBlock, Message, StopReason, StreamEvent, TextContent, ToolCall,
         Usage,
@@ -282,11 +348,26 @@ mod tests {
     use futures::Stream;
     use serde_json::json;
     use std::pin::Pin;
-    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex as StdMutex, PoisonError};
+    use std::time::Duration;
 
     async fn setup_js_tool(
         source: &str,
         tool_name: &str,
+    ) -> (
+        tempfile::TempDir,
+        ExtensionManager,
+        JsExtensionRuntimeHandle,
+        ExtensionToolDef,
+    ) {
+        setup_js_tool_with_native_tools(source, tool_name, Vec::new()).await
+    }
+
+    async fn setup_js_tool_with_native_tools(
+        source: &str,
+        tool_name: &str,
+        native_tools: Vec<Box<dyn Tool>>,
     ) -> (
         tempfile::TempDir,
         ExtensionManager,
@@ -298,7 +379,11 @@ mod tests {
         std::fs::write(&entry_path, source).expect("write extension entry");
 
         let manager = ExtensionManager::new();
-        let tools = Arc::new(ToolRegistry::new(&[], temp_dir.path(), None));
+        let mut tools = ToolRegistry::new(&[], temp_dir.path(), None);
+        for tool in native_tools {
+            tools.push(tool);
+        }
+        let tools = Arc::new(tools);
         let js_runtime = JsExtensionRuntimeHandle::start(
             PiJsRuntimeConfig {
                 cwd: temp_dir.path().display().to_string(),
@@ -326,6 +411,518 @@ mod tests {
             .expect("tool registered");
 
         (temp_dir, manager, js_runtime, def)
+    }
+
+    const TOOL_INVOCATION_FIXTURE: &str = r"
+        export default function init(pi) {
+          let abortCount = 0;
+          let savedUpdate;
+          const output = (text, details = {}) => ({
+            content: [{ type: 'text', text }], details
+          });
+          pi.registerTool({
+            name: 'invocation_tool', description: 'Invocation lifecycle fixture',
+            parameters: { type: 'object', properties: { mode: { type: 'string' } } },
+            async execute(callId, input, signal, onUpdate) {
+              if (!(signal instanceof AbortSignal) || signal.aborted) {
+                throw new Error('tool must receive its own live AbortSignal');
+              }
+              const update = typeof onUpdate === 'function' ? onUpdate : () => {};
+              savedUpdate = update;
+              if (input.mode === 'complete') {
+                if (typeof onUpdate !== 'function') throw new Error('missing update callback');
+                update(output('started', { phase: 'started', callId }));
+                // The native read fixture cannot return until the update
+                // callback releases it. Buffering updates until completion
+                // therefore deadlocks and fails the outer test timeout.
+                await pi.tool('read', {});
+                return output('finished', { phase: 'finished', callId });
+              }
+              const pending = new Promise((resolve) => {
+                signal.addEventListener('abort', () => {
+                  abortCount++;
+                  try { update(output('late abort update')); } catch (_) {}
+                  if (input.mode !== 'ignore') resolve(output('cancelled'));
+                }, { once: true });
+              });
+              update(output('started', { phase: 'started', callId }));
+              return pending;
+            }
+          });
+          pi.registerTool({
+            name: 'probe_tool', description: 'Observe the prior invocation',
+            parameters: { type: 'object' },
+            async execute(_callId, _input, signal, onUpdate) {
+              if (savedUpdate) {
+                try { savedUpdate(output('stale update')); } catch (_) {}
+              }
+              if (typeof onUpdate === 'function') {
+                onUpdate(output('probe progress', { phase: 'probe' }));
+              }
+              return output('probe', {
+                abortCount, freshSignal: signal instanceof AbortSignal && !signal.aborted
+              });
+            }
+          });
+        }
+    ";
+
+    struct ProgressGateTool {
+        release: StdMutex<Option<futures::channel::oneshot::Receiver<()>>>,
+    }
+
+    #[async_trait]
+    impl Tool for ProgressGateTool {
+        fn name(&self) -> &str {
+            "read"
+        }
+
+        fn label(&self) -> &str {
+            "Progress gate"
+        }
+
+        fn description(&self) -> &str {
+            "Test fixture released by the native progress callback"
+        }
+
+        fn parameters(&self) -> Value {
+            json!({ "type": "object" })
+        }
+
+        async fn execute(
+            &self,
+            _tool_call_id: &str,
+            _input: Value,
+            _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+        ) -> Result<ToolOutput> {
+            let release = self
+                .release
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take()
+                .ok_or_else(|| Error::tool("read", "progress gate entered more than once"))?;
+            release
+                .await
+                .map_err(|_| Error::tool("read", "progress callback was abandoned"))?;
+            Ok(ToolOutput {
+                content: Vec::new(),
+                details: None,
+                is_error: false,
+            })
+        }
+    }
+
+    type TestUpdateCallback = Box<dyn Fn(ToolUpdate) + Send + Sync>;
+
+    fn first_update_channel() -> (
+        futures::channel::oneshot::Receiver<ToolUpdate>,
+        TestUpdateCallback,
+    ) {
+        let (sender, receiver) = futures::channel::oneshot::channel();
+        let sender = StdMutex::new(Some(sender));
+        let callback = Box::new(move |update| {
+            let sender = sender.lock().unwrap_or_else(PoisonError::into_inner).take();
+            if let Some(sender) = sender {
+                let _ = sender.send(update);
+            }
+        });
+        (receiver, callback)
+    }
+
+    async fn abandon_started_tool(wrapper: &ExtensionToolWrapper, mode: &str) {
+        let (update, callback) = first_update_channel();
+        let execution = wrapper.execute("abandoned-call", json!({ "mode": mode }), Some(callback));
+        let first = asupersync::time::timeout(
+            asupersync::time::wall_now(),
+            Duration::from_secs(5),
+            futures::future::select(update, execution),
+        )
+        .await
+        .expect("tool must deliver progress before its execution deadline");
+        match first {
+            futures::future::Either::Left((update, pending)) => {
+                // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression assertion; absent from production builds.
+                assert_eq!(
+                    update
+                        .expect("initial progress")
+                        .details
+                        .expect("progress details")["phase"],
+                    "started",
+                );
+                drop(pending);
+            }
+            futures::future::Either::Right((result, _)) => {
+                panic!("tool must stay pending until cancellation, got {result:?}");
+            }
+        }
+    }
+
+    async fn probe_invocation(runtime: &JsExtensionRuntimeHandle) -> Result<Value> {
+        asupersync::time::timeout(
+            asupersync::time::wall_now(),
+            Duration::from_secs(5),
+            runtime.execute_tool(
+                "probe_tool".to_string(),
+                "probe-call".to_string(),
+                json!({}),
+                Arc::new(json!({})),
+                5_000,
+            ),
+        )
+        .await
+        .expect("the next request must not wait for the abandoned tool's 60-second budget")
+    }
+
+    #[test]
+    fn extension_tool_updates_release_work_before_final_output_and_ignore_late_callbacks() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            let (release, wait) = futures::channel::oneshot::channel();
+            let gate = ProgressGateTool {
+                release: StdMutex::new(Some(wait)),
+            };
+            let (_directory, _manager, js_runtime, def) = setup_js_tool_with_native_tools(
+                TOOL_INVOCATION_FIXTURE,
+                "invocation_tool",
+                vec![Box::new(gate)],
+            )
+            .await;
+            let wrapper = ExtensionToolWrapper::new(def, js_runtime.clone());
+            let updates = Arc::new(StdMutex::new(Vec::new()));
+            let observed = Arc::clone(&updates);
+            let release = StdMutex::new(Some(release));
+            let output = asupersync::time::timeout(
+                asupersync::time::wall_now(),
+                Duration::from_secs(5),
+                wrapper.execute(
+                    "progress-call",
+                    json!({ "mode": "complete" }),
+                    Some(Box::new(move |update| {
+                        observed
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .push(update);
+                        let release = release
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .take();
+                        if let Some(release) = release {
+                            release.send(()).expect("release the native tool");
+                        }
+                    })),
+                ),
+            )
+            .await
+            .expect("progress must be delivered while the JS tool waits for host work")
+            .expect("completed extension tool");
+            // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression assertion; absent from production builds.
+            assert_eq!(output.details.as_ref().unwrap()["phase"], "finished");
+            {
+                let updates = updates.lock().unwrap_or_else(PoisonError::into_inner);
+                // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression assertion; absent from production builds.
+                assert_eq!(updates.len(), 1);
+                // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+                assert_eq!(updates[0].details.as_ref().unwrap()["phase"], "started");
+                // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+                assert_eq!(
+                    updates[0].details.as_ref().unwrap()["callId"],
+                    "progress-call"
+                );
+            }
+
+            let probe_updates = Arc::new(StdMutex::new(Vec::new()));
+            let observed_probe = Arc::clone(&probe_updates);
+            let probe = js_runtime
+                .execute_tool_with_updates(
+                    "probe_tool".to_string(),
+                    // Reusing a model-supplied call ID must not reuse the
+                    // previous invocation's signal or progress recipient.
+                    "progress-call".to_string(),
+                    json!({}),
+                    Arc::new(json!({})),
+                    5_000,
+                    Some(Box::new(move |update| {
+                        observed_probe
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .push(update);
+                    })),
+                )
+                .await
+                .expect("healthy runtime");
+            // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+            assert_eq!(probe["details"]["abortCount"], 0);
+            // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+            assert_eq!(probe["details"]["freshSignal"], true);
+            // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+            assert_eq!(
+                updates.lock().unwrap_or_else(PoisonError::into_inner).len(),
+                1
+            );
+            let probe_updates = probe_updates.lock().unwrap_or_else(PoisonError::into_inner);
+            // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+            assert_eq!(probe_updates.len(), 1);
+            // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+            assert_eq!(probe_updates[0].details.as_ref().unwrap()["phase"], "probe");
+        });
+    }
+
+    #[test]
+    fn extension_tool_caller_abandonment_aborts_only_its_invocation() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            let (_directory, _manager, js_runtime, def) =
+                setup_js_tool(TOOL_INVOCATION_FIXTURE, "invocation_tool").await;
+            let wrapper = ExtensionToolWrapper::new(def, js_runtime.clone());
+            abandon_started_tool(&wrapper, "wait").await;
+            let probe = probe_invocation(&js_runtime)
+                .await
+                .expect("cooperative cancellation must retain a healthy realm");
+            // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+            assert_eq!(probe["details"]["abortCount"], 1);
+            // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+            assert_eq!(probe["details"]["freshSignal"], true);
+        });
+    }
+
+    #[test]
+    fn extension_tool_deadline_aborts_cooperative_work_without_quarantining_the_realm() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            let (_directory, _manager, js_runtime, def) =
+                setup_js_tool(TOOL_INVOCATION_FIXTURE, "invocation_tool").await;
+            let wrapper = ExtensionToolWrapper::new(def, js_runtime.clone()).with_timeout_ms(500);
+            let failure = asupersync::time::timeout(
+                asupersync::time::wall_now(),
+                Duration::from_secs(5),
+                wrapper.execute("deadline-call", json!({ "mode": "wait" }), None),
+            )
+            .await
+            .expect("execution deadline must be enforced")
+            .expect_err("a completed abort cleanup must not become a successful tool result");
+            // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+            assert!(failure.to_string().contains("timed out"), "{failure}");
+            let probe = probe_invocation(&js_runtime)
+                .await
+                .expect("cooperative deadline cleanup must retain a healthy realm");
+            // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+            assert_eq!(probe["details"]["abortCount"], 1);
+            // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+            assert_eq!(probe["details"]["freshSignal"], true);
+        });
+    }
+
+    #[test]
+    fn extension_tool_noncooperative_cancellation_quarantines_its_realm() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            let (_directory, _manager, js_runtime, def) =
+                setup_js_tool(TOOL_INVOCATION_FIXTURE, "invocation_tool").await;
+            let wrapper = ExtensionToolWrapper::new(def, js_runtime.clone());
+            abandon_started_tool(&wrapper, "ignore").await;
+            let error = probe_invocation(&js_runtime)
+                .await
+                .expect_err("a tool that ignores abort cannot keep its realm live indefinitely");
+            // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+            assert!(error.to_string().contains("quarantin"), "{error}");
+        });
+    }
+
+    #[test]
+    fn extension_tool_cpu_deadline_quarantines_only_the_offending_realm() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            let directory = tempfile::tempdir().expect("separate extension directories");
+            let cpu_directory = directory.path().join("cpu");
+            let healthy_directory = directory.path().join("healthy");
+            std::fs::create_dir(&cpu_directory).expect("cpu directory");
+            std::fs::create_dir(&healthy_directory).expect("healthy directory");
+            let cpu_path = cpu_directory.join("index.mjs");
+            let healthy_path = healthy_directory.join("index.mjs");
+            std::fs::write(
+                &cpu_path,
+                r"
+                export default function init(pi) {
+                  pi.registerTool({
+                    name: 'cpu_tool', description: 'Never yields to the event loop',
+                    parameters: { type: 'object' },
+                    execute() { while (true) {} }
+                  });
+                }
+                ",
+            )
+            .expect("cpu extension");
+            std::fs::write(
+                &healthy_path,
+                r"
+                export default function init(pi) {
+                  pi.registerTool({
+                    name: 'healthy_tool', description: 'Independent extension',
+                    parameters: { type: 'object' },
+                    execute(_callId, _input, signal, onUpdate) {
+                      return {
+                        content: [{ type: 'text', text: 'healthy' }],
+                        details: {
+                          freshSignal: signal instanceof AbortSignal && !signal.aborted,
+                          updatesOmitted: onUpdate === undefined
+                        }
+                      };
+                    }
+                  });
+                }
+                ",
+            )
+            .expect("healthy extension");
+            let manager = ExtensionManager::new();
+            let native_tools = Arc::new(ToolRegistry::new(&[], directory.path(), None));
+            let js_runtime = JsExtensionRuntimeHandle::start(
+                PiJsRuntimeConfig {
+                    cwd: directory.path().display().to_string(),
+                    limits: PiJsRuntimeLimits {
+                        // This must be stopped by the per-invocation deadline,
+                        // not a global instruction-count budget.
+                        interrupt_budget: None,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                native_tools,
+                manager.clone(),
+            )
+            .await
+            .expect("start separate realms");
+            manager.set_js_runtime(js_runtime.clone());
+            manager
+                .load_js_extensions(vec![
+                    JsExtensionLoadSpec::from_entry_path(&cpu_path).expect("cpu spec"),
+                    JsExtensionLoadSpec::from_entry_path(&healthy_path).expect("healthy spec"),
+                ])
+                .await
+                .expect("load independent extensions");
+            let def = js_runtime
+                .get_registered_tools()
+                .await
+                .expect("registered tools")
+                .into_iter()
+                .find(|tool| tool.name == "cpu_tool")
+                .expect("cpu tool");
+            let cpu = ExtensionToolWrapper::new(def, js_runtime.clone()).with_timeout_ms(500);
+            let failure = asupersync::time::timeout(
+                asupersync::time::wall_now(),
+                Duration::from_secs(5),
+                cpu.execute("cpu-call", json!({}), None),
+            )
+            .await
+            .expect("CPU-bound JavaScript must not prevent deadline enforcement")
+            .expect_err("CPU-bound JavaScript must be interrupted");
+            let failure = failure.to_string();
+            // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+            assert!(
+                failure.contains("timed out") || failure.contains("interrupt"),
+                "{failure}"
+            );
+            let healthy = js_runtime
+                .execute_tool(
+                    "healthy_tool".to_string(),
+                    "healthy-call".to_string(),
+                    json!({}),
+                    Arc::new(json!({})),
+                    5_000,
+                )
+                .await
+                .expect("the interrupted realm must not poison an independent extension");
+            // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+            assert_eq!(healthy["content"][0]["text"], "healthy");
+            // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+            assert_eq!(healthy["details"]["freshSignal"], true);
+            // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+            assert_eq!(healthy["details"]["updatesOmitted"], true);
+            let quarantined = cpu
+                .execute("cpu-retry", json!({}), None)
+                .await
+                .expect_err("an interrupted realm must remain quarantined");
+            // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+            assert!(
+                quarantined.to_string().contains("quarantin"),
+                "{quarantined}"
+            );
+        });
+    }
+
+    #[test]
+    fn native_descriptor_tools_keep_legacy_results_without_synthetic_updates() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            let directory = tempfile::tempdir().expect("native descriptor directory");
+            let path = directory.path().join("fixture.native.json");
+            let expected = json!({
+                "content": [{ "type": "text", "text": "native result" }],
+                "details": { "runtime": "native-rust" }
+            });
+            std::fs::write(
+                &path,
+                json!({
+                    "tools": [{
+                        "name": "native_tool", "description": "Native result fixture",
+                        "parameters": { "type": "object" }
+                    }],
+                    "toolOutputs": { "native_tool": expected }
+                })
+                .to_string(),
+            )
+            .expect("write native descriptor");
+            let native = NativeRustExtensionRuntimeHandle::start()
+                .await
+                .expect("native runtime");
+            let manager = ExtensionManager::new();
+            manager.set_native_runtime(native.clone());
+            manager
+                .load_native_extensions(vec![
+                    NativeRustExtensionLoadSpec::from_entry_path(&path).expect("native spec"),
+                ])
+                .await
+                .expect("load native descriptor");
+            let def = native
+                .get_registered_tools()
+                .await
+                .expect("native tools")
+                .pop()
+                .expect("native tool");
+            let handle = ExtensionRuntimeHandle::from(native);
+            // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+            assert_eq!(
+                handle
+                    .execute_tool_ref(
+                        "native_tool",
+                        "legacy",
+                        json!({}),
+                        Arc::new(json!({})),
+                        5_000
+                    )
+                    .await
+                    .expect("legacy native execution"),
+                expected,
+            );
+            let count = Arc::new(AtomicUsize::new(0));
+            let observed = Arc::clone(&count);
+            let output = ExtensionToolWrapper::new(def, handle)
+                .execute(
+                    "with-updates",
+                    json!({}),
+                    Some(Box::new(move |_| {
+                        observed.fetch_add(1, Ordering::SeqCst);
+                    })),
+                )
+                .await
+                .expect("native execution with an update callback");
+            // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+            assert_eq!(
+                serde_json::to_value(output).expect("native result"),
+                expected
+            );
+            // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+            assert_eq!(count.load(Ordering::SeqCst), 0);
+        });
     }
 
     #[test]
@@ -536,6 +1133,7 @@ mod tests {
                     model: "test-model".to_string(),
                     usage: Usage::default(),
                     stop_reason: StopReason::Stop,
+                    stop_details: None,
                     error_message: None,
                     timestamp: 0,
                 }
@@ -673,6 +1271,339 @@ mod tests {
                 [ContentBlock::Text(text)] => assert_eq!(text.text, "done"),
                 other => panic!(),
             }
+        });
+    }
+
+    /// Tool the agent mounts after the JS runtime has already booted.
+    struct LateEchoTool;
+
+    #[async_trait]
+    #[allow(clippy::unnecessary_literal_bound)]
+    impl crate::tools::Tool for LateEchoTool {
+        fn name(&self) -> &str {
+            "late_echo"
+        }
+        fn label(&self) -> &str {
+            "late_echo"
+        }
+        fn description(&self) -> &str {
+            "echoes its input; mounted after the extension runtime started"
+        }
+        fn parameters(&self) -> serde_json::Value {
+            json!({ "type": "object", "properties": { "text": { "type": "string" } } })
+        }
+        async fn execute(
+            &self,
+            _tool_call_id: &str,
+            input: serde_json::Value,
+            _on_update: Option<Box<dyn Fn(crate::tools::ToolUpdate) + Send + Sync>>,
+        ) -> crate::error::Result<crate::tools::ToolOutput> {
+            let text = input
+                .get("text")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            Ok(crate::tools::ToolOutput {
+                content: vec![crate::model::ContentBlock::Text(
+                    crate::model::TextContent::new(format!("echo:{text}")),
+                )],
+                details: None,
+                is_error: false,
+            })
+        }
+    }
+
+    /// Boot a JS runtime on a fresh shared registry and load `source`. The
+    /// `tool` capability needs an approval prompt under the default policy,
+    /// and tests cannot answer one; the permissive profile grants it, which
+    /// is what the classic startup path does for trusted workspaces.
+    async fn start_extension_on_shared_registry(
+        source: &str,
+    ) -> (
+        tempfile::TempDir,
+        ExtensionManager,
+        JsExtensionRuntimeHandle,
+        crate::tools::SharedToolRegistry,
+    ) {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let entry_path = temp_dir.path().join("ext.mjs");
+        std::fs::write(&entry_path, source).expect("write extension entry");
+        let manager = ExtensionManager::new();
+        let shared =
+            crate::tools::SharedToolRegistry::new(ToolRegistry::new(&[], temp_dir.path(), None));
+        let js_runtime = JsExtensionRuntimeHandle::start_with_policy(
+            PiJsRuntimeConfig {
+                cwd: temp_dir.path().display().to_string(),
+                ..Default::default()
+            },
+            shared.clone(),
+            manager.clone(),
+            crate::extensions::ExtensionPolicy::from_profile(
+                crate::extensions::PolicyProfile::Permissive,
+            ),
+        )
+        .await
+        .expect("start js runtime");
+        manager.set_js_runtime(js_runtime.clone());
+        let spec = JsExtensionLoadSpec::from_entry_path(&entry_path).expect("spec");
+        manager
+            .load_js_extensions(vec![spec])
+            .await
+            .expect("load js extensions");
+        (temp_dir, manager, js_runtime, shared)
+    }
+
+    #[test]
+    fn deferred_catalog_preserves_host_overrides_and_replacement_owners() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            let (temp_dir, manager, _js_runtime, shared) = start_extension_on_shared_registry(
+                r#"
+                export default function(pi) {
+                    for (const name of ["late_echo", "survivor"]) {
+                        pi.registerTool({
+                            name, description: "extension " + name,
+                            parameters: { type: "object" },
+                            execute: async () => ({
+                                content: [{ type: "text", text: "extension:" + name }],
+                            }),
+                        });
+                    }
+                }
+                "#,
+            ).await;
+            shared.update(|registry| registry.push(Box::new(LateEchoTool)));
+            let ctx = json!({ "cwd": temp_dir.path().display().to_string() });
+            manager.set_active_tools(vec!["survivor".to_string()]);
+            let mut filtered = ExtensionToolCatalog::new(ctx.clone());
+            filtered.refresh(&manager, &shared).await.unwrap();
+            assert_eq!(shared.snapshot().get("late_echo").unwrap().origin(), crate::tools::ToolOrigin::BuiltIn);
+            assert!(shared.snapshot().get("survivor").is_some());
+            filtered.clear(&shared);
+            manager.set_active_tools(vec!["late_echo".to_string(), "survivor".to_string()]);
+            let mut catalog = ExtensionToolCatalog::new(ctx.clone());
+            catalog.refresh(&manager, &shared).await.unwrap();
+            let original = shared.snapshot();
+            assert_eq!(original.get("late_echo").unwrap().origin(), crate::tools::ToolOrigin::Extension);
+            let version = shared.version();
+            catalog.refresh(&manager, &shared).await.unwrap();
+            assert_eq!(shared.version(), version, "unchanged schemas retain the provider cache");
+
+            manager.set_active_tools(vec!["survivor".to_string()]);
+            catalog.refresh(&manager, &shared).await.unwrap();
+            assert!(shared.snapshot().get("late_echo").is_none());
+            assert!(shared.snapshot().inactive_tools().iter().any(|tool| tool.name() == "late_echo"));
+
+            // A later host mount can share a shelved registration's name.
+            // Refresh must neither erase that host tool nor revive the old
+            // inactive wrapper over it.
+            shared.update(|registry| registry.push(Box::new(LateEchoTool)));
+            catalog.refresh(&manager, &shared).await.unwrap();
+            manager.set_active_tools(vec!["late_echo".to_string(), "survivor".to_string()]);
+            catalog.refresh(&manager, &shared).await.unwrap();
+            let snapshot = shared.snapshot();
+            assert_eq!(snapshot.get("late_echo").unwrap().origin(), crate::tools::ToolOrigin::BuiltIn);
+            assert!(!snapshot.inactive_tools().iter().any(|tool| tool.name() == "late_echo"));
+            let output = snapshot.get("late_echo").unwrap()
+                .execute("native-override", json!({ "text": "retained" }), None).await.unwrap();
+            assert!(matches!(&output.content[0], ContentBlock::Text(text) if text.text == "echo:retained"));
+            let old_output = original.get("late_echo").unwrap()
+                .execute("retained-snapshot", json!({}), None).await.unwrap();
+            assert!(matches!(&old_output.content[0], ContentBlock::Text(text) if text.text == "extension:late_echo"));
+
+            // Reload publishes a fresh owner before the former one is
+            // cleared. Both sets have Extension origin and identical names.
+            let mut replacement = ExtensionToolCatalog::new(ctx);
+            replacement.refresh(&manager, &shared).await.unwrap();
+            catalog.clear(&shared);
+            assert_eq!(shared.snapshot().get("late_echo").unwrap().origin(), crate::tools::ToolOrigin::Extension);
+            assert!(shared.snapshot().get("survivor").is_some());
+            shared.update(|registry| registry.push(Box::new(LateEchoTool)));
+            replacement.clear(&shared);
+            assert_eq!(shared.snapshot().tools().len(), 1);
+            assert_eq!(shared.snapshot().get("late_echo").unwrap().origin(), crate::tools::ToolOrigin::BuiltIn);
+            assert!(manager.shutdown(std::time::Duration::from_secs(5)).await);
+        });
+    }
+
+    /// Production-path check for the shared registry (bd-4t6oz): the JS
+    /// runtime boots on the same [`crate::tools::SharedToolRegistry`] the
+    /// agent is built over, a Rust tool is mounted through the agent AFTER
+    /// boot, and a `pi.tool` hostcall issued by an extension tool reaches it.
+    /// Under the previous split registry the runtime kept its pre-warm copy
+    /// and answered "Unknown tool: late_echo".
+    #[test]
+    fn hostcall_sees_tool_mounted_after_runtime_start() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async {
+            let (temp_dir, manager, _js_runtime, shared) = start_extension_on_shared_registry(
+                r#"
+                export default function init(pi) {
+                  pi.registerTool({
+                    name: "call_late_tool",
+                    description: "calls a tool the agent mounted after boot",
+                    parameters: { type: "object" },
+                    execute: async () => {
+                      const result = await pi.tool("late_echo", { text: "mounted-late" });
+                      return {
+                        content: [{ type: "text", text: JSON.stringify(result) }],
+                        isError: false
+                      };
+                    }
+                  });
+                }
+                "#,
+            )
+            .await;
+
+            // The agent shares the registry handle and mounts a tool now that
+            // the runtime is already up.
+            let provider = Arc::new(ToolCallingProvider);
+            let mut agent =
+                Agent::with_shared_tools(provider, shared.clone(), AgentConfig::default());
+            assert!(!agent.has_tool("late_echo"));
+            agent.extend_tools(vec![Box::new(LateEchoTool) as Box<dyn crate::tools::Tool>]);
+            assert!(agent.has_tool("late_echo"));
+
+            let wrappers = collect_extension_tool_wrappers(
+                &manager,
+                json!({ "cwd": temp_dir.path().display().to_string() }),
+            )
+            .await
+            .expect("collect wrappers");
+            let wrapper = wrappers
+                .into_iter()
+                .find(|wrapper| wrapper.name() == "call_late_tool")
+                .expect("extension tool wrapper");
+            let output = wrapper
+                .execute("call-late", json!({}), None)
+                .await
+                .expect("extension tool executes");
+            let text = output
+                .content
+                .iter()
+                .filter_map(|block| match block {
+                    crate::model::ContentBlock::Text(text) => Some(text.text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                !output.is_error && text.contains("echo:mounted-late"),
+                "the hostcall must reach the tool mounted after boot: is_error={} text={text}",
+                output.is_error
+            );
+        });
+    }
+
+    /// bd-4t6oz slice 3: `pi.setActiveTools` changes what the live agent can
+    /// see and execute in one published registry swap. Before, the hostcall
+    /// only rewrote extension-manager metadata consulted when wrappers were
+    /// collected, so an already-mounted tool stayed callable and in the
+    /// provider schema.
+    #[test]
+    fn set_active_tools_shelves_and_restores_mounted_extension_tools() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async {
+            // Extension tool `execute` receives (callId, input, signal,
+            // onUpdate, ctx); the active list travels in `input.names`.
+            let (temp_dir, manager, _js_runtime, shared) = start_extension_on_shared_registry(
+                r#"
+                export default function init(pi) {
+                  const ok = (text) => ({ content: [{ type: "text", text }], isError: false });
+                  pi.registerTool({
+                    name: "keep_tool",
+                    description: "stays active",
+                    parameters: { type: "object" },
+                    execute: async () => ok("keep")
+                  });
+                  pi.registerTool({
+                    name: "drop_tool",
+                    description: "gets shelved",
+                    parameters: { type: "object" },
+                    execute: async () => ok("drop")
+                  });
+                  pi.registerTool({
+                    name: "toggle_tool",
+                    description: "applies an active-tool list",
+                    parameters: { type: "object", properties: { names: { type: "array" } } },
+                    execute: async (_callId, input) => {
+                      await pi.setActiveTools(input.names);
+                      return ok("toggled");
+                    }
+                  });
+                }
+                "#,
+            )
+            .await;
+
+            let provider = Arc::new(ToolCallingProvider);
+            let mut agent =
+                Agent::with_shared_tools(provider, shared.clone(), AgentConfig::default());
+            let wrappers = collect_extension_tool_wrappers(
+                &manager,
+                json!({ "cwd": temp_dir.path().display().to_string() }),
+            )
+            .await
+            .expect("collect wrappers");
+            assert_eq!(wrappers.len(), 3);
+            agent.extend_tools(wrappers);
+            assert!(agent.has_tool("keep_tool") && agent.has_tool("drop_tool"));
+            let version_before = shared.version();
+
+            // The extension narrows its active set: the shelved tool leaves
+            // the live registry in the same swap, the others stay.
+            let registry = shared.snapshot();
+            let toggle = registry.get("toggle_tool").expect("toggle_tool mounted");
+            let output = toggle
+                .execute(
+                    "toggle-1",
+                    json!({ "names": ["keep_tool", "toggle_tool"] }),
+                    None,
+                )
+                .await
+                .expect("toggle executes");
+            assert!(!output.is_error, "toggle must succeed: {output:?}");
+            assert!(
+                shared.version() > version_before,
+                "the swap must be published"
+            );
+            assert!(agent.has_tool("keep_tool"));
+            assert!(
+                !agent.has_tool("drop_tool"),
+                "a de-activated extension tool must be unreachable for the agent"
+            );
+            assert_eq!(
+                shared
+                    .snapshot()
+                    .inactive_tools()
+                    .iter()
+                    .map(|tool| tool.name().to_string())
+                    .collect::<Vec<_>>(),
+                vec!["drop_tool".to_string()]
+            );
+
+            // Naming it again restores it; built-ins are never part of this.
+            let registry = shared.snapshot();
+            let toggle = registry
+                .get("toggle_tool")
+                .expect("toggle_tool still mounted");
+            toggle
+                .execute(
+                    "toggle-2",
+                    json!({ "names": ["keep_tool", "drop_tool", "toggle_tool"] }),
+                    None,
+                )
+                .await
+                .expect("toggle executes again");
+            assert!(
+                agent.has_tool("drop_tool"),
+                "a re-activated tool must come back"
+            );
+            assert!(shared.snapshot().inactive_tools().is_empty());
         });
     }
 

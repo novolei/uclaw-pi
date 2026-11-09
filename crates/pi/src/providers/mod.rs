@@ -4,19 +4,21 @@
 //! for various LLM APIs.
 
 use crate::error::{Error, Result};
-use crate::extensions::{ExtensionManager, ExtensionRuntimeHandle};
-use crate::http::client::{Client, RequestBuilder};
+use crate::extensions::{ExtensionManager, ExtensionRuntimeHandle, JsExtensionRuntimeHandle};
+use crate::http::client::{Client, HttpTransport, RequestBuilder, TransportResponse};
 use crate::model::{
     AssistantMessage, AssistantMessageEvent, ContentBlock, StopReason, TextContent, Usage,
 };
-use crate::models::ModelEntry;
+use crate::models::{ModelEntry, extension_provider_bindings};
 use crate::provider::{Context, Provider, StreamEvent, StreamOptions};
 use crate::provider_metadata::{
     PROVIDER_METADATA, canonical_provider_id, provider_routing_defaults,
 };
 use crate::vcr::{VCR_ENV_MODE, VcrRecorder};
 use async_trait::async_trait;
+use base64::Engine as _;
 use chrono::Utc;
+use futures::StreamExt;
 use futures::stream;
 use futures::stream::Stream;
 use serde_json::Value;
@@ -31,17 +33,102 @@ pub mod azure;
 pub mod bedrock;
 pub mod cohere;
 pub mod copilot;
+pub mod cursor;
+mod extension_stream;
 pub mod gemini;
 pub mod gitlab;
 pub mod model_fetch;
 pub mod openai;
 pub mod openai_responses;
+mod tool_schema;
 pub mod vertex;
 
 pub use model_fetch::{
-    DISABLE_CACHE_ENV, MODEL_CACHE_TTL, fetch_provider_models, refresh_provider_models,
-    static_registry_models,
+    DISABLE_CACHE_ENV, MODEL_CACHE_TTL, ModelCatalogSource, ProviderModelCatalog,
+    ProviderModelCatalogFetchPlan, fetch_provider_model_catalog, fetch_provider_models,
+    persist_provider_model_catalog, prepare_provider_model_catalog_fetch,
+    refresh_provider_model_catalog, refresh_provider_models, static_registry_models,
 };
+
+/// Offer a fully built request body to the `before_provider_request`
+/// extension hook (gh #167 / bd-1q31s core, bd-dzddo breadth).
+///
+/// Returns a validated rewritten body to send verbatim, or `None` to keep the
+/// original. Every failure path — serialization, hook error, rejected rewrite —
+/// fails open to the original request. Auth material is never part of the
+/// exchange: the event carries only the JSON body plus routing metadata.
+pub(super) async fn offer_before_provider_request<B, V>(
+    options: &StreamOptions,
+    provider: &str,
+    api: &str,
+    model: &str,
+    base_url: &str,
+    body: &B,
+    validate: V,
+) -> Option<serde_json::Value>
+where
+    B: serde::Serialize + Sync,
+    V: FnOnce(serde_json::Value) -> std::result::Result<serde_json::Value, String> + Send,
+{
+    let hook = options.before_provider_request.as_ref()?;
+    let original = match serde_json::to_value(body) {
+        Ok(value) => value,
+        Err(err) => {
+            tracing::warn!(
+                "failed to serialize request body for before_provider_request (fail-open): {err}"
+            );
+            return None;
+        }
+    };
+    let event = crate::provider::BeforeProviderRequestEvent {
+        provider: provider.to_string(),
+        api: api.to_string(),
+        model: model.to_string(),
+        base_url: base_url.to_string(),
+        payload: original,
+    };
+    let mutated = hook.rewrite(event).await?;
+    match validate(mutated) {
+        Ok(validated) => Some(validated),
+        Err(reason) => {
+            tracing::warn!(
+                "before_provider_request rewrite rejected (fail-open, original request kept): {reason}"
+            );
+            None
+        }
+    }
+}
+
+/// Structural validation shared by the JSON-body provider routes.
+///
+/// A rewrite must remain a JSON object, keep each required key as a non-empty
+/// string / an array respectively, and has stream-critical key/values
+/// re-imposed (e.g. `stream: true` where the SSE reader depends on it).
+pub(super) fn validate_streamed_json_rewrite(
+    mut value: serde_json::Value,
+    required_string_keys: &[&str],
+    required_array_keys: &[&str],
+    forced: &[(&str, serde_json::Value)],
+) -> std::result::Result<serde_json::Value, String> {
+    let Some(object) = value.as_object_mut() else {
+        return Err("rewrite is not a JSON object".to_string());
+    };
+    for key in required_string_keys {
+        match object.get(*key) {
+            Some(serde_json::Value::String(s)) if !s.is_empty() => {}
+            _ => return Err(format!("rewrite is missing a non-empty string `{key}`")),
+        }
+    }
+    for key in required_array_keys {
+        if !object.get(*key).is_some_and(serde_json::Value::is_array) {
+            return Err(format!("rewrite is missing a `{key}` array"));
+        }
+    }
+    for (key, forced_value) in forced {
+        object.insert((*key).to_string(), forced_value.clone());
+    }
+    Ok(value)
+}
 
 pub(super) fn first_non_empty_header_value_case_insensitive(
     headers: &HashMap<String, String>,
@@ -99,6 +186,251 @@ fn vcr_client_if_enabled(base_url: &str) -> Result<Option<Client>> {
     Ok(Some(Client::new().with_vcr(recorder)))
 }
 
+/// Canonical origin accepted by the extension-owned in-memory HTTP bridge.
+/// It cannot be used for arbitrary URLs, real loopback listeners, or TLS.
+fn extension_http_origin(value: &str) -> Result<String> {
+    let url = Url::parse(value)
+        .map_err(|error| Error::config(format!("Invalid virtual HTTP provider URL: {error}")))?;
+    let loopback = matches!(
+        url.host_str(),
+        Some("127.0.0.1" | "localhost" | "[::1]" | "::1")
+    );
+    if url.scheme() != "http"
+        || !loopback
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.port_or_known_default() == Some(0)
+    {
+        return Err(Error::config(
+            "Virtual HTTP providers require a loopback HTTP origin without URL credentials",
+        ));
+    }
+    Ok(url.origin().ascii_serialization())
+}
+
+fn extension_http_provider_binding(
+    manager: &ExtensionManager,
+    entry: &ModelEntry,
+) -> Result<Option<(String, String)>> {
+    let specs = manager.extension_providers();
+    extension_provider_bindings(&specs)?;
+    let requested = extension_provider_key(&entry.model.provider);
+    let Some(spec) = specs.iter().find(|spec| {
+        spec.get("id")
+            .and_then(Value::as_str)
+            .is_some_and(|id| extension_provider_key(id) == requested)
+    }) else {
+        return Ok(None);
+    };
+    if spec
+        .get("virtualHttpServer")
+        .and_then(Value::as_str)
+        .is_none_or(str::is_empty)
+    {
+        return Ok(None);
+    }
+    // The manager stamps this owner from the actual JS runtime snapshot.
+    // The runtime will independently verify the provider's live server binding
+    // when each request starts; this marker alone never grants dispatch rights.
+    if spec
+        .get("extension_id")
+        .and_then(Value::as_str)
+        .is_none_or(str::is_empty)
+    {
+        return Err(Error::config("Virtual HTTP provider has no runtime owner"));
+    }
+    let base_url = spec
+        .get("baseUrl")
+        .and_then(Value::as_str)
+        .ok_or_else(|| Error::config("Virtual HTTP provider has no registered base URL"))?;
+    let origin = extension_http_origin(base_url)?;
+    if extension_http_origin(&entry.model.base_url)? != origin {
+        return Err(Error::config(
+            "Model URL does not match its extension-owned virtual HTTP provider origin",
+        ));
+    }
+    let provider_id = spec
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| Error::config("Virtual HTTP provider has no registered identity"))?;
+    Ok(Some((provider_id.trim().to_string(), origin)))
+}
+
+struct ExtensionHttpTransport {
+    runtime: JsExtensionRuntimeHandle,
+    provider_id: String,
+    origin: String,
+}
+
+impl std::fmt::Debug for ExtensionHttpTransport {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ExtensionHttpTransport")
+            .field("provider_id", &self.provider_id)
+            .field("origin", &self.origin)
+            .finish_non_exhaustive()
+    }
+}
+
+struct ExtensionHttpStream {
+    runtime: JsExtensionRuntimeHandle,
+    stream_id: Option<String>,
+}
+
+impl Drop for ExtensionHttpStream {
+    fn drop(&mut self) {
+        if let Some(stream_id) = self.stream_id.take() {
+            self.runtime
+                .provider_stream_simple_cancel_best_effort(stream_id);
+        }
+    }
+}
+
+impl ExtensionHttpStream {
+    const COMMAND_TIMEOUT_MS: u64 = 600_000;
+
+    async fn next_frame(&mut self) -> Result<Option<Value>> {
+        loop {
+            let Some(stream_id) = self.stream_id.clone() else {
+                return Ok(None);
+            };
+            let frame = self
+                .runtime
+                .provider_stream_simple_next(stream_id, Self::COMMAND_TIMEOUT_MS)
+                .await?;
+            let Some(frame) = frame else {
+                self.stream_id = None;
+                return Ok(None);
+            };
+            if frame.get("pending").and_then(Value::as_bool) == Some(true) {
+                // Polling leaves the JS actor free to process upstream HTTP,
+                // timers, and cancellation while a local handler awaits data.
+                let now = asupersync::Cx::current()
+                    .and_then(|cx| cx.timer_driver())
+                    .map_or_else(asupersync::time::wall_now, |timer| timer.now());
+                asupersync::time::sleep(now, std::time::Duration::from_millis(5)).await;
+                continue;
+            }
+            return Ok(Some(frame));
+        }
+    }
+}
+
+#[async_trait]
+impl HttpTransport for ExtensionHttpTransport {
+    #[allow(clippy::too_many_lines)]
+    async fn send(
+        &self,
+        method: &str,
+        url: &str,
+        headers: &[(String, String)],
+        body: &[u8],
+    ) -> Result<TransportResponse> {
+        if extension_http_origin(url)? != self.origin {
+            return Err(Error::api(
+                "Virtual HTTP provider request escaped its registered origin",
+            ));
+        }
+        if body.len() > 10 * 1024 * 1024 {
+            return Err(Error::api("Virtual HTTP request exceeds 10 MiB"));
+        }
+        let header_map: serde_json::Map<String, Value> = headers
+            .iter()
+            .map(|(name, value)| (name.clone(), Value::String(value.clone())))
+            .collect();
+        let request = serde_json::json!({
+            "url": url,
+            "method": method,
+            "headers": header_map,
+            "body_bytes": base64::engine::general_purpose::STANDARD.encode(body),
+        });
+        let stream_id = self
+            .runtime
+            .provider_http_stream_start(
+                &self.provider_id,
+                request,
+                ExtensionHttpStream::COMMAND_TIMEOUT_MS,
+            )
+            .await?;
+        // The guard covers errors and cancellation before headers as well as
+        // an abandoned response body. No fallback to a real socket is allowed.
+        let mut state = ExtensionHttpStream {
+            runtime: self.runtime.clone(),
+            stream_id: Some(stream_id),
+        };
+        let head = state
+            .next_frame()
+            .await?
+            .ok_or_else(|| Error::api("Virtual HTTP response ended before headers"))?;
+        let status = head
+            .get("status")
+            .and_then(Value::as_u64)
+            .and_then(|status| u16::try_from(status).ok())
+            .filter(|status| (100..=599).contains(status))
+            .ok_or_else(|| Error::api("Invalid virtual HTTP response status"))?;
+        let response_header_map = head
+            .get("headers")
+            .and_then(Value::as_object)
+            .ok_or_else(|| Error::api("Invalid virtual HTTP response headers"))?;
+        if response_header_map.len() > 100 {
+            return Err(Error::api("Virtual HTTP response exceeds 100 headers"));
+        }
+        let response_headers = response_header_map
+            .iter()
+            .map(|(name, value)| {
+                value
+                    .as_str()
+                    .map(|value| (name.clone(), value.to_string()))
+                    .ok_or_else(|| Error::api("Invalid virtual HTTP response header value"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if response_headers
+            .iter()
+            .map(|(name, value)| name.len().saturating_add(value.len()))
+            .sum::<usize>()
+            > 64 * 1024
+        {
+            return Err(Error::api("Virtual HTTP response headers exceed 64 KiB"));
+        }
+        let stream = stream::try_unfold(state, |mut state| async move {
+            loop {
+                let Some(frame) = state.next_frame().await.map_err(std::io::Error::other)? else {
+                    return Ok(None);
+                };
+                let encoded = frame
+                    .get("body_bytes")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "Invalid virtual HTTP body frame",
+                        )
+                    })?;
+                if encoded.len() > (1024_usize * 1024).div_ceil(3) * 4 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "Virtual HTTP body frame exceeds 1 MiB",
+                    ));
+                }
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(encoded)
+                    .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+                if bytes.len() > 1024 * 1024 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "Virtual HTTP body frame exceeds 1 MiB",
+                    ));
+                }
+                if !bytes.is_empty() {
+                    return Ok(Some((bytes, state)));
+                }
+            }
+        })
+        .boxed();
+        Ok((status, response_headers, stream))
+    }
+}
+
 struct ExtensionStreamSimpleProvider {
     model: crate::provider::Model,
     runtime: ExtensionRuntimeHandle,
@@ -107,14 +439,8 @@ struct ExtensionStreamSimpleProvider {
 struct ExtensionStreamSimpleState {
     runtime: ExtensionRuntimeHandle,
     stream_id: Option<String>,
-    model_id: String,
-    provider: String,
-    api: String,
-    accumulated_text: String,
-    last_message: Option<AssistantMessage>,
-    /// Whether `StreamEvent::Start` + `TextStart` have been emitted for string-chunk mode.
-    string_chunk_started: bool,
-    /// Buffered events to drain before polling the next JS chunk.
+    decoder: extension_stream::Decoder,
+    /// Buffered events to drain before polling the next extension chunk.
     pending_events: std::collections::VecDeque<StreamEvent>,
 }
 
@@ -134,6 +460,7 @@ enum ProviderRouteKind {
     NativeOpenAIResponses,
     NativeOpenAICodexResponses,
     NativeCohere,
+    NativeCursor,
     NativeGoogle,
     NativeGoogleGeminiCli,
     NativeGoogleVertex,
@@ -158,6 +485,7 @@ impl ProviderRouteKind {
             Self::NativeOpenAIResponses => "native:openai-responses",
             Self::NativeOpenAICodexResponses => "native:openai-codex-responses",
             Self::NativeCohere => "native:cohere",
+            Self::NativeCursor => "native:cursor",
             Self::NativeGoogle => "native:google",
             Self::NativeGoogleGeminiCli => "native:google-gemini-cli",
             Self::NativeGoogleVertex => "native:google-vertex",
@@ -173,6 +501,62 @@ impl ProviderRouteKind {
             Self::ApiGoogleGenerativeAi => "api:google-generative-ai",
             Self::ApiGoogleGeminiCli => "api:google-gemini-cli",
         }
+    }
+}
+
+fn extension_provider_key(provider: &str) -> String {
+    provider.trim().to_ascii_lowercase()
+}
+
+fn extension_stream_simple_provider_id(
+    manager: &ExtensionManager,
+    requested_provider: &str,
+) -> Result<Option<String>> {
+    let requested_key = extension_provider_key(requested_provider);
+    if requested_key.is_empty() {
+        return Ok(None);
+    }
+
+    let provider_specs = manager.extension_providers();
+    extension_provider_bindings(&provider_specs)?;
+    let mut candidates = provider_specs
+        .into_iter()
+        .filter_map(|provider| {
+            let provider_id = provider.get("id")?.as_str()?.trim();
+            if extension_provider_key(provider_id) != requested_key {
+                return None;
+            }
+            let has_stream_simple = provider
+                .get("hasStreamSimple")
+                .and_then(Value::as_bool)
+                .or_else(|| provider.get("streamSimple").and_then(Value::as_bool))
+                .unwrap_or(false);
+            Some((provider_id.to_string(), has_stream_simple))
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_unstable();
+
+    let mut provider_ids = candidates
+        .iter()
+        .map(|(provider_id, _)| provider_id.clone())
+        .collect::<Vec<_>>();
+    provider_ids.dedup();
+
+    match provider_ids.as_slice() {
+        [] => Ok(None),
+        [provider_id] => {
+            if candidates
+                .iter()
+                .any(|(_, has_stream_simple)| *has_stream_simple)
+            {
+                Ok(Some(provider_id.clone()))
+            } else {
+                Ok(None)
+            }
+        }
+        _ => Err(Error::config(format!(
+            "extension providers {provider_ids:?} resolve to the same normalized extension provider identity {requested_key:?}"
+        ))),
     }
 }
 
@@ -197,6 +581,7 @@ fn resolve_provider_route(entry: &ModelEntry) -> Result<(ProviderRouteKind, Stri
         }
         "openai-codex" => ProviderRouteKind::NativeOpenAICodexResponses,
         "cohere" => ProviderRouteKind::NativeCohere,
+        "cursor" => ProviderRouteKind::NativeCursor,
         "google" => ProviderRouteKind::NativeGoogle,
         "google-gemini-cli" | "google-antigravity" => ProviderRouteKind::NativeGoogleGeminiCli,
         "google-vertex" | "vertexai" => ProviderRouteKind::NativeGoogleVertex,
@@ -556,10 +941,10 @@ impl ExtensionStreamSimpleProvider {
             "cacheRetention".to_string(),
             Value::String(cache_retention.to_string()),
         );
-        if let Some(level) = options.thinking_level {
-            if level != crate::model::ThinkingLevel::Off {
-                map.insert("reasoning".to_string(), Value::String(level.to_string()));
-            }
+        if let Some(level) = options.thinking_level
+            && level != crate::model::ThinkingLevel::Off
+        {
+            map.insert("reasoning".to_string(), Value::String(level.to_string()));
         }
         if let Some(budgets) = &options.thinking_budgets {
             map.insert(
@@ -570,6 +955,7 @@ impl ExtensionStreamSimpleProvider {
                     "medium": budgets.medium,
                     "high": budgets.high,
                     "xhigh": budgets.xhigh,
+                    "max": budgets.max,
                 }),
             );
         }
@@ -619,8 +1005,23 @@ impl ExtensionStreamSimpleProvider {
                 content_index,
                 content,
             },
-            AssistantMessageEvent::ToolCallStart { content_index, .. } => {
-                StreamEvent::ToolCallStart { content_index }
+            AssistantMessageEvent::ToolCallStart {
+                content_index,
+                partial,
+            } => {
+                // #129: recover the tool-call id/name from the partial so the
+                // reconstructed stream stays correlatable from the start.
+                let (id, name) = match partial.content.get(content_index) {
+                    Some(crate::model::ContentBlock::ToolCall(tc)) => {
+                        (tc.id.clone(), tc.name.clone())
+                    }
+                    _ => (String::new(), String::new()),
+                };
+                StreamEvent::ToolCallStart {
+                    content_index,
+                    id,
+                    name,
+                }
             }
             AssistantMessageEvent::ToolCallDelta {
                 content_index,
@@ -660,6 +1061,7 @@ impl ExtensionStreamSimpleProvider {
             })],
             stop_reason: StopReason::default(),
             usage: Usage::default(),
+            stop_details: None,
             error_message: None,
             timestamp: Utc::now().timestamp_millis(),
         }
@@ -705,178 +1107,53 @@ impl Provider for ExtensionStreamSimpleProvider {
         let state = ExtensionStreamSimpleState {
             runtime: self.runtime.clone(),
             stream_id: Some(stream_id),
-            model_id: self.model.id.clone(),
-            provider: self.model.provider.clone(),
-            api: self.model.api.clone(),
-            accumulated_text: String::new(),
-            last_message: None,
-            string_chunk_started: false,
+            decoder: extension_stream::Decoder::new(
+                self.model.id.clone(),
+                self.model.provider.clone(),
+                self.model.api.clone(),
+            ),
             pending_events: std::collections::VecDeque::new(),
         };
 
         let stream = stream::unfold(state, |mut state| async move {
-            // Drain any buffered events before polling JS.
+            // Drain terminal text-mode events even after retiring the iterator.
             if let Some(event) = state.pending_events.pop_front() {
                 return Some((Ok(event), state));
             }
 
             let stream_id = state.stream_id.clone()?;
-            let stream_id_for_cancel = stream_id.clone();
-
-            match state
+            let decoded = match state
                 .runtime
                 .provider_stream_simple_next(stream_id, Self::NEXT_TIMEOUT_MS)
                 .await
             {
-                Ok(Some(value)) => {
-                    if let Some(chunk) = value.as_str() {
-                        let chunk = chunk.to_string();
-                        state.accumulated_text.push_str(&chunk);
-                        // Update last_message in-place: mutate existing text
-                        // content instead of rebuilding the entire
-                        // AssistantMessage (avoids 3 String + Vec allocs per
-                        // chunk).
-                        match &mut state.last_message {
-                            Some(msg) => {
-                                if let Some(ContentBlock::Text(t)) = msg.content.first_mut() {
-                                    t.text.clone_from(&state.accumulated_text);
-                                }
-                            }
-                            None => {
-                                state.last_message = Some(Self::make_partial(
-                                    &state.model_id,
-                                    &state.provider,
-                                    &state.api,
-                                    &state.accumulated_text,
-                                ));
-                            }
-                        }
-
-                        // Emit Start + TextStart before first string-chunk TextDelta.
-                        if !state.string_chunk_started {
-                            state.string_chunk_started = true;
-                            state
-                                .pending_events
-                                .push_back(StreamEvent::TextStart { content_index: 0 });
-                            state.pending_events.push_back(StreamEvent::TextDelta {
-                                content_index: 0,
-                                delta: chunk,
-                            });
-                            // Raw string mode still streams deltas chunk-by-chunk, so the
-                            // synthetic Start event must begin empty. Otherwise the agent
-                            // seeds the partial with the first chunk and then appends that
-                            // same first delta again.
-                            return Some((
-                                Ok(StreamEvent::Start {
-                                    partial: Self::make_partial(
-                                        &state.model_id,
-                                        &state.provider,
-                                        &state.api,
-                                        "",
-                                    ),
-                                }),
-                                state,
-                            ));
-                        }
-                        return Some((
-                            Ok(StreamEvent::TextDelta {
-                                content_index: 0,
-                                delta: chunk,
-                            }),
-                            state,
-                        ));
+                Ok(Some(value)) => state.decoder.push(value),
+                Ok(None) => state.decoder.finish(),
+                Err(error) => Err(error),
+            };
+            match decoded {
+                Ok(events) => {
+                    // A structured terminal is authoritative now; never wait
+                    // for or pull more extension work after it. Text-only
+                    // iterators finish through their separate EOF contract.
+                    if state.decoder.finished()
+                        && let Some(id) = state.stream_id.take()
+                    {
+                        state.runtime.provider_stream_simple_cancel_best_effort(id);
                     }
-
-                    let event: AssistantMessageEvent = match serde_json::from_value(value) {
-                        Ok(event) => event,
-                        Err(err) => {
-                            state
-                                .runtime
-                                .provider_stream_simple_cancel_best_effort(stream_id_for_cancel);
-                            state.stream_id = None;
-                            return Some((
-                                Err(Error::extension(format!(
-                                    "streamSimple yielded invalid event: {err}"
-                                ))),
-                                state,
-                            ));
-                        }
-                    };
-
-                    match &event {
-                        AssistantMessageEvent::Start { partial }
-                        | AssistantMessageEvent::TextStart { partial, .. }
-                        | AssistantMessageEvent::TextDelta { partial, .. }
-                        | AssistantMessageEvent::TextEnd { partial, .. }
-                        | AssistantMessageEvent::ThinkingStart { partial, .. }
-                        | AssistantMessageEvent::ThinkingDelta { partial, .. }
-                        | AssistantMessageEvent::ThinkingEnd { partial, .. }
-                        | AssistantMessageEvent::ToolCallStart { partial, .. }
-                        | AssistantMessageEvent::ToolCallDelta { partial, .. }
-                        | AssistantMessageEvent::ToolCallEnd { partial, .. } => {
-                            state.last_message = Some(partial.as_ref().clone());
-                        }
-                        AssistantMessageEvent::Done { message, .. } => {
-                            state.last_message = Some(message.as_ref().clone());
-                        }
-                        AssistantMessageEvent::Error { error, .. } => {
-                            state.last_message = Some(error.as_ref().clone());
-                        }
-                    }
-
-                    let stream_event = Self::assistant_event_to_stream_event(event);
-                    if matches!(
-                        stream_event,
-                        StreamEvent::Done { .. } | StreamEvent::Error { .. }
-                    ) {
-                        state
-                            .runtime
-                            .provider_stream_simple_cancel_best_effort(stream_id_for_cancel);
-                        state.stream_id = None;
-                    }
-                    Some((Ok(stream_event), state))
+                    state.pending_events.extend(events);
+                    let event = state.pending_events.pop_front()?;
+                    Some((Ok(event), state))
                 }
-                Ok(None) => {
-                    // Stream ended — emit TextEnd (if string chunks were used) then Done.
-                    state.stream_id = None;
-                    let message = state.last_message.clone().unwrap_or_else(|| {
-                        Self::make_partial(
-                            &state.model_id,
-                            &state.provider,
-                            &state.api,
-                            &state.accumulated_text,
-                        )
-                    });
-
-                    if state.string_chunk_started {
-                        // Emit TextEnd before Done.
-                        state.pending_events.push_back(StreamEvent::Done {
-                            reason: StopReason::Stop,
-                            message,
-                        });
-                        Some((
-                            Ok(StreamEvent::TextEnd {
-                                content_index: 0,
-                                content: state.accumulated_text.clone(),
-                            }),
-                            state,
-                        ))
-                    } else {
-                        Some((
-                            Ok(StreamEvent::Done {
-                                reason: StopReason::Stop,
-                                message,
-                            }),
-                            state,
-                        ))
+                Err(error) => {
+                    state.pending_events.clear();
+                    if let Some(id) = state.stream_id.take() {
+                        state.runtime.provider_stream_simple_cancel_best_effort(id);
                     }
-                }
-                Err(err) => {
-                    state
-                        .runtime
-                        .provider_stream_simple_cancel_best_effort(stream_id_for_cancel);
-                    state.stream_id = None;
-                    Some((Err(err), state))
+                    // Emit exactly one error, then EOF. In particular, the
+                    // agent must not receive a synthetic Done for a partial
+                    // tool call after a structured iterator ends early.
+                    Some((Err(error), state))
                 }
             }
         });
@@ -885,29 +1162,118 @@ impl Provider for ExtensionStreamSimpleProvider {
     }
 }
 
-#[allow(clippy::too_many_lines)]
+/// Wraps a transport provider with the catalog pricing of the model entry it
+/// was created from, so the agent can price usage (gh #221). Everything else
+/// delegates to the inner provider.
+struct PricedProvider {
+    inner: Arc<dyn Provider>,
+    cost: crate::provider::ModelCost,
+}
+
+#[async_trait]
+impl Provider for PricedProvider {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    fn api(&self) -> &str {
+        self.inner.api()
+    }
+
+    fn model_id(&self) -> &str {
+        self.inner.model_id()
+    }
+
+    fn model_cost(&self) -> Option<crate::provider::ModelCost> {
+        Some(self.cost.clone())
+    }
+
+    async fn stream(
+        &self,
+        context: &Context<'_>,
+        options: &StreamOptions,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>> {
+        self.inner.stream(context, options).await
+    }
+
+    async fn compact_native(&self, request_body: &Value, options: &StreamOptions) -> Result<Value> {
+        self.inner.compact_native(request_body, options).await
+    }
+}
+
+/// Create the provider for a model entry (gh #221: with its catalog pricing).
+///
+/// Priced entries are wrapped so the agent can price usage; unpriced entries
+/// (ad-hoc `provider/model` ids, custom models without `cost`) are returned
+/// bare so only a provider-reported cost can populate `usage.cost`.
 pub fn create_provider(
     entry: &ModelEntry,
     extensions: Option<&ExtensionManager>,
 ) -> Result<Arc<dyn Provider>> {
-    if let Some(manager) = extensions {
-        if manager.provider_has_stream_simple(&entry.model.provider) {
-            let runtime = manager.runtime().ok_or_else(|| {
-                Error::provider(
-                    &entry.model.provider,
-                    "Extension runtime not configured for streamSimple provider",
-                )
-            })?;
-            return Ok(Arc::new(ExtensionStreamSimpleProvider::new(
-                entry.model.clone(),
-                runtime,
-            )));
-        }
+    create_provider_with_auth(entry, extensions, None)
+}
+
+/// Create a provider bound to the runtime's credential file and command workspace.
+///
+/// Bedrock retains an immutable source binding, not the store's credential
+/// entries. This keeps reused provider instances (including compaction and
+/// other auxiliary requests) in the same workspace while allowing on-disk
+/// credentials to change between requests. Other providers are unchanged.
+pub fn create_provider_with_auth(
+    entry: &ModelEntry,
+    extensions: Option<&ExtensionManager>,
+    auth: Option<&crate::auth::AuthStorage>,
+) -> Result<Arc<dyn Provider>> {
+    let provider = create_transport_provider(entry, extensions, auth)?;
+    if entry.model.cost.is_priced() {
+        Ok(Arc::new(PricedProvider {
+            inner: provider,
+            cost: entry.model.cost.clone(),
+        }))
+    } else {
+        Ok(provider)
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn create_transport_provider(
+    entry: &ModelEntry,
+    extensions: Option<&ExtensionManager>,
+    auth: Option<&crate::auth::AuthStorage>,
+) -> Result<Arc<dyn Provider>> {
+    if let Some(manager) = extensions
+        && let Some(provider_id) =
+            extension_stream_simple_provider_id(manager, &entry.model.provider)?
+    {
+        let runtime = manager.runtime().ok_or_else(|| {
+            Error::provider(
+                &provider_id,
+                "Extension runtime not configured for streamSimple provider",
+            )
+        })?;
+        let mut model = entry.model.clone();
+        model.provider = provider_id;
+        return Ok(Arc::new(ExtensionStreamSimpleProvider::new(model, runtime)));
     }
 
     let (route, canonical_provider, effective_api) = resolve_provider_route(entry)?;
     let vcr_client = vcr_client_if_enabled(&entry.model.base_url)?;
-    let client = vcr_client.unwrap_or_else(Client::new);
+    let mut client = vcr_client.unwrap_or_else(Client::new);
+    if let Some(manager) = extensions
+        && let Some((provider_id, origin)) = extension_http_provider_binding(manager, entry)?
+    {
+        let runtime = manager.js_runtime().ok_or_else(|| {
+            Error::provider(
+                &provider_id,
+                "JS runtime unavailable for virtual HTTP provider",
+            )
+        })?;
+        client = client.with_transport(Arc::new(ExtensionHttpTransport {
+            runtime,
+            provider_id,
+            origin,
+        }));
+    }
     tracing::debug!(
         event = "pi.provider.factory.select",
         provider = %entry.model.provider,
@@ -934,6 +1300,10 @@ pub fn create_provider(
                     .with_provider_name(entry.model.provider.clone())
                     .with_base_url(normalize_openai_base(&entry.model.base_url))
                     .with_compat(entry.compat.clone())
+                    .with_auth_header(entry.auth_header)
+                    .with_reasoning(entry.model.reasoning)
+                    .with_input_types(&entry.model.input)
+                    .with_model_cost(entry.model.cost.clone())
                     .with_client(client),
             ))
         }
@@ -943,6 +1313,8 @@ pub fn create_provider(
                     .with_provider_name(entry.model.provider.clone())
                     .with_base_url(normalize_openai_responses_base(&entry.model.base_url))
                     .with_compat(entry.compat.clone())
+                    .with_auth_header(entry.auth_header)
+                    .with_reasoning(entry.model.reasoning)
                     .with_client(client),
             ))
         }
@@ -954,6 +1326,14 @@ pub fn create_provider(
                 .with_codex_mode(true)
                 .with_base_url(normalize_openai_codex_responses_base(&entry.model.base_url))
                 .with_compat(entry.compat.clone())
+                .with_auth_header(entry.auth_header)
+                .with_reasoning(entry.model.reasoning)
+                .with_client(client),
+        )),
+        ProviderRouteKind::NativeCursor => Ok(Arc::new(
+            cursor::CursorProvider::new(entry.model.id.clone())
+                .with_provider_name(entry.model.provider.clone())
+                .with_base_url(normalize_cursor_base(&entry.model.base_url))
                 .with_client(client),
         )),
         ProviderRouteKind::NativeCohere | ProviderRouteKind::ApiCohereChat => Ok(Arc::new(
@@ -993,13 +1373,17 @@ pub fn create_provider(
                     .with_client(client),
             ))
         }
-        ProviderRouteKind::NativeBedrock => Ok(Arc::new(
-            bedrock::BedrockProvider::new(&entry.model.id)
+        ProviderRouteKind::NativeBedrock => {
+            let provider = bedrock::BedrockProvider::new(&entry.model.id)
                 .with_provider_name(&entry.model.provider)
                 .with_base_url(&entry.model.base_url)
                 .with_compat(entry.compat.clone())
-                .with_client(client),
-        )),
+                .with_client(client);
+            Ok(Arc::new(match auth {
+                Some(auth) => provider.with_auth_storage(auth)?,
+                None => provider,
+            }))
+        }
         ProviderRouteKind::NativeAzure => {
             let runtime = resolve_azure_provider_runtime(entry)?;
             Ok(Arc::new(
@@ -1018,7 +1402,13 @@ pub fn create_provider(
                 .with_compat(entry.compat.clone())
                 .with_client(client);
             if !entry.model.base_url.is_empty() {
-                provider = provider.with_github_api_base(&entry.model.base_url);
+                // The catalog `base_url` is a chat-completions endpoint hint
+                // (as for every other provider), never the GitHub REST API
+                // host. Routing it into `with_github_api_base` sent the
+                // OAuth `copilot_internal/v2/token` exchange to the chat
+                // endpoint (gh #191). GHE / data-residency deployments move
+                // the exchange host via `PI_COPILOT_GITHUB_API_BASE`.
+                provider = provider.with_chat_completions_endpoint(&entry.model.base_url);
             }
             Ok(Arc::new(provider))
         }
@@ -1238,12 +1628,41 @@ pub fn normalize_cohere_base(base_url: &str) -> String {
     format!("{base_url}/chat")
 }
 
+/// Normalize a Cursor base URL into the full Connect RPC endpoint.
+///
+/// Accepts an empty string (uses the default), a bare origin such as
+/// `https://api2.cursor.sh` (appends the RPC path), or a full path already
+/// ending in `/agent.v1.AgentService/Run`.
+pub fn normalize_cursor_base(base_url: &str) -> String {
+    const RPC_PATH: &str = "agent.v1.AgentService/Run";
+    let trimmed = base_url.trim();
+    if trimmed.is_empty() {
+        return cursor::CURSOR_API_URL.to_string();
+    }
+
+    if let Ok(url) = Url::parse(trimmed)
+        && !url.cannot_be_a_base()
+    {
+        if trimmed_url_path(&url).ends_with(&format!("/{RPC_PATH}")) {
+            return canonicalize_url_path(&url);
+        }
+        return append_url_path(&url, RPC_PATH);
+    }
+
+    let base = trimmed.trim_end_matches('/');
+    if base.ends_with(RPC_PATH) {
+        return base.to_string();
+    }
+    format!("{base}/{RPC_PATH}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::extensions::{ExtensionManager, JsExtensionLoadSpec, JsExtensionRuntimeHandle};
     use crate::extensions_js::PiJsRuntimeConfig;
     use crate::model::{ContentBlock, Message, UserContent, UserMessage};
+    use crate::models::{ModelRegistry, extension_provider_bindings};
     use crate::tools::ToolRegistry;
     use asupersync::runtime::RuntimeBuilder;
     use asupersync::time::{sleep, wall_now};
@@ -1251,6 +1670,109 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
     use tempfile::tempdir;
+
+    /// bd-dzddo: the shared rewrite validator must keep well-formed rewrites
+    /// (with forced stream keys re-imposed and extension-added fields
+    /// preserved) and reject everything structurally unsound.
+    #[test]
+    fn validate_streamed_json_rewrite_accepts_and_rejects() {
+        let valid = serde_json::json!({
+            "model": "m1",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": false,
+            "extension_field": {"kept": true},
+        });
+        let accepted = validate_streamed_json_rewrite(
+            valid,
+            &["model"],
+            &["messages"],
+            &[("stream", serde_json::Value::Bool(true))],
+        )
+        .expect("valid rewrite accepted");
+        assert_eq!(accepted["stream"], serde_json::Value::Bool(true));
+        assert_eq!(accepted["extension_field"]["kept"], true);
+
+        for (label, invalid) in [
+            ("non-object", serde_json::json!(["array"])),
+            ("missing model", serde_json::json!({"messages": []})),
+            (
+                "empty model",
+                serde_json::json!({"model": "", "messages": []}),
+            ),
+            ("missing messages", serde_json::json!({"model": "m1"})),
+            (
+                "non-array messages",
+                serde_json::json!({"model": "m1", "messages": {}}),
+            ),
+        ] {
+            assert!(
+                validate_streamed_json_rewrite(
+                    invalid,
+                    &["model"],
+                    &["messages"],
+                    &[("stream", serde_json::Value::Bool(true))],
+                )
+                .is_err(),
+                "rewrite must be rejected: {label}"
+            );
+        }
+    }
+
+    /// bd-dzddo: the shared offer plumbing must pass hook rewrites through
+    /// validation and fail open (return None) on rejection or missing hook.
+    #[test]
+    fn offer_before_provider_request_validates_and_fails_open() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async {
+            let body = serde_json::json!({"model": "orig", "messages": []});
+            let validate = |value: serde_json::Value| {
+                validate_streamed_json_rewrite(value, &["model"], &["messages"], &[])
+            };
+
+            let no_hook = StreamOptions::default();
+            assert!(
+                offer_before_provider_request(&no_hook, "p", "a", "m", "u", &body, validate)
+                    .await
+                    .is_none(),
+                "no hook configured must keep the original"
+            );
+
+            let rewriting = StreamOptions {
+                before_provider_request: Some(crate::provider::BeforeProviderRequestHook::new(
+                    |event| {
+                        Box::pin(async move {
+                            let mut payload = event.payload;
+                            payload["messages"] = serde_json::json!([{"role": "user"}]);
+                            payload["marker"] = serde_json::json!(event.provider);
+                            Some(payload)
+                        })
+                    },
+                )),
+                ..Default::default()
+            };
+            let accepted = offer_before_provider_request(
+                &rewriting, "prov", "api", "model", "url", &body, validate,
+            )
+            .await
+            .expect("valid rewrite accepted");
+            assert_eq!(accepted["marker"], "prov");
+
+            let invalid = StreamOptions {
+                before_provider_request: Some(crate::provider::BeforeProviderRequestHook::new(
+                    |_event| Box::pin(async move { Some(serde_json::json!("not an object")) }),
+                )),
+                ..Default::default()
+            };
+            assert!(
+                offer_before_provider_request(&invalid, "p", "a", "m", "u", &body, validate)
+                    .await
+                    .is_none(),
+                "rejected rewrite must fail open"
+            );
+        });
+    }
 
     #[test]
     fn vcr_loopback_detection_covers_provider_factory_mock_hosts() {
@@ -1341,6 +1863,66 @@ export default function init(pi) {
 }
 "#;
 
+    const MIXED_CASE_STREAM_SIMPLE_EXTENSION: &str = r#"
+export default function init(pi) {
+  pi.registerProvider("Acme", {
+    baseUrl: "https://extension.example.test",
+    api: "extension-mixed-case-api",
+    oauth: {
+      authUrl: "https://auth.example.test/authorize",
+      tokenUrl: "https://auth.example.test/token",
+      clientId: "mixed-case-client",
+      scopes: ["models:use"],
+      redirectUri: "http://127.0.0.1/oauth/callback",
+      clientSecret: "must-not-cross-the-provider-snapshot"
+    },
+    models: [],
+    streamSimple: async function* () {
+      yield "mixed-case-handler";
+    }
+  });
+}
+"#;
+
+    const API_REGISTERED_PROVIDER_EXTENSION: &str = r#"
+import { createAssistantMessageEventStream, registerApiProvider } from "@earendil-works/pi-ai/compat";
+
+registerApiProvider({
+  api: "extension-fixture-api",
+  stream: (model, context, options) => {
+    const events = createAssistantMessageEventStream();
+    events.push({ type: "done", message: { role: "assistant", content: [], api: model.api, provider: model.provider, model: model.id, stopReason: "stop" } });
+    return events;
+  },
+  streamSimple: (model, context, options) => {
+    const partial = {
+      role: "assistant",
+      content: [{ type: "text", text: "" }],
+      api: model.api,
+      provider: model.provider,
+      model: model.id,
+      usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+      stopReason: "stop",
+      timestamp: 0
+    };
+    const events = createAssistantMessageEventStream();
+    events.push({ type: "start", partial });
+    events.push({ type: "text_start", contentIndex: 0, partial });
+    partial.content[0].text = "via-api-registry";
+    events.push({ type: "text_delta", contentIndex: 0, delta: "via-api-registry", partial });
+    events.push({ type: "done", reason: "stop", message: partial });
+    return events;
+  },
+}, "api-registration-fixture");
+
+export default function init(pi) {
+  pi.registerProvider("api-registered-provider", {
+    api: "extension-fixture-api",
+    models: [{ id: "api-registered-model", name: "API Registered Model", contextWindow: 100, maxTokens: 10, input: ["text"] }]
+  });
+}
+"#;
+
     async fn load_extension(
         source: &str,
         allow_write: bool,
@@ -1397,6 +1979,271 @@ export default function init(pi) {
     }
 
     #[test]
+    fn virtual_http_origin_rejects_network_and_credentials() {
+        assert_eq!(
+            extension_http_origin("http://127.0.0.1:28180/v1").expect("loopback"),
+            "http://127.0.0.1:28180"
+        );
+        assert_eq!(
+            extension_http_origin("http://[::1]:28180/v1").expect("IPv6 loopback"),
+            "http://[::1]:28180"
+        );
+        for url in [
+            "https://127.0.0.1:28180/v1",
+            "http://127.0.0.2:28180/v1",
+            "http://0.0.0.0:28180/v1",
+            "http://example.com/v1",
+            "http://user:secret@127.0.0.1:28180/v1",
+            "http://localhost:0/v1",
+        ] {
+            assert!(extension_http_origin(url).is_err(), "accepted {url}");
+        }
+    }
+
+    #[test]
+    fn virtual_http_binding_requires_owned_identity_and_same_origin() {
+        let manager = ExtensionManager::new();
+        manager.register_provider(serde_json::json!({
+            "id": "freeflow", "extension_id": "owned-extension",
+            "baseUrl": "http://127.0.0.1:28180/v1",
+            "virtualHttpServer": "virtual-http-server-1"
+        }));
+        let entry = model_entry(
+            "freeflow",
+            "openai-completions",
+            "fixture",
+            "http://127.0.0.1:28180/v1",
+        );
+        assert_eq!(
+            extension_http_provider_binding(&manager, &entry).expect("binding"),
+            Some(("freeflow".to_string(), "http://127.0.0.1:28180".to_string()))
+        );
+        let mut changed = entry.clone();
+        changed.model.base_url = "http://127.0.0.1:28181/v1".to_string();
+        assert!(extension_http_provider_binding(&manager, &changed).is_err());
+        changed.model.provider = "another-provider".to_string();
+        assert!(
+            extension_http_provider_binding(&manager, &changed)
+                .expect("different identity")
+                .is_none()
+        );
+
+        let unowned = ExtensionManager::new();
+        unowned.register_provider(serde_json::json!({
+            "id": "freeflow", "baseUrl": "http://127.0.0.1:28180/v1",
+            "virtualHttpServer": "forged-marker"
+        }));
+        assert!(extension_http_provider_binding(&unowned, &entry).is_err());
+        assert!(
+            create_provider(&entry, Some(&manager)).is_err(),
+            "missing JS runtime must fail closed"
+        );
+    }
+
+    #[test]
+    fn extension_virtual_http_provider_streams_through_native_openai_parser() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async move {
+            let source = r"
+import http from 'node:http';
+export default function activate(pi) {
+  const server = http.createServer((req, res) => {
+    let body = '';
+    req.on('data', chunk => { body += chunk.toString(); });
+    req.on('end', () => {
+      const parsed = JSON.parse(body);
+      if (req.method !== 'POST' || req.url !== '/v1/chat/completions' ||
+          req.headers.authorization !== 'Bearer sk-test' || parsed.model !== 'fixture-model') {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: { message: 'incorrect virtual provider request' } }));
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.write('data: ' + JSON.stringify({ id: 'fixture', choices: [{ index: 0, delta: { role: 'assistant', content: 'isolated proxy' }, finish_reason: null }] }) + '\n\n');
+      res.write('data: ' + JSON.stringify({ id: 'fixture', choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] }) + '\n\n');
+      res.end('data: [DONE]\n\n');
+    });
+  });
+  server.listen(28180, '127.0.0.1');
+  pi.registerProvider('virtual-freeflow', {
+    api: 'openai-completions', baseUrl: 'http://127.0.0.1:28180/v1',
+    models: [{ id: 'fixture-model', name: 'Fixture', contextWindow: 100, maxTokens: 10, input: ['text'] }]
+  });
+}
+";
+            let (_dir, manager) = load_extension(source, false).await;
+            let entries = manager.extension_model_entries();
+            let entry = entries
+                .iter()
+                .find(|entry| entry.model.provider == "virtual-freeflow")
+                .expect("registered model");
+            assert!(
+                extension_http_provider_binding(&manager, entry)
+                    .expect("binding")
+                    .is_some()
+            );
+            let provider = create_provider(entry, Some(&manager)).expect("provider");
+            let context = basic_context();
+            let options = basic_options();
+            let mut events = provider
+                .stream(&context, &options)
+                .await
+                .expect("start stream");
+            let mut text = String::new();
+            let mut done = false;
+            while let Some(event) = events.next().await {
+                match event.expect("provider event") {
+                    StreamEvent::TextDelta { delta, .. } => text.push_str(&delta),
+                    StreamEvent::Done { .. } => {
+                        done = true;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            assert_eq!(text, "isolated proxy");
+            assert!(
+                done,
+                "native parser must produce a completed assistant response"
+            );
+            drop(events);
+            assert!(manager.shutdown(Duration::from_secs(2)).await);
+        });
+    }
+
+    #[test]
+    fn extension_model_reasoning_settings_reach_the_virtual_proxy_request() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async move {
+            let source = r"
+import http from 'node:http';
+export default function activate(pi) {
+  http.createServer((req, res) => {
+    let body = '';
+    req.on('data', chunk => { body += chunk.toString(); });
+    req.on('end', () => {
+      const parsed = JSON.parse(body);
+      const correct = parsed.model === 'plain' ? parsed.reasoning_effort === 'high' && !parsed.reasoning
+        : parsed.model === 'gateway' ? parsed.reasoning?.effort === 'xhigh' && !parsed.reasoning_effort
+        : parsed.model === 'disabled' && !parsed.reasoning_effort && !parsed.reasoning;
+      if (!correct || parsed.thinking) {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: { message: 'model reasoning contract was lost' } }));
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.write('data: ' + JSON.stringify({ choices: [{ index: 0, delta: { content: parsed.model }, finish_reason: null }] }) + '\n\n');
+      res.write('data: ' + JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] }) + '\n\n');
+      res.end('data: [DONE]\n\n');
+    });
+  }).listen(28180, '127.0.0.1');
+  pi.registerProvider('freeflow-contract', {
+    api: 'openai-completions', baseUrl: 'http://127.0.0.1:28180/v1',
+    compat: { supportsDeveloperRole: false, supportsReasoningEffort: true },
+    models: [
+      { id: 'plain', reasoning: true, thinkingLevelMap: { xhigh: 'high', max: null } },
+      { id: 'gateway', reasoning: true, compat: { thinkingFormat: 'openrouter' }, thinkingLevelMap: { xhigh: 'xhigh', max: null } },
+      { id: 'disabled', reasoning: true, compat: { supportsReasoningEffort: false } }
+    ]
+  });
+}
+";
+            let (_dir, manager) = load_extension(source, false).await;
+            let entries = manager.extension_model_entries();
+            assert_eq!(entries.len(), 3);
+            for entry in &entries {
+                let compat = entry.compat.as_ref().expect("registered compatibility");
+                assert_eq!(compat.supports_developer_role, Some(false));
+                assert!(!entry.supports_max());
+                let provider = create_provider(entry, Some(&manager)).expect("provider");
+                let context = basic_context();
+                let options = StreamOptions {
+                    thinking_level: Some(entry.clamp_thinking_level(crate::model::ThinkingLevel::Max)),
+                    ..basic_options()
+                };
+                let mut events = provider.stream(&context, &options).await.expect("stream");
+                let mut text = String::new();
+                let mut done = false;
+                while let Some(event) = events.next().await {
+                    match event.expect("provider event") {
+                        StreamEvent::TextDelta { delta, .. } => text.push_str(&delta),
+                        StreamEvent::Done { .. } => {
+                            done = true;
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+                assert_eq!(text, entry.model.id);
+                assert!(done);
+            }
+            assert!(manager.shutdown(Duration::from_secs(2)).await);
+        });
+    }
+
+    #[test]
+    fn extension_virtual_http_response_drop_cancels_its_handler() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async move {
+            let source = r"
+import http from 'node:http';
+export default function activate(pi) {
+  let cancelled = false;
+  http.createServer((req, res) => {
+    req.once('close', () => { cancelled = true; });
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.write('first chunk');
+  }).listen(28180, '127.0.0.1');
+  pi.registerProvider('virtual-freeflow', {
+    api: 'openai-completions', baseUrl: 'http://127.0.0.1:28180/v1',
+    models: [{ id: 'fixture-model', name: 'Fixture', contextWindow: 100, maxTokens: 10, input: ['text'] }]
+  });
+  pi.on('agent_start', () => ({ cancelled }));
+}
+";
+            let (_dir, manager) = load_extension(source, false).await;
+            let entry = manager.extension_model_entries().remove(0);
+            let (provider_id, origin) = extension_http_provider_binding(&manager, &entry)
+                .expect("binding")
+                .expect("virtual route");
+            let client = Client::new().with_transport(Arc::new(ExtensionHttpTransport {
+                runtime: manager.js_runtime().expect("JS runtime"),
+                provider_id,
+                origin,
+            }));
+            let response = client
+                .get("http://127.0.0.1:28180/v1/models")
+                .send()
+                .await
+                .expect("response headers");
+            assert_eq!(response.status(), 200);
+            let mut bytes = response.bytes_stream();
+            assert_eq!(
+                bytes.next().await.expect("body frame").expect("body bytes"),
+                b"first chunk"
+            );
+            drop(bytes);
+            let result = manager
+                .dispatch_event_with_response(
+                    crate::extensions::ExtensionEventName::AgentStart,
+                    None,
+                    10_000,
+                )
+                .await
+                .expect("cancellation observation")
+                .expect("hook result");
+            assert_eq!(result["cancelled"], true);
+            assert!(manager.shutdown(Duration::from_secs(2)).await);
+        });
+    }
+
+    #[test]
     fn extension_stream_simple_provider_emits_assistant_events() {
         let runtime = RuntimeBuilder::current_thread()
             .build()
@@ -1445,6 +2292,204 @@ export default function init(pi) {
 
             assert!(saw_start, "expected a Start event");
             assert!(saw_text_delta, "expected a TextDelta event");
+        });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn manual_model_override_keeps_mixed_case_extension_stream_handler_reachable() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async move {
+            let (dir, manager) = load_extension(MIXED_CASE_STREAM_SIMPLE_EXTENSION, false).await;
+            let models_path = dir.path().join("models.json");
+            std::fs::write(
+                &models_path,
+                r#"{
+                    "providers": {
+                        " acme ": {
+                            "baseUrl": "https://manual.example.test",
+                            "api": "extension-mixed-case-api",
+                            "models": [{
+                                "id": " manual-chat ",
+                                "name": "Manual Chat",
+                                "contextWindow": 100,
+                                "maxTokens": 10,
+                                "input": ["text"]
+                            }]
+                        }
+                    }
+                }"#,
+            )
+            .expect("write models.json");
+
+            let mut registry =
+                ModelRegistry::load_with_credential_resolver(Some(models_path), |_| None);
+            assert!(registry.error().is_none(), "{:?}", registry.error());
+            let unmerged = registry
+                .find("acme", "manual-chat")
+                .expect("unmerged mixed-case model");
+            assert_eq!(unmerged.model.provider, "acme");
+            assert!(!manager.provider_has_stream_simple(&unmerged.model.provider));
+            let canonical_provider = create_provider(&unmerged, Some(&manager))
+                .expect("normalized provider identity should reach the extension handler");
+            assert_eq!(canonical_provider.name(), "Acme");
+
+            let provider_specs = manager.extension_providers();
+            let oauth_snapshot = provider_specs
+                .first()
+                .and_then(|provider| provider.get("oauth"))
+                .and_then(Value::as_object)
+                .expect("registered provider OAuth snapshot");
+            assert!(!oauth_snapshot.contains_key("clientSecret"));
+            let extension_bindings = extension_provider_bindings(&provider_specs)
+                .expect("parse extension provider bindings");
+            let extension_oauth = extension_bindings
+                .first()
+                .expect("registered extension provider")
+                .oauth_config
+                .as_ref()
+                .expect("JS provider OAuth metadata should reach the manager snapshot");
+            assert_eq!(
+                extension_oauth.auth_url,
+                "https://auth.example.test/authorize"
+            );
+            assert_eq!(extension_oauth.token_url, "https://auth.example.test/token");
+            assert_eq!(extension_oauth.client_id, "mixed-case-client");
+            assert_eq!(extension_oauth.scopes.len(), 1);
+            assert_eq!(
+                extension_oauth.scopes.first().map(String::as_str),
+                Some("models:use")
+            );
+            assert_eq!(
+                extension_oauth.redirect_uri.as_deref(),
+                Some("http://127.0.0.1/oauth/callback")
+            );
+            let extension_entries = manager.extension_model_entries();
+            assert!(extension_entries.is_empty());
+            registry
+                .merge_extension_registry(&extension_bindings, extension_entries)
+                .expect("merge extension models");
+
+            let entry = registry
+                .find("acme", "manual-chat")
+                .expect("merged mixed-case model");
+            assert_eq!(entry.model.provider, "Acme");
+            assert_eq!(entry.model.name, "Manual Chat");
+            assert_eq!(entry.model.base_url, "https://manual.example.test");
+            assert_eq!(
+                entry
+                    .oauth_config
+                    .as_ref()
+                    .expect("extension OAuth metadata should survive manual precedence")
+                    .client_id,
+                "mixed-case-client"
+            );
+            assert!(manager.provider_has_stream_simple(&entry.model.provider));
+
+            let provider = create_provider(&entry, Some(&manager)).expect("create provider");
+            let context = basic_context();
+            let options = basic_options();
+            let mut stream = provider
+                .stream(&context, &options)
+                .await
+                .expect("start extension stream");
+            let mut text = String::new();
+            while let Some(event) = stream.next().await {
+                if let StreamEvent::TextDelta { delta, .. } = event.expect("stream event") {
+                    text.push_str(&delta);
+                }
+            }
+            assert_eq!(text, "mixed-case-handler");
+        });
+    }
+
+    #[test]
+    fn provider_factory_rejects_canonical_extension_stream_handler_collisions() {
+        let manager = ExtensionManager::new();
+        manager.register_provider(serde_json::json!({
+            "id": "Acme",
+            "hasStreamSimple": true,
+        }));
+        manager.register_provider(serde_json::json!({
+            "id": "acme",
+            "hasStreamSimple": true,
+        }));
+
+        let mut entry = ModelRegistry::load_with_credential_resolver(None, |_| None)
+            .find("openai", "gpt-4o")
+            .expect("built-in model template");
+        entry.model.provider = "acme".to_string();
+        let error = match create_provider(&entry, Some(&manager)) {
+            Ok(_) => panic!("canonical extension provider collision must fail"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains("normalized extension provider identity"),
+            "{error}"
+        );
+        assert!(error.contains("\"Acme\""), "{error}");
+        assert!(error.contains("\"acme\""), "{error}");
+    }
+
+    #[test]
+    fn extension_stream_handler_selection_preserves_declared_builtin_aliases() {
+        let manager = ExtensionManager::new();
+        manager.register_provider(serde_json::json!({
+            "id": "azure",
+            "hasStreamSimple": true,
+        }));
+        manager.register_provider(serde_json::json!({
+            "id": "azure-openai",
+            "hasStreamSimple": true,
+        }));
+
+        assert_eq!(
+            extension_stream_simple_provider_id(&manager, "azure")
+                .expect("valid extension provider snapshot")
+                .as_deref(),
+            Some("azure")
+        );
+        assert_eq!(
+            extension_stream_simple_provider_id(&manager, "azure-openai")
+                .expect("valid extension provider snapshot")
+                .as_deref(),
+            Some("azure-openai")
+        );
+    }
+
+    #[test]
+    fn extension_api_provider_registration_routes_models_through_registered_handler() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async move {
+            let (_dir, manager) = load_extension(API_REGISTERED_PROVIDER_EXTENSION, false).await;
+            assert!(manager.provider_has_stream_simple("api-registered-provider"));
+
+            let entries = manager.extension_model_entries();
+            assert_eq!(entries.len(), 1);
+            let entry = entries
+                .iter()
+                .find(|entry| entry.model.provider == "api-registered-provider")
+                .expect("registered provider model entry");
+            assert_eq!(entry.model.api, "extension-fixture-api");
+
+            let provider = create_provider(entry, Some(&manager)).expect("create provider");
+            let context = basic_context();
+            let options = basic_options();
+            let mut stream = provider.stream(&context, &options).await.expect("stream");
+
+            let mut text = String::new();
+            while let Some(event) = stream.next().await {
+                if let StreamEvent::TextDelta { delta, .. } = event.expect("stream event") {
+                    text.push_str(&delta);
+                }
+            }
+            assert_eq!(text, "via-api-registry");
         });
     }
 
@@ -1782,6 +2827,7 @@ export default function init(pi) {
                 reasoning: false,
                 input: vec![InputType::Text],
                 cost: ModelCost {
+                    audio: None,
                     input: 3.0,
                     output: 15.0,
                     cache_read: 0.3,
@@ -1797,6 +2843,39 @@ export default function init(pi) {
             compat: None,
             oauth_config: None,
         }
+    }
+
+    /// gh #221: the factory attaches catalog pricing to priced entries and
+    /// leaves unpriced (ad-hoc) entries bare.
+    #[test]
+    fn create_provider_carries_catalog_pricing_only_when_priced() {
+        let priced = model_entry(
+            "openai",
+            "openai-completions",
+            "gpt-4o-mini",
+            "https://api.openai.com/v1",
+        );
+        let provider = create_provider(&priced, None).expect("priced provider");
+        assert_eq!(provider.name(), "openai");
+        assert_eq!(provider.model_id(), "gpt-4o-mini");
+        assert_eq!(provider.api(), "openai-completions");
+        assert_eq!(provider.model_cost(), Some(priced.model.cost.clone()));
+
+        let mut unpriced = model_entry(
+            "openrouter",
+            "openai-completions",
+            "deepseek/deepseek-v4-pro",
+            "https://openrouter.ai/api/v1",
+        );
+        unpriced.model.cost = ModelCost {
+            audio: None,
+            input: 0.0,
+            output: 0.0,
+            cache_read: 0.0,
+            cache_write: 0.0,
+        };
+        let provider = create_provider(&unpriced, None).expect("unpriced provider");
+        assert_eq!(provider.model_cost(), None);
     }
 
     #[test]
@@ -1968,6 +3047,32 @@ export default function init(pi) {
         assert!(
             suggestions.len() <= 3,
             "expected at most 3 suggestions: {suggestions:?}"
+        );
+    }
+
+    #[test]
+    fn suggest_similar_providers_covers_omp_delta_presets() {
+        // bd-cv653.7.3: typo/near-miss inputs must keep resolving to the new
+        // presets after their aliases joined the table.
+        let cases: [(&str, &str); 5] = [
+            ("qianfa", "qianfan"),
+            ("coreweav", "coreweave"),
+            ("opencode-zn", "opencode"),
+            ("opencode-g", "opencode-go"),
+            ("umans-ai", "umans"),
+        ];
+        for (input, expected) in cases {
+            let suggestions = suggest_similar_providers(input);
+            assert!(
+                suggestions.contains(&expected.to_string()),
+                "expected '{expected}' in suggestions for '{input}': {suggestions:?}"
+            );
+        }
+        // Newly added aliases must not hijack suggestions for unrelated ids.
+        let opencode = suggest_similar_providers("opencode");
+        assert!(
+            opencode.contains(&"opencode".to_string()),
+            "exact id must remain the top suggestion: {opencode:?}"
         );
     }
 

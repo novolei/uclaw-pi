@@ -861,7 +861,7 @@ impl<T: Clone + QueueTenant> HostcallRequestQueue<T> {
         }
     }
 
-    fn pop_front(&mut self) -> Option<T> {
+    pub(crate) fn pop_front(&mut self) -> Option<T> {
         let value = if let Some(value) = self.fast.pop() {
             value
         } else {
@@ -2052,6 +2052,7 @@ mod tests {
             while !gate.pin_ready {
                 gate = cvar.wait(gate).expect("wait for pin");
             }
+            drop(gate);
         }
 
         fn mark_pin_ready(sync: &Arc<(Mutex<PinGate>, Condvar)>) {
@@ -2062,12 +2063,14 @@ mod tests {
             while !gate.release_pin {
                 gate = cvar.wait(gate).expect("wait for pin release");
             }
+            drop(gate);
         }
 
         fn release_pin(sync: &Arc<(Mutex<PinGate>, Condvar)>) {
             let (lock, cvar) = &**sync;
             let mut gate = lock.lock().expect("lock pin gate");
             gate.release_pin = true;
+            drop(gate);
             cvar.notify_all();
         }
 

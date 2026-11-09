@@ -9,13 +9,46 @@ use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::package_manager::{
     PackageManager, PackageScope, ResolveExtensionSourcesOptions, ResolvedResource, ResourceOrigin,
+    project_universal_skill_dirs,
 };
-use crate::theme::Theme;
+use crate::theme::{MAX_RESOURCE_FILE_BYTES, Theme};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use tracing::warn;
+
+pub(crate) fn read_resource_file_bounded(path: &Path, resource_label: &str) -> Result<String> {
+    let file = fs::File::open(path).map_err(|err| {
+        Error::config(format!(
+            "Failed to open {resource_label} file '{}': {err}",
+            path.display()
+        ))
+    })?;
+    let mut bytes = Vec::new();
+    file.take((MAX_RESOURCE_FILE_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|err| {
+            Error::config(format!(
+                "Failed to read {resource_label} file '{}': {err}",
+                path.display()
+            ))
+        })?;
+    if bytes.len() > MAX_RESOURCE_FILE_BYTES {
+        return Err(Error::config(format!(
+            "{resource_label} file '{}' exceeds the {MAX_RESOURCE_FILE_BYTES}-byte resource limit",
+            path.display()
+        )));
+    }
+    String::from_utf8(bytes).map_err(|err| {
+        Error::config(format!(
+            "{resource_label} file '{}' is not valid UTF-8: {}",
+            path.display(),
+            err.utf8_error()
+        ))
+    })
+}
 
 fn panic_payload_message(payload: Box<dyn std::any::Any + Send + 'static>) -> String {
     payload.downcast::<String>().map_or_else(
@@ -37,6 +70,25 @@ fn read_dir_sorted_paths(dir: &Path) -> Vec<PathBuf> {
     let mut paths: Vec<PathBuf> = entries.flatten().map(|entry| entry.path()).collect();
     paths.sort();
     paths
+}
+
+fn read_dir_sorted_paths_bounded(dir: &Path, remaining: usize) -> Option<Vec<PathBuf>> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Some(Vec::new());
+    };
+
+    let mut paths = Vec::new();
+    for entry in entries.flatten() {
+        if paths.len() >= remaining {
+            // Read one entry beyond the budget only to prove that this root
+            // exceeds its cap. Fail the whole root closed instead of returning
+            // an OS-order-dependent partial catalogue.
+            return None;
+        }
+        paths.push(entry.path());
+    }
+    paths.sort();
+    Some(paths)
 }
 
 fn canonical_identity_path(path: &Path) -> PathBuf {
@@ -85,8 +137,9 @@ pub struct ResourceDiagnostic {
 
 const MAX_SKILL_NAME_LEN: usize = 64;
 const MAX_SKILL_DESC_LEN: usize = 1024;
+const MAX_SKILL_DISCOVERY_ENTRIES: usize = 16_384;
 
-const ALLOWED_SKILL_FRONTMATTER: [&str; 7] = [
+const ALLOWED_SKILL_FRONTMATTER: [&str; 9] = [
     "name",
     "description",
     "license",
@@ -94,6 +147,10 @@ const ALLOWED_SKILL_FRONTMATTER: [&str; 7] = [
     "metadata",
     "allowed-tools",
     "disable-model-invocation",
+    "user-invocable",
+    // Agent-authored managed skills (bd-cv653.4.2): the marker protects
+    // user-authored skills from manage_skill mutations.
+    "managed",
 ];
 
 #[derive(Debug, Clone)]
@@ -104,6 +161,9 @@ pub struct Skill {
     pub base_dir: PathBuf,
     pub source: String,
     pub disable_model_invocation: bool,
+    /// Whether users may discover and expand this skill as a slash command.
+    /// Independent of model visibility; absent frontmatter defaults to true.
+    pub user_invocable: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -116,6 +176,9 @@ pub struct LoadSkillsResult {
 pub struct LoadSkillsOptions {
     pub cwd: PathBuf,
     pub agent_dir: PathBuf,
+    /// Home for universal user skills, independent of `agent_dir`.
+    /// `None` disables that root for hermetic callers.
+    pub home_dir: Option<PathBuf>,
     pub skill_paths: Vec<PathBuf>,
     pub include_defaults: bool,
 }
@@ -129,6 +192,9 @@ pub struct PromptTemplate {
     pub name: String,
     pub description: String,
     pub content: String,
+    /// Interactive invocations use the ephemeral `/btw` lane. Other
+    /// surfaces still expand this template into an ordinary prompt.
+    pub side: bool,
     pub source: String,
     pub file_path: PathBuf,
 }
@@ -139,6 +205,12 @@ pub struct LoadPromptTemplatesOptions {
     pub agent_dir: PathBuf,
     pub prompt_paths: Vec<PathBuf>,
     pub include_defaults: bool,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct LoadPromptTemplatesResult {
+    pub(crate) templates: Vec<PromptTemplate>,
+    pub(crate) diagnostics: Vec<ResourceDiagnostic>,
 }
 
 // ============================================================================
@@ -186,7 +258,7 @@ pub struct ResourceCliOptions {
 
 impl ResourceCliOptions {
     #[must_use]
-    pub fn has_explicit_paths(&self) -> bool {
+    pub const fn has_explicit_paths(&self) -> bool {
         !self.skill_paths.is_empty()
             || !self.prompt_paths.is_empty()
             || !self.extension_paths.is_empty()
@@ -218,7 +290,7 @@ pub struct ExtensionResourcePaths {
 }
 
 impl ExtensionResourcePaths {
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.skill_paths.is_empty() && self.prompt_paths.is_empty() && self.theme_paths.is_empty()
     }
 }
@@ -363,12 +435,13 @@ impl ResourceLoader {
                 load_skills(LoadSkillsOptions {
                     cwd: cwd_s.clone(),
                     agent_dir: agent_s.clone(),
+                    home_dir: dirs::home_dir(),
                     skill_paths,
                     include_defaults: false,
                 })
             });
             let prompts_handle = s.spawn(move || {
-                load_prompt_templates(LoadPromptTemplatesOptions {
+                load_prompt_templates_with_diagnostics(LoadPromptTemplatesOptions {
                     cwd: cwd_s.clone(),
                     agent_dir: agent_s.clone(),
                     prompt_paths,
@@ -395,7 +468,7 @@ impl ResourceLoader {
                 panic_payload_message(payload)
             ))
         })?;
-        let prompt_templates = prompts_join.map_err(|payload| {
+        let prompts_result = prompts_join.map_err(|payload| {
             Error::config(format!(
                 "Prompt loader thread panicked: {}",
                 panic_payload_message(payload)
@@ -407,7 +480,9 @@ impl ResourceLoader {
                 panic_payload_message(payload)
             ))
         })?;
-        let (prompts, prompt_diagnostics) = dedupe_prompts(prompt_templates);
+        let (prompts, prompt_collision_diagnostics) = dedupe_prompts(prompts_result.templates);
+        let mut prompt_diagnostics = prompts_result.diagnostics;
+        prompt_diagnostics.extend(prompt_collision_diagnostics);
         let (themes, theme_diagnostics) = dedupe_themes(themes_result.themes);
         let mut theme_diags = themes_result.diagnostics;
         theme_diags.extend(theme_diagnostics);
@@ -421,7 +496,7 @@ impl ResourceLoader {
             &skills_result.diagnostics,
             ExplicitResourceKind::Skill,
         )?;
-        ensure_explicit_file_paths_loaded(
+        ensure_explicit_prompt_paths_loaded(
             &explicit_prompt_paths,
             prompts
                 .iter()
@@ -463,6 +538,7 @@ impl ResourceLoader {
                 let result = load_skills(LoadSkillsOptions {
                     cwd: cwd_buf.clone(),
                     agent_dir: agent_dir.clone(),
+                    home_dir: dirs::home_dir(),
                     skill_paths,
                     include_defaults: false,
                 });
@@ -507,15 +583,17 @@ impl ResourceLoader {
         if !paths.prompt_paths.is_empty() {
             let prompt_paths = dedupe_paths(paths.prompt_paths.clone());
             if !prompt_paths.is_empty() {
-                let new_prompts = load_prompt_templates(LoadPromptTemplatesOptions {
-                    cwd: cwd_buf.clone(),
-                    agent_dir: agent_dir.clone(),
-                    prompt_paths,
-                    include_defaults: false,
-                });
-                if !new_prompts.is_empty() {
+                let new_prompts =
+                    load_prompt_templates_with_diagnostics(LoadPromptTemplatesOptions {
+                        cwd: cwd_buf.clone(),
+                        agent_dir: agent_dir.clone(),
+                        prompt_paths,
+                        include_defaults: false,
+                    });
+                self.prompt_diagnostics.extend(new_prompts.diagnostics);
+                if !new_prompts.templates.is_empty() {
                     let mut merged = self.prompts.clone();
-                    merged.extend(new_prompts);
+                    merged.extend(new_prompts.templates);
                     let (deduped, diagnostics) = dedupe_prompts(merged);
                     self.prompts = deduped;
                     self.prompt_diagnostics.extend(diagnostics);
@@ -550,6 +628,12 @@ impl ResourceLoader {
 
     pub fn skills(&self) -> &[Skill] {
         &self.skills
+    }
+
+    /// Test-only: inject a prompt template directly, bypassing disk loading.
+    #[cfg(test)]
+    pub(crate) fn push_prompt_for_tests(&mut self, template: PromptTemplate) {
+        self.prompts.push(template);
     }
 
     pub fn prompts(&self) -> &[PromptTemplate] {
@@ -617,6 +701,7 @@ impl ResourceLoader {
                 "name": template.name,
                 "description": template.description,
                 "source": "template",
+                "side": template.side,
                 "location": template.source,
                 "path": template.file_path.display().to_string(),
             }));
@@ -642,6 +727,20 @@ impl ResourceLoader {
         }
         expand_prompt_template(&expanded, &self.prompts)
     }
+
+    /// Expand an explicitly invoked side template without reinterpreting its
+    /// body as another command. Command owners must resolve built-in and
+    /// extension precedence before choosing this interactive-only route.
+    pub fn expand_side_prompt(&self, text: &str) -> Option<String> {
+        if !text.starts_with('/') || text.starts_with("/skill:") {
+            return None;
+        }
+        let (name, _) = split_command_name_and_args(text, 1);
+        let template = self.prompts.iter().find(|template| template.name == name)?;
+        template
+            .side
+            .then(|| expand_prompt_template(text, &self.prompts))
+    }
 }
 
 // ============================================================================
@@ -656,11 +755,11 @@ pub async fn discover_package_resources(manager: &PackageManager) -> Result<Pack
         let Some(root) = manager.installed_path(&entry.source, entry.scope).await? else {
             continue;
         };
-        if !root.exists() {
-            if let Err(err) = manager.install(&entry.source, entry.scope).await {
-                warn!("Failed to install {}: {err}", entry.source);
-                continue;
-            }
+        if !root.exists()
+            && let Err(err) = manager.install(&entry.source, entry.scope).await
+        {
+            warn!("Failed to install {}: {err}", entry.source);
+            continue;
         }
 
         if !root.exists() {
@@ -895,11 +994,31 @@ fn resolve_manifest_resource_path(
 // Skills loader
 // ============================================================================
 
+/// Default roots in collision precedence order. Only these exact directories
+/// are searched: never parent projects, sibling workspaces, or the whole home.
+pub(crate) fn default_skill_dirs(
+    cwd: &Path,
+    agent_dir: &Path,
+    home_dir: Option<&Path>,
+) -> Vec<(PathBuf, &'static str)> {
+    let mut roots = vec![(cwd.join(Config::project_dir()).join("skills"), "project")];
+    roots.extend(
+        project_universal_skill_dirs(cwd, home_dir)
+            .into_iter()
+            .map(|path| (path, "project")),
+    );
+    roots.push((agent_dir.join("skills"), "user"));
+    if let Some(home) = home_dir {
+        roots.push((home.join(".agents").join("skills"), "user"));
+    }
+    roots
+}
+
 #[allow(clippy::too_many_lines, clippy::items_after_statements)]
 pub fn load_skills(options: LoadSkillsOptions) -> LoadSkillsResult {
     let mut skill_map: HashMap<String, Skill> = HashMap::new();
     let mut real_paths: HashSet<PathBuf> = HashSet::new();
-    let mut visited_dirs: HashSet<PathBuf> = HashSet::new();
+    let mut visited_dirs: HashMap<PathBuf, bool> = HashMap::new();
     let mut diagnostics = Vec::new();
     let mut collisions = Vec::new();
 
@@ -914,7 +1033,7 @@ pub fn load_skills(options: LoadSkillsOptions) -> LoadSkillsResult {
         diagnostics.extend(result.diagnostics);
         for skill in result.skills {
             let real_path = canonical_identity_path(&skill.file_path);
-            if real_paths.contains(&real_path) {
+            if !real_paths.insert(real_path) {
                 continue;
             }
 
@@ -931,37 +1050,54 @@ pub fn load_skills(options: LoadSkillsOptions) -> LoadSkillsResult {
                     }),
                 });
             } else {
-                real_paths.insert(real_path);
                 skill_map.insert(skill.name.clone(), skill);
             }
         }
     }
 
+    let default_dirs = default_skill_dirs(
+        &options.cwd,
+        &options.agent_dir,
+        options.home_dir.as_deref(),
+    );
+    let project_universal_dirs =
+        project_universal_skill_dirs(&options.cwd, options.home_dir.as_deref());
+    let user_universal_dir = options
+        .home_dir
+        .as_ref()
+        .map(|home| home.join(".agents").join("skills"));
+    let managed_dir = options.agent_dir.join("skills.managed");
+    let mut source_dirs = default_dirs.clone();
+    source_dirs.push((managed_dir.clone(), "managed"));
     if options.include_defaults {
-        merge_skills(
-            load_skills_from_dir_with_visited(
-                options.cwd.join(Config::project_dir()).join("skills"),
-                "project".to_string(),
-                true,
-                &mut visited_dirs,
-            ),
-            &mut skill_map,
-            &mut real_paths,
-            &mut diagnostics,
-            &mut collisions,
-        );
-        merge_skills(
-            load_skills_from_dir_with_visited(
-                options.agent_dir.join("skills"),
-                "user".to_string(),
-                true,
-                &mut visited_dirs,
-            ),
-            &mut skill_map,
-            &mut real_paths,
-            &mut diagnostics,
-            &mut collisions,
-        );
+        for (dir, source) in &default_dirs {
+            let universal_root = project_universal_dirs.iter().any(|root| root == dir)
+                || user_universal_dir.as_ref() == Some(dir);
+            merge_skills(
+                load_skills_from_dir_with_visited(
+                    dir.clone(),
+                    (*source).to_string(),
+                    !universal_root,
+                    &mut visited_dirs,
+                ),
+                &mut skill_map,
+                &mut real_paths,
+                &mut diagnostics,
+                &mut collisions,
+            );
+        }
+
+        // Legacy footgun (bd-3znxm): users coming from upstream pi docs put
+        // skills in `~/.pi/skills`, which Pi never loads — previously a
+        // silent no-op. Surface a diagnostic pointing at the real roots.
+        // Only when loading the real global dir: hermetic tests point
+        // agent_dir at temp roots and must not see host-dependent warnings.
+        if options.agent_dir == Config::global_dir()
+            && let Some(diagnostic) =
+                legacy_skills_dir_diagnostic(options.home_dir.as_deref(), &options.agent_dir)
+        {
+            diagnostics.push(diagnostic);
+        }
     }
 
     for resolved in options.skill_paths {
@@ -977,13 +1113,16 @@ pub fn load_skills(options: LoadSkillsOptions) -> LoadSkillsResult {
 
         let source = if options.include_defaults {
             "path".to_string()
-        } else if is_under_path(&resolved, &options.agent_dir.join("skills")) {
-            "user".to_string()
-        } else if is_under_path(
-            &resolved,
-            &options.cwd.join(Config::project_dir()).join("skills"),
-        ) {
-            "project".to_string()
+        } else if let Some((_, source)) = source_dirs
+            .iter()
+            .find(|(dir, _)| resolved.starts_with(dir))
+            .or_else(|| {
+                source_dirs
+                    .iter()
+                    .find(|(dir, _)| is_under_path(&resolved, dir))
+            })
+        {
+            (*source).to_string()
         } else {
             "path".to_string()
         };
@@ -1032,6 +1171,24 @@ pub fn load_skills(options: LoadSkillsOptions) -> LoadSkillsResult {
         }
     }
 
+    // Managed skills tier (bd-cv653.4.2): agent-authored skills load dead
+    // last — user/project skills always win collisions, and the collision
+    // diagnostic names the shadowed managed skill.
+    if options.include_defaults && managed_dir.is_dir() {
+        merge_skills(
+            load_skills_from_dir_with_visited(
+                managed_dir,
+                "managed".to_string(),
+                true,
+                &mut visited_dirs,
+            ),
+            &mut skill_map,
+            &mut real_paths,
+            &mut diagnostics,
+            &mut collisions,
+        );
+    }
+
     diagnostics.extend(collisions);
 
     let mut skills: Vec<Skill> = skill_map.into_values().collect();
@@ -1049,7 +1206,7 @@ fn load_skills_from_dir(
     source: String,
     include_root_files: bool,
 ) -> LoadSkillsResult {
-    let mut visited_dirs = HashSet::new();
+    let mut visited_dirs = HashMap::new();
     load_skills_from_dir_with_visited(dir, source, include_root_files, &mut visited_dirs)
 }
 
@@ -1057,10 +1214,12 @@ fn load_skills_from_dir_with_visited(
     dir: PathBuf,
     source: String,
     include_root_files: bool,
-    visited_dirs: &mut HashSet<PathBuf>,
+    visited_dirs: &mut HashMap<PathBuf, bool>,
 ) -> LoadSkillsResult {
     let mut skills = Vec::new();
     let mut diagnostics = Vec::new();
+    let root_dir = dir.clone();
+    let mut scanned_entries = 0usize;
     let mut stack = vec![(dir, source, include_root_files)];
 
     while let Some((current_dir, current_source, current_include_root)) = stack.pop() {
@@ -1068,15 +1227,43 @@ fn load_skills_from_dir_with_visited(
             continue;
         }
 
-        // Prevent unbounded recursion for symlink cycles.
+        // Prevent cycles and repeated subtree walks. A directory encountered
+        // earlier as a child may later be a discovery root, where all *.md
+        // files (not just SKILL.md) are eligible. In that case inspect only
+        // the additional root files; its descendants were already visited.
         let canonical_dir = fs::canonicalize(&current_dir).unwrap_or_else(|_| current_dir.clone());
-        if !visited_dirs.insert(canonical_dir) {
-            continue;
-        }
+        let root_files_only = match visited_dirs.entry(canonical_dir) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(current_include_root);
+                false
+            }
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                if !current_include_root || *entry.get() {
+                    continue;
+                }
+                entry.insert(true);
+                true
+            }
+        };
 
         let mut child_dirs = Vec::new();
+        let remaining = MAX_SKILL_DISCOVERY_ENTRIES.saturating_sub(scanned_entries);
+        let Some(paths) = read_dir_sorted_paths_bounded(&current_dir, remaining) else {
+            return LoadSkillsResult {
+                skills: Vec::new(),
+                diagnostics: vec![ResourceDiagnostic {
+                    kind: DiagnosticKind::Warning,
+                    message: format!(
+                        "skill discovery root exceeds the {MAX_SKILL_DISCOVERY_ENTRIES}-entry limit"
+                    ),
+                    path: root_dir,
+                    collision: None,
+                }],
+            };
+        };
+        scanned_entries = scanned_entries.saturating_add(paths.len());
 
-        for full_path in read_dir_sorted_paths(&current_dir) {
+        for full_path in paths {
             let file_name = full_path.file_name().unwrap_or_default().to_string_lossy();
 
             if file_name.starts_with('.') || file_name == "node_modules" {
@@ -1086,7 +1273,9 @@ fn load_skills_from_dir_with_visited(
             let (is_dir, is_file) = resolved_path_kind(&full_path);
 
             if is_dir {
-                child_dirs.push(full_path);
+                if !root_files_only {
+                    child_dirs.push(full_path);
+                }
                 continue;
             }
 
@@ -1097,6 +1286,9 @@ fn load_skills_from_dir_with_visited(
             let is_root_md = current_include_root && file_name.ends_with(".md");
             let is_skill_md = !current_include_root && file_name == "SKILL.md";
             if !is_root_md && !is_skill_md {
+                continue;
+            }
+            if root_files_only && file_name == "SKILL.md" {
                 continue;
             }
 
@@ -1126,17 +1318,20 @@ struct LoadSkillFileResult {
 fn load_skill_from_file(path: &Path, source: String) -> LoadSkillFileResult {
     let mut diagnostics = Vec::new();
 
-    let Ok(raw) = fs::read_to_string(path) else {
-        diagnostics.push(ResourceDiagnostic {
-            kind: DiagnosticKind::Warning,
-            message: "failed to parse skill file".to_string(),
-            path: path.to_path_buf(),
-            collision: None,
-        });
-        return LoadSkillFileResult {
-            skill: None,
-            diagnostics,
-        };
+    let raw = match read_resource_file_bounded(path, "Skill") {
+        Ok(raw) => raw,
+        Err(err) => {
+            diagnostics.push(ResourceDiagnostic {
+                kind: DiagnosticKind::Warning,
+                message: err.to_string(),
+                path: path.to_path_buf(),
+                collision: None,
+            });
+            return LoadSkillFileResult {
+                skill: None,
+                diagnostics,
+            };
+        }
     };
 
     let parsed = parse_frontmatter(&raw);
@@ -1197,6 +1392,20 @@ fn load_skill_from_file(path: &Path, source: String) -> LoadSkillFileResult {
     let disable_model_invocation = frontmatter
         .get("disable-model-invocation")
         .is_some_and(|v| v.eq_ignore_ascii_case("true"));
+    let user_invocable = parsed
+        .booleans
+        .get("user-invocable")
+        .copied()
+        .unwrap_or(true);
+    if frontmatter.contains_key("user-invocable") && !parsed.booleans.contains_key("user-invocable")
+    {
+        diagnostics.push(ResourceDiagnostic {
+            kind: DiagnosticKind::Warning,
+            message: "frontmatter field \"user-invocable\" must be a boolean".to_string(),
+            path: path.to_path_buf(),
+            collision: None,
+        });
+    }
 
     LoadSkillFileResult {
         skill: Some(Skill {
@@ -1206,12 +1415,13 @@ fn load_skill_from_file(path: &Path, source: String) -> LoadSkillFileResult {
             base_dir,
             source,
             disable_model_invocation,
+            user_invocable,
         }),
         diagnostics,
     }
 }
 
-fn validate_name(name: &str, parent_dir: &str) -> Vec<String> {
+pub(crate) fn validate_name(name: &str, parent_dir: &str) -> Vec<String> {
     let mut errors = Vec::new();
 
     if name != parent_dir {
@@ -1248,7 +1458,7 @@ fn validate_name(name: &str, parent_dir: &str) -> Vec<String> {
     errors
 }
 
-fn validate_description(description: &str) -> Vec<String> {
+pub(crate) fn validate_description(description: &str) -> Vec<String> {
     let mut errors = Vec::new();
     if description.trim().is_empty() {
         errors.push("description is required".to_string());
@@ -1261,7 +1471,7 @@ fn validate_description(description: &str) -> Vec<String> {
     errors
 }
 
-fn validate_frontmatter_fields<'a, I>(keys: I) -> Vec<String>
+pub(crate) fn validate_frontmatter_fields<'a, I>(keys: I) -> Vec<String>
 where
     I: IntoIterator<Item = &'a String>,
 {
@@ -1325,21 +1535,42 @@ fn escape_xml(input: &str) -> String {
 // ============================================================================
 
 pub fn load_prompt_templates(options: LoadPromptTemplatesOptions) -> Vec<PromptTemplate> {
+    let result = load_prompt_templates_with_diagnostics(options);
+    for diagnostic in &result.diagnostics {
+        warn!(
+            path = %diagnostic.path.display(),
+            message = %diagnostic.message,
+            "Prompt template was not loaded"
+        );
+    }
+    result.templates
+}
+
+pub(crate) fn load_prompt_templates_with_diagnostics(
+    options: LoadPromptTemplatesOptions,
+) -> LoadPromptTemplatesResult {
     let mut templates = Vec::new();
+    let mut diagnostics = Vec::new();
     let user_dir = options.agent_dir.join("prompts");
     let project_dir = options.cwd.join(Config::project_dir()).join("prompts");
 
     if options.include_defaults {
-        templates.extend(load_templates_from_dir(
-            &project_dir,
-            "project",
-            "(project)",
-        ));
-        templates.extend(load_templates_from_dir(&user_dir, "user", "(user)"));
+        let project = load_templates_from_dir(&project_dir, "project", "(project)");
+        templates.extend(project.templates);
+        diagnostics.extend(project.diagnostics);
+        let user = load_templates_from_dir(&user_dir, "user", "(user)");
+        templates.extend(user.templates);
+        diagnostics.extend(user.diagnostics);
     }
 
     for path in options.prompt_paths {
         if !path.exists() {
+            diagnostics.push(ResourceDiagnostic {
+                kind: DiagnosticKind::Warning,
+                message: "prompt template path does not exist".to_string(),
+                path,
+                collision: None,
+            });
             continue;
         }
 
@@ -1357,41 +1588,105 @@ pub fn load_prompt_templates(options: LoadPromptTemplatesOptions) -> Vec<PromptT
 
         match fs::metadata(&path) {
             Ok(meta) if meta.is_dir() => {
-                templates.extend(load_templates_from_dir(&path, source, &label));
+                let loaded = load_templates_from_dir(&path, source, &label);
+                templates.extend(loaded.templates);
+                diagnostics.extend(loaded.diagnostics);
             }
             Ok(meta) if meta.is_file() && path.extension().is_some_and(|ext| ext == "md") => {
-                if let Some(template) = load_template_from_file(&path, source, &label) {
-                    templates.push(template);
+                match load_template_from_file(&path, source, &label) {
+                    Ok(template) => templates.push(template),
+                    Err(err) => diagnostics.push(ResourceDiagnostic {
+                        kind: DiagnosticKind::Warning,
+                        message: err.to_string(),
+                        path,
+                        collision: None,
+                    }),
                 }
             }
-            _ => {}
+            Ok(_) => diagnostics.push(ResourceDiagnostic {
+                kind: DiagnosticKind::Warning,
+                message: "prompt template path is not a markdown file".to_string(),
+                path,
+                collision: None,
+            }),
+            Err(err) => diagnostics.push(ResourceDiagnostic {
+                kind: DiagnosticKind::Warning,
+                message: format!("failed to inspect prompt template path: {err}"),
+                path,
+                collision: None,
+            }),
         }
     }
 
-    templates
+    LoadPromptTemplatesResult {
+        templates,
+        diagnostics,
+    }
 }
 
-fn load_templates_from_dir(dir: &Path, source: &str, label: &str) -> Vec<PromptTemplate> {
+fn load_templates_from_dir(dir: &Path, source: &str, label: &str) -> LoadPromptTemplatesResult {
     let mut templates = Vec::new();
+    let mut diagnostics = Vec::new();
     if !dir.exists() {
-        return templates;
+        return LoadPromptTemplatesResult {
+            templates,
+            diagnostics,
+        };
     }
 
-    for full_path in read_dir_sorted_paths(dir) {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(err) => {
+            diagnostics.push(ResourceDiagnostic {
+                kind: DiagnosticKind::Warning,
+                message: format!("failed to read prompt template directory: {err}"),
+                path: dir.to_path_buf(),
+                collision: None,
+            });
+            return LoadPromptTemplatesResult {
+                templates,
+                diagnostics,
+            };
+        }
+    };
+    let mut paths = Vec::new();
+    for entry in entries {
+        match entry {
+            Ok(entry) => paths.push(entry.path()),
+            Err(err) => diagnostics.push(ResourceDiagnostic {
+                kind: DiagnosticKind::Warning,
+                message: format!("failed to inspect prompt template directory entry: {err}"),
+                path: dir.to_path_buf(),
+                collision: None,
+            }),
+        }
+    }
+    paths.sort();
+
+    for full_path in paths {
         let (_, is_file) = resolved_path_kind(&full_path);
 
         if is_file && full_path.extension().is_some_and(|ext| ext == "md") {
-            if let Some(template) = load_template_from_file(&full_path, source, label) {
-                templates.push(template);
+            match load_template_from_file(&full_path, source, label) {
+                Ok(template) => templates.push(template),
+                Err(err) => diagnostics.push(ResourceDiagnostic {
+                    kind: DiagnosticKind::Warning,
+                    message: err.to_string(),
+                    path: full_path,
+                    collision: None,
+                }),
             }
         }
     }
 
-    templates
+    LoadPromptTemplatesResult {
+        templates,
+        diagnostics,
+    }
 }
 
-fn load_template_from_file(path: &Path, source: &str, label: &str) -> Option<PromptTemplate> {
-    let raw = fs::read_to_string(path).ok()?;
+fn load_template_from_file(path: &Path, source: &str, label: &str) -> Result<PromptTemplate> {
+    let raw = read_resource_file_bounded(path, "Prompt template")?;
     let parsed = parse_frontmatter(&raw);
     let mut description = parsed
         .frontmatter
@@ -1399,17 +1694,17 @@ fn load_template_from_file(path: &Path, source: &str, label: &str) -> Option<Pro
         .cloned()
         .unwrap_or_default();
 
-    if description.is_empty() {
-        if let Some(first_line) = parsed.body.lines().find(|line| !line.trim().is_empty()) {
-            let trimmed = first_line.trim();
-            let truncated = if trimmed.chars().count() > 60 {
-                let s: String = trimmed.chars().take(57).collect();
-                format!("{s}...")
-            } else {
-                trimmed.to_string()
-            };
-            description = truncated;
-        }
+    if description.is_empty()
+        && let Some(first_line) = parsed.body.lines().find(|line| !line.trim().is_empty())
+    {
+        let trimmed = first_line.trim();
+        let truncated = if trimmed.chars().count() > 60 {
+            let s: String = trimmed.chars().take(57).collect();
+            format!("{s}...")
+        } else {
+            trimmed.to_string()
+        };
+        description = truncated;
     }
 
     if description.is_empty() {
@@ -1424,9 +1719,10 @@ fn load_template_from_file(path: &Path, source: &str, label: &str) -> Option<Pro
         .unwrap_or("template")
         .to_string();
 
-    Some(PromptTemplate {
+    Ok(PromptTemplate {
         name,
         description,
+        side: parsed.booleans.get("side") == Some(&true),
         content: parsed.body,
         source: source.to_string(),
         file_path: path.to_path_buf(),
@@ -1514,10 +1810,11 @@ fn load_themes_from_dir(
     for full_path in read_dir_sorted_paths(dir) {
         let (_, is_file) = resolved_path_kind(&full_path);
 
-        if is_file && is_theme_file(&full_path) {
-            if let Some(theme) = load_theme_from_file(&full_path, source, label, diagnostics) {
-                themes.push(theme);
-            }
+        if is_file
+            && is_theme_file(&full_path)
+            && let Some(theme) = load_theme_from_file(&full_path, source, label, diagnostics)
+        {
+            themes.push(theme);
         }
     }
 
@@ -1573,7 +1870,7 @@ fn load_theme_from_file(
 }
 
 fn load_legacy_ini_theme(path: &Path) -> Result<Theme> {
-    let content = fs::read_to_string(path)?;
+    let content = read_resource_file_bounded(path, "Theme")?;
     let mut theme = Theme::dark();
     if let Some(name) = path.file_stem().and_then(|s| s.to_str()) {
         theme.name = name.to_string();
@@ -1729,54 +2026,59 @@ fn split_command_name_and_args(text: &str, prefix_len: usize) -> (&str, &str) {
     (name, args)
 }
 
-/// Cached regex for positional `$1`, `$2`, … substitution.
-fn positional_arg_regex() -> &'static regex::Regex {
+/// Cached regex for every template argument placeholder: `${@:start}` /
+/// `${@:start:length}` (pi), `$@[start]` / `$@[start:]` / `$@[start:length]`
+/// (OMP), `$ARGUMENTS`, `$@` and positional `$1`, `$2`, ….
+fn template_arg_regex() -> &'static regex::Regex {
     static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    RE.get_or_init(|| regex::Regex::new(r"\$(\d+)").expect("positional arg regex"))
+    RE.get_or_init(|| {
+        regex::Regex::new(
+            r"\$\{@:(\d+)(?::(\d+))?\}|\$@\[(\d+)(?::(\d*))?\]|\$ARGUMENTS|\$@|\$(\d+)",
+        )
+        .expect("template arg regex")
+    })
 }
 
-/// Cached regex for `${@:start}` or `${@:start:length}` substitution.
-fn slice_arg_regex() -> &'static regex::Regex {
-    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    RE.get_or_init(|| regex::Regex::new(r"\$\{@:(\d+)(?::(\d+))?\}").expect("slice arg regex"))
-}
-
-#[allow(clippy::option_if_let_else)] // Clearer with if-let than map_or_else in the closure
+/// Fill a template's placeholders in one pass, so an argument that itself
+/// contains `$1` or `$@` is inserted as written, not substituted again.
 pub fn substitute_args(content: &str, args: &[String]) -> String {
-    let mut result = content.to_string();
-
-    // Positional $1, $2, ...
-    result = replace_regex(&result, positional_arg_regex(), |caps| {
-        let idx = caps[1].parse::<usize>().unwrap_or(0);
-        if idx == 0 {
-            String::new()
-        } else {
-            args.get(idx.saturating_sub(1)).cloned().unwrap_or_default()
-        }
-    });
-
-    // ${@:start} or ${@:start:length}
-    result = replace_regex(&result, slice_arg_regex(), |caps| {
-        let mut start = caps[1].parse::<usize>().unwrap_or(1);
-        if start == 0 {
-            start = 1;
-        }
-        let start_idx = start.saturating_sub(1);
-        let maybe_len = caps.get(2).and_then(|m| m.as_str().parse::<usize>().ok());
-        let slice = maybe_len.map_or_else(
-            || args.get(start_idx..).unwrap_or(&[]).to_vec(),
-            |len| {
-                let end = start_idx.saturating_add(len).min(args.len());
-                args.get(start_idx..end).unwrap_or(&[]).to_vec()
-            },
-        );
-        slice.join(" ")
-    });
-
     let all_args = args.join(" ");
-    result = result.replace("$ARGUMENTS", &all_args);
-    result = result.replace("$@", &all_args);
-    result
+    let number = |m: Option<regex::Match<'_>>| m.and_then(|m| m.as_str().parse::<usize>().ok());
+    replace_regex(content, template_arg_regex(), |caps| {
+        if let Some(idx) = caps.get(5) {
+            // `$0` names no argument.
+            let idx = idx.as_str().parse::<usize>().unwrap_or(0);
+            return idx
+                .checked_sub(1)
+                .and_then(|idx| args.get(idx))
+                .cloned()
+                .unwrap_or_default();
+        }
+        // `${@:0}` starts at the first argument, as bash's `$@` does.
+        let (start, length) = if caps.get(1).is_some() {
+            (number(caps.get(1)).unwrap_or(1).max(1), number(caps.get(2)))
+        } else if caps.get(3).is_some() {
+            // OMP: `$@[0]` and `$@[n:0]` select nothing.
+            let start = number(caps.get(3)).unwrap_or(0);
+            let length = caps
+                .get(4)
+                .filter(|m| !m.as_str().is_empty())
+                .map(|m| m.as_str().parse::<usize>().unwrap_or(usize::MAX));
+            if start == 0 || length == Some(0) {
+                return String::new();
+            }
+            (start, length)
+        } else {
+            return all_args.clone();
+        };
+        args.get(start.saturating_sub(1)..)
+            .unwrap_or(&[])
+            .iter()
+            .take(length.unwrap_or(usize::MAX))
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join(" ")
+    })
 }
 
 pub fn expand_prompt_template(text: &str, templates: &[PromptTemplate]) -> String {
@@ -1787,7 +2089,17 @@ pub fn expand_prompt_template(text: &str, templates: &[PromptTemplate]) -> Strin
 
     if let Some(template) = templates.iter().find(|t| t.name == name) {
         let args = parse_command_args(args);
-        return substitute_args(&template.content, &args);
+        let expanded = substitute_args(&template.content, &args);
+        // A template with no placeholder would drop what was typed after
+        // its name; OMP appends it instead (appendInlineArgsFallback).
+        let args_text = args.join(" ");
+        if args_text.is_empty() || template_arg_regex().is_match(&template.content) {
+            return expanded;
+        }
+        if expanded.is_empty() {
+            return args_text;
+        }
+        return format!("{expanded}\n\n{args_text}");
     }
 
     text.to_string()
@@ -1800,11 +2112,11 @@ fn expand_skill_command(text: &str, skills: &[Skill]) -> String {
 
     let (name, args) = split_command_name_and_args(text, 7);
 
-    let Some(skill) = skills.iter().find(|s| s.name == name) else {
+    let Some(skill) = skills.iter().find(|s| s.name == name && s.user_invocable) else {
         return text.to_string();
     };
 
-    match fs::read_to_string(&skill.file_path) {
+    match read_resource_file_bounded(&skill.file_path, "Skill") {
         Ok(content) => {
             let body = strip_frontmatter(&content).trim().to_string();
             let block = format!(
@@ -1836,6 +2148,9 @@ fn expand_skill_command(text: &str, skills: &[Skill]) -> String {
 
 struct ParsedFrontmatter {
     frontmatter: HashMap<String, String>,
+    /// Preserve scalar types for opt-in behavior such as `side: true`;
+    /// quoted or block-scalar text must not enable a boolean capability.
+    booleans: HashMap<String, bool>,
     body: String,
 }
 
@@ -1844,6 +2159,7 @@ fn parse_frontmatter(raw: &str) -> ParsedFrontmatter {
     let Some(first) = lines.next() else {
         return ParsedFrontmatter {
             frontmatter: HashMap::new(),
+            booleans: HashMap::new(),
             body: String::new(),
         };
     };
@@ -1851,6 +2167,7 @@ fn parse_frontmatter(raw: &str) -> ParsedFrontmatter {
     if first.trim() != "---" {
         return ParsedFrontmatter {
             frontmatter: HashMap::new(),
+            booleans: HashMap::new(),
             body: raw.to_string(),
         };
     }
@@ -1873,19 +2190,26 @@ fn parse_frontmatter(raw: &str) -> ParsedFrontmatter {
     if in_frontmatter {
         return ParsedFrontmatter {
             frontmatter: HashMap::new(),
+            booleans: HashMap::new(),
             body: raw.to_string(),
         };
     }
 
+    let (frontmatter, booleans) = parse_frontmatter_lines(&front_lines);
     ParsedFrontmatter {
-        frontmatter: parse_frontmatter_lines(&front_lines),
+        frontmatter,
+        booleans,
         body: body_lines.join("\n"),
     }
 }
 
-fn parse_frontmatter_lines(lines: &[&str]) -> HashMap<String, String> {
+fn parse_frontmatter_lines(lines: &[&str]) -> (HashMap<String, String>, HashMap<String, bool>) {
     let mut map = HashMap::new();
-    for line in lines {
+    let mut booleans = HashMap::new();
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
+        i += 1;
         let trimmed = line.trim();
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
@@ -1897,10 +2221,110 @@ fn parse_frontmatter_lines(lines: &[&str]) -> HashMap<String, String> {
         if key.is_empty() {
             continue;
         }
-        let value = value.trim().trim_matches('"').trim_matches('\'');
+        let value = value.trim();
+        if indent_of(line) == 0 {
+            booleans.remove(key);
+            let scalar = value.split_whitespace().next().unwrap_or("");
+            let suffix = value[scalar.len()..].trim_start();
+            if suffix.is_empty() || suffix.starts_with('#') {
+                match scalar {
+                    "true" | "True" | "TRUE" => {
+                        booleans.insert(key.to_string(), true);
+                    }
+                    "false" | "False" | "FALSE" => {
+                        booleans.insert(key.to_string(), false);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        // gh #240: `key: >` / `key: |` is a YAML block scalar whose value is
+        // the following, more-indented lines. Parsed line by line, each of
+        // those became its own entry, and any containing a colon surfaced as
+        // an "unknown frontmatter field" warning.
+        if let Some(folded) = block_scalar_folds(value) {
+            let (text, consumed) = read_block_scalar(&lines[i..], indent_of(line), folded);
+            i += consumed;
+            map.insert(key.to_string(), text);
+            continue;
+        }
+        let value = value.trim_matches('"').trim_matches('\'');
         map.insert(key.to_string(), value.to_string());
     }
-    map
+    (map, booleans)
+}
+
+/// `Some(true)` for a folded (`>`) block scalar header, `Some(false)` for a
+/// literal (`|`) one, with optional chomping/indentation indicators.
+fn block_scalar_folds(value: &str) -> Option<bool> {
+    let mut chars = value.chars();
+    let folded = match chars.next()? {
+        '>' => true,
+        '|' => false,
+        _ => return None,
+    };
+    chars
+        .all(|c| c == '-' || c == '+' || c.is_ascii_digit())
+        .then_some(folded)
+}
+
+/// Leading ASCII spaces and tabs, in bytes. Only those count as YAML
+/// indentation; `trim_start` would also eat Unicode spaces (NBSP, U+3000),
+/// and slicing a line at that width can land inside a multi-byte char.
+fn indent_of(line: &str) -> usize {
+    line.bytes()
+        .take_while(|b| matches!(b, b' ' | b'\t'))
+        .count()
+}
+
+/// Read a block scalar's lines (those indented deeper than its key) and
+/// return its text plus how many lines it used. Folded blocks join lines
+/// with spaces (a blank line is a newline); literal blocks keep newlines.
+/// Trailing blank lines are dropped, as frontmatter values never want them.
+fn read_block_scalar(lines: &[&str], key_indent: usize, folded: bool) -> (String, usize) {
+    let mut body: Vec<&str> = Vec::new();
+    let mut block_indent = None;
+    let mut consumed = 0;
+    for line in lines {
+        if line.trim().is_empty() {
+            body.push("");
+            consumed += 1;
+            continue;
+        }
+        let indent = indent_of(line);
+        let block = *block_indent.get_or_insert(indent);
+        if indent <= key_indent || indent < block {
+            break;
+        }
+        // The first `block` bytes are ASCII whitespace, so this is a char
+        // boundary.
+        body.push(line[block..].trim_end());
+        consumed += 1;
+    }
+    while body.last() == Some(&"") {
+        body.pop();
+        consumed -= 1;
+    }
+    let text = if folded {
+        let mut out = String::new();
+        let mut after_break = true;
+        for line in body {
+            if line.is_empty() {
+                out.push('\n');
+                after_break = true;
+            } else {
+                if !after_break {
+                    out.push(' ');
+                }
+                out.push_str(line);
+                after_break = false;
+            }
+        }
+        out
+    } else {
+        body.join("\n")
+    };
+    (text, consumed)
 }
 
 fn strip_frontmatter(raw: &str) -> String {
@@ -1984,6 +2408,39 @@ fn module_cache_dir() -> Option<PathBuf> {
     dirs::home_dir().map(|home| home.join(".pi").join("agent").join("cache").join("modules"))
 }
 
+/// Warn when a non-empty legacy `~/.pi/skills` directory exists (bd-3znxm):
+/// This is distinct from both the Pi-specific and universal skill roots, so
+/// skills placed there following upstream pi docs silently never load.
+fn legacy_skills_dir_diagnostic(
+    home_dir: Option<&Path>,
+    agent_dir: &Path,
+) -> Option<ResourceDiagnostic> {
+    let legacy_dir = home_dir?.join(".pi").join("skills");
+    let loaded_user_dir = agent_dir.join("skills");
+    let is_same_dir = match (legacy_dir.canonicalize(), loaded_user_dir.canonicalize()) {
+        (Ok(legacy), Ok(user)) => legacy == user,
+        _ => legacy_dir == loaded_user_dir,
+    };
+    if is_same_dir {
+        return None;
+    }
+    let has_entries = fs::read_dir(&legacy_dir).is_ok_and(|mut entries| entries.next().is_some());
+    if !has_entries {
+        return None;
+    }
+    Some(ResourceDiagnostic {
+        kind: DiagnosticKind::Warning,
+        message: format!(
+            "skills found in {} are never loaded; move them to {} (global) or \
+             .pi/skills/ (project)",
+            legacy_dir.display(),
+            loaded_user_dir.display()
+        ),
+        path: legacy_dir,
+        collision: None,
+    })
+}
+
 fn is_cache_module_path_with_cache_dir(path: &Path, cache_dir: Option<&Path>) -> bool {
     let Some(cache_dir) = cache_dir else {
         return false;
@@ -2043,11 +2500,11 @@ fn dedupe_extension_entries_by_id_with_cache_dir(
         let cache = is_cache_module_path_with_cache_dir(path, cache_dir);
         is_cache.push(cache);
 
-        if let Some(id) = extension_dedupe_key_from_path(path) {
-            if !cache {
-                // Source entry wins; record its index.
-                id_to_source_idx.entry(id).or_insert(idx);
-            }
+        if let Some(id) = extension_dedupe_key_from_path(path)
+            && !cache
+        {
+            // Source entry wins; record its index.
+            id_to_source_idx.entry(id).or_insert(idx);
         }
     }
 
@@ -2055,13 +2512,12 @@ fn dedupe_extension_entries_by_id_with_cache_dir(
     // has a source entry.
     let mut out = Vec::with_capacity(entries.len());
     for (idx, path) in entries.into_iter().enumerate() {
-        if is_cache[idx] {
-            if let Some(id) = extension_dedupe_key_from_path(&path) {
-                if id_to_source_idx.contains_key(&id) {
-                    // Skip cache entry — source entry is preferred.
-                    continue;
-                }
-            }
+        if is_cache[idx]
+            && let Some(id) = extension_dedupe_key_from_path(&path)
+            && id_to_source_idx.contains_key(&id)
+        {
+            // Skip cache entry — source entry is preferred.
+            continue;
         }
         out.push(path);
     }
@@ -2072,9 +2528,12 @@ fn dedupe_extension_entries_by_id_with_cache_dir(
 enum ResourcePathPrecedence {
     CliExtension,
     ProjectDirectory,
+    ProjectUniversal,
     GlobalDirectory,
+    GlobalUniversal,
     ProjectPackage,
     GlobalPackage,
+    Managed,
 }
 
 fn precedence_sorted_enabled_paths(resources: Vec<ResolvedResource>) -> Vec<PathBuf> {
@@ -2108,9 +2567,14 @@ const fn resource_path_precedence(resource: &ResolvedResource) -> ResourcePathPr
         (PackageScope::Project, ResourceOrigin::TopLevel) => {
             ResourcePathPrecedence::ProjectDirectory
         }
+        (PackageScope::Project, ResourceOrigin::Universal) => {
+            ResourcePathPrecedence::ProjectUniversal
+        }
         (PackageScope::User, ResourceOrigin::TopLevel) => ResourcePathPrecedence::GlobalDirectory,
+        (PackageScope::User, ResourceOrigin::Universal) => ResourcePathPrecedence::GlobalUniversal,
         (PackageScope::Project, ResourceOrigin::Package) => ResourcePathPrecedence::ProjectPackage,
         (PackageScope::User, ResourceOrigin::Package) => ResourcePathPrecedence::GlobalPackage,
+        (_, ResourceOrigin::Managed) => ResourcePathPrecedence::Managed,
     }
 }
 
@@ -2249,6 +2713,46 @@ fn ensure_explicit_file_paths_loaded(
     Ok(())
 }
 
+fn ensure_explicit_prompt_paths_loaded(
+    explicit_paths: &[PathBuf],
+    loaded_paths: Vec<PathBuf>,
+    diagnostics: &[ResourceDiagnostic],
+    resource_kind: ExplicitResourceKind,
+) -> Result<()> {
+    ensure_explicit_file_paths_loaded(explicit_paths, loaded_paths, diagnostics, resource_kind)?;
+
+    for root in explicit_paths {
+        let metadata = fs::metadata(root).map_err(|err| {
+            Error::config(format!(
+                "Failed to inspect explicit {} path '{}': {err}",
+                resource_kind.label(),
+                root.display()
+            ))
+        })?;
+        if !metadata.is_dir() {
+            continue;
+        }
+
+        if let Some(diagnostic) = diagnostics.iter().find(|diagnostic| {
+            diagnostic.kind == DiagnosticKind::Warning
+                && diagnostic.collision.is_none()
+                && (diagnostic.path == *root
+                    || diagnostic.path.starts_with(root)
+                    || is_under_path(&diagnostic.path, root))
+        }) {
+            return Err(Error::config(format!(
+                "Explicit {} directory '{}' could not load '{}': {}",
+                resource_kind.label(),
+                root.display(),
+                diagnostic.path.display(),
+                diagnostic.message
+            )));
+        }
+    }
+
+    Ok(())
+}
+
 fn replace_regex<F>(input: &str, regex: &regex::Regex, mut replacer: F) -> String
 where
     F: FnMut(&regex::Captures<'_>) -> String,
@@ -2268,12 +2772,365 @@ mod tests {
     use asupersync::runtime::RuntimeBuilder;
     use std::fs;
     use std::future::Future;
+    use std::io::Write;
+
+    #[test]
+    fn bounded_skill_directory_read_fails_closed_instead_of_returning_a_partial_set() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for name in ["c.md", "a.md", "b.md"] {
+            fs::write(dir.path().join(name), name).expect("write fixture");
+        }
+
+        assert!(
+            read_dir_sorted_paths_bounded(dir.path(), 2).is_none(),
+            "an over-budget directory must fail closed"
+        );
+        let paths = read_dir_sorted_paths_bounded(dir.path(), 3).expect("within budget");
+        assert_eq!(
+            paths
+                .iter()
+                .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+            ["a.md", "b.md", "c.md"]
+        );
+    }
+
+    fn write_resource_at_limit(path: &Path, prefix: &[u8]) {
+        assert!(prefix.len() <= MAX_RESOURCE_FILE_BYTES);
+        let mut file = fs::File::create(path).expect("create exact-limit resource");
+        file.write_all(prefix).expect("write resource prefix");
+        let padding = [b' '; 8192];
+        let mut remaining = MAX_RESOURCE_FILE_BYTES - prefix.len();
+        while remaining > 0 {
+            let count = remaining.min(padding.len());
+            file.write_all(&padding[..count])
+                .expect("write resource padding");
+            remaining -= count;
+        }
+    }
+
+    fn create_resource_over_limit(path: &Path) {
+        let file = fs::File::create(path).expect("create oversized sparse resource");
+        file.set_len((MAX_RESOURCE_FILE_BYTES + 1) as u64)
+            .expect("set oversized sparse resource length");
+    }
+
+    fn prompt_only_cli(path: &Path) -> ResourceCliOptions {
+        ResourceCliOptions {
+            no_skills: true,
+            no_prompt_templates: true,
+            no_extensions: true,
+            no_themes: true,
+            skill_paths: Vec::new(),
+            prompt_paths: vec![path.to_string_lossy().into_owned()],
+            extension_paths: Vec::new(),
+            theme_paths: Vec::new(),
+        }
+    }
+
+    fn load_explicit_prompt(temp_dir: &tempfile::TempDir, path: &Path) -> Result<ResourceLoader> {
+        run_async(async {
+            ResourceLoader::load(
+                &PackageManager::new(temp_dir.path().to_path_buf()),
+                temp_dir.path(),
+                &Config::default(),
+                &prompt_only_cli(path),
+            )
+            .await
+        })
+    }
 
     fn run_async<T>(future: impl Future<Output = T>) -> T {
         let runtime = RuntimeBuilder::current_thread()
             .build()
             .expect("build runtime");
         runtime.block_on(future)
+    }
+
+    #[test]
+    fn test_skill_resource_limit_accepts_exact_and_rejects_plus_one() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let exact_dir = temp_dir.path().join("exact-skill");
+        let oversized_dir = temp_dir.path().join("oversized-skill");
+        fs::create_dir_all(&exact_dir).expect("create exact skill dir");
+        fs::create_dir_all(&oversized_dir).expect("create oversized skill dir");
+        let exact = exact_dir.join("SKILL.md");
+        let oversized = oversized_dir.join("SKILL.md");
+        write_resource_at_limit(
+            &exact,
+            b"---\nname: exact-skill\ndescription: Exact-limit skill\n---\nBody\n",
+        );
+        create_resource_over_limit(&oversized);
+
+        let result = load_skills(LoadSkillsOptions {
+            cwd: temp_dir.path().to_path_buf(),
+            agent_dir: temp_dir.path().join("agent"),
+            home_dir: None,
+            skill_paths: vec![exact.clone(), oversized.clone()],
+            include_defaults: false,
+        });
+
+        assert_eq!(result.skills.len(), 1);
+        assert_eq!(result.skills[0].file_path, exact);
+        assert!(result.diagnostics.iter().any(|diagnostic| {
+            diagnostic.path == oversized
+                && diagnostic
+                    .message
+                    .contains(&format!("{MAX_RESOURCE_FILE_BYTES}-byte resource limit"))
+        }));
+    }
+
+    #[test]
+    fn test_prompt_resource_limit_accepts_exact_and_rejects_plus_one() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let prompts_dir = temp_dir.path().join("prompts");
+        fs::create_dir_all(&prompts_dir).expect("create prompts dir");
+        let exact = prompts_dir.join("exact.md");
+        let oversized = prompts_dir.join("oversized.md");
+        write_resource_at_limit(
+            &exact,
+            b"---\ndescription: Exact-limit prompt\n---\nPrompt body\n",
+        );
+        create_resource_over_limit(&oversized);
+
+        let result = load_prompt_templates_with_diagnostics(LoadPromptTemplatesOptions {
+            cwd: temp_dir.path().to_path_buf(),
+            agent_dir: temp_dir.path().join("agent"),
+            prompt_paths: vec![prompts_dir],
+            include_defaults: false,
+        });
+
+        assert_eq!(result.templates.len(), 1);
+        assert_eq!(result.templates[0].file_path, exact);
+        assert!(result.diagnostics.iter().any(|diagnostic| {
+            diagnostic.path == oversized
+                && diagnostic
+                    .message
+                    .contains(&format!("{MAX_RESOURCE_FILE_BYTES}-byte resource limit"))
+        }));
+    }
+
+    #[test]
+    fn test_theme_resource_limit_accepts_exact_and_rejects_plus_one() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let themes_dir = temp_dir.path().join("themes");
+        fs::create_dir_all(&themes_dir).expect("create themes dir");
+        let exact = themes_dir.join("exact.ini");
+        let oversized = themes_dir.join("oversized.theme");
+        write_resource_at_limit(&exact, b"[styles]\nbrand.accent = #38bdf8\n");
+        create_resource_over_limit(&oversized);
+
+        let result = load_themes(LoadThemesOptions {
+            cwd: temp_dir.path().to_path_buf(),
+            agent_dir: temp_dir.path().join("agent"),
+            theme_paths: vec![themes_dir],
+            include_defaults: false,
+        });
+
+        assert_eq!(result.themes.len(), 1);
+        assert_eq!(result.themes[0].file_path, exact);
+        assert!(result.diagnostics.iter().any(|diagnostic| {
+            diagnostic.path == oversized
+                && diagnostic
+                    .message
+                    .contains(&format!("{MAX_RESOURCE_FILE_BYTES}-byte resource limit"))
+        }));
+    }
+
+    #[test]
+    fn test_json_theme_resource_limit_accepts_exact_and_rejects_plus_one() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let exact = temp_dir.path().join("exact.json");
+        let oversized = temp_dir.path().join("oversized.json");
+        let encoded = serde_json::to_vec(&Theme::dark()).expect("serialize theme");
+        write_resource_at_limit(&exact, &encoded);
+        create_resource_over_limit(&oversized);
+
+        Theme::load(&exact).expect("exact-limit JSON theme should load");
+        let error = Theme::load(&oversized).expect_err("plus-one JSON theme should fail");
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("{MAX_RESOURCE_FILE_BYTES}-byte resource limit")),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn test_json_theme_rejects_invalid_utf8_without_lossy_decoding() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let invalid = temp_dir.path().join("invalid.json");
+        fs::write(&invalid, [0xff, 0xfe]).expect("write invalid JSON theme");
+
+        let error = Theme::load(&invalid).expect_err("invalid UTF-8 theme must fail");
+        let message = error.to_string();
+        assert!(
+            message.contains(&invalid.display().to_string()),
+            "{message}"
+        );
+        assert!(message.contains("not valid UTF-8"), "{message}");
+    }
+
+    #[test]
+    fn test_configured_resource_failures_remain_visible_in_loader_diagnostics() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let skill_dir = temp_dir.path().join("oversized-skill");
+        fs::create_dir_all(&skill_dir).expect("create skill dir");
+        let skill = skill_dir.join("SKILL.md");
+        let prompt = temp_dir.path().join("oversized-prompt.md");
+        let theme = temp_dir.path().join("oversized-theme.ini");
+        create_resource_over_limit(&skill);
+        create_resource_over_limit(&prompt);
+        create_resource_over_limit(&theme);
+
+        let mut loader = ResourceLoader::empty(true);
+        loader
+            .extend_with_paths(
+                temp_dir.path(),
+                &ExtensionResourcePaths {
+                    skill_paths: vec![skill.clone()],
+                    prompt_paths: vec![prompt.clone()],
+                    theme_paths: vec![theme.clone()],
+                },
+            )
+            .expect("configured resource failures should be diagnostics");
+
+        assert!(loader.skills().is_empty());
+        assert!(loader.prompts().is_empty());
+        assert!(loader.themes().is_empty());
+        assert!(loader.skill_diagnostics().iter().any(|d| d.path == skill));
+        assert!(loader.prompt_diagnostics().iter().any(|d| d.path == prompt));
+        assert!(loader.theme_diagnostics().iter().any(|d| d.path == theme));
+    }
+
+    #[test]
+    fn test_explicit_prompt_file_rejects_invalid_utf8_with_path() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let prompt = temp_dir.path().join("invalid.md");
+        fs::write(&prompt, [0xff, 0xfe]).expect("write invalid UTF-8 prompt");
+
+        let error = load_explicit_prompt(&temp_dir, &prompt)
+            .expect_err("explicit invalid UTF-8 prompt should fail");
+        let message = error.to_string();
+        assert!(message.contains(&prompt.display().to_string()), "{message}");
+        assert!(message.contains("not valid UTF-8"), "{message}");
+    }
+
+    #[test]
+    fn test_explicit_prompt_file_rejects_oversize_with_path() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let prompt = temp_dir.path().join("oversized.md");
+        create_resource_over_limit(&prompt);
+
+        let error = load_explicit_prompt(&temp_dir, &prompt)
+            .expect_err("explicit oversized prompt should fail");
+        let message = error.to_string();
+        assert!(message.contains(&prompt.display().to_string()), "{message}");
+        assert!(
+            message.contains(&format!("{MAX_RESOURCE_FILE_BYTES}-byte resource limit")),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn test_explicit_prompt_directory_rejects_invalid_utf8_child_with_path() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let prompts = temp_dir.path().join("prompts");
+        fs::create_dir_all(&prompts).expect("create prompts dir");
+        let prompt = prompts.join("invalid.md");
+        fs::write(&prompt, [0xff, 0xfe]).expect("write invalid UTF-8 prompt");
+
+        let error = load_explicit_prompt(&temp_dir, &prompts)
+            .expect_err("explicit prompt directory should fail on invalid UTF-8 child");
+        let message = error.to_string();
+        assert!(
+            message.contains(&prompts.display().to_string()),
+            "{message}"
+        );
+        assert!(message.contains(&prompt.display().to_string()), "{message}");
+        assert!(message.contains("not valid UTF-8"), "{message}");
+    }
+
+    #[test]
+    fn test_explicit_prompt_directory_rejects_oversize_child_with_path() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let prompts = temp_dir.path().join("prompts");
+        fs::create_dir_all(&prompts).expect("create prompts dir");
+        let prompt = prompts.join("oversized.md");
+        create_resource_over_limit(&prompt);
+
+        let error = load_explicit_prompt(&temp_dir, &prompts)
+            .expect_err("explicit prompt directory should fail on oversized child");
+        let message = error.to_string();
+        assert!(
+            message.contains(&prompts.display().to_string()),
+            "{message}"
+        );
+        assert!(message.contains(&prompt.display().to_string()), "{message}");
+        assert!(
+            message.contains(&format!("{MAX_RESOURCE_FILE_BYTES}-byte resource limit")),
+            "{message}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_explicit_prompt_path_and_directory_reject_unreadable_file_with_path() {
+        use std::os::unix::fs::PermissionsExt;
+
+        for use_directory in [false, true] {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let prompts = temp_dir.path().join("prompts");
+            fs::create_dir_all(&prompts).expect("create prompts dir");
+            let prompt = prompts.join("unreadable.md");
+            fs::write(&prompt, "Prompt body\n").expect("write prompt");
+            let original_permissions = fs::metadata(&prompt)
+                .expect("prompt metadata")
+                .permissions();
+            let mut unreadable = original_permissions.clone();
+            unreadable.set_mode(0o0);
+            fs::set_permissions(&prompt, unreadable).expect("make prompt unreadable");
+
+            let open_is_denied = fs::File::open(&prompt).is_err();
+            let selected = if use_directory { &prompts } else { &prompt };
+            let result = load_explicit_prompt(&temp_dir, selected);
+            fs::set_permissions(&prompt, original_permissions).expect("restore prompt permissions");
+
+            if !open_is_denied {
+                assert!(
+                    result.is_ok(),
+                    "privileged runner could open the permissionless fixture but loader disagreed"
+                );
+                continue;
+            }
+            let error = result.expect_err("unreadable explicit prompt should fail");
+            let message = error.to_string();
+            assert!(message.contains(&prompt.display().to_string()), "{message}");
+            assert!(message.contains("Failed to open"), "{message}");
+        }
+    }
+
+    #[test]
+    fn test_skill_command_reread_enforces_the_resource_limit() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let skill_path = temp_dir.path().join("SKILL.md");
+        create_resource_over_limit(&skill_path);
+        let skill = Skill {
+            name: "reread-limit".to_string(),
+            description: "reread limit probe".to_string(),
+            file_path: skill_path,
+            base_dir: temp_dir.path().to_path_buf(),
+            source: "test".to_string(),
+            disable_model_invocation: false,
+            user_invocable: true,
+        };
+
+        let command = "/skill:reread-limit keep-these-args";
+        assert_eq!(
+            expand_skill_command(command, &[skill]),
+            command,
+            "an oversized /skill source must not expand through an unbounded reread"
+        );
     }
 
     #[test]
@@ -2300,12 +3157,71 @@ mod tests {
         assert_eq!(substitute_args("${@:2:1}", &args), "two");
     }
 
+    /// OMP's `$@[start:length]` slices work next to pi's `${@:start:length}`,
+    /// and an argument is inserted as written: the old pass-per-placeholder
+    /// loop substituted a `$@` or `$2` inside an argument a second time.
+    #[test]
+    fn substitute_args_reads_omp_slices_and_never_substitutes_twice() {
+        let args = vec!["one".to_string(), "two".to_string(), "three".to_string()];
+        assert_eq!(substitute_args("$@[2]", &args), "two three");
+        assert_eq!(substitute_args("$@[2:]", &args), "two three");
+        assert_eq!(substitute_args("$@[2:1]", &args), "two");
+        assert_eq!(
+            substitute_args("[$@[0]] [$@[2:0]] [$@[9]]", &args),
+            "[] [] []"
+        );
+        assert_eq!(substitute_args("${@:0}", &args), "one two three");
+
+        let tricky = vec!["$2".to_string(), "$@".to_string()];
+        assert_eq!(substitute_args("[$1] [$2]", &tricky), "[$2] [$@]");
+        assert_eq!(substitute_args("$ARGUMENTS", &tricky), "$2 $@");
+    }
+
+    /// A template with no placeholder used to drop everything typed after
+    /// its name. OMP appends it (appendInlineArgsFallback).
+    #[test]
+    fn expand_prompt_template_appends_arguments_the_template_does_not_place() {
+        let template = |content: &str| PromptTemplate {
+            name: "review".to_string(),
+            description: "Review code".to_string(),
+            content: content.to_string(),
+            side: false,
+            source: "user".to_string(),
+            file_path: PathBuf::from("/tmp/review.md"),
+        };
+        let plain = [template("Review the staged changes.")];
+        assert_eq!(
+            expand_prompt_template("/review focus on \"error paths\"", &plain),
+            "Review the staged changes.\n\nfocus on error paths"
+        );
+        assert_eq!(
+            expand_prompt_template("/review", &plain),
+            "Review the staged changes."
+        );
+        assert_eq!(
+            expand_prompt_template("/review only this", &[template("")]),
+            "only this"
+        );
+        for placed in [
+            "Review $1",
+            "Review $@[2]",
+            "Review ${@:2}",
+            "Review $ARGUMENTS",
+        ] {
+            assert!(
+                !expand_prompt_template("/review a b", &[template(placed)]).contains("\n\n"),
+                "{placed}: placed arguments are not appended again"
+            );
+        }
+    }
+
     #[test]
     fn test_expand_prompt_template() {
         let template = PromptTemplate {
             name: "review".to_string(),
             description: "Review code".to_string(),
             content: "Review $1".to_string(),
+            side: false,
             source: "user".to_string(),
             file_path: PathBuf::from("/tmp/review.md"),
         };
@@ -2315,6 +3231,72 @@ mod tests {
         assert_eq!(tab_out, "Review foo");
         let newline_out = expand_prompt_template("/review\nfoo", std::slice::from_ref(&template));
         assert_eq!(newline_out, "Review foo");
+    }
+
+    #[test]
+    fn side_templates_require_boolean_frontmatter_and_keep_ordinary_expansion() {
+        let dir = tempfile::tempdir().expect("templates");
+        let path = dir.path().join("sitrep.md");
+        for (header, side) in [
+            ("side: true", true),
+            ("side: true # ephemeral", true),
+            ("side: false", false),
+            ("description: Brief status", false),
+            ("side: \"true\"", false),
+            ("side: 'true'", false),
+            ("side: yes", false),
+            ("side: trueish", false),
+            ("side: |\n  true", false),
+            ("metadata:\n  side: true", false),
+            ("description: |\n  side: true", false),
+            ("side: true\nside: false", false),
+        ] {
+            fs::write(&path, format!("---\n{header}\n---\nSummarize $ARGUMENTS"))
+                .expect("write template");
+            let template =
+                load_template_from_file(&path, "project", "(project)").expect("load template");
+            assert_eq!(template.side, side, "{header}");
+            let mut resources = ResourceLoader::empty(true);
+            resources.prompts.push(template);
+            for (input, expanded) in [
+                ("/sitrep", "Summarize "),
+                ("/sitrep \"the retry path\"", "Summarize the retry path"),
+                ("/sitrep '$1'", "Summarize $1"),
+            ] {
+                assert_eq!(resources.expand_input(input), expanded);
+                assert_eq!(
+                    resources.expand_side_prompt(input).as_deref(),
+                    side.then_some(expanded),
+                );
+            }
+            assert_eq!(resources.list_commands()[0]["side"], json!(side));
+            assert!(resources.expand_side_prompt("/sitrep-extra").is_none());
+            assert!(resources.expand_side_prompt("ordinary /sitrep").is_none());
+        }
+    }
+
+    #[test]
+    fn side_template_routing_follows_the_winning_template_and_never_recurses() {
+        let mut resources = ResourceLoader::empty(true);
+        let mut template = PromptTemplate {
+            name: "summary".into(),
+            description: String::new(),
+            content: "/other generated".into(),
+            side: false,
+            source: "project".into(),
+            file_path: PathBuf::from("summary.md"),
+        };
+        resources.prompts.push(template.clone());
+        template.side = true;
+        template.source = "user".into();
+        resources.prompts.push(template);
+        assert!(resources.expand_side_prompt("/summary").is_none());
+        resources.prompts[0].side = true;
+        assert_eq!(
+            resources.expand_side_prompt("/summary detail").as_deref(),
+            Some("/other generated\n\ndetail")
+        );
+        assert!(resources.expand_side_prompt("/skill:summary").is_none());
     }
 
     #[test]
@@ -2336,6 +3318,7 @@ mod tests {
             base_dir: skill_dir,
             source: "user".to_string(),
             disable_model_invocation: false,
+            user_invocable: true,
         };
 
         let tab_out = expand_skill_command(
@@ -2360,6 +3343,7 @@ mod tests {
                 base_dir: PathBuf::from("/tmp/a"),
                 source: "user".to_string(),
                 disable_model_invocation: false,
+                user_invocable: true,
             },
             Skill {
                 name: "b".to_string(),
@@ -2368,6 +3352,7 @@ mod tests {
                 base_dir: PathBuf::from("/tmp/b"),
                 source: "user".to_string(),
                 disable_model_invocation: true,
+                user_invocable: true,
             },
         ];
         let prompt = format_skills_for_prompt(&skills);
@@ -2643,6 +3628,49 @@ mod tests {
     }
 
     #[test]
+    fn test_explicit_cli_skill_survives_no_skills_flag() {
+        // gh #177: `--no-skills` disables configured/discovered skills
+        // (settings.json `skills` entries included — upstream parity with
+        // pi-mono's resource-loader), while explicit `--skill` paths must
+        // still load. This pins the "still load" half of that contract.
+        run_async(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let skill_path = temp_dir.path().join("SKILL.md");
+            fs::write(
+                &skill_path,
+                "---\nname: explicit-skill\ndescription: Survives --no-skills\n---\nBody.",
+            )
+            .expect("write skill");
+
+            let manager = PackageManager::new(temp_dir.path().to_path_buf());
+            let config = Config::default();
+            let cli = ResourceCliOptions {
+                no_skills: true,
+                no_prompt_templates: true,
+                no_extensions: true,
+                no_themes: true,
+                skill_paths: vec![skill_path.to_string_lossy().to_string()],
+                prompt_paths: Vec::new(),
+                extension_paths: Vec::new(),
+                theme_paths: Vec::new(),
+            };
+
+            let loader = ResourceLoader::load(&manager, temp_dir.path(), &config, &cli)
+                .await
+                .expect("load resources");
+            assert_eq!(
+                loader
+                    .skills()
+                    .iter()
+                    .map(|skill| skill.name.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["explicit-skill"],
+                "explicit --skill path must load under --no-skills"
+            );
+        });
+    }
+
+    #[test]
     fn test_resource_loader_rejects_invalid_cli_theme_file() {
         run_async(async {
             let temp_dir = tempfile::tempdir().expect("tempdir");
@@ -2892,9 +3920,122 @@ mod tests {
     }
 
     #[test]
+    fn context_mode_skill_invocation_frontmatter_controls_commands_independently() {
+        let root = tempfile::tempdir().expect("tempdir");
+        for (field, expected, warning) in [
+            ("", true, false),
+            ("user-invocable: true\n", true, false),
+            ("user-invocable: false\n", false, false),
+            ("user-invocable: FALSE # model-only\n", false, false),
+            ("user-invocable: \"false\"\n", true, true),
+        ] {
+            let skill_dir = root.path().join("ctx-search");
+            fs::create_dir_all(&skill_dir).expect("create skill directory");
+            let skill_file = skill_dir.join("SKILL.md");
+            fs::write(
+                &skill_file,
+                format!(
+                    "---\nname: ctx-search\ndescription: |\n  Search persistent context.\n  Trigger: context search\n{field}---\nCall the context search tool.\n"
+                ),
+            )
+            .expect("write context-mode style skill");
+            let loaded = load_skill_from_file(&skill_file, "npm:context-mode".to_string());
+            assert_eq!(loaded.diagnostics.len(), usize::from(warning), "{field}");
+            if warning {
+                assert!(loaded.diagnostics[0].message.contains("must be a boolean"));
+            }
+            let skill = loaded.skill.expect("load skill");
+            assert_eq!(skill.user_invocable, expected, "{field}");
+            let mut resources = ResourceLoader::empty(true);
+            resources.skills.push(skill);
+            let catalog = crate::autocomplete::AutocompleteCatalog::from_resources(&resources);
+            assert_eq!(catalog.skills.len(), usize::from(expected), "{field}");
+            let command = "/skill:ctx-search retained arguments";
+            let expanded = expand_skill_command(command, resources.skills());
+            assert_eq!(expanded != command, expected, "{field}");
+            assert!(
+                format_skills_for_prompt(resources.skills()).contains("<name>ctx-search</name>")
+            );
+            resources.skills[0].disable_model_invocation = true;
+            assert!(format_skills_for_prompt(resources.skills()).is_empty());
+        }
+    }
+
+    #[test]
     fn test_escape_xml_replaces_all_special_chars() {
         let escaped = escape_xml("& < > \" '");
         assert_eq!(escaped, "&amp; &lt; &gt; &quot; &apos;");
+    }
+
+    /// gh #240: the reporter's folded description. Its continuation lines
+    /// (one contains a colon) belong to `description`, so no bogus field is
+    /// parsed and validation stays clean.
+    #[test]
+    fn test_parse_frontmatter_folded_block_scalar() {
+        let parsed = parse_frontmatter(
+            "---\n\
+             name: ponytail\n\
+             description: >\n  \
+               Forces the laziest solution that actually works.\n  \
+               Use on ANY coding task: writing, adding, refactoring.\n\
+             disable-model-invocation: true\n\
+             ---\n\
+             body",
+        );
+        assert_eq!(
+            parsed.frontmatter.get("description").map(String::as_str),
+            Some(
+                "Forces the laziest solution that actually works. \
+                 Use on ANY coding task: writing, adding, refactoring."
+            )
+        );
+        assert_eq!(
+            parsed
+                .frontmatter
+                .get("disable-model-invocation")
+                .map(String::as_str),
+            Some("true"),
+            "the key after the block still parses"
+        );
+        assert!(validate_frontmatter_fields(parsed.frontmatter.keys()).is_empty());
+        assert_eq!(parsed.body, "body");
+    }
+
+    /// A Unicode space is not YAML indentation: a block line led by NBSP
+    /// must not be sliced mid-character (it used to panic skill loading).
+    #[test]
+    fn test_parse_frontmatter_block_scalar_survives_unicode_spaces() {
+        let parsed = parse_frontmatter(
+            "---\ndescription: >\n  one\n \u{a0}two\n\u{3000}three\nname: x\n---\n",
+        );
+        assert_eq!(
+            parsed.frontmatter.get("description").map(String::as_str),
+            Some("one")
+        );
+        assert_eq!(
+            parsed.frontmatter.get("name").map(String::as_str),
+            Some("x")
+        );
+    }
+
+    #[test]
+    fn test_parse_frontmatter_literal_block_scalar_keeps_lines() {
+        let parsed =
+            parse_frontmatter("---\ndescription: |-\n  line one: a\n\n  line two\nname: x\n---\n");
+        assert_eq!(
+            parsed.frontmatter.get("description").map(String::as_str),
+            Some("line one: a\n\nline two")
+        );
+        assert_eq!(
+            parsed.frontmatter.get("name").map(String::as_str),
+            Some("x")
+        );
+        // A value that merely starts with `>` text is not a block header.
+        let plain = parse_frontmatter("---\ndescription: >not a block\n---\n");
+        assert_eq!(
+            plain.frontmatter.get("description").map(String::as_str),
+            Some(">not a block")
+        );
     }
 
     #[test]
@@ -3075,6 +4216,119 @@ still frontmatter",
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
+    fn test_skill_precedence_across_cli_universal_packages_and_managed() {
+        run_async(async {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let cwd = temp.path().join("project");
+            let agent_dir = temp.path().join("custom-agent");
+            let home = temp.path().join("home");
+            let cli_package = temp.path().join("cli-package");
+            let project_package = temp.path().join("project-package");
+            let user_package = temp.path().join("user-package");
+            let tiers = [
+                temp.path().join("explicit"),
+                cli_package.join("skills"),
+                cwd.join(".pi/skills"),
+                cwd.join(".agents/skills"),
+                agent_dir.join("skills"),
+                home.join(".agents/skills"),
+                project_package.join("skills"),
+                user_package.join("skills"),
+                agent_dir.join("skills.managed"),
+            ];
+            // Each winner competes with every lower tier. This exercises real
+            // package resolution, including its path sorting, before the same
+            // merge/load pipeline used by ResourceLoader::load.
+            for winner in 0..tiers.len() {
+                let name = format!("tier-{winner}");
+                for dir in &tiers[winner..] {
+                    let skill_dir = dir.join(&name);
+                    fs::create_dir_all(&skill_dir).expect("create skill dir");
+                    fs::write(
+                        skill_dir.join("SKILL.md"),
+                        format!("---\nname: {name}\ndescription: A precedence fixture\n---\nBody"),
+                    )
+                    .expect("write skill");
+                }
+            }
+            for package in [&cli_package, &project_package, &user_package] {
+                fs::write(
+                    package.join("package.json"),
+                    r#"{"pi":{"skills":["skills"]}}"#,
+                )
+                .expect("write package manifest");
+            }
+            let roots = crate::package_manager::ResolveRoots {
+                global_settings_path: agent_dir.join("settings.json"),
+                project_settings_path: cwd.join(".pi/settings.json"),
+                global_base_dir: agent_dir.clone(),
+                project_base_dir: cwd.join(".pi"),
+                project_settings_enabled: true,
+                home_dir: Some(home.clone()),
+            };
+            for (settings, package) in [
+                (&roots.global_settings_path, &user_package),
+                (&roots.project_settings_path, &project_package),
+            ] {
+                fs::write(
+                    settings,
+                    serde_json::to_vec(&json!({"packages": [package]})).expect("encode settings"),
+                )
+                .expect("write settings");
+            }
+            let manager = PackageManager::new(cwd.clone());
+            let resolved = manager
+                .resolve_with_roots(&roots)
+                .await
+                .expect("resolve defaults");
+            let cli = manager
+                .resolve_extension_sources(
+                    &[cli_package.to_string_lossy().into_owned()],
+                    ResolveExtensionSourcesOptions {
+                        local: false,
+                        temporary: true,
+                    },
+                )
+                .await
+                .expect("resolve CLI package");
+
+            for include_configured in [true, false] {
+                let paths = merge_resource_paths(
+                    &tiers[..1],
+                    cli.skills.clone(),
+                    resolved.skills.clone(),
+                    include_configured,
+                );
+                let result = load_skills(LoadSkillsOptions {
+                    cwd: cwd.clone(),
+                    agent_dir: agent_dir.clone(),
+                    home_dir: Some(home.clone()),
+                    skill_paths: paths,
+                    include_defaults: false,
+                });
+                let expected_count = if include_configured { 9 } else { 2 };
+                assert_eq!(result.skills.len(), expected_count);
+                for (index, skill) in result.skills.iter().enumerate() {
+                    let name = format!("tier-{index}");
+                    assert_eq!(skill.name, name);
+                    assert_eq!(skill.file_path, tiers[index].join(name).join("SKILL.md"));
+                }
+                assert_eq!(
+                    result.diagnostics.len(),
+                    if include_configured { 36 } else { 1 }
+                );
+                assert!(
+                    result
+                        .diagnostics
+                        .iter()
+                        .all(|d| d.kind == DiagnosticKind::Collision)
+                );
+            }
+        });
+    }
+
+    #[test]
     fn test_precedence_sorted_enabled_paths_preserves_source_order_within_same_precedence() {
         let resources = vec![
             ResolvedResource {
@@ -3226,6 +4480,7 @@ still frontmatter",
                 name: "review".to_string(),
                 description: "first".to_string(),
                 content: "content1".to_string(),
+                side: false,
                 source: "a".to_string(),
                 file_path: PathBuf::from("/a/review.md"),
             },
@@ -3233,6 +4488,7 @@ still frontmatter",
                 name: "review".to_string(),
                 description: "second".to_string(),
                 content: "content2".to_string(),
+                side: false,
                 source: "b".to_string(),
                 file_path: PathBuf::from("/b/review.md"),
             },
@@ -3240,6 +4496,7 @@ still frontmatter",
                 name: "unique".to_string(),
                 description: "only one".to_string(),
                 content: "content3".to_string(),
+                side: false,
                 source: "c".to_string(),
                 file_path: PathBuf::from("/c/unique.md"),
             },
@@ -3258,6 +4515,7 @@ still frontmatter",
                 name: "z-prompt".to_string(),
                 description: "z".to_string(),
                 content: String::new(),
+                side: false,
                 source: "s".to_string(),
                 file_path: PathBuf::from("/z.md"),
             },
@@ -3265,6 +4523,7 @@ still frontmatter",
                 name: "a-prompt".to_string(),
                 description: "a".to_string(),
                 content: String::new(),
+                side: false,
                 source: "s".to_string(),
                 file_path: PathBuf::from("/a.md"),
             },
@@ -3276,6 +4535,47 @@ still frontmatter",
     }
 
     // ── expand_skill_command ───────────────────────────────────────────
+
+    #[test]
+    fn legacy_skills_dir_diag_warns_for_nonempty_misplaced_dir() {
+        let home = tempfile::tempdir().expect("home dir");
+        let agent_dir = home.path().join(".pi").join("agent");
+        let legacy = home.path().join(".pi").join("skills");
+        std::fs::create_dir_all(legacy.join("my-skill")).expect("legacy skill dir");
+
+        let diagnostic = legacy_skills_dir_diagnostic(Some(home.path()), &agent_dir)
+            .expect("expected a warning for misplaced skills");
+        assert_eq!(diagnostic.kind, DiagnosticKind::Warning);
+        assert!(diagnostic.message.contains("never loaded"));
+        assert!(
+            diagnostic
+                .message
+                .contains(&agent_dir.join("skills").display().to_string())
+        );
+    }
+
+    #[test]
+    fn legacy_skills_dir_diag_silent_when_empty_or_missing_or_same() {
+        let home = tempfile::tempdir().expect("home dir");
+        let agent_dir = home.path().join(".pi").join("agent");
+
+        // Missing legacy dir: silent.
+        assert!(legacy_skills_dir_diagnostic(Some(home.path()), &agent_dir).is_none());
+
+        // Empty legacy dir: silent.
+        let legacy = home.path().join(".pi").join("skills");
+        std::fs::create_dir_all(&legacy).expect("legacy dir");
+        assert!(legacy_skills_dir_diagnostic(Some(home.path()), &agent_dir).is_none());
+
+        // agent_dir == ~/.pi (so its skills dir IS the legacy dir): silent
+        // even when non-empty.
+        std::fs::create_dir_all(legacy.join("my-skill")).expect("skill entry");
+        let pi_as_agent_dir = home.path().join(".pi");
+        assert!(legacy_skills_dir_diagnostic(Some(home.path()), &pi_as_agent_dir).is_none());
+
+        // No home dir at all: silent.
+        assert!(legacy_skills_dir_diagnostic(None, &agent_dir).is_none());
+    }
 
     #[test]
     fn test_expand_skill_command_with_matching_skill() {
@@ -3294,6 +4594,7 @@ still frontmatter",
             base_dir: tmp.path().to_path_buf(),
             source: "test".to_string(),
             disable_model_invocation: false,
+            user_invocable: true,
         }];
         let result = expand_skill_command("/skill:test-skill extra args", &skills);
         assert!(result.contains("<skill name=\"test-skill\""));
@@ -3405,6 +4706,7 @@ still frontmatter",
             name: "review".to_string(),
             description: "review prompt".to_string(),
             content: "first=[$1] second=[$2] rest=[${@:2}]".to_string(),
+            side: false,
             source: "test".to_string(),
             file_path: PathBuf::from("/review.md"),
         };
@@ -3419,6 +4721,7 @@ still frontmatter",
             name: "review".to_string(),
             description: "review prompt".to_string(),
             content: "first=[$1] second=[$2] third=[$3]".to_string(),
+            side: false,
             source: "test".to_string(),
             file_path: PathBuf::from("/review.md"),
         };
@@ -3433,6 +4736,7 @@ still frontmatter",
             name: "review".to_string(),
             description: "review prompt".to_string(),
             content: "first=[$1] second=[$2] third=[$3] fourth=[$4]".to_string(),
+            side: false,
             source: "test".to_string(),
             file_path: PathBuf::from("/review.md"),
         };
@@ -3447,6 +4751,7 @@ still frontmatter",
             name: "review".to_string(),
             description: "review prompt".to_string(),
             content: "first=[$1] second=[$2]".to_string(),
+            side: false,
             source: "test".to_string(),
             file_path: PathBuf::from("/review.md"),
         };
@@ -3650,6 +4955,48 @@ still frontmatter",
         assert_eq!(result.skills[0].name, "my-skill");
     }
 
+    /// A directory first walked as a child of one native root and later
+    /// selected as another native root still contributes its root Markdown.
+    /// A universal `.agents/skills` alias of the same directory does not:
+    /// universal roots only accept `SKILL.md` files in subdirectories.
+    #[cfg(unix)]
+    #[test]
+    fn test_native_root_nested_in_native_tree_loads_root_markdown() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let cwd = temp.path().join("project");
+        // Stop `.agents/skills` ancestor discovery at the project.
+        fs::create_dir_all(cwd.join(".git")).expect("create Git root marker");
+        let nested_root = cwd.join(".pi/skills/shared");
+        fs::create_dir_all(&nested_root).expect("create nested root");
+        fs::write(
+            nested_root.join("instructions.md"),
+            "---\nname: skills\ndescription: Root Markdown skill\n---\nBody",
+        )
+        .expect("write root markdown");
+        fs::create_dir_all(cwd.join(".agents")).expect("create universal base");
+        std::os::unix::fs::symlink(&nested_root, cwd.join(".agents/skills"))
+            .expect("universal alias of the nested root");
+        let agent_dir = temp.path().join("agent");
+        fs::create_dir_all(&agent_dir).expect("create agent dir");
+        std::os::unix::fs::symlink(&nested_root, agent_dir.join("skills"))
+            .expect("user root alias of the nested root");
+        let result = load_skills(LoadSkillsOptions {
+            cwd,
+            agent_dir: agent_dir.clone(),
+            home_dir: None,
+            skill_paths: Vec::new(),
+            include_defaults: true,
+        });
+        assert_eq!(result.skills.len(), 1, "{:?}", result.skills);
+        assert_eq!(
+            result.skills[0].file_path,
+            agent_dir.join("skills/instructions.md")
+        );
+        assert_eq!(result.skills[0].name, "skills");
+        assert_eq!(result.skills[0].source, "user");
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+    }
+
     #[cfg(unix)]
     #[test]
     fn test_load_skills_ignores_alias_symlink_to_same_skill_tree() {
@@ -3670,6 +5017,7 @@ still frontmatter",
         let result = load_skills(LoadSkillsOptions {
             cwd: tmp.path().to_path_buf(),
             agent_dir: tmp.path().join("agent"),
+            home_dir: None,
             skill_paths: vec![skills_root],
             include_defaults: false,
         });
@@ -3698,6 +5046,7 @@ still frontmatter",
         let result = load_skills(LoadSkillsOptions {
             cwd: tmp.path().to_path_buf(),
             agent_dir: tmp.path().join("agent"),
+            home_dir: None,
             skill_paths: vec![real_root, alias_root],
             include_defaults: false,
         });
@@ -3735,6 +5084,7 @@ still frontmatter",
         let result = load_skills(LoadSkillsOptions {
             cwd: temp.path().to_path_buf(),
             agent_dir: temp.path().join("agent"),
+            home_dir: None,
             skill_paths: vec![root],
             include_defaults: false,
         });

@@ -6,12 +6,60 @@
 
 use crate::config::Config;
 use crate::error::{Error, Result};
+#[cfg(feature = "tui")]
 use glamour::{Style as GlamourStyle, StyleConfig as GlamourStyleConfig};
+#[cfg(feature = "tui")]
 use lipgloss::Style as LipglossStyle;
 use serde::{Deserialize, Serialize};
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
+/// Maximum UTF-8 source size accepted for any user-supplied resource file.
+///
+/// Theme loading shares this limit with skills and prompt templates so startup
+/// cannot allocate an arbitrarily large file while resource categories load in
+/// parallel. Readers consume at most one byte beyond the limit to distinguish
+/// an exact-limit file from an oversized one.
+pub(crate) const MAX_RESOURCE_FILE_BYTES: usize = 1024 * 1024;
+
+fn read_theme_file_bounded(path: &Path) -> Result<String> {
+    let file = fs::File::open(path).map_err(|err| {
+        Error::config(format!(
+            "Failed to open theme file '{}': {err}",
+            path.display()
+        ))
+    })?;
+    let mut bytes = Vec::new();
+    file.take((MAX_RESOURCE_FILE_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|err| {
+            Error::config(format!(
+                "Failed to read theme file '{}': {err}",
+                path.display()
+            ))
+        })?;
+    if bytes.len() > MAX_RESOURCE_FILE_BYTES {
+        return Err(Error::config(format!(
+            "Theme file '{}' exceeds the {MAX_RESOURCE_FILE_BYTES}-byte resource limit",
+            path.display()
+        )));
+    }
+    String::from_utf8(bytes).map_err(|err| {
+        Error::config(format!(
+            "Theme file '{}' is not valid UTF-8: {}",
+            path.display(),
+            err.utf8_error()
+        ))
+    })
+}
+
+// `TuiStyles` and the `tui_styles`/`glamour_style_config` helpers below build
+// concrete lipgloss/glamour render styles and are only needed by the
+// interactive front-end. The `Theme` data struct itself (colors, schema,
+// discovery) stays unconditional because non-TUI code (resource loading,
+// config) depends on it.
+#[cfg(feature = "tui")]
 #[derive(Debug, Clone)]
 pub struct TuiStyles {
     pub title: LipglossStyle,
@@ -64,6 +112,58 @@ pub struct UiColors {
     pub cursor: String,
 }
 
+/// Terminal background classification used for theme auto-detection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalBackground {
+    Dark,
+    Light,
+}
+
+/// Classify a `COLORFGBG` value into a terminal background.
+///
+/// `COLORFGBG` is a passive environment hint set by some terminals
+/// (rxvt, konsole, and others) with the format `"<fg>;<bg>"` or
+/// `"<fg>;default;<bg>"`. The last segment is the background color
+/// index: values below 8 are dark colors, 8 and above are light.
+///
+/// Mirrors original Pi's `detectTerminalBackground()`: missing or
+/// unparseable values default to dark.
+#[must_use]
+pub fn classify_colorfgbg(value: Option<&str>) -> TerminalBackground {
+    let Some(value) = value else {
+        return TerminalBackground::Dark;
+    };
+    let value = value.trim();
+    if value.is_empty() {
+        return TerminalBackground::Dark;
+    }
+    let mut parts = value.split(';');
+    let (Some(_fg), Some(second)) = (parts.next(), parts.next()) else {
+        return TerminalBackground::Dark;
+    };
+    // "fg;default;bg" form: the background index is the last segment.
+    let bg = parts.next_back().unwrap_or(second);
+    bg.trim()
+        .parse::<u32>()
+        .map_or(TerminalBackground::Dark, |index| {
+            if index < 8 {
+                TerminalBackground::Dark
+            } else {
+                TerminalBackground::Light
+            }
+        })
+}
+
+/// Detect the terminal background from the `COLORFGBG` environment variable.
+///
+/// This is intentionally passive (no OSC/tty queries, which can hang or
+/// raise SIGTTIN in background processes). Defaults to dark when the
+/// variable is missing or unparseable.
+#[must_use]
+pub fn detect_terminal_background() -> TerminalBackground {
+    classify_colorfgbg(std::env::var("COLORFGBG").ok().as_deref())
+}
+
 /// Explicit roots for theme discovery.
 #[derive(Debug, Clone)]
 pub struct ThemeRoots {
@@ -84,8 +184,11 @@ impl ThemeRoots {
 impl Theme {
     /// Resolve the active theme for the given config/cwd.
     ///
-    /// - If `config.theme` is unset/empty, defaults to [`Theme::dark`].
+    /// - If `config.theme` is unset/empty, auto-detects dark/light from the
+    ///   terminal background (`COLORFGBG`), defaulting to [`Theme::dark`]
+    ///   when detection is inconclusive — matching original Pi.
     /// - If set to `dark`, `light`, or `solarized`, uses built-in defaults.
+    /// - If set to `light/dark`, `auto`, or `system`, auto-detects as above.
     /// - Otherwise, attempts to resolve a theme spec:
     ///   - discovered theme name (from user/project theme dirs)
     ///   - theme JSON file path (absolute or cwd-relative, supports `~/...`)
@@ -94,11 +197,11 @@ impl Theme {
     #[must_use]
     pub fn resolve(config: &Config, cwd: &Path) -> Self {
         let Some(spec) = config.theme.as_deref() else {
-            return Self::dark();
+            return Self::detected();
         };
         let spec = spec.trim();
         if spec.is_empty() {
-            return Self::dark();
+            return Self::detected();
         }
 
         match Self::resolve_spec(spec, cwd) {
@@ -114,6 +217,7 @@ impl Theme {
     ///
     /// Supported specs:
     /// - Built-ins: `dark`, `light`, `solarized`
+    /// - Auto-detection: `light/dark`, `auto`, `system` (via `COLORFGBG`)
     /// - Theme name: resolves via [`Self::load_by_name`]
     /// - File path: resolves via [`Self::load`] (absolute or cwd-relative, supports `~/...`)
     pub fn resolve_spec(spec: &str, cwd: &Path) -> Result<Self> {
@@ -129,6 +233,12 @@ impl Theme {
         }
         if spec.eq_ignore_ascii_case("solarized") {
             return Ok(Self::solarized());
+        }
+        if spec.eq_ignore_ascii_case("light/dark")
+            || spec.eq_ignore_ascii_case("auto")
+            || spec.eq_ignore_ascii_case("system")
+        {
+            return Ok(Self::detected());
         }
 
         if looks_like_theme_path(spec) {
@@ -159,6 +269,7 @@ impl Theme {
         luma >= 128.0
     }
 
+    #[cfg(feature = "tui")]
     #[must_use]
     pub fn tui_styles(&self) -> TuiStyles {
         let title = LipglossStyle::new()
@@ -195,6 +306,7 @@ impl Theme {
         }
     }
 
+    #[cfg(feature = "tui")]
     #[must_use]
     pub fn glamour_style_config(&self) -> GlamourStyleConfig {
         let mut config = if self.is_light() {
@@ -205,15 +317,27 @@ impl Theme {
 
         config.document.style.color = Some(self.colors.foreground.clone());
 
-        // Headings use accent color
+        // Headings use accent color. The glamour presets pair their heading
+        // foregrounds with a fixed ANSI background (H1 ships on ANSI-63
+        // purple); overriding only the foreground left theme-accent text on
+        // that preset background — unreadable for most accent colors (issue
+        // #195). Clear the preset backgrounds so headings render as accent
+        // on the document background.
         let accent = Some(self.colors.accent.clone());
         config.heading.style.color.clone_from(&accent);
+        config.heading.style.background_color = None;
         config.h1.style.color.clone_from(&accent);
+        config.h1.style.background_color = None;
         config.h2.style.color.clone_from(&accent);
+        config.h2.style.background_color = None;
         config.h3.style.color.clone_from(&accent);
+        config.h3.style.background_color = None;
         config.h4.style.color.clone_from(&accent);
+        config.h4.style.background_color = None;
         config.h5.style.color.clone_from(&accent);
+        config.h5.style.background_color = None;
         config.h6.style.color.clone_from(&accent);
+        config.h6.style.background_color = None;
 
         // Links
         config.link.color.clone_from(&accent);
@@ -259,7 +383,7 @@ impl Theme {
 
     /// Load a theme from a JSON file.
     pub fn load(path: &Path) -> Result<Self> {
-        let content = fs::read_to_string(path)?;
+        let content = read_theme_file_bounded(path)?;
         let theme: Self = serde_json::from_str(&content)?;
         theme.validate()?;
         Ok(theme)
@@ -316,6 +440,22 @@ impl Theme {
         }
 
         Ok(None)
+    }
+
+    /// Built-in theme matching a detected terminal background.
+    #[must_use]
+    pub fn from_background(background: TerminalBackground) -> Self {
+        match background {
+            TerminalBackground::Dark => Self::dark(),
+            TerminalBackground::Light => Self::light(),
+        }
+    }
+
+    /// Built-in theme auto-detected from the terminal background
+    /// (`COLORFGBG`; dark when inconclusive).
+    #[must_use]
+    pub fn detected() -> Self {
+        Self::from_background(detect_terminal_background())
     }
 
     /// Default dark theme.
@@ -525,7 +665,7 @@ fn resolve_theme_path(spec: &str, cwd: &Path) -> PathBuf {
     }
 }
 
-fn parse_hex_color(value: &str) -> Option<(u8, u8, u8)> {
+pub(crate) fn parse_hex_color(value: &str) -> Option<(u8, u8, u8)> {
     let value = value.trim();
     let hex = value.strip_prefix('#')?;
     if hex.len() != 6 || !hex.is_ascii() {
@@ -777,38 +917,120 @@ mod tests {
     }
 
     // ── resolve with empty/None config ───────────────────────────────
+    //
+    // With no theme configured, `resolve` auto-detects from COLORFGBG
+    // (matching original Pi). In environments without COLORFGBG this is
+    // dark; assert against `Theme::detected()` so the tests hold either way.
 
     #[test]
-    fn resolve_defaults_to_dark_when_no_theme_set() {
+    fn resolve_auto_detects_when_no_theme_set() {
         let cfg = Config {
             theme: None,
             ..Default::default()
         };
         let cwd = tempfile::tempdir().expect("tempdir");
         let resolved = Theme::resolve(&cfg, cwd.path());
-        assert_eq!(resolved.name, "dark");
+        assert_eq!(resolved.name, Theme::detected().name);
     }
 
     #[test]
-    fn resolve_defaults_to_dark_when_theme_is_empty() {
+    fn resolve_auto_detects_when_theme_is_empty() {
         let cfg = Config {
             theme: Some(String::new()),
             ..Default::default()
         };
         let cwd = tempfile::tempdir().expect("tempdir");
         let resolved = Theme::resolve(&cfg, cwd.path());
-        assert_eq!(resolved.name, "dark");
+        assert_eq!(resolved.name, Theme::detected().name);
     }
 
     #[test]
-    fn resolve_defaults_to_dark_when_theme_is_whitespace() {
+    fn resolve_auto_detects_when_theme_is_whitespace() {
         let cfg = Config {
             theme: Some("   ".to_string()),
             ..Default::default()
         };
         let cwd = tempfile::tempdir().expect("tempdir");
         let resolved = Theme::resolve(&cfg, cwd.path());
-        assert_eq!(resolved.name, "dark");
+        assert_eq!(resolved.name, Theme::detected().name);
+    }
+
+    // ── terminal background detection (COLORFGBG) ────────────────────
+
+    #[test]
+    fn classify_colorfgbg_missing_defaults_to_dark() {
+        assert_eq!(classify_colorfgbg(None), TerminalBackground::Dark);
+        assert_eq!(classify_colorfgbg(Some("")), TerminalBackground::Dark);
+        assert_eq!(classify_colorfgbg(Some("   ")), TerminalBackground::Dark);
+    }
+
+    #[test]
+    fn classify_colorfgbg_two_part_form() {
+        assert_eq!(classify_colorfgbg(Some("0;15")), TerminalBackground::Light);
+        assert_eq!(classify_colorfgbg(Some("15;0")), TerminalBackground::Dark);
+        assert_eq!(classify_colorfgbg(Some("15;7")), TerminalBackground::Dark);
+        assert_eq!(classify_colorfgbg(Some("0;8")), TerminalBackground::Light);
+    }
+
+    #[test]
+    fn classify_colorfgbg_three_part_form_uses_last_segment() {
+        assert_eq!(
+            classify_colorfgbg(Some("0;default;15")),
+            TerminalBackground::Light
+        );
+        assert_eq!(
+            classify_colorfgbg(Some("15;default;0")),
+            TerminalBackground::Dark
+        );
+    }
+
+    #[test]
+    fn classify_colorfgbg_unparseable_defaults_to_dark() {
+        assert_eq!(
+            classify_colorfgbg(Some("default;default")),
+            TerminalBackground::Dark
+        );
+        assert_eq!(
+            classify_colorfgbg(Some("garbage")),
+            TerminalBackground::Dark
+        );
+        assert_eq!(classify_colorfgbg(Some("0;abc")), TerminalBackground::Dark);
+        assert_eq!(classify_colorfgbg(Some(";;")), TerminalBackground::Dark);
+        assert_eq!(classify_colorfgbg(Some("0;-1")), TerminalBackground::Dark);
+    }
+
+    #[test]
+    fn from_background_maps_to_builtin_themes() {
+        assert_eq!(
+            Theme::from_background(TerminalBackground::Dark).name,
+            "dark"
+        );
+        assert_eq!(
+            Theme::from_background(TerminalBackground::Light).name,
+            "light"
+        );
+    }
+
+    #[test]
+    fn resolve_spec_auto_detection_specs() {
+        let cwd = Path::new(".");
+        let expected = Theme::detected().name;
+        for spec in [
+            "light/dark",
+            "LIGHT/DARK",
+            "auto",
+            "Auto",
+            "system",
+            "SYSTEM",
+        ] {
+            let resolved = Theme::resolve_spec(spec, cwd).expect("resolve auto spec");
+            assert_eq!(resolved.name, expected, "spec {spec:?}");
+            assert!(
+                resolved.name == "dark" || resolved.name == "light",
+                "auto specs resolve to a built-in, got {}",
+                resolved.name
+            );
+        }
     }
 
     // ── resolve_spec case insensitivity ──────────────────────────────
@@ -1048,6 +1270,7 @@ mod tests {
 
     // ── tui_styles and glamour_style_config smoke tests ─────────────
 
+    #[cfg(feature = "tui")]
     #[test]
     fn tui_styles_returns_valid_struct() {
         let styles = Theme::dark().tui_styles();
@@ -1058,6 +1281,7 @@ mod tests {
         let _ = format!("{:?}", styles.error_bold);
     }
 
+    #[cfg(feature = "tui")]
     #[test]
     fn glamour_style_config_smoke() {
         let dark_config = Theme::dark().glamour_style_config();
@@ -1065,6 +1289,125 @@ mod tests {
         // Verify the configs are created without panic
         assert!(dark_config.document.style.color.is_some());
         assert!(light_config.document.style.color.is_some());
+    }
+
+    /// Issue #195, the table half: a table cell truncated at a double-width
+    /// character boundary must be re-padded so the grid does not shear
+    /// (bd-xxlwk).
+    ///
+    /// The defect was in charmed-glamour: `truncate_content` reserves one
+    /// column for the ellipsis and fills the rest with whole characters, so a
+    /// CJK cell came back one column short whenever the cut landed
+    /// mid-character (`truncate_content("日本語", 4) == "日…"`, three columns
+    /// for a budget of four), and `table::fit_content` returned it unpadded.
+    /// charmed-glamour 0.2.4 re-pads it (charmed_rust 4150912).
+    ///
+    /// The user-visible property, which is what this asserts, is that the
+    /// column separator in a truncated data row lines up with the separator in
+    /// the header rule above it. It takes both wide characters and a column
+    /// narrow enough to truncate, which is why it was reported from a CJK
+    /// terminal. The untruncated control below shows the widths are otherwise
+    /// computed correctly.
+    #[cfg(feature = "tui")]
+    #[test]
+    fn glamour_table_stays_aligned_when_a_wide_char_cell_is_truncated() {
+        use unicode_width::UnicodeWidthStr;
+
+        fn visible(line: &str) -> String {
+            // Drop CSI sequences, then any stray control characters.
+            let mut out = String::new();
+            let mut chars = line.chars().peekable();
+            while let Some(c) = chars.next() {
+                if c == '\u{1b}' {
+                    if chars.peek() == Some(&'[') {
+                        chars.next();
+                        for tail in chars.by_ref() {
+                            if tail.is_ascii_alphabetic() {
+                                break;
+                            }
+                        }
+                    }
+                    continue;
+                }
+                if !c.is_control() {
+                    out.push(c);
+                }
+            }
+            out
+        }
+
+        // Column one is narrow enough at this wrap width to truncate the CJK
+        // cell; column two is not involved.
+        let markdown = "| A | B |\n| --- | --- |\n| 日本語テキスト | x |\n";
+        let rendered = glamour::Renderer::new().with_word_wrap(20).render(markdown);
+
+        let rule = rendered
+            .lines()
+            .map(visible)
+            .find(|line| line.contains('┼'))
+            .expect("the header rule row");
+        let data = rendered
+            .lines()
+            .map(visible)
+            .find(|line| line.contains('…'))
+            .expect("the truncated data row");
+
+        let rule_prefix = rule.split('┼').next().expect("rule prefix").width();
+        let data_prefix = data.split('│').next().expect("data prefix").width();
+
+        assert_eq!(
+            rule_prefix, data_prefix,
+            "a truncated wide-character cell must be re-padded to its column width (gh #195): \
+             the header rule and the data row disagree.\nrule: {rule:?}\ndata: {data:?}"
+        );
+
+        // The control that makes this a truncation defect rather than a width
+        // miscalculation: widen the wrap so nothing truncates and the same two
+        // rows line up exactly.
+        let wide = glamour::Renderer::new().with_word_wrap(30).render(markdown);
+        let wide_rule = wide
+            .lines()
+            .map(visible)
+            .find(|line| line.contains('┼'))
+            .expect("the wide header rule row");
+        let wide_data = wide
+            .lines()
+            .map(visible)
+            .find(|line| line.contains("日本語テキスト"))
+            .expect("the untruncated data row");
+        assert_eq!(
+            wide_rule
+                .split('┼')
+                .next()
+                .expect("wide rule prefix")
+                .width(),
+            wide_data
+                .split('│')
+                .next()
+                .expect("wide data prefix")
+                .width(),
+            "an untruncated wide-character cell must line up with the header rule"
+        );
+    }
+
+    /// Issue #195: theme heading foregrounds must not sit on the glamour
+    /// presets' fixed ANSI heading backgrounds (accent-on-ANSI-63 is
+    /// unreadable); the preset backgrounds must be cleared.
+    #[cfg(feature = "tui")]
+    #[test]
+    fn glamour_style_config_clears_preset_heading_backgrounds() {
+        for config in [
+            Theme::dark().glamour_style_config(),
+            Theme::light().glamour_style_config(),
+        ] {
+            assert!(config.heading.style.background_color.is_none());
+            assert!(config.h1.style.background_color.is_none());
+            assert!(config.h2.style.background_color.is_none());
+            assert!(config.h3.style.background_color.is_none());
+            assert!(config.h4.style.background_color.is_none());
+            assert!(config.h5.style.background_color.is_none());
+            assert!(config.h6.style.background_color.is_none());
+        }
     }
 
     mod proptest_theme {

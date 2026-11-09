@@ -2,15 +2,39 @@
 
 use crate::agent::QueueMode;
 use crate::error::{Error, Result};
-use fs4::fs_std::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+// Only `sync_settings_parent_dir` opens a directory to fsync it, and only Unix
+// allows that; the `cfg(not(unix))` arm is a no-op.
+#[cfg(unix)]
 use std::fs::File;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tempfile::NamedTempFile;
+
+/// The tracing target for diagnostics addressed to the person running pi,
+/// rather than to someone debugging pi.
+///
+/// A message here says the user's own configuration is wrong and pi carried on
+/// without it: a misspelled settings key, an unparseable queue mode, a
+/// `session_store` nobody recognises, a `keybindings.json` naming an action
+/// that does not exist. Nobody sets `RUST_LOG` to find out that their settings
+/// file has a typo in it, so the binary's default filter turns this one target
+/// on at WARN and leaves every module exactly as quiet as it was.
+///
+/// The value is arbitrary; what matters is that the filter and every emitter
+/// share this constant. A filter directive that matches no target is not an
+/// error — it simply never fires — so a written-out string on either side can
+/// take the diagnostics away in silence, which is how the first version of
+/// this went wrong: `pi_agent_rust::config` looks right and matches nothing,
+/// because the library is `[lib] name = "pi"`.
+///
+/// This deliberately does not follow the module path. These messages come from
+/// `config`, `session` and the interactive stacks, and what they have in
+/// common is their audience, not their origin.
+pub const USER_DIAGNOSTIC_TARGET: &str = "pi::settings";
 
 /// Main configuration structure.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -47,6 +71,61 @@ pub struct Config {
     pub default_thinking_level: Option<String>,
     #[serde(alias = "enabledModels")]
     pub enabled_models: Option<Vec<String>>,
+    /// Per-role model assignments (see [`ModelRoleSettings`], bd-cv653.3.1).
+    #[serde(alias = "modelRoles")]
+    pub model_roles: Option<ModelRoleSettings>,
+    /// Automatic session titling (see [`TitlingSettings`], bd-cv653.3.1).
+    #[serde(alias = "title")]
+    pub titling: Option<TitlingSettings>,
+    /// Opt in to a one-shot strong-to-small model handoff on fresh sessions.
+    pub prewalk: Option<PrewalkSettings>,
+    /// Providers whose models are hidden from selection and cycling
+    /// (bd-cv653.3.2). Canonical ids or aliases, case-insensitive.
+    #[serde(alias = "disabledProviders")]
+    pub disabled_providers: Option<Vec<String>>,
+    /// Path-scoped model sets (bd-cv653.3.2): pin a different model set on
+    /// one repo without touching the global config. Most specific matching
+    /// path prefix wins.
+    #[serde(alias = "modelScopeOverrides")]
+    pub model_scope_overrides: Option<Vec<ModelScopeOverride>>,
+    /// Optional-tool activation and load modes (`tools.loadMode`).
+    pub tools: Option<ToolSettings>,
+    /// Plan-mode settings (bd-cv653.3.5).
+    pub plan: Option<PlanSettings>,
+    /// Read-tool settings (bd-cv653.2.2 URL reads).
+    pub read: Option<ReadSettings>,
+    /// Mid-turn Markdown replies through `write out://`.
+    pub out: Option<OutSettings>,
+    /// Bash-tool mediation settings (bd-cv653.1.7).
+    pub bash: Option<BashSettings>,
+    /// Memory-bank settings (bd-cv653.4.1).
+    pub memory: Option<MemorySettings>,
+    /// MCP discovery controls. Explicit files and client definitions remain eligible.
+    pub mcp: Option<McpSettings>,
+    /// Opt-in media trio settings (bd-cv653.2.7).
+    pub media: Option<crate::media_tools::MediaSettings>,
+    /// Opt-in computer tool settings (bd-cv653.2.5).
+    pub computer: Option<crate::computer::ComputerSettings>,
+    /// Opt-in browser tool settings (bd-cv653.2.4).
+    pub browser: Option<crate::browser::BrowserSettings>,
+    /// Secrets vault settings (bd-cv653.7.9).
+    pub secrets: Option<crate::secrets::SecretsSettings>,
+    /// Magic-keyword settings (bd-cv653.3.6).
+    #[serde(alias = "magicKeywords", alias = "magic_keywords")]
+    pub keywords: Option<crate::magic_keywords::KeywordSettings>,
+    /// Advisor settings (bd-cv653.3.3).
+    pub advisor: Option<AdvisorSettings>,
+    /// LSP tool settings (bd-cv653.1.1).
+    pub lsp: Option<LspSettings>,
+    /// Approval mode settings (bd-cv653.3.19).
+    pub approval: Option<ApprovalSettings>,
+
+    /// HTTP transport settings — proxy configuration (#210).
+    ///
+    /// ```json
+    /// "http": { "proxy": "http://127.0.0.1:2080", "noProxy": ["localhost"] }
+    /// ```
+    pub http: Option<crate::http::proxy::HttpSettings>,
 
     /// HTTP request timeout in seconds for provider API calls.
     ///
@@ -66,6 +145,11 @@ pub struct Config {
     pub steering_mode: Option<String>,
     #[serde(alias = "followUpMode")]
     pub follow_up_mode: Option<String>,
+    /// Background completion behavior for unattended print runs.
+    #[serde(rename = "async", alias = "async_settings")]
+    pub async_settings: Option<AsyncSettings>,
+    /// Shared model-spend warning/cap for a session and its native children.
+    pub session: Option<SessionSettings>,
 
     // Version check
     #[serde(alias = "checkForUpdates")]
@@ -93,6 +177,23 @@ pub struct Config {
     /// Session durability mode: `strict`, `balanced` (default), or `throughput`.
     #[serde(alias = "sessionDurability")]
     pub session_durability: Option<String>,
+    /// Search backend for the grep/find tools: `inproc` (default; in-process
+    /// ignore/grep crates, no external binaries) or `external` (shell out to
+    /// `rg`/`fd`, the pre-bd-cv653.1.5 behavior — kept as a debugging escape
+    /// hatch).
+    #[serde(alias = "searchBackend")]
+    pub search_backend: Option<String>,
+    /// Import rules from other tools' native config files found in the
+    /// workspace — Cursor MDC/.cursorrules, Cline, Copilot instructions,
+    /// Windsurf, GEMINI.md (bd-cv653.6.2). Read-only; native AGENTS.md /
+    /// CLAUDE.md conventions always win. Default `true`.
+    #[serde(alias = "foreignRules")]
+    pub foreign_rules: Option<bool>,
+    /// How the `ask` tool resolves in non-interactive sessions
+    /// (bd-cv653.3.8): `recommended` (default; auto-answer with the
+    /// recommended option, loudly) or `error` (fail the tool call).
+    #[serde(alias = "askPolicy")]
+    pub ask_policy: Option<String>,
 
     // Compaction
     pub compaction: Option<CompactionSettings>,
@@ -113,6 +214,23 @@ pub struct Config {
     #[serde(alias = "ghPath")]
     pub gh_path: Option<String>,
 
+    // Subagent tool
+    /// Append a machine-readable `<subagent-structured-result>` JSON block to
+    /// the `subagent` tool's result text. See pi_agent_rust#163.
+    ///
+    /// Providers only serialize a tool result's text content, so the
+    /// structured `details` payload (`pi.subagent.result.v1`) never reaches
+    /// the parent model. When `true`, the subagent tool appends a compact
+    /// JSON array (field names match the `pi.subagent.result.v1` schema)
+    /// wrapped in `<subagent-structured-result>...</subagent-structured-result>`
+    /// so parents can parse per-child results. `output`/`error` fields are
+    /// truncated to 2 KiB each and the whole block is capped at 16 KiB.
+    ///
+    /// Default `false` keeps subagent tool output byte-identical to previous
+    /// releases.
+    #[serde(alias = "subagentStructuredResults")]
+    pub subagent_structured_results: Option<bool>,
+
     // Images
     pub images: Option<ImageSettings>,
 
@@ -126,6 +244,12 @@ pub struct Config {
     #[serde(alias = "thinkingBudgets")]
     pub thinking_budgets: Option<ThinkingBudgets>,
 
+    // Workspace trust (GH #151): trust every workspace's project-local
+    // configuration without the first-use prompt. Automation escape hatch;
+    // only honored when set in the GLOBAL settings file.
+    #[serde(alias = "trustAllWorkspaces")]
+    pub trust_all_workspaces: Option<bool>,
+
     // Extensions/Skills/etc.
     pub packages: Option<Vec<PackageSource>>,
     pub extensions: Option<Vec<String>>,
@@ -138,6 +262,29 @@ pub struct Config {
     // Extension tool hook behavior
     #[serde(alias = "failClosedHooks")]
     pub fail_closed_hooks: Option<bool>,
+
+    /// Shared deadline for awaited `before_agent_start` readiness hooks.
+    /// Resolved from trusted host settings, never from extension metadata.
+    #[serde(alias = "extensionStartupTimeoutMs")]
+    pub extension_startup_timeout_ms: Option<u64>,
+
+    /// Auto-compaction mode (bd-cv653.3.18): "summary" (default) |
+    /// "shake-first" | "aggressive".
+    #[serde(
+        default,
+        alias = "compactionMode",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub compaction_mode: Option<crate::compaction::AutoCompactionMode>,
+
+    /// Auto-continue policy for unexpected mid-task stops (bd-cv653.3.15):
+    /// "off" | "conservative" (default) | "aggressive".
+    #[serde(
+        default,
+        alias = "turnRecovery",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub turn_recovery: Option<crate::turn_recovery::TurnRecoveryMode>,
 
     // Extension Policy
     #[serde(alias = "extensionPolicy")]
@@ -265,6 +412,75 @@ pub struct CompactionSettings {
     pub reserve_tokens: Option<u32>,
     #[serde(alias = "keepRecentTokens")]
     pub keep_recent_tokens: Option<u32>,
+    /// Optional earlier automatic trigger in tokens; reserved headroom still applies.
+    #[serde(
+        alias = "thresholdTokens",
+        deserialize_with = "deserialize_compaction_token_threshold",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub threshold_tokens: Option<u32>,
+    /// Optional earlier automatic trigger as a percentage of the active context window.
+    #[serde(
+        alias = "thresholdPercent",
+        deserialize_with = "deserialize_compaction_percent_threshold",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub threshold_percent: Option<f64>,
+    /// Optional ordered automatic methods; absent keeps the legacy mode policy.
+    #[serde(
+        alias = "methodOrder",
+        deserialize_with = "deserialize_compaction_method_order",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub method_order: Option<Vec<crate::compaction::AutoCompactionMethod>>,
+    /// Compaction output rendering: "text" (default) | "snapcompact"
+    /// (bd-cv653.7.6).
+    #[serde(alias = "mode")]
+    pub mode: Option<crate::compaction::CompactionRenderMode>,
+}
+
+fn deserialize_compaction_token_threshold<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<u32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<u32>::deserialize(deserializer)?;
+    if value == Some(0) {
+        return Err(serde::de::Error::custom(
+            "compaction thresholdTokens must be a positive integer",
+        ));
+    }
+    Ok(value)
+}
+
+fn deserialize_compaction_percent_threshold<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<f64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<f64>::deserialize(deserializer)?;
+    if value.is_some_and(|percent| !percent.is_finite() || percent <= 0.0 || percent > 100.0) {
+        return Err(serde::de::Error::custom(
+            "compaction thresholdPercent must be greater than 0 and at most 100",
+        ));
+    }
+    Ok(value)
+}
+
+fn deserialize_compaction_method_order<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<Vec<crate::compaction::AutoCompactionMethod>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<Vec<crate::compaction::AutoCompactionMethod>>::deserialize(deserializer)?;
+    if let Some(order) = value.as_ref() {
+        crate::compaction::validate_compaction_method_order(order)
+            .map_err(serde::de::Error::custom)?;
+    }
+    Ok(value)
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -274,16 +490,357 @@ pub struct BranchSummarySettings {
     pub reserve_tokens: Option<u32>,
 }
 
+/// Opt-in background completion handling. Ordinary print runs still exit
+/// when their authored prompts finish.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AsyncSettings {
+    #[serde(alias = "printWake")]
+    pub print_wake: Option<bool>,
+}
+
+/// Model costs are denominated in USD. CLI thresholds override these values.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct SessionSettings {
+    #[serde(alias = "warn_cost", deserialize_with = "deserialize_cost_threshold")]
+    pub warn_cost: Option<f64>,
+    #[serde(alias = "max_cost", deserialize_with = "deserialize_cost_threshold")]
+    pub max_cost: Option<f64>,
+}
+
+fn deserialize_cost_threshold<'de, D>(deserializer: D) -> std::result::Result<Option<f64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<f64>::deserialize(deserializer)?;
+    if value.is_some_and(|amount| !amount.is_finite() || amount <= 0.0) {
+        return Err(serde::de::Error::custom(
+            "expected a positive finite USD amount",
+        ));
+    }
+    Ok(value)
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RetrySettings {
     pub enabled: Option<bool>,
+    /// Allow recovery to switch models after an eligible provider failure.
+    #[serde(alias = "modelFallback")]
+    pub model_fallback: Option<bool>,
+    /// Restrict the provider failures that may advance the fallback chain.
+    #[serde(alias = "fallbackOn")]
+    pub fallback_on: Option<crate::failover::FallbackOn>,
     #[serde(alias = "maxRetries")]
     pub max_retries: Option<u32>,
     #[serde(alias = "baseDelayMs")]
     pub base_delay_ms: Option<u32>,
     #[serde(alias = "maxDelayMs")]
     pub max_delay_ms: Option<u32>,
+    /// Cross-model failover chains (bd-cv653.3.2): maps a role name
+    /// (`default`/`smol`/…) or an exact `provider/model` spec to an ordered
+    /// list of fallback `provider/model[:thinking]` specs. An explicit empty
+    /// role chain disables fallback for that role. On a classified transient
+    /// failure (429/quota/overload after the retry budget) the NEXT entry
+    /// continues the turn; the primary is restored after the cooldown.
+    #[serde(alias = "fallbackChains")]
+    pub fallback_chains: Option<std::collections::HashMap<String, Vec<String>>>,
+    /// Seconds before the primary model is retried after a failover
+    /// (default 300).
+    #[serde(alias = "failoverCooldownSecs", alias = "cooldownSecs")]
+    pub failover_cooldown_secs: Option<u64>,
+    /// Maximum failovers within a single turn (default 8, hard cap).
+    #[serde(alias = "maxFailoversPerTurn")]
+    pub max_failovers_per_turn: Option<u32>,
+}
+
+/// Per-role model assignments (bd-cv653.3.1).
+///
+/// Each value is a model spec string: `"provider/model"` (optionally with a
+/// `:thinking-level` suffix, e.g. `"openai/gpt-5:high"`). All roles are
+/// optional; unset roles fall back to the `default` role, which itself falls
+/// back to `defaultProvider`/`defaultModel` and then the built-in auto-select.
+/// CLI role flags (`--smol`/`--slow`/`--plan`) override these values.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ModelRoleSettings {
+    pub default: Option<String>,
+    pub smol: Option<String>,
+    pub slow: Option<String>,
+    pub plan: Option<String>,
+    pub commit: Option<String>,
+    pub vision: Option<String>,
+    pub designer: Option<String>,
+    pub task: Option<String>,
+    pub advisor: Option<String>,
+    pub tiny: Option<String>,
+}
+
+/// Automatic session titling (bd-cv653.3.1 round-4 scope).
+///
+/// After the first exchange of a new session, a tiny/smol-role model call
+/// summarizes the task into a short session name (the `SessionInfo` entry),
+/// making `--resume` pickers and status lines readable. Never blocks the turn
+/// and silently no-ops when no cheap role resolves or credentials are missing.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TitlingSettings {
+    /// Master switch for automatic session titling (default: true).
+    #[serde(alias = "autoTitle", alias = "auto")]
+    pub auto_title: Option<bool>,
+    /// Recheck generated titles after this many substantive user prompts.
+    /// Zero (the default) disables refresh; explicit user names are preserved.
+    #[serde(alias = "refreshAfterPrompts")]
+    pub refresh_after_prompts: Option<u32>,
+}
+
+/// Prewalk is off unless explicitly enabled. Selectors are resolved when a
+/// cycle is armed; command overrides never change these saved defaults.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PrewalkSettings {
+    pub enabled: Option<bool>,
+    /// Planning model selected by `/prewalk restart` (default: `@default`).
+    pub from: Option<String>,
+    /// Handoff destination (default: `@smol`).
+    pub into: Option<String>,
+}
+
+/// A path-scoped model-set override (bd-cv653.3.2).
+///
+/// Applies when the current working directory is inside `path` (or `path`
+/// itself); the most specific matching prefix wins over less specific
+/// prefixes and the global settings.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ModelScopeOverride {
+    /// Directory prefix this override applies to (absolute or `~`-rooted).
+    pub path: String,
+    #[serde(alias = "enabledModels")]
+    pub enabled_models: Option<Vec<String>>,
+    #[serde(alias = "disabledProviders")]
+    pub disabled_providers: Option<Vec<String>>,
+}
+
+/// Optional-tool activation and load-mode configuration.
+///
+/// The `enable*` settings opt in to additional tools when no explicit
+/// `--tools` list was supplied. Unset flags inherit lower-priority settings
+/// and otherwise default to false; `--no-tools` disables all built-ins.
+/// `loadMode` maps a tool name to `essential` (always in the provider
+/// schema), `discoverable` (behind the xdev dispatcher), or `off` and does
+/// not activate an optional tool by itself.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ToolSettings {
+    /// Enable persistent evaluation sessions. Default: false.
+    #[serde(alias = "enableEval")]
+    pub enable_eval: Option<bool>,
+    /// Enable GitHub operations through the configured `gh` executable.
+    /// Default: false.
+    #[serde(alias = "enableGithub")]
+    pub enable_github: Option<bool>,
+    /// Enable the security scanner. Default: false.
+    #[serde(alias = "enableSecurityScan")]
+    pub enable_security_scan: Option<bool>,
+    /// Enable native child-agent delegation. Default: false.
+    #[serde(alias = "enableSubagent")]
+    pub enable_subagent: Option<bool>,
+    #[serde(alias = "loadMode")]
+    pub load_mode: Option<std::collections::HashMap<String, String>>,
+}
+
+/// Interim responses shown without ending the agent's current task.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OutSettings {
+    /// Unset follows the host surface: on in the top-level interactive TUI,
+    /// off in unattended sessions. Native child agents never emit replies.
+    pub enabled: Option<bool>,
+}
+
+/// Plan-mode configuration (bd-cv653.3.5).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PlanSettings {
+    /// Auto-approve submitted plans without interactive review
+    /// (`--plan-yolo` wins over this). Default: false.
+    #[serde(alias = "autoApprove", alias = "yolo")]
+    pub auto_approve: Option<bool>,
+}
+
+/// Advisor configuration (bd-cv653.3.5 -> .3.3).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AdvisorSettings {
+    /// Master switch when the advisor role is configured (default: true).
+    pub enabled: Option<bool>,
+    /// Hard timeout per advisor call in seconds (default 15).
+    #[serde(alias = "timeoutSecs")]
+    pub timeout_secs: Option<u64>,
+    /// Lowest severity that resumes a completed turn. Default: concern.
+    #[serde(alias = "continueSeverity")]
+    pub continue_severity: Option<crate::advisor::ContinueSeverity>,
+}
+
+/// LSP tool configuration (bd-cv653.1.1).
+///
+/// `servers` merges over the built-in defaults table per server name
+/// (set fields win); unknown names add new servers and require `command`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LspSettings {
+    /// Per-server overrides/extensions, keyed by server name.
+    pub servers: Option<std::collections::HashMap<String, LspServerSettings>>,
+    /// Default per-request timeout in seconds (default 120).
+    #[serde(alias = "requestTimeoutSecs")]
+    pub request_timeout_secs: Option<u64>,
+    /// Idle shutdown TTL in seconds (default 300).
+    #[serde(alias = "idleShutdownSecs")]
+    pub idle_shutdown_secs: Option<u64>,
+}
+
+/// One `lsp.servers.<name>` entry.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LspServerSettings {
+    /// Executable (required for new servers).
+    pub command: Option<String>,
+    /// argv after the executable.
+    pub args: Option<Vec<String>>,
+    /// Extra environment overrides.
+    pub env: Option<std::collections::HashMap<String, String>>,
+    /// LSP language ids served.
+    pub languages: Option<Vec<String>>,
+    /// File extensions routed to this server (with leading dot).
+    pub extensions: Option<Vec<String>>,
+    /// Workspace root marker filenames.
+    #[serde(alias = "rootMarkers")]
+    pub root_markers: Option<Vec<String>>,
+    /// `initializationOptions` payload for the handshake.
+    #[serde(alias = "initializationOptions")]
+    pub initialization_options: Option<serde_json::Value>,
+    /// Workspace settings exposed during initialization and notified after it.
+    /// Must be an object; each higher-precedence value replaces the whole object.
+    pub settings: Option<serde_json::Value>,
+}
+
+/// Approval mode configuration (bd-cv653.3.19).
+///
+/// `approval.mode`: `always-ask` (default) | `write` | `yolo`.
+/// `approval.dualConfirmClasses`: danger classes that always require typed confirmation even in yolo.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct ApprovalSettings {
+    /// Approval mode: `always-ask` | `write` | `yolo`.
+    pub mode: Option<String>,
+    /// Dangerous command classes requiring a second typed confirmation even in yolo mode.
+    #[serde(alias = "dualConfirmClasses")]
+    pub dual_confirm_classes: Option<Vec<String>>,
+}
+
+/// Read-tool configuration (bd-cv653.2.2).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ReadSettings {
+    /// Allow fetching private/loopback/link-local URL targets (SSRF override).
+    /// Default: false (blocked with a named `[SSRF_BLOCKED]` error).
+    #[serde(alias = "urlAllowPrivateTargets")]
+    pub url_allow_private_targets: Option<bool>,
+}
+
+/// Bash-tool mediation configuration (bd-cv653.1.7).
+///
+/// `bash.mediation`: `off` (default) | `warn` | `block-critical` | `block-high`.
+/// `bash.mediationDcg`: use a `dcg` binary on PATH as the authoritative verdict
+/// source when present (default true); the in-tree classifier is the fallback.
+///
+/// `bash.mediationForced` is accepted and has no effect. It was specified to
+/// mean "mediation applies even under yolo-style approval overrides", but
+/// mediation ended up unconditional in both places it runs — as a hard policy
+/// gate in `ApprovalState::evaluate`, ahead of every mode check, and again in
+/// the bash tool before spawn — so there is no weaker behaviour for it to
+/// select. `approval::tests::test_yolo_mode_respects_hard_policy_gates` pins
+/// that guarantee, and it passes with `mediation_forced` unset. Nothing reads
+/// the field; whether to give it meaning or retire it is open (bd-cv653.1.7).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BashSettings {
+    /// Mediation mode: off | warn | block-critical | block-high.
+    pub mediation: Option<String>,
+    /// Accepted and unread; mediation is already unconditional. See the type
+    /// doc above.
+    #[serde(alias = "mediationForced")]
+    pub mediation_forced: Option<bool>,
+    /// Prefer the `dcg` binary's verdicts when available (default true).
+    #[serde(alias = "mediationDcg")]
+    pub mediation_dcg: Option<bool>,
+    /// PTY allocation for isatty-requiring commands: `off`, `auto`
+    /// (default), or `always` (bd-cv653.1.7).
+    pub pty: Option<String>,
+    /// Keep native Bash variables, functions, aliases, options, and cwd across
+    /// foreground calls on Unix (default true). Explicit jobs stay isolated.
+    pub persistent: Option<bool>,
+    /// Promote long-running non-PTY calls without restarting the command.
+    #[serde(alias = "autoBackground")]
+    pub auto_background: Option<BashAutoBackgroundSettings>,
+}
+
+/// Foreground waiting policy for managed bash commands.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BashAutoBackgroundSettings {
+    /// Enabled by default; explicit background:false disables it for one call.
+    pub enabled: Option<bool>,
+    /// Foreground wait in milliseconds (default 60,000; clamped to 600,000).
+    /// Zero promotes immediately. The command's execution timeout is unchanged.
+    #[serde(alias = "thresholdMs")]
+    pub threshold_ms: Option<u64>,
+}
+
+/// `memory.backend` (bd-cv653.4.1).
+///
+/// `off` (default while experimental, omp's setting-gated posture) |
+/// `local` (per-project SQLite+FTS5 bank with
+/// retain/recall/reflect/memory_edit tools and a mental-model block on the
+/// first turn) | `cass` (the local bank plus optional, read-only CASS
+/// history search scoped to the project).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MemorySettings {
+    /// Memory backend: off | local | cass.
+    pub backend: Option<String>,
+    /// Learn durable facts from completed saved turns. Explicitly opt-in.
+    #[serde(alias = "autoExtract")]
+    pub auto_extract: Option<bool>,
+    /// Authored turns between automatic extractions (default 3; range 1..=100).
+    #[serde(alias = "extractEveryTurns")]
+    pub extract_every_turns: Option<u32>,
+}
+
+impl MemorySettings {
+    #[must_use]
+    pub fn enabled(&self) -> bool {
+        matches!(
+            self.backend.as_deref().map(str::trim),
+            Some("local" | "cass")
+        )
+    }
+
+    #[must_use]
+    pub fn extraction_cadence(&self) -> usize {
+        self.extract_every_turns.unwrap_or(3).clamp(1, 100) as usize
+    }
+}
+
+/// Controls automatic discovery of project MCP configuration files.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct McpSettings {
+    /// Default true; false skips every discovered project-native and foreign file.
+    #[serde(alias = "enableProjectConfig")]
+    pub enable_project_config: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -304,6 +861,22 @@ pub struct MarkdownSettings {
         deserialize_with = "deserialize_code_block_indent_option"
     )]
     pub code_block_indent: Option<u8>,
+    /// Vertical spacing policy for rendered markdown in the transcript
+    /// (issue #202): "comfortable" (default) keeps the renderer's blank line
+    /// after every block; "compact" drops the blanks between paragraphs and
+    /// list items while keeping one line of air around headings and fences.
+    pub spacing: Option<MarkdownSpacing>,
+}
+
+/// Inter-block spacing policy for transcript markdown (issue #202).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MarkdownSpacing {
+    /// Renderer default: one blank line after every block.
+    #[default]
+    Comfortable,
+    /// Blank lines survive only around headings and code fences.
+    Compact,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -323,6 +896,7 @@ pub struct ThinkingBudgets {
     pub medium: Option<u32>,
     pub high: Option<u32>,
     pub xhigh: Option<u32>,
+    pub max: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -385,14 +959,8 @@ impl Config {
     }
 
     /// Get the project configuration directory.
-    ///
-    /// uClaw renames the legacy `.pi` project dir to `.uclaw-pi` so it matches
-    /// the global `~/.uclaw-pi` home and sits beside the rest of a workspace's
-    /// uclaw-pi state (skills, plans, settings, package caches). Existing `.pi`
-    /// project dirs are migrated on first use by
-    /// [`crate::migrations::migrate_project_dir`].
     pub fn project_dir() -> PathBuf {
-        PathBuf::from(".uclaw-pi")
+        PathBuf::from(".pi")
     }
 
     /// Get the sessions directory.
@@ -452,6 +1020,8 @@ impl Config {
                 path.display()
             ))
         })?;
+        warn_unrecognised_setting_keys(path, &content);
+        warn_invalid_tool_load_modes(path, &content);
         Ok(config)
     }
 
@@ -460,6 +1030,18 @@ impl Config {
         global_dir: &std::path::Path,
         cwd: &std::path::Path,
     ) -> Result<Self> {
+        Self::load_with_roots_and_project_trust(config_path, global_dir, cwd, true)
+    }
+
+    /// [`Self::load_with_roots`], but skipping the project settings merge when
+    /// the workspace is untrusted (GH #151). An explicit `PI_CONFIG_PATH`
+    /// override is user-provided and always honored.
+    pub fn load_with_roots_and_project_trust(
+        config_path: Option<&std::path::Path>,
+        global_dir: &std::path::Path,
+        cwd: &std::path::Path,
+        project_trusted: bool,
+    ) -> Result<Self> {
         if let Some(path) = config_path {
             let config = Self::load_from_path(&Self::resolve_config_override_path(path, cwd))?;
             config.emit_queue_mode_diagnostics();
@@ -467,10 +1049,39 @@ impl Config {
         }
 
         let global = Self::load_from_path(&global_dir.join("settings.json"))?;
+        if !project_trusted {
+            global.emit_queue_mode_diagnostics();
+            return Ok(global);
+        }
         let project = Self::load_from_path(&cwd.join(Self::project_dir()).join("settings.json"))?;
         let merged = Self::merge(global, project);
         merged.emit_queue_mode_diagnostics();
         Ok(merged)
+    }
+
+    /// Load only the global settings (plus any `PI_CONFIG_PATH` override),
+    /// ignoring project-local `.pi/settings.json`. Used for untrusted
+    /// workspaces and for pre-trust reads of global-only knobs such as
+    /// `trustAllWorkspaces`.
+    pub fn load_global_only() -> Result<Self> {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let config_path = Self::config_path_override_from_env(&cwd);
+        Self::load_with_roots_and_project_trust(
+            config_path.as_deref(),
+            &Self::global_dir(),
+            &cwd,
+            false,
+        )
+    }
+
+    /// [`Self::load`], but skipping the project settings merge when the
+    /// workspace is untrusted (GH #151).
+    pub fn load_with_project_trust(project_trusted: bool) -> Result<Self> {
+        if project_trusted {
+            Self::load()
+        } else {
+            Self::load_global_only()
+        }
     }
 
     pub fn settings_path_with_roots(
@@ -514,11 +1125,64 @@ impl Config {
             default_model: other.default_model.or(base.default_model),
             default_thinking_level: other.default_thinking_level.or(base.default_thinking_level),
             enabled_models: other.enabled_models.or(base.enabled_models),
+            model_roles: merge_model_roles(base.model_roles, other.model_roles),
+            titling: merge_titling(base.titling, other.titling),
+            prewalk: match (base.prewalk, other.prewalk) {
+                (Some(base), Some(other)) => Some(PrewalkSettings {
+                    enabled: other.enabled.or(base.enabled),
+                    from: other.from.or(base.from),
+                    into: other.into.or(base.into),
+                }),
+                (base, other) => other.or(base),
+            },
+            disabled_providers: other.disabled_providers.or(base.disabled_providers),
+            model_scope_overrides: other.model_scope_overrides.or(base.model_scope_overrides),
+            tools: merge_tools(base.tools, other.tools),
+            plan: merge_plan(base.plan, other.plan),
+            read: merge_read(base.read, other.read),
+            out: match (base.out, other.out) {
+                (Some(base), Some(other)) => Some(OutSettings {
+                    enabled: other.enabled.or(base.enabled),
+                }),
+                (base, other) => other.or(base),
+            },
+            bash: merge_bash(base.bash, other.bash),
+            memory: merge_memory(base.memory, other.memory),
+            mcp: match (base.mcp, other.mcp) {
+                (Some(base), Some(other)) => Some(McpSettings {
+                    enable_project_config: other
+                        .enable_project_config
+                        .or(base.enable_project_config),
+                }),
+                (base, other) => other.or(base),
+            },
+            media: merge_media(base.media, other.media),
+            computer: merge_computer(base.computer, other.computer),
+            browser: merge_browser(base.browser, other.browser),
+            secrets: other.secrets.or(base.secrets),
+            keywords: merge_keywords(base.keywords, other.keywords),
+            advisor: merge_advisor(base.advisor, other.advisor),
+            lsp: merge_lsp(base.lsp, other.lsp),
+            approval: merge_approval(base.approval, other.approval),
             request_timeout_secs: other.request_timeout_secs.or(base.request_timeout_secs),
+            http: merge_http_settings(base.http, other.http),
 
             // Message Handling
             steering_mode: other.steering_mode.or(base.steering_mode),
             follow_up_mode: other.follow_up_mode.or(base.follow_up_mode),
+            async_settings: match (base.async_settings, other.async_settings) {
+                (Some(base), Some(other)) => Some(AsyncSettings {
+                    print_wake: other.print_wake.or(base.print_wake),
+                }),
+                (base, other) => other.or(base),
+            },
+            session: match (base.session, other.session) {
+                (Some(base), Some(other)) => Some(SessionSettings {
+                    warn_cost: other.warn_cost.or(base.warn_cost),
+                    max_cost: other.max_cost.or(base.max_cost),
+                }),
+                (base, other) => other.or(base),
+            },
 
             // Version check
             check_for_updates: other.check_for_updates.or(base.check_for_updates),
@@ -535,6 +1199,9 @@ impl Config {
             session_picker_input: other.session_picker_input.or(base.session_picker_input),
             session_store: other.session_store.or(base.session_store),
             session_durability: other.session_durability.or(base.session_durability),
+            search_backend: other.search_backend.or(base.search_backend),
+            foreign_rules: other.foreign_rules.or(base.foreign_rules),
+            ask_policy: other.ask_policy.or(base.ask_policy),
 
             // Compaction
             compaction: merge_compaction(base.compaction, other.compaction),
@@ -550,6 +1217,11 @@ impl Config {
             shell_command_prefix: other.shell_command_prefix.or(base.shell_command_prefix),
             gh_path: other.gh_path.or(base.gh_path),
 
+            // Subagent tool
+            subagent_structured_results: other
+                .subagent_structured_results
+                .or(base.subagent_structured_results),
+
             // Images
             images: merge_images(base.images, other.images),
 
@@ -562,6 +1234,9 @@ impl Config {
             // Thinking Budgets
             thinking_budgets: merge_thinking_budgets(base.thinking_budgets, other.thinking_budgets),
 
+            // Workspace trust
+            trust_all_workspaces: other.trust_all_workspaces.or(base.trust_all_workspaces),
+
             // Extensions/Skills/etc.
             packages: other.packages.or(base.packages),
             extensions: other.extensions.or(base.extensions),
@@ -570,6 +1245,11 @@ impl Config {
             themes: other.themes.or(base.themes),
             enable_skill_commands: other.enable_skill_commands.or(base.enable_skill_commands),
             fail_closed_hooks: other.fail_closed_hooks.or(base.fail_closed_hooks),
+            extension_startup_timeout_ms: other
+                .extension_startup_timeout_ms
+                .or(base.extension_startup_timeout_ms),
+            compaction_mode: other.compaction_mode.or(base.compaction_mode),
+            turn_recovery: other.turn_recovery.or(base.turn_recovery),
 
             // Extension Policy
             extension_policy: merge_extension_policy(base.extension_policy, other.extension_policy),
@@ -584,11 +1264,179 @@ impl Config {
 
     // === Accessor methods with defaults ===
 
+    /// Await extension readiness for at most 120 seconds by default. A host
+    /// override is bounded to 1..=300_000 milliseconds; other event deadlines
+    /// and explicit runtime API timeout arguments remain independent.
+    #[must_use]
+    pub fn extension_startup_timeout_ms(&self) -> u64 {
+        self.extension_startup_timeout_ms
+            .unwrap_or(crate::extensions::EXTENSION_STARTUP_EVENT_TIMEOUT_MS)
+            .clamp(1, 300_000)
+    }
+
+    /// Keep print mode alive for owned background work only when opted in.
+    #[must_use]
+    pub fn async_print_wake(&self) -> bool {
+        self.async_settings
+            .as_ref()
+            .and_then(|settings| settings.print_wake)
+            .unwrap_or(false)
+    }
+
+    /// Discover project-local MCP definitions when the workspace is also trusted.
+    /// Explicit CLI files, global definitions, and ACP client declarations are
+    /// independent of this setting.
+    #[must_use]
+    pub fn mcp_project_config_enabled(&self) -> bool {
+        self.mcp
+            .as_ref()
+            .and_then(|settings| settings.enable_project_config)
+            .unwrap_or(true)
+    }
+
     pub fn compaction_enabled(&self) -> bool {
         self.compaction
             .as_ref()
             .and_then(|c| c.enabled)
             .unwrap_or(true)
+    }
+
+    /// Compaction output rendering mode (bd-cv653.7.6). Default: text-only.
+    pub fn compaction_render_mode(&self) -> crate::compaction::CompactionRenderMode {
+        self.compaction
+            .as_ref()
+            .and_then(|c| c.mode)
+            .unwrap_or_default()
+    }
+
+    /// Whether automatic session titling is enabled (bd-cv653.3.1).
+    /// Default: true — it degrades to a silent no-op without a tiny/smol role.
+    pub fn auto_title_enabled(&self) -> bool {
+        self.titling
+            .as_ref()
+            .and_then(|t| t.auto_title)
+            .unwrap_or(true)
+    }
+
+    /// Optional prompt interval for checking whether a generated title drifted.
+    #[must_use]
+    pub fn title_refresh_after_prompts(&self) -> u32 {
+        if !self.auto_title_enabled() {
+            return 0;
+        }
+        self.titling
+            .as_ref()
+            .and_then(|settings| settings.refresh_after_prompts)
+            .unwrap_or(0)
+    }
+
+    /// Planning selector for an explicit prewalk restart.
+    #[must_use]
+    pub fn prewalk_from(&self) -> &str {
+        self.prewalk
+            .as_ref()
+            .and_then(|settings| settings.from.as_deref())
+            .unwrap_or("@default")
+    }
+
+    /// Destination for startup arming and commands without an override.
+    #[must_use]
+    pub fn prewalk_into(&self) -> &str {
+        self.prewalk
+            .as_ref()
+            .and_then(|settings| settings.into.as_deref())
+            .unwrap_or("@smol")
+    }
+
+    /// Seconds before the primary model is retried after a failover
+    /// (bd-cv653.3.2). Default: 300.
+    pub fn failover_cooldown_secs(&self) -> u64 {
+        self.retry
+            .as_ref()
+            .and_then(|r| r.failover_cooldown_secs)
+            .unwrap_or(300)
+    }
+
+    /// Maximum failovers within a single turn (bd-cv653.3.2). Default: 8.
+    pub fn max_failovers_per_turn(&self) -> u32 {
+        self.retry
+            .as_ref()
+            .and_then(|r| r.max_failovers_per_turn)
+            .unwrap_or(8)
+            .min(8)
+    }
+
+    /// Whether submitted plans auto-approve (bd-cv653.3.5). Default: false.
+    pub fn plan_auto_approve(&self) -> bool {
+        self.plan
+            .as_ref()
+            .and_then(|p| p.auto_approve)
+            .unwrap_or(false)
+    }
+
+    /// Active tool approval mode (bd-cv653.3.19). Default: `always-ask`.
+    #[must_use]
+    pub fn approval_mode(&self) -> crate::approval::ApprovalMode {
+        self.approval
+            .as_ref()
+            .and_then(|a| a.mode.as_deref())
+            .map_or(crate::approval::ApprovalMode::AlwaysAsk, |s| {
+                crate::approval::ApprovalMode::from_setting(Some(s))
+            })
+    }
+
+    /// Dangerous command classes requiring dual confirmation even under YOLO mode (bd-cv653.3.19).
+    #[must_use]
+    pub fn approval_dual_confirm_classes(&self) -> Vec<crate::extensions::DangerousCommandClass> {
+        self.approval
+            .as_ref()
+            .and_then(|a| a.dual_confirm_classes.as_ref())
+            .map_or_else(Vec::new, |list| {
+                list.iter()
+                    .filter_map(|s| crate::approval::parse_dangerous_command_class(s))
+                    .collect()
+            })
+    }
+
+    /// Whether the advisor is enabled when its role resolves (bd-cv653.3.3).
+    /// Default: true.
+    pub fn advisor_enabled(&self) -> bool {
+        self.advisor
+            .as_ref()
+            .and_then(|a| a.enabled)
+            .unwrap_or(true)
+    }
+
+    /// Memory backend (bd-cv653.4.1): `off` (default while experimental) |
+    /// `local` | `cass` (local bank plus history). Unknown values degrade to off.
+    pub fn memory_backend(&self) -> &str {
+        match self
+            .memory
+            .as_ref()
+            .and_then(|m| m.backend.as_deref())
+            .map(str::trim)
+        {
+            Some("local") => "local",
+            Some("cass") => "cass",
+            _ => "off",
+        }
+    }
+
+    /// Advisor per-call timeout in seconds (bd-cv653.3.3). Default: 15.
+    pub fn advisor_timeout_secs(&self) -> u64 {
+        self.advisor
+            .as_ref()
+            .and_then(|a| a.timeout_secs)
+            .unwrap_or(15)
+    }
+
+    /// Lowest advisor severity that resumes a completed turn. Default: concern.
+    #[must_use]
+    pub fn advisor_continue_severity(&self) -> crate::advisor::ContinueSeverity {
+        self.advisor
+            .as_ref()
+            .and_then(|advisor| advisor.continue_severity)
+            .unwrap_or_default()
     }
 
     pub fn steering_queue_mode(&self) -> QueueMode {
@@ -597,6 +1445,12 @@ impl Config {
 
     pub fn follow_up_queue_mode(&self) -> QueueMode {
         parse_queue_mode_or_default(self.follow_up_mode.as_deref())
+    }
+
+    /// Resolved auto-compaction mode (bd-cv653.3.18).
+    #[must_use]
+    pub fn compaction_mode(&self) -> crate::compaction::AutoCompactionMode {
+        self.compaction_mode.unwrap_or_default()
     }
 
     pub fn compaction_reserve_tokens(&self) -> u32 {
@@ -613,6 +1467,33 @@ impl Config {
             .unwrap_or(20000)
     }
 
+    /// Resolve one automatic compaction policy for every native session surface.
+    /// Thresholds retain their original units so a model switch can recompute them.
+    #[must_use]
+    pub fn resolved_compaction_settings(
+        &self,
+        context_window_tokens: u32,
+    ) -> crate::compaction::ResolvedCompactionSettings {
+        crate::compaction::ResolvedCompactionSettings {
+            enabled: self.compaction_enabled(),
+            context_window_tokens: if context_window_tokens == 0 {
+                crate::compaction::ResolvedCompactionSettings::default().context_window_tokens
+            } else {
+                context_window_tokens
+            },
+            reserve_tokens: self.compaction_reserve_tokens(),
+            keep_recent_tokens: self.compaction_keep_recent_tokens(),
+            threshold_tokens: self.compaction.as_ref().and_then(|c| c.threshold_tokens),
+            threshold_percent: self.compaction.as_ref().and_then(|c| c.threshold_percent),
+            method_order: self
+                .compaction
+                .as_ref()
+                .and_then(|c| c.method_order.clone()),
+            mode: self.compaction_mode(),
+            render_mode: self.compaction_render_mode(),
+        }
+    }
+
     pub fn branch_summary_reserve_tokens(&self) -> u32 {
         self.branch_summary
             .as_ref()
@@ -622,6 +1503,22 @@ impl Config {
 
     pub fn retry_enabled(&self) -> bool {
         self.retry.as_ref().and_then(|r| r.enabled).unwrap_or(true)
+    }
+
+    /// Whether automatic recovery may change models (default: true).
+    pub fn model_fallback_enabled(&self) -> bool {
+        self.retry
+            .as_ref()
+            .and_then(|retry| retry.model_fallback)
+            .unwrap_or(true)
+    }
+
+    /// Provider failure filter for model fallback (default: any).
+    pub fn retry_fallback_on(&self) -> crate::failover::FallbackOn {
+        self.retry
+            .as_ref()
+            .and_then(|retry| retry.fallback_on)
+            .unwrap_or_default()
     }
 
     pub fn retry_max_retries(&self) -> u32 {
@@ -642,6 +1539,12 @@ impl Config {
             .unwrap_or(60000)
     }
 
+    /// Whether foreign-format workspace rules are imported (bd-cv653.6.2).
+    #[must_use]
+    pub fn foreign_rules_enabled(&self) -> bool {
+        self.foreign_rules.unwrap_or(true)
+    }
+
     pub fn image_auto_resize(&self) -> bool {
         self.images
             .as_ref()
@@ -650,7 +1553,27 @@ impl Config {
     }
 
     /// Whether to check for version updates on startup (default: true).
+    ///
+    /// The check reaches the network, so `PI_SKIP_VERSION_CHECK` can turn it
+    /// off but never on: an environment that wants silence gets silence
+    /// whatever `checkForUpdates` says. That is also pi-mono's order — its
+    /// `checkForNewVersion` returns on the variable before it reads any
+    /// setting — and the variable is the one a migrating user already has in
+    /// their shell profile.
     pub fn should_check_for_updates(&self) -> bool {
+        self.should_check_for_updates_with_lookup(env_lookup)
+    }
+
+    fn should_check_for_updates_with_lookup<F>(&self, get_env: F) -> bool
+    where
+        F: Fn(&str) -> Option<String>,
+    {
+        // pi-mono tests the variable for JavaScript truthiness, and
+        // `PI_SKIP_VERSION_CHECK=` is the empty string, which is falsy. An
+        // empty value therefore does not skip the check, here either.
+        if get_env("PI_SKIP_VERSION_CHECK").is_some_and(|value| !value.is_empty()) {
+            return false;
+        }
         self.check_for_updates.unwrap_or(true)
     }
 
@@ -690,6 +1613,7 @@ impl Config {
             "medium" => budgets.and_then(|b| b.medium).unwrap_or(8192),
             "high" => budgets.and_then(|b| b.high).unwrap_or(16384),
             "xhigh" => budgets.and_then(|b| b.xhigh).unwrap_or(32768),
+            "max" => budgets.and_then(|b| b.max).unwrap_or(65536),
             _ => 0,
         }
     }
@@ -701,8 +1625,23 @@ impl Config {
             .unwrap_or(2)
     }
 
+    /// Resolved transcript markdown spacing policy (issue #202).
+    #[must_use]
+    pub fn markdown_spacing(&self) -> MarkdownSpacing {
+        self.markdown
+            .as_ref()
+            .and_then(|m| m.spacing)
+            .unwrap_or_default()
+    }
+
     pub fn enable_skill_commands(&self) -> bool {
         self.enable_skill_commands.unwrap_or(true)
+    }
+
+    /// Resolved turn-recovery mode (bd-cv653.3.15).
+    #[must_use]
+    pub fn turn_recovery_mode(&self) -> crate::turn_recovery::TurnRecoveryMode {
+        self.turn_recovery.unwrap_or_default()
     }
 
     pub fn fail_closed_hooks(&self) -> bool {
@@ -777,6 +1716,7 @@ impl Config {
         } else {
             // Unknown values fail closed to the safe profile.
             tracing::warn!(
+                target: USER_DIAGNOSTIC_TARGET,
                 requested = %normalized_profile,
                 fallback = "safe",
                 "Unknown extension policy profile; falling back to safe"
@@ -1077,6 +2017,197 @@ pub(crate) fn parse_queue_mode_or_default(mode: Option<&str>) -> QueueMode {
     parse_queue_mode(mode).unwrap_or(QueueMode::OneAtATime)
 }
 
+/// Is this exact settings diagnostic being reported for the first time?
+///
+/// Startup reads the same settings file more than once — the HTTP proxy, the
+/// workspace-trust probe and the main load each call [`Config::load`] — so one
+/// mistake in `settings.json` otherwise produces three identical warnings.
+fn first_report_of(scope: &str, item: &str) -> bool {
+    static REPORTED: OnceLock<Mutex<std::collections::HashSet<(String, String)>>> = OnceLock::new();
+
+    let Ok(mut seen) = REPORTED
+        .get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+        .lock()
+    else {
+        // A lock poisoned by an unrelated panic must not swallow a diagnostic,
+        // so a lost set warns again rather than going quiet.
+        return true;
+    };
+    seen.insert((scope.to_string(), item.to_string()))
+}
+
+/// Warn once per process for each unrecognised key in a settings file.
+fn warn_unrecognised_setting_keys(path: &Path, content: &str) {
+    let keys = unrecognised_setting_keys(content);
+    if keys.is_empty() {
+        return;
+    }
+
+    let file = path.display().to_string();
+    for key in keys {
+        if first_report_of(&file, &key) {
+            tracing::warn!(
+                target: USER_DIAGNOSTIC_TARGET,
+                setting = key,
+                file = file.as_str(),
+                "Unrecognised setting; it is being ignored"
+            );
+        }
+    }
+}
+
+/// Validate mode values without restricting extension or MCP tool names.
+/// Use the runtime parser so whitespace and case normalization cannot drift.
+fn warn_invalid_tool_load_modes(path: &Path, content: &str) {
+    let Ok(value) = serde_json::from_str::<Value>(content) else {
+        return;
+    };
+    let Some(tools) = value.get("tools") else {
+        return;
+    };
+
+    let file = path.display().to_string();
+    for key in ["load_mode", "loadMode"] {
+        let Some(modes) = tools.get(key).and_then(Value::as_object) else {
+            continue;
+        };
+        for (name, value) in modes {
+            let Some(mode) = value.as_str() else {
+                continue; // Wrong types are already rejected by Config deserialization.
+            };
+            if crate::xdev::LoadMode::from_name(mode).is_some() {
+                continue;
+            }
+            let setting = format!("tools.{key}.{name}");
+            if first_report_of(&file, &setting) {
+                tracing::warn!(
+                    target: USER_DIAGNOSTIC_TARGET,
+                    setting,
+                    file = file.as_str(),
+                    value = mode,
+                    "Invalid tool load mode; expected essential, discoverable, or off. This value is being ignored; normal tool selection and default load modes apply"
+                );
+            }
+        }
+    }
+}
+
+/// Settings keys this build does not recognise, as dotted paths.
+///
+/// `Config` is `#[serde(default)]` with no `deny_unknown_fields`, so an
+/// unknown key is dropped in silence. That is the right default for forward
+/// compatibility — a settings file written by a newer pi must not stop an older
+/// one from starting — and the wrong outcome for a typo, which is the common
+/// case and otherwise produces no signal at all. `"hide_thinking_blocks"`,
+/// where the field is `hide_thinking_block`, simply does nothing, for ever,
+/// with no message. So does `"bash": { "mediatoin": "block-high" }`, and that
+/// one costs more.
+///
+/// Recognition is asked of serde rather than of a hand-kept list: the name is
+/// placed alone in a `Config`-shaped probe and the round-trip compared against
+/// the same probe with nothing in it. A recognised key moves something; an
+/// unknown one is dropped and leaves the shape untouched. That cannot drift as
+/// fields and their camelCase aliases are added, which a list would — and it
+/// needs no knowledge of the aliases at all, of which there are 73 here.
+///
+/// Every field is an `Option`, so any non-null value differs from the default.
+/// Four things are deliberately not reported:
+///
+///   * an explicit `null`, which is indistinguishable from "not set" by
+///     construction and is not a typo;
+///   * keys beginning with `$`, the convention for editor metadata such as
+///     `$schema`;
+///   * a name serde knows but whose value has the wrong type, because the
+///     caller has already failed the whole file with a parse error and
+///     "unknown key" would be a second, wrong diagnosis;
+///   * the keys of a map-valued setting — `retry.fallbackChains` is keyed by
+///     role, `lsp.servers` by server name, `lsp.servers.<name>.env` by
+///     variable — which are the user's data and cannot be misspelled. Those
+///     need no special case: serde KEEPS them, so they move the shape, which
+///     is the same evidence of being read that a struct field gives.
+pub(crate) fn unrecognised_setting_keys(content: &str) -> Vec<String> {
+    let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(content)
+    else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    collect_unrecognised_keys(&[], &map, &mut found);
+    found
+}
+
+fn collect_unrecognised_keys(
+    path: &[&str],
+    map: &serde_json::Map<String, serde_json::Value>,
+    found: &mut Vec<String>,
+) {
+    let Some(empty) = config_shape_with(path, empty_object()) else {
+        return;
+    };
+
+    for (key, value) in map {
+        if key.starts_with('$') || value.is_null() {
+            continue;
+        }
+        // `None` is a type error, which is serde saying it knows this name and
+        // disliked the value — not an unrecognised key.
+        let recognised =
+            config_shape_with(path, one_key(key, value.clone())).is_none_or(|shape| shape != empty);
+        if !recognised {
+            found.push(dotted(path, key));
+            continue;
+        }
+
+        if let serde_json::Value::Object(nested) = value {
+            let mut deeper: Vec<&str> = path.to_vec();
+            deeper.push(key);
+            collect_unrecognised_keys(&deeper, nested, found);
+        }
+    }
+}
+
+/// Does this build recognise `key` as a top-level settings key, by any spelling?
+///
+/// The same question asked about one name with no value to hand, which is the
+/// shape `pi doctor` needs.
+pub(crate) fn recognises_setting_key(key: &str) -> bool {
+    let Some(empty) = config_shape_with(&[], empty_object()) else {
+        return true;
+    };
+    config_shape_with(&[], one_key(key, serde_json::Value::Bool(true)))
+        .is_none_or(|shape| shape != empty)
+}
+
+/// A whole `Config`, round-tripped, with `value` placed at `path`.
+///
+/// `None` means serde refused the shape, which only happens when it recognises
+/// a name and rejects its value.
+fn config_shape_with(path: &[&str], value: serde_json::Value) -> Option<serde_json::Value> {
+    let mut probe = value;
+    for key in path.iter().rev() {
+        probe = one_key(key, probe);
+    }
+    let parsed: Config = serde_json::from_value(probe).ok()?;
+    serde_json::to_value(parsed).ok()
+}
+
+fn one_key(key: &str, value: serde_json::Value) -> serde_json::Value {
+    let mut map = serde_json::Map::new();
+    map.insert(key.to_string(), value);
+    serde_json::Value::Object(map)
+}
+
+fn empty_object() -> serde_json::Value {
+    serde_json::Value::Object(serde_json::Map::new())
+}
+
+fn dotted(path: &[&str], key: &str) -> String {
+    if path.is_empty() {
+        key.to_string()
+    } else {
+        format!("{}.{key}", path.join("."))
+    }
+}
+
 fn emit_queue_mode_diagnostic(setting: &'static str, mode: Option<&str>) {
     let Some(mode) = mode else {
         return;
@@ -1086,8 +2217,13 @@ fn emit_queue_mode_diagnostic(setting: &'static str, mode: Option<&str>) {
     if parse_queue_mode(Some(trimmed)).is_some() {
         return;
     }
+    // Same triple-load as the unrecognised-key warning; see `first_report_of`.
+    if !first_report_of(setting, trimmed) {
+        return;
+    }
 
     tracing::warn!(
+        target: USER_DIAGNOSTIC_TARGET,
         setting,
         value = trimmed,
         "Unknown queue mode; falling back to one-at-a-time"
@@ -1103,6 +2239,10 @@ fn merge_compaction(
             enabled: other.enabled.or(base.enabled),
             reserve_tokens: other.reserve_tokens.or(base.reserve_tokens),
             keep_recent_tokens: other.keep_recent_tokens.or(base.keep_recent_tokens),
+            threshold_tokens: other.threshold_tokens.or(base.threshold_tokens),
+            threshold_percent: other.threshold_percent.or(base.threshold_percent),
+            method_order: other.method_order.or(base.method_order),
+            mode: other.mode.or(base.mode),
         }),
         (None, Some(other)) => Some(other),
         (Some(base), None) => Some(base),
@@ -1124,13 +2264,39 @@ fn merge_branch_summary(
     }
 }
 
+/// Field-wise merge of the `[http]` section (#210): a project config can set
+/// just `proxy` without dropping a global `noProxy`.
+fn merge_http_settings(
+    base: Option<crate::http::proxy::HttpSettings>,
+    other: Option<crate::http::proxy::HttpSettings>,
+) -> Option<crate::http::proxy::HttpSettings> {
+    match (base, other) {
+        (Some(base), Some(other)) => Some(crate::http::proxy::HttpSettings {
+            proxy: other.proxy.or(base.proxy),
+            https_proxy: other.https_proxy.or(base.https_proxy),
+            http_proxy: other.http_proxy.or(base.http_proxy),
+            no_proxy: other.no_proxy.or(base.no_proxy),
+            proxy_loopback: other.proxy_loopback.or(base.proxy_loopback),
+            ignore_env_proxy: other.ignore_env_proxy.or(base.ignore_env_proxy),
+        }),
+        (None, Some(other)) => Some(other),
+        (Some(base), None) => Some(base),
+        (None, None) => None,
+    }
+}
+
 fn merge_retry(base: Option<RetrySettings>, other: Option<RetrySettings>) -> Option<RetrySettings> {
     match (base, other) {
         (Some(base), Some(other)) => Some(RetrySettings {
             enabled: other.enabled.or(base.enabled),
+            model_fallback: other.model_fallback.or(base.model_fallback),
+            fallback_on: other.fallback_on.or(base.fallback_on),
             max_retries: other.max_retries.or(base.max_retries),
             base_delay_ms: other.base_delay_ms.or(base.base_delay_ms),
             max_delay_ms: other.max_delay_ms.or(base.max_delay_ms),
+            fallback_chains: other.fallback_chains.or(base.fallback_chains),
+            failover_cooldown_secs: other.failover_cooldown_secs.or(base.failover_cooldown_secs),
+            max_failovers_per_turn: other.max_failovers_per_turn.or(base.max_failovers_per_turn),
         }),
         (None, Some(other)) => Some(other),
         (Some(base), None) => Some(base),
@@ -1145,7 +2311,324 @@ fn merge_markdown(
     match (base, other) {
         (Some(base), Some(other)) => Some(MarkdownSettings {
             code_block_indent: other.code_block_indent.or(base.code_block_indent),
+            spacing: other.spacing.or(base.spacing),
         }),
+        (None, Some(other)) => Some(other),
+        (Some(base), None) => Some(base),
+        (None, None) => None,
+    }
+}
+
+/// Merge per-role model assignments field-wise (other wins per role).
+fn merge_model_roles(
+    base: Option<ModelRoleSettings>,
+    other: Option<ModelRoleSettings>,
+) -> Option<ModelRoleSettings> {
+    match (base, other) {
+        (Some(base), Some(other)) => Some(ModelRoleSettings {
+            default: other.default.or(base.default),
+            smol: other.smol.or(base.smol),
+            slow: other.slow.or(base.slow),
+            plan: other.plan.or(base.plan),
+            commit: other.commit.or(base.commit),
+            vision: other.vision.or(base.vision),
+            designer: other.designer.or(base.designer),
+            task: other.task.or(base.task),
+            advisor: other.advisor.or(base.advisor),
+            tiny: other.tiny.or(base.tiny),
+        }),
+        (None, Some(other)) => Some(other),
+        (Some(base), None) => Some(base),
+        (None, None) => None,
+    }
+}
+
+/// Merge titling settings (other wins).
+fn merge_titling(
+    base: Option<TitlingSettings>,
+    other: Option<TitlingSettings>,
+) -> Option<TitlingSettings> {
+    match (base, other) {
+        (Some(base), Some(other)) => Some(TitlingSettings {
+            auto_title: other.auto_title.or(base.auto_title),
+            refresh_after_prompts: other.refresh_after_prompts.or(base.refresh_after_prompts),
+        }),
+        (None, Some(other)) => Some(other),
+        (Some(base), None) => Some(base),
+        (None, None) => None,
+    }
+}
+
+/// Merge advisor settings (other wins).
+fn merge_advisor(
+    base: Option<AdvisorSettings>,
+    other: Option<AdvisorSettings>,
+) -> Option<AdvisorSettings> {
+    match (base, other) {
+        (Some(base), Some(other)) => Some(AdvisorSettings {
+            enabled: other.enabled.or(base.enabled),
+            timeout_secs: other.timeout_secs.or(base.timeout_secs),
+            continue_severity: other.continue_severity.or(base.continue_severity),
+        }),
+        (None, Some(other)) => Some(other),
+        (Some(base), None) => Some(base),
+        (None, None) => None,
+    }
+}
+
+/// Merge magic-keyword settings field-wise. Scalar toggles inherit from the
+/// lower-precedence layer when omitted; an explicitly supplied custom-word
+/// list replaces the lower layer's list (including an explicit empty list).
+fn merge_keywords(
+    base: Option<crate::magic_keywords::KeywordSettings>,
+    other: Option<crate::magic_keywords::KeywordSettings>,
+) -> Option<crate::magic_keywords::KeywordSettings> {
+    match (base, other) {
+        (Some(base), Some(other)) => Some(crate::magic_keywords::KeywordSettings {
+            enabled: other.enabled.or(base.enabled),
+            ultrathink: other.ultrathink.or(base.ultrathink),
+            chillax: other.chillax.or(base.chillax),
+            orchestrate: other.orchestrate.or(base.orchestrate),
+            workflowz: other.workflowz.or(base.workflowz),
+            jevify: other.jevify.or(base.jevify),
+            extra: other.extra.or(base.extra),
+        }),
+        (None, Some(other)) => Some(other),
+        (Some(base), None) => Some(base),
+        (None, None) => None,
+    }
+}
+
+/// Merge bash mediation settings field-wise (bd-cv653.1.7).
+fn merge_bash(base: Option<BashSettings>, other: Option<BashSettings>) -> Option<BashSettings> {
+    match (base, other) {
+        (Some(base), Some(other)) => Some(BashSettings {
+            mediation: other.mediation.or(base.mediation),
+            mediation_forced: other.mediation_forced.or(base.mediation_forced),
+            mediation_dcg: other.mediation_dcg.or(base.mediation_dcg),
+            pty: other.pty.or(base.pty),
+            persistent: other.persistent.or(base.persistent),
+            auto_background: merge_bash_auto_background(
+                base.auto_background,
+                other.auto_background,
+            ),
+        }),
+        (None, Some(other)) => Some(other),
+        (Some(base), None) => Some(base),
+        (None, None) => None,
+    }
+}
+
+fn merge_bash_auto_background(
+    base: Option<BashAutoBackgroundSettings>,
+    other: Option<BashAutoBackgroundSettings>,
+) -> Option<BashAutoBackgroundSettings> {
+    match (base, other) {
+        (Some(base), Some(other)) => Some(BashAutoBackgroundSettings {
+            enabled: other.enabled.or(base.enabled),
+            threshold_ms: other.threshold_ms.or(base.threshold_ms),
+        }),
+        (None, Some(other)) => Some(other),
+        (Some(base), None) => Some(base),
+        (None, None) => None,
+    }
+}
+
+/// Merge memory settings field-wise (bd-cv653.4.1).
+fn merge_memory(
+    base: Option<MemorySettings>,
+    other: Option<MemorySettings>,
+) -> Option<MemorySettings> {
+    match (base, other) {
+        (Some(base), Some(other)) => Some(MemorySettings {
+            backend: other.backend.or(base.backend),
+            auto_extract: other.auto_extract.or(base.auto_extract),
+            extract_every_turns: other.extract_every_turns.or(base.extract_every_turns),
+        }),
+        (None, Some(other)) => Some(other),
+        (Some(base), None) => Some(base),
+        (None, None) => None,
+    }
+}
+
+/// Merge media settings field-wise before resolving individual activation
+/// overrides against the aggregate default.
+fn merge_media(
+    base: Option<crate::media_tools::MediaSettings>,
+    other: Option<crate::media_tools::MediaSettings>,
+) -> Option<crate::media_tools::MediaSettings> {
+    match (base, other) {
+        (Some(base), Some(other)) => Some(crate::media_tools::MediaSettings {
+            enable_media: other.enable_media.or(base.enable_media),
+            enable_inspect_image: other.enable_inspect_image.or(base.enable_inspect_image),
+            enable_generate_image: other.enable_generate_image.or(base.enable_generate_image),
+            enable_tts: other.enable_tts.or(base.enable_tts),
+            enable_read_media: other.enable_read_media.or(base.enable_read_media),
+            max_bytes: other.max_bytes.or(base.max_bytes),
+            vision_model: other.vision_model.or(base.vision_model),
+            vision_provider: other.vision_provider.or(base.vision_provider),
+            image_gen_provider: other.image_gen_provider.or(base.image_gen_provider),
+            image_gen_model: other.image_gen_model.or(base.image_gen_model),
+            tts_voice: other.tts_voice.or(base.tts_voice),
+            tts_provider: other.tts_provider.or(base.tts_provider),
+        }),
+        (None, Some(other)) => Some(other),
+        (Some(base), None) => Some(base),
+        (None, None) => None,
+    }
+}
+
+/// Merge computer settings field-wise (bd-cv653.2.5).
+fn merge_computer(
+    base: Option<crate::computer::ComputerSettings>,
+    other: Option<crate::computer::ComputerSettings>,
+) -> Option<crate::computer::ComputerSettings> {
+    match (base, other) {
+        (Some(base), Some(other)) => Some(crate::computer::ComputerSettings {
+            enable_computer: other.enable_computer.or(base.enable_computer),
+            require_approval: other.require_approval.or(base.require_approval),
+            screenshot_dir: other.screenshot_dir.or(base.screenshot_dir),
+        }),
+        (None, Some(other)) => Some(other),
+        (Some(base), None) => Some(base),
+        (None, None) => None,
+    }
+}
+
+/// Merge browser settings field-wise (bd-cv653.2.4).
+fn merge_browser(
+    base: Option<crate::browser::BrowserSettings>,
+    other: Option<crate::browser::BrowserSettings>,
+) -> Option<crate::browser::BrowserSettings> {
+    match (base, other) {
+        (Some(base), Some(other)) => Some(crate::browser::BrowserSettings {
+            enable_browser: other.enable_browser.or(base.enable_browser),
+            executable_path: other.executable_path.or(base.executable_path),
+            remote_debugging_port: other.remote_debugging_port.or(base.remote_debugging_port),
+            headless: other.headless.or(base.headless),
+            user_agent: other.user_agent.or(base.user_agent),
+            domain_allowlist: other.domain_allowlist.or(base.domain_allowlist),
+        }),
+        (None, Some(other)) => Some(other),
+        (Some(base), None) => Some(base),
+        (None, None) => None,
+    }
+}
+
+/// Merge LSP settings: server maps union, set fields prefer `other` within
+/// each server, and object-valued fields replace as a whole (bd-cv653.1.1).
+fn merge_lsp(base: Option<LspSettings>, other: Option<LspSettings>) -> Option<LspSettings> {
+    match (base, other) {
+        (Some(base), Some(other)) => {
+            let mut servers = base.servers.unwrap_or_default();
+            if let Some(other_servers) = other.servers {
+                for (name, other) in other_servers {
+                    let server = match servers.remove(&name) {
+                        Some(base) => LspServerSettings {
+                            command: other.command.or(base.command),
+                            args: other.args.or(base.args),
+                            env: other.env.or(base.env),
+                            languages: other.languages.or(base.languages),
+                            extensions: other.extensions.or(base.extensions),
+                            root_markers: other.root_markers.or(base.root_markers),
+                            initialization_options: other
+                                .initialization_options
+                                .or(base.initialization_options),
+                            settings: other.settings.or(base.settings),
+                        },
+                        None => other,
+                    };
+                    servers.insert(name, server);
+                }
+            }
+            Some(LspSettings {
+                servers: if servers.is_empty() {
+                    None
+                } else {
+                    Some(servers)
+                },
+                request_timeout_secs: other.request_timeout_secs.or(base.request_timeout_secs),
+                idle_shutdown_secs: other.idle_shutdown_secs.or(base.idle_shutdown_secs),
+            })
+        }
+        (None, Some(other)) => Some(other),
+        (Some(base), None) => Some(base),
+        (None, None) => None,
+    }
+}
+
+/// Merge approval settings (other wins per scalar, classes union).
+fn merge_approval(
+    base: Option<ApprovalSettings>,
+    other: Option<ApprovalSettings>,
+) -> Option<ApprovalSettings> {
+    match (base, other) {
+        (Some(base), Some(other)) => {
+            let mut classes = base.dual_confirm_classes.unwrap_or_default();
+            if let Some(other_classes) = other.dual_confirm_classes {
+                for c in other_classes {
+                    if !classes.contains(&c) {
+                        classes.push(c);
+                    }
+                }
+            }
+            Some(ApprovalSettings {
+                mode: other.mode.or(base.mode),
+                dual_confirm_classes: if classes.is_empty() {
+                    None
+                } else {
+                    Some(classes)
+                },
+            })
+        }
+        (None, Some(other)) => Some(other),
+        (Some(base), None) => Some(base),
+        (None, None) => None,
+    }
+}
+
+/// Merge read settings (other wins).
+fn merge_read(base: Option<ReadSettings>, other: Option<ReadSettings>) -> Option<ReadSettings> {
+    match (base, other) {
+        (Some(base), Some(other)) => Some(ReadSettings {
+            url_allow_private_targets: other
+                .url_allow_private_targets
+                .or(base.url_allow_private_targets),
+        }),
+        (None, Some(other)) => Some(other),
+        (Some(base), None) => Some(base),
+        (None, None) => None,
+    }
+}
+
+/// Merge plan-mode settings (other wins).
+fn merge_plan(base: Option<PlanSettings>, other: Option<PlanSettings>) -> Option<PlanSettings> {
+    match (base, other) {
+        (Some(base), Some(other)) => Some(PlanSettings {
+            auto_approve: other.auto_approve.or(base.auto_approve),
+        }),
+        (None, Some(other)) => Some(other),
+        (Some(base), None) => Some(base),
+        (None, None) => None,
+    }
+}
+
+/// Merge tool settings (other wins per activation flag and tool-mode entry).
+fn merge_tools(base: Option<ToolSettings>, other: Option<ToolSettings>) -> Option<ToolSettings> {
+    match (base, other) {
+        (Some(base), Some(other)) => {
+            let mut modes = base.load_mode.unwrap_or_default();
+            if let Some(other_modes) = other.load_mode {
+                modes.extend(other_modes);
+            }
+            Some(ToolSettings {
+                enable_eval: other.enable_eval.or(base.enable_eval),
+                enable_github: other.enable_github.or(base.enable_github),
+                enable_security_scan: other.enable_security_scan.or(base.enable_security_scan),
+                enable_subagent: other.enable_subagent.or(base.enable_subagent),
+                load_mode: if modes.is_empty() { None } else { Some(modes) },
+            })
+        }
         (None, Some(other)) => Some(other),
         (Some(base), None) => Some(base),
         (None, None) => None,
@@ -1216,6 +2699,7 @@ fn merge_thinking_budgets(
             medium: other.medium.or(base.medium),
             high: other.high.or(base.high),
             xhigh: other.xhigh.or(base.xhigh),
+            max: other.max.or(base.max),
         }),
         (None, Some(other)) => Some(other),
         (Some(base), None) => Some(base),
@@ -1307,13 +2791,19 @@ fn deep_merge_settings_value(dst: &mut Value, patch: Value) -> Result<()> {
             continue;
         }
 
-        match (dst_obj.get_mut(&key), value) {
-            (Some(Value::Object(dst_child)), Value::Object(patch_child)) => {
-                let mut child = Value::Object(std::mem::take(dst_child));
-                deep_merge_settings_value(&mut child, Value::Object(patch_child))?;
-                dst_obj.insert(key, child);
+        match value {
+            Value::Object(patch_child) => {
+                let child = dst_obj
+                    .entry(key)
+                    .or_insert_with(|| Value::Object(serde_json::Map::new()));
+                if !child.is_object() {
+                    *child = Value::Object(serde_json::Map::new());
+                }
+                // Null means deletion at every depth, including when the
+                // parent object is newly created or replaces a scalar.
+                deep_merge_settings_value(child, Value::Object(patch_child))?;
             }
-            (_, other) => {
+            other => {
                 dst_obj.insert(key, other);
             }
         }
@@ -1358,8 +2848,11 @@ fn patch_settings_file(path: &Path, patch: Value) -> Result<Value> {
     let _process_guard = settings_persist_lock()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let lock_handle = open_settings_lock_file(path)?;
-    let _file_guard = lock_settings_file(lock_handle, Duration::from_secs(30))?;
+    // Directory-based lock compatible with upstream TS pi's `proper-lockfile`
+    // (see `crate::file_lock`); the in-process `settings_persist_lock` above still
+    // serializes threads within this process.
+    let _file_guard = crate::file_lock::DirLock::acquire_for(path, Duration::from_secs(30))
+        .map_err(|e| Error::config(format!("settings lock: {e}")))?;
     let mut settings = load_settings_json_object(path)?;
     deep_merge_settings_value(&mut settings, patch)?;
     write_settings_json_atomic(path, &settings)?;
@@ -1369,73 +2862,6 @@ fn patch_settings_file(path: &Path, patch: Value) -> Result<Value> {
 fn settings_persist_lock() -> &'static Mutex<()> {
     static PERSIST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     PERSIST_LOCK.get_or_init(|| Mutex::new(()))
-}
-
-fn settings_lock_path(path: &Path) -> PathBuf {
-    let mut lock_path = path.to_path_buf();
-    let mut file_name = path.file_name().map_or_else(
-        || std::ffi::OsString::from("settings"),
-        std::ffi::OsString::from,
-    );
-    file_name.push(".lock");
-    lock_path.set_file_name(file_name);
-    lock_path
-}
-
-fn open_settings_lock_file(path: &Path) -> Result<File> {
-    let lock_path = settings_lock_path(path);
-    if let Some(parent) = lock_path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        std::fs::create_dir_all(parent)?;
-    }
-
-    let mut options = File::options();
-    options.read(true).write(true).create(true).truncate(false);
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.mode(0o600);
-    }
-
-    options.open(&lock_path).map_err(|err| {
-        Error::config(format!(
-            "Failed to open settings lock file {}: {err}",
-            lock_path.display()
-        ))
-    })
-}
-
-fn lock_settings_file(file: File, timeout: Duration) -> Result<SettingsLockGuard> {
-    let start = Instant::now();
-    loop {
-        match FileExt::try_lock_exclusive(&file) {
-            Ok(true) => return Ok(SettingsLockGuard { file }),
-            Ok(false) => {}
-            Err(err) => {
-                return Err(Error::config(format!(
-                    "Failed to lock settings file: {err}"
-                )));
-            }
-        }
-
-        if start.elapsed() >= timeout {
-            return Err(Error::config("Timed out waiting for settings lock"));
-        }
-
-        std::thread::sleep(Duration::from_millis(50));
-    }
-}
-
-struct SettingsLockGuard {
-    file: File,
-}
-
-impl Drop for SettingsLockGuard {
-    fn drop(&mut self) {
-        let _ = FileExt::unlock(&self.file);
-    }
 }
 
 #[cfg(unix)]
@@ -1449,7 +2875,9 @@ fn sync_settings_parent_dir(path: &Path) -> std::io::Result<()> {
     File::open(parent)?.sync_all()
 }
 
+// Mirrors the Unix arm's fallible signature, which really can fail.
 #[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps, clippy::missing_const_for_fn)]
 fn sync_settings_parent_dir(_path: &Path) -> std::io::Result<()> {
     Ok(())
 }
@@ -1458,14 +2886,15 @@ fn sync_settings_parent_dir(_path: &Path) -> std::io::Result<()> {
 mod tests {
     use super::{
         BranchSummarySettings, CompactionSettings, Config, ExtensionPolicyConfig,
-        ExtensionRiskConfig, ImageSettings, RepairPolicyConfig, RetrySettings, SettingsScope,
-        TerminalSettings, ThinkingBudgets, deep_merge_settings_value,
-        extension_index_path_from_env, global_dir_from_env, merge_branch_summary, merge_compaction,
-        merge_extension_policy, merge_extension_risk, merge_images, merge_repair_policy,
-        merge_retry, merge_terminal, merge_thinking_budgets, package_dir_from_env,
-        sessions_dir_from_env,
+        ExtensionRiskConfig, ImageSettings, MarkdownSpacing, RepairPolicyConfig, RetrySettings,
+        SettingsScope, TerminalSettings, ThinkingBudgets, deep_merge_settings_value,
+        extension_index_path_from_env, first_report_of, global_dir_from_env, merge_branch_summary,
+        merge_compaction, merge_extension_policy, merge_extension_risk, merge_images,
+        merge_repair_policy, merge_retry, merge_terminal, merge_thinking_budgets,
+        package_dir_from_env, sessions_dir_from_env, unrecognised_setting_keys,
     };
     use crate::agent::QueueMode;
+    use clap::Parser;
     use proptest::prelude::*;
     use proptest::string::string_regex;
     use serde_json::{Value, json};
@@ -1474,11 +2903,1196 @@ mod tests {
     use std::sync::{Arc, Barrier};
     use tempfile::TempDir;
 
+    #[test]
+    fn extension_startup_timeout_is_bounded_and_recognizes_settings_spellings() {
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+        assert_eq!(Config::default().extension_startup_timeout_ms(), 120_000);
+        let camel: Config = serde_json::from_str(r#"{"extensionStartupTimeoutMs":75000}"#)
+            .expect("camelCase startup setting");
+        let snake: Config = serde_json::from_str(r#"{"extension_startup_timeout_ms":90000}"#)
+            .expect("snake_case startup setting");
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+        assert_eq!(camel.extension_startup_timeout_ms(), 75_000);
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+        assert_eq!(snake.extension_startup_timeout_ms(), 90_000);
+        let merged = Config::merge(camel, snake);
+        let inherited = Config::merge(merged, Config::default());
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+        assert_eq!(inherited.extension_startup_timeout_ms(), 90_000);
+        let zero = Config {
+            extension_startup_timeout_ms: Some(0),
+            ..Config::default()
+        };
+        let oversized = Config {
+            extension_startup_timeout_ms: Some(u64::MAX),
+            ..Config::default()
+        };
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+        assert_eq!(zero.extension_startup_timeout_ms(), 1);
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+        assert_eq!(oversized.extension_startup_timeout_ms(), 300_000);
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+        assert!(unrecognised_setting_keys(r#"{"extensionStartupTimeoutMs":75000}"#).is_empty());
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+        assert!(unrecognised_setting_keys(r#"{"extension_startup_timeout_ms":90000}"#).is_empty());
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+        assert!(serde_json::from_str::<Config>(r#"{"extensionStartupTimeoutMs":-1}"#).is_err());
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+        assert!(serde_json::from_str::<Config>(r#"{"extensionStartupTimeoutMs":1.5}"#).is_err());
+    }
+
+    #[test]
+    fn extension_startup_timeout_uses_only_admitted_settings_sources() {
+        let temp = TempDir::new().expect("fixture directory");
+        let cwd = temp.path().join("workspace");
+        let global = temp.path().join("global");
+        let override_path = temp.path().join("explicit-settings.json");
+        write_file(
+            &global.join("settings.json"),
+            r#"{"extensionStartupTimeoutMs":20000}"#,
+        );
+        write_file(
+            &cwd.join(".pi/settings.json"),
+            r#"{"extensionStartupTimeoutMs":240000}"#,
+        );
+        write_file(&override_path, r#"{"extensionStartupTimeoutMs":45000}"#);
+        let trusted = Config::load_with_roots_and_project_trust(None, &global, &cwd, true)
+            .expect("trusted project config");
+        let untrusted = Config::load_with_roots_and_project_trust(None, &global, &cwd, false)
+            .expect("global config without project trust");
+        let explicit =
+            Config::load_with_roots_and_project_trust(Some(&override_path), &global, &cwd, false)
+                .expect("explicit user config path");
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+        assert_eq!(trusted.extension_startup_timeout_ms(), 240_000);
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+        assert_eq!(untrusted.extension_startup_timeout_ms(), 20_000);
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+        assert_eq!(explicit.extension_startup_timeout_ms(), 45_000);
+    }
+
+    #[test]
+    fn prewalk_selectors_merge_independently_without_enabling_the_workflow()
+    -> serde_json::Result<()> {
+        let base: Config = serde_json::from_value(json!({
+            "prewalk": {"enabled": true, "from": "@slow", "into": "@smol"}
+        }))?;
+        let project: Config = serde_json::from_value(json!({
+            "prewalk": {"enabled": false, "into": "openai/gpt-5-mini:low"}
+        }))?;
+        let merged = Config::merge(base, project);
+        assert_eq!(
+            merged
+                .prewalk
+                .as_ref()
+                .and_then(|settings| settings.enabled),
+            Some(false)
+        );
+        assert_eq!(merged.prewalk_from(), "@slow");
+        assert_eq!(merged.prewalk_into(), "openai/gpt-5-mini:low");
+
+        let selectors_only: Config = serde_json::from_value(json!({
+            "prewalk": {"from": "@plan", "into": "@default"}
+        }))?;
+        assert_eq!(
+            selectors_only
+                .prewalk
+                .as_ref()
+                .and_then(|settings| settings.enabled),
+            None
+        );
+        assert_eq!(Config::default().prewalk_from(), "@default");
+        assert_eq!(Config::default().prewalk_into(), "@smol");
+        Ok(())
+    }
+
+    #[test]
+    fn title_refresh_is_opt_in_and_merges_without_losing_auto_title() {
+        assert_eq!(Config::default().title_refresh_after_prompts(), 0);
+        for source in [
+            r#"{"title":{"refreshAfterPrompts":3}}"#,
+            r#"{"titling":{"refresh_after_prompts":3}}"#,
+        ] {
+            let config: Config = serde_json::from_str(source).expect("title refresh settings");
+            assert!(unrecognised_setting_keys(source).is_empty());
+            assert_eq!(config.title_refresh_after_prompts(), 3);
+            let empty = serde_json::from_str(r#"{"titling":{}}"#).expect("empty title override");
+            let merged = Config::merge(config, empty);
+            assert_eq!(merged.title_refresh_after_prompts(), 3);
+            let disabled = serde_json::from_str(r#"{"titling":{"autoTitle":false}}"#)
+                .expect("disable auto titles");
+            let disabled = Config::merge(merged, disabled);
+            assert_eq!(disabled.title_refresh_after_prompts(), 0);
+            assert_eq!(disabled.titling.unwrap().refresh_after_prompts, Some(3));
+        }
+        for invalid in ["-1", "1.5", "true", "4294967296"] {
+            let source = format!(r#"{{"title":{{"refreshAfterPrompts":{invalid}}}}}"#);
+            assert!(serde_json::from_str::<Config>(&source).is_err());
+        }
+    }
+
+    /// gh #281: the remaining snake_case-only settings accept camelCase too,
+    /// like every other multi-word key.
+    #[test]
+    fn camel_case_spellings_reach_the_last_snake_case_only_settings() {
+        let source = r#"{
+            "compactionMode": "shake-first",
+            "turnRecovery": "off",
+            "secrets": { "extraPatterns": ["sk-[a-z]+"] }
+        }"#;
+        assert!(
+            unrecognised_setting_keys(source).is_empty(),
+            "{:?}",
+            unrecognised_setting_keys(source)
+        );
+        let config: Config = serde_json::from_str(source).expect("camelCase settings");
+        assert_eq!(
+            config.compaction_mode,
+            Some(crate::compaction::AutoCompactionMode::ShakeFirst)
+        );
+        assert!(matches!(
+            config.turn_recovery,
+            Some(crate::turn_recovery::TurnRecoveryMode::Off)
+        ));
+        assert_eq!(
+            config.secrets.and_then(|secrets| secrets.extra_patterns),
+            Some(vec![String::from("sk-[a-z]+")])
+        );
+    }
+
+    #[test]
+    fn compaction_method_order_validates_aliases_and_replaces_the_sequence() {
+        use crate::compaction::AutoCompactionMethod::{Remote, Shake, Soft};
+
+        for content in [
+            r#"{"compaction":{"methodOrder":["remote","shake","soft"]}}"#,
+            r#"{"compaction":{"method_order":["remote","shake","soft"]}}"#,
+        ] {
+            let config: Config = serde_json::from_str(content).expect("ordered policy");
+            assert!(unrecognised_setting_keys(content).is_empty());
+            let encoded = serde_json::to_value(&config).expect("serialize policy");
+            let restored: Config = serde_json::from_value(encoded).expect("restore policy");
+            assert_eq!(
+                restored.resolved_compaction_settings(100_000).method_order,
+                Some(vec![Remote, Shake, Soft])
+            );
+            let inherited = Config::merge(
+                restored,
+                serde_json::from_str(r#"{"compaction":{"methodOrder":null}}"#)
+                    .expect("unset override"),
+            );
+            assert_eq!(
+                inherited.resolved_compaction_settings(100_000).method_order,
+                Some(vec![Remote, Shake, Soft])
+            );
+            let replaced = Config::merge(
+                inherited,
+                serde_json::from_str(r#"{"compaction":{"methodOrder":["soft","shake"]}}"#)
+                    .expect("project order"),
+            );
+            assert_eq!(
+                replaced.resolved_compaction_settings(100_000).method_order,
+                Some(vec![Soft, Shake])
+            );
+        }
+        for value in [
+            r"[]",
+            r#"["shake","shake"]"#,
+            r#"["remote","soft","shake","remote"]"#,
+            r#"["unknown"]"#,
+            r#""soft""#,
+            r"[false]",
+        ] {
+            let content = format!(r#"{{"compaction":{{"methodOrder":{value}}}}}"#);
+            assert!(
+                serde_json::from_str::<Config>(&content).is_err(),
+                "accepted {content}"
+            );
+        }
+        let legacy = Config::default().resolved_compaction_settings(100_000);
+        assert!(legacy.method_order.is_none());
+    }
+
+    #[test]
+    fn explicit_compaction_order_preserves_configured_retention_and_thresholds() {
+        let config: Config = serde_json::from_str(
+            r#"{
+                "compactionMode":"aggressive",
+                "compaction":{
+                    "reserveTokens":10000,"keepRecentTokens":4000,
+                    "thresholdTokens":60000,"thresholdPercent":40,
+                    "methodOrder":["shake","soft"]
+                }
+            }"#,
+        )
+        .expect("ordered policy with legacy mode");
+        let resolved = config
+            .resolved_compaction_settings(100_000)
+            .with_mode_applied();
+        assert_eq!(resolved.keep_recent_tokens, 4_000);
+        assert_eq!(resolved.reserve_tokens, 10_000);
+        assert_eq!(resolved.trigger_tokens(), 40_000);
+    }
+
+    #[test]
+    fn compaction_threshold_settings_validate_aliases_and_roundtrip() {
+        for content in [
+            r#"{"compaction":{"thresholdTokens":60000,"thresholdPercent":75.5}}"#,
+            r#"{"compaction":{"threshold_tokens":60000,"threshold_percent":75.5}}"#,
+        ] {
+            let config: Config = serde_json::from_str(content).expect("threshold settings");
+            assert!(unrecognised_setting_keys(content).is_empty());
+            let encoded = serde_json::to_value(&config).expect("serialize thresholds");
+            let restored: Config = serde_json::from_value(encoded).expect("restore thresholds");
+            let resolved = restored.resolved_compaction_settings(100_000);
+            assert_eq!(resolved.threshold_tokens, Some(60_000));
+            assert_eq!(resolved.threshold_percent, Some(75.5));
+            assert_eq!(resolved.trigger_tokens(), 60_000);
+        }
+        for content in [
+            r"{}",
+            r#"{"compaction":{}}"#,
+            r#"{"compaction":{"thresholdTokens":null,"thresholdPercent":null}}"#,
+        ] {
+            let config: Config = serde_json::from_str(content).expect("legacy settings");
+            let resolved = config.resolved_compaction_settings(100_000);
+            assert_eq!(resolved.threshold_tokens, None);
+            assert_eq!(resolved.threshold_percent, None);
+            assert_eq!(resolved.trigger_tokens(), 100_000 - 16_384);
+            if let Some(settings) = config.compaction.as_ref() {
+                let encoded = serde_json::to_value(settings).expect("legacy compaction settings");
+                assert!(encoded.get("threshold_tokens").is_none());
+                assert!(encoded.get("threshold_percent").is_none());
+            }
+        }
+        for (key, values) in [
+            (
+                "thresholdTokens",
+                &["0", "-1", "1.5", "4294967296", "\"60000\"", "true"][..],
+            ),
+            (
+                "thresholdPercent",
+                &["0", "-1", "100.1", "1e999", "\"NaN\"", "true"][..],
+            ),
+        ] {
+            for value in values {
+                let content = format!(r#"{{"compaction":{{"{key}":{value}}}}}"#);
+                assert!(
+                    serde_json::from_str::<Config>(&content).is_err(),
+                    "accepted {content}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn compaction_thresholds_layer_without_changing_context_capacity_or_retention() {
+        let temp = TempDir::new().expect("create tempdir");
+        let cwd = temp.path().join("cwd");
+        let global_dir = temp.path().join("global");
+        write_file(
+            &global_dir.join("settings.json"),
+            r#"{"compaction":{
+                "reserveTokens":10000,"keepRecentTokens":4000,
+                "thresholdTokens":60000,"thresholdPercent":75
+            }}"#,
+        );
+        write_file(
+            &cwd.join(".pi/settings.json"),
+            r#"{"compaction":{"enabled":false,"thresholdPercent":50}}"#,
+        );
+
+        let config = Config::load_with_roots(None, &global_dir, &cwd).expect("load settings");
+        let mut resolved = config.resolved_compaction_settings(100_000);
+        assert!(!resolved.enabled);
+        assert_eq!(resolved.context_window_tokens, 100_000);
+        assert_eq!(resolved.reserve_tokens, 10_000);
+        assert_eq!(resolved.keep_recent_tokens, 4_000);
+        assert_eq!(resolved.threshold_tokens, Some(60_000));
+        assert_eq!(resolved.threshold_percent, Some(50.0));
+        assert_eq!(resolved.trigger_tokens(), 50_000);
+
+        resolved.context_window_tokens = 40_000;
+        assert_eq!(resolved.trigger_tokens(), 20_000);
+        assert_eq!(resolved.reserve_tokens, 10_000);
+        assert_eq!(resolved.keep_recent_tokens, 4_000);
+        let unknown_window = config.resolved_compaction_settings(0);
+        assert_eq!(
+            unknown_window.context_window_tokens,
+            crate::compaction::ResolvedCompactionSettings::default().context_window_tokens
+        );
+        assert_eq!(unknown_window.threshold_tokens, Some(60_000));
+        assert_eq!(unknown_window.threshold_percent, Some(50.0));
+    }
+
+    #[test]
+    fn session_cost_thresholds_validate_and_merge_individually() {
+        for content in [
+            r#"{"session":{"warnCost":1.5,"maxCost":5}}"#,
+            r#"{"session":{"warn_cost":1.5,"max_cost":5}}"#,
+        ] {
+            let base: Config = serde_json::from_str(content).expect("cost settings");
+            assert!(unrecognised_setting_keys(content).is_empty());
+            let other = serde_json::from_str(r#"{"session":{"maxCost":8}}"#).expect("override");
+            let merged = Config::merge(base, other)
+                .session
+                .expect("session settings");
+            assert_eq!(merged.warn_cost, Some(1.5));
+            assert_eq!(merged.max_cost, Some(8.0));
+        }
+        for value in ["0", "-1", "1e999", "\"NaN\"", "true"] {
+            for key in ["warnCost", "maxCost"] {
+                let content = format!(r#"{{"session":{{"{key}":{value}}}}}"#);
+                assert!(
+                    serde_json::from_str::<Config>(&content).is_err(),
+                    "accepted {content}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn async_print_wake_is_opt_in_and_preserves_partial_settings_merges() {
+        assert!(!Config::default().async_print_wake());
+        for content in [
+            r#"{"async":{"printWake":true}}"#,
+            r#"{"async":{"print_wake":true}}"#,
+            r#"{"async_settings":{"print_wake":true}}"#,
+        ] {
+            let enabled: Config = serde_json::from_str(content).expect("async settings");
+            assert!(enabled.async_print_wake());
+            assert!(unrecognised_setting_keys(content).is_empty());
+            let partial = serde_json::from_str(r#"{"async":{}}"#).expect("empty override");
+            let inherited = Config::merge(enabled, partial);
+            assert!(inherited.async_print_wake());
+            let disabled = serde_json::from_str(r#"{"async":{"printWake":false}}"#)
+                .expect("explicit project override");
+            assert!(!Config::merge(inherited, disabled).async_print_wake());
+        }
+        assert!(serde_json::from_str::<Config>(r#"{"async":{"printWake":"true"}}"#).is_err());
+    }
+
+    #[test]
+    fn mcp_project_discovery_setting_aliases_defaults_and_layering() {
+        assert!(Config::default().mcp_project_config_enabled());
+        for content in [
+            r#"{"mcp":{"enableProjectConfig":false}}"#,
+            r#"{"mcp":{"enable_project_config":false}}"#,
+        ] {
+            let disabled: Config = serde_json::from_str(content).expect("MCP settings");
+            assert!(!disabled.mcp_project_config_enabled());
+            assert!(unrecognised_setting_keys(content).is_empty());
+            let empty: Config = serde_json::from_str(r#"{"mcp":{}}"#).expect("empty override");
+            let inherited = Config::merge(disabled, empty);
+            assert!(!inherited.mcp_project_config_enabled());
+            let enabled: Config = serde_json::from_str(r#"{"mcp":{"enableProjectConfig":true}}"#)
+                .expect("explicit override");
+            assert!(Config::merge(inherited, enabled).mcp_project_config_enabled());
+        }
+        assert!(
+            serde_json::from_str::<Config>(r#"{"mcp":{"enableProjectConfig":"false"}}"#).is_err()
+        );
+    }
+
+    #[test]
+    fn advisor_continuation_threshold_aliases_defaults_and_layering() {
+        use crate::advisor::ContinueSeverity;
+
+        assert_eq!(
+            Config::default().advisor_continue_severity(),
+            ContinueSeverity::Concern
+        );
+        for (key, value, expected) in [
+            ("continueSeverity", "nit", ContinueSeverity::Nit),
+            ("continue_severity", "note", ContinueSeverity::Nit),
+            ("continueSeverity", "concern", ContinueSeverity::Concern),
+            ("continue_severity", "blocker", ContinueSeverity::Blocker),
+        ] {
+            let content = format!(r#"{{"advisor":{{"{key}":"{value}"}}}}"#);
+            let config: Config = serde_json::from_str(&content).expect("advisor settings");
+            assert_eq!(config.advisor_continue_severity(), expected);
+            assert!(unrecognised_setting_keys(&content).is_empty());
+        }
+        assert!(
+            serde_json::from_str::<Config>(r#"{"advisor":{"continueSeverity":"critical"}}"#)
+                .is_err(),
+            "unknown thresholds must not silently enable automatic continuation"
+        );
+        let global: Config = serde_json::from_value(json!({
+            "advisor": {"enabled": false, "timeoutSecs": 25, "continueSeverity": "blocker"}
+        }))
+        .expect("global settings");
+        let project: Config = serde_json::from_value(json!({
+            "advisor": {"timeoutSecs": 8}
+        }))
+        .expect("project settings");
+        let inherited = Config::merge(global, project);
+        assert!(!inherited.advisor_enabled());
+        assert_eq!(inherited.advisor_timeout_secs(), 8);
+        assert_eq!(
+            inherited.advisor_continue_severity(),
+            ContinueSeverity::Blocker
+        );
+
+        let override_config: Config = serde_json::from_value(json!({
+            "advisor": {"enabled": true, "continue_severity": "nit"}
+        }))
+        .expect("project override");
+        let overridden = Config::merge(inherited, override_config);
+        assert!(overridden.advisor_enabled());
+        assert_eq!(overridden.advisor_timeout_secs(), 8);
+        assert_eq!(
+            overridden.advisor_continue_severity(),
+            ContinueSeverity::Nit
+        );
+    }
+
+    #[test]
+    fn bash_auto_background_settings_merge_without_losing_parent_fields() {
+        for content in [
+            r#"{"bash":{"autoBackground":{"enabled":false,"thresholdMs":250}}}"#,
+            r#"{"bash":{"auto_background":{"enabled":false,"threshold_ms":250}}}"#,
+        ] {
+            let config: Config = serde_json::from_str(content).expect("bash settings");
+            let settings = config
+                .bash
+                .expect("bash")
+                .auto_background
+                .expect("auto background");
+            assert_eq!(settings.enabled, Some(false));
+            assert_eq!(settings.threshold_ms, Some(250));
+            assert!(unrecognised_setting_keys(content).is_empty());
+        }
+        let global: Config = serde_json::from_value(json!({
+            "bash": {
+                "mediation": "block-high",
+                "persistent": false,
+                "autoBackground": {"enabled": false, "thresholdMs": 400}
+            }
+        }))
+        .expect("global settings");
+        let project: Config = serde_json::from_value(json!({
+            "bash": {"autoBackground": {"enabled": true}}
+        }))
+        .expect("project settings");
+        let merged = Config::merge(global, project);
+        let bash = merged.bash.expect("merged bash");
+        assert_eq!(bash.mediation.as_deref(), Some("block-high"));
+        assert_eq!(bash.persistent, Some(false));
+        let auto = bash.auto_background.expect("merged auto background");
+        assert_eq!(auto.enabled, Some(true));
+        assert_eq!(auto.threshold_ms, Some(400));
+        assert!(
+            serde_json::from_value::<Config>(json!({
+                "bash": {"autoBackground": {"thresholdMs": -1}}
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn http_loopback_proxy_setting_accepts_camel_and_snake_case() {
+        for (content, expected) in [
+            (r#"{"http":{"proxyLoopback":true}}"#, true),
+            (r#"{"http":{"proxy_loopback":true}}"#, true),
+            (r#"{"http":{"proxyLoopback":false}}"#, false),
+            (r#"{"http":{"proxy_loopback":false}}"#, false),
+        ] {
+            let config: Config = serde_json::from_str(content).expect("parse HTTP settings");
+            assert_eq!(
+                config.http.expect("HTTP settings").proxy_loopback,
+                Some(expected)
+            );
+            assert!(
+                unrecognised_setting_keys(content).is_empty(),
+                "the settings checker must recognize {content}"
+            );
+        }
+    }
+
+    #[test]
+    fn http_loopback_proxy_setting_survives_partial_merge_and_false_override() {
+        let global: Config = serde_json::from_value(json!({
+            "http": {
+                "proxy": "http://proxy.example:8080",
+                "proxyLoopback": true,
+                "noProxy": ["internal.example"],
+                "ignoreEnvProxy": true
+            }
+        }))
+        .expect("global HTTP settings");
+        let project: Config = serde_json::from_value(json!({
+            "http": {"httpsProxy": "http://secure.example:8443"}
+        }))
+        .expect("partial project HTTP settings");
+        let merged = Config::merge(global, project);
+        let inherited = merged.http.as_ref().expect("merged HTTP settings");
+        assert_eq!(inherited.proxy_loopback, Some(true));
+        assert_eq!(
+            inherited.proxy.as_deref(),
+            Some("http://proxy.example:8080")
+        );
+        assert_eq!(
+            inherited.https_proxy.as_deref(),
+            Some("http://secure.example:8443")
+        );
+
+        let project: Config = serde_json::from_value(json!({
+            "http": {"proxyLoopback": false}
+        }))
+        .expect("project disables loopback proxying");
+        let merged = Config::merge(merged, project);
+        let settings = merged.http.as_ref().expect("merged HTTP settings");
+        assert_eq!(settings.proxy_loopback, Some(false));
+        assert_eq!(settings.ignore_env_proxy, Some(true));
+        assert_eq!(
+            settings.no_proxy.as_deref(),
+            Some(["internal.example".to_string()].as_slice())
+        );
+        let (resolved, warnings) =
+            crate::http::proxy::ProxyConfig::resolve(Some(settings), &|_| None);
+        assert!(warnings.is_empty());
+        assert!(resolved.endpoint_for(false, "127.0.0.1", 11434).is_none());
+        assert!(resolved.endpoint_for(true, "localhost", 443).is_none());
+        assert!(
+            resolved
+                .endpoint_for(true, "internal.example", 443)
+                .is_none()
+        );
+        assert_eq!(
+            resolved
+                .endpoint_for(true, "remote.example", 443)
+                .expect("secure proxy retained")
+                .redacted_url(),
+            "http://secure.example:8443"
+        );
+        assert_eq!(
+            resolved
+                .endpoint_for(false, "remote.example", 80)
+                .expect("generic proxy retained")
+                .redacted_url(),
+            "http://proxy.example:8080"
+        );
+    }
+
+    #[test]
+    fn failover_settings_parse_chains_cooldown_and_cap() {
+        let json = json!({
+            "retry": {
+                "enabled": true,
+                "maxRetries": 2,
+                "modelFallback": false,
+                "fallbackOn": "usage-limit",
+                "fallbackChains": {
+                    "default": ["openai/gpt-5-mini", "google/gemini-3-pro"],
+                    "anthropic/claude-opus-4-7": ["openai/gpt-5.5"]
+                },
+                "failoverCooldownSecs": 120,
+                "maxFailoversPerTurn": 3
+            }
+        });
+        let config: Config = serde_json::from_value(json).expect("parse failover settings");
+        let retry = config.retry.clone().expect("retry settings present");
+        let chains = retry.fallback_chains.expect("chains present");
+        assert_eq!(
+            chains.get("default").unwrap(),
+            &vec![
+                "openai/gpt-5-mini".to_string(),
+                "google/gemini-3-pro".to_string()
+            ]
+        );
+        assert_eq!(
+            chains.get("anthropic/claude-opus-4-7").unwrap(),
+            &vec!["openai/gpt-5.5".to_string()]
+        );
+        assert_eq!(retry.failover_cooldown_secs, Some(120));
+        assert_eq!(retry.max_failovers_per_turn, Some(3));
+        assert_eq!(config.failover_cooldown_secs(), 120);
+        assert_eq!(config.max_failovers_per_turn(), 3);
+        assert!(!config.model_fallback_enabled());
+        assert_eq!(
+            config.retry_fallback_on(),
+            crate::failover::FallbackOn::UsageLimit
+        );
+    }
+
+    #[test]
+    fn failover_settings_defaults_apply_when_unset() {
+        let config = Config::default();
+        assert_eq!(config.failover_cooldown_secs(), 300);
+        assert_eq!(config.max_failovers_per_turn(), 8);
+        assert!(config.model_fallback_enabled());
+        assert_eq!(config.retry_fallback_on(), crate::failover::FallbackOn::Any);
+        assert!(config.disabled_providers.is_none());
+        assert!(config.model_scope_overrides.is_none());
+    }
+
+    #[test]
+    fn disabled_providers_and_scope_overrides_parse() {
+        let json = json!({
+            "disabledProviders": ["anthropic", "OpenAI"],
+            "modelScopeOverrides": [
+                {
+                    "path": "/repo/a",
+                    "enabledModels": ["openai/gpt-5.5"],
+                    "disabledProviders": ["google"]
+                },
+                {"path": "/repo", "disabledProviders": ["mistral"]}
+            ]
+        });
+        let config: Config = serde_json::from_value(json).expect("parse scope settings");
+        assert_eq!(
+            config.disabled_providers.as_deref(),
+            Some(["anthropic".to_string(), "OpenAI".to_string()].as_slice())
+        );
+        let overrides = config.model_scope_overrides.expect("overrides");
+        assert_eq!(overrides.len(), 2);
+        assert_eq!(overrides[0].path, "/repo/a");
+        assert_eq!(
+            overrides[0].enabled_models.as_deref(),
+            Some(["openai/gpt-5.5".to_string()].as_slice())
+        );
+        assert_eq!(
+            overrides[1].disabled_providers.as_deref(),
+            Some(["mistral".to_string()].as_slice())
+        );
+    }
+
+    #[test]
+    fn failover_chains_merge_field_wise() {
+        let base = RetrySettings {
+            model_fallback: Some(false),
+            fallback_on: Some(crate::failover::FallbackOn::UsageLimit),
+            fallback_chains: Some(HashMap::from([(
+                "default".to_string(),
+                vec!["openai/gpt-5-mini".to_string()],
+            )])),
+            failover_cooldown_secs: Some(60),
+            ..Default::default()
+        };
+        let other = RetrySettings {
+            max_retries: Some(5),
+            fallback_on: Some(crate::failover::FallbackOn::ExceptUsageLimit),
+            ..Default::default()
+        };
+        let merged = merge_retry(Some(base), Some(other)).expect("merged");
+        assert!(merged.fallback_chains.is_some(), "base chains preserved");
+        assert_eq!(merged.failover_cooldown_secs, Some(60));
+        assert_eq!(merged.max_retries, Some(5));
+        assert_eq!(merged.model_fallback, Some(false));
+        assert_eq!(
+            merged.fallback_on,
+            Some(crate::failover::FallbackOn::ExceptUsageLimit)
+        );
+    }
+
+    #[test]
+    fn fallback_filters_round_trip_and_reject_unknown_modes() {
+        for mode in ["any", "usage-limit", "except-usage-limit"] {
+            let config: Config = serde_json::from_value(json!({
+                "retry": {"model_fallback": false, "fallback_on": mode}
+            }))
+            .expect("valid fallback policy");
+            assert!(!config.model_fallback_enabled());
+            assert_eq!(config.retry_fallback_on().as_str(), mode);
+            let encoded = serde_json::to_value(config).expect("serialize");
+            assert_eq!(encoded["retry"]["model_fallback"], false);
+            assert_eq!(encoded["retry"]["fallback_on"], mode);
+        }
+        assert!(
+            serde_json::from_value::<Config>(json!({
+                "retry": {"fallbackOn": "sometimes"}
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn scope_override_and_disabled_round_trip_serialization() {
+        let config = Config {
+            disabled_providers: Some(vec!["anthropic".to_string()]),
+            model_scope_overrides: Some(vec![super::ModelScopeOverride {
+                path: "/repo/a".to_string(),
+                enabled_models: Some(vec!["openai/gpt-5.5".to_string()]),
+                disabled_providers: Some(vec!["google".to_string()]),
+            }]),
+            ..Config::default()
+        };
+        let json = serde_json::to_value(&config).expect("serialize");
+        let parsed: Config = serde_json::from_value(json).expect("round-trip");
+        assert_eq!(
+            parsed.disabled_providers.as_deref(),
+            Some(["anthropic".to_string()].as_slice())
+        );
+        let overrides = parsed.model_scope_overrides.expect("overrides");
+        assert_eq!(overrides[0].path, "/repo/a");
+        assert_eq!(
+            overrides[0].disabled_providers.as_deref(),
+            Some(["google".to_string()].as_slice())
+        );
+    }
+
     fn write_file(path: &std::path::Path, contents: &str) {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).expect("create parent dir");
         }
         std::fs::write(path, contents).expect("write file");
+    }
+
+    const OPTIONAL_TOOL_SETTINGS: [(&str, &str, &str); 4] = [
+        ("eval", "enableEval", "enable_eval"),
+        ("github", "enableGithub", "enable_github"),
+        (
+            "security_scan",
+            "enableSecurityScan",
+            "enable_security_scan",
+        ),
+        ("subagent", "enableSubagent", "enable_subagent"),
+    ];
+
+    fn assert_optional_tool_selection(config: &Config, expected: &[&str]) {
+        let cli = crate::cli::Cli::try_parse_from(["pi"]).expect("default CLI");
+        let enabled = cli.enabled_tools(config);
+        for (name, _, _) in OPTIONAL_TOOL_SETTINGS {
+            assert_eq!(
+                enabled.contains(&name),
+                expected.contains(&name),
+                "optional tool {name} in {enabled:?}"
+            );
+        }
+    }
+
+    const MEDIA_TOOL_SETTINGS: [(&str, &str, &str); 3] = [
+        (
+            "inspect_image",
+            "enableInspectImage",
+            "enable_inspect_image",
+        ),
+        (
+            "generate_image",
+            "enableGenerateImage",
+            "enable_generate_image",
+        ),
+        ("tts", "enableTts", "enable_tts"),
+    ];
+
+    fn assert_media_tool_selection(config: &Config, cwd: &std::path::Path, expected: &[&str]) {
+        let registry = crate::tools::ToolRegistry::new(&["read"], cwd, Some(config));
+        for name in ["inspect_image", "generate_image", "tts", "read_media"] {
+            assert_eq!(
+                registry.get(name).is_some(),
+                expected.contains(&name),
+                "media tool {name}, expected {expected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn media_aggregate_aliases_and_individual_switches_select_tools() {
+        let temp = TempDir::new().expect("create tempdir");
+        let cwd = temp.path().join("cwd");
+        let global_dir = temp.path().join("global");
+        let path = global_dir.join("settings.json");
+        let names = ["inspect_image", "generate_image", "tts"];
+        for aggregate_key in ["enable_media", "enableMedia"] {
+            for value in [json!(true), json!(false), Value::Null] {
+                let content = json!({"media": {(aggregate_key): value}}).to_string();
+                assert!(unrecognised_setting_keys(&content).is_empty());
+                write_file(&path, &content);
+                let config = Config::load_with_roots(None, &global_dir, &cwd)
+                    .expect("load aggregate media activation");
+                assert_media_tool_selection(
+                    &config,
+                    &cwd,
+                    if value == json!(true) { &names } else { &[] },
+                );
+            }
+            for (name, camel, snake) in MEDIA_TOOL_SETTINGS {
+                for individual_key in [camel, snake] {
+                    for aggregate in [false, true] {
+                        let individual = !aggregate;
+                        let content = json!({"media": {
+                            (aggregate_key): aggregate,
+                            (individual_key): individual
+                        }})
+                        .to_string();
+                        assert!(unrecognised_setting_keys(&content).is_empty());
+                        write_file(&path, &content);
+                        let config = Config::load_with_roots(None, &global_dir, &cwd)
+                            .expect("load individual media override");
+                        let expected: Vec<&str> = names
+                            .iter()
+                            .copied()
+                            .filter(|candidate| (*candidate == name) == individual)
+                            .collect();
+                        assert_media_tool_selection(&config, &cwd, &expected);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn media_aggregate_merges_across_aliases_and_respects_project_trust() {
+        let temp = TempDir::new().expect("create tempdir");
+        let cwd = temp.path().join("cwd");
+        let global_dir = temp.path().join("global");
+        let global_path = global_dir.join("settings.json");
+        let project_path = cwd.join(".pi/settings.json");
+        let names = ["inspect_image", "generate_image", "tts"];
+        for global_key in ["enable_media", "enableMedia"] {
+            for project_key in ["enable_media", "enableMedia"] {
+                for global_enabled in [false, true] {
+                    write_file(
+                        &global_path,
+                        &json!({"media": {(global_key): global_enabled}}).to_string(),
+                    );
+                    write_file(
+                        &project_path,
+                        &json!({"media": {(project_key): !global_enabled}}).to_string(),
+                    );
+                    for trusted in [false, true] {
+                        let config = Config::load_with_roots_and_project_trust(
+                            None,
+                            &global_dir,
+                            &cwd,
+                            trusted,
+                        )
+                        .expect("load media settings with project trust");
+                        let enabled = global_enabled != trusted;
+                        assert_eq!(
+                            config.media.as_ref().expect("media settings").enable_media,
+                            Some(enabled)
+                        );
+                        assert_media_tool_selection(
+                            &config,
+                            &cwd,
+                            if enabled { &names } else { &[] },
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn media_individual_choices_survive_aggregate_overrides_in_another_scope() {
+        let temp = TempDir::new().expect("create tempdir");
+        let cwd = temp.path().join("cwd");
+        let global_dir = temp.path().join("global");
+        let global_path = global_dir.join("settings.json");
+        let project_path = cwd.join(".pi/settings.json");
+        let names = ["inspect_image", "generate_image", "tts"];
+        for (name, camel, snake) in MEDIA_TOOL_SETTINGS {
+            for (global_key, project_key) in [(camel, snake), (snake, camel)] {
+                for individual in [false, true] {
+                    write_file(
+                        &global_path,
+                        &json!({"media": {
+                            (global_key): individual,
+                            "enableMedia": individual,
+                            "visionProvider": "gemini"
+                        }})
+                        .to_string(),
+                    );
+                    write_file(
+                        &project_path,
+                        &json!({"media": {"enable_media": !individual}}).to_string(),
+                    );
+                    let config = Config::load_with_roots(None, &global_dir, &cwd)
+                        .expect("inherit explicit individual choice");
+                    let expected: Vec<&str> = names
+                        .iter()
+                        .copied()
+                        .filter(|candidate| (*candidate == name) == individual)
+                        .collect();
+                    assert_media_tool_selection(&config, &cwd, &expected);
+                    assert_eq!(
+                        config
+                            .media
+                            .as_ref()
+                            .and_then(|m| m.vision_provider.as_deref()),
+                        Some("gemini")
+                    );
+
+                    write_file(
+                        &project_path,
+                        &json!({"media": {
+                            "enable_media": !individual,
+                            (project_key): !individual
+                        }})
+                        .to_string(),
+                    );
+                    let overridden = Config::load_with_roots(None, &global_dir, &cwd)
+                        .expect("project overrides the same individual field");
+                    assert_media_tool_selection(
+                        &overridden,
+                        &cwd,
+                        if individual { &[] } else { &names },
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn media_unset_fields_inherit_without_expanding_the_aggregate() {
+        let temp = TempDir::new().expect("create tempdir");
+        let cwd = temp.path().join("cwd");
+        let global_dir = temp.path().join("global");
+        write_file(
+            &global_dir.join("settings.json"),
+            r#"{"media":{"enableMedia":true,"enableTts":false,"enableReadMedia":true,"ttsVoice":"alloy"}}"#,
+        );
+        for project in [
+            r"{}",
+            r#"{"media":{}}"#,
+            r#"{"media":{"enable_media":null,"enable_tts":null,"enable_read_media":null,"tts_voice":null}}"#,
+        ] {
+            write_file(&cwd.join(".pi/settings.json"), project);
+            let config = Config::load_with_roots(None, &global_dir, &cwd)
+                .expect("inherit unset media fields");
+            let media = config.media.as_ref().expect("merged media settings");
+            assert_eq!(media.enable_media, Some(true));
+            assert_eq!(media.enable_inspect_image, None);
+            assert_eq!(media.enable_generate_image, None);
+            assert_eq!(media.enable_tts, Some(false));
+            assert_eq!(media.enable_read_media, Some(true));
+            assert_eq!(media.tts_voice.as_deref(), Some("alloy"));
+            assert_media_tool_selection(
+                &config,
+                &cwd,
+                &["inspect_image", "generate_image", "read_media"],
+            );
+        }
+        write_file(
+            &cwd.join(".pi/settings.json"),
+            r#"{"media":{"enable_media":false}}"#,
+        );
+        let config = Config::load_with_roots(None, &global_dir, &cwd)
+            .expect("disable aggregate independently of read_media");
+        assert_media_tool_selection(&config, &cwd, &["read_media"]);
+    }
+
+    #[test]
+    fn invalid_media_aggregate_values_and_duplicate_aliases_name_the_settings_file() {
+        let temp = TempDir::new().expect("create tempdir");
+        let cwd = temp.path().join("cwd");
+        let global_dir = temp.path().join("global");
+        let path = global_dir.join("settings.json");
+        for key in ["enable_media", "enableMedia"] {
+            for value in [json!("true"), json!(1), json!([]), json!({})] {
+                write_file(&path, &json!({"media": {(key): value}}).to_string());
+                let error = Config::load_with_roots(None, &global_dir, &cwd)
+                    .expect_err("aggregate activation must be a JSON boolean");
+                assert!(
+                    error
+                        .to_string()
+                        .contains(path.to_str().expect("UTF-8 path"))
+                );
+                assert!(error.to_string().contains("boolean"), "{error}");
+            }
+        }
+        for content in [
+            r#"{"media":{"enable_media":true,"enableMedia":true}}"#,
+            r#"{"media":{"enableMedia":false,"enable_media":true}}"#,
+        ] {
+            write_file(&path, content);
+            let error = Config::load_with_roots(None, &global_dir, &cwd)
+                .expect_err("duplicate spellings must not silently pick a value");
+            assert!(
+                error
+                    .to_string()
+                    .contains(path.to_str().expect("UTF-8 path"))
+            );
+            assert!(error.to_string().contains("duplicate field"), "{error}");
+        }
+    }
+
+    #[test]
+    fn optional_tool_defaults_and_global_setting_aliases() {
+        let temp = TempDir::new().expect("create tempdir");
+        let cwd = temp.path().join("cwd");
+        let global_dir = temp.path().join("global");
+        let path = global_dir.join("settings.json");
+
+        let missing = Config::load_with_roots(None, &global_dir, &cwd).expect("missing settings");
+        assert_optional_tool_selection(&missing, &[]);
+        for content in [
+            r"{}",
+            r#"{"tools":{}}"#,
+            r#"{"tools":{"loadMode":{"eval":"essential","github":"essential","security_scan":"essential","subagent":"essential"}}}"#,
+        ] {
+            write_file(&path, content);
+            let config = Config::load_with_roots(None, &global_dir, &cwd).expect("load defaults");
+            assert_optional_tool_selection(&config, &[]);
+        }
+
+        for (name, camel, snake) in OPTIONAL_TOOL_SETTINGS {
+            for key in [camel, snake] {
+                for value in [json!(true), json!(false), Value::Null] {
+                    let expected = if value == json!(true) {
+                        vec![name]
+                    } else {
+                        vec![]
+                    };
+                    let content = json!({"tools":{(key):value}}).to_string();
+                    assert!(unrecognised_setting_keys(&content).is_empty());
+                    write_file(&path, &content);
+                    let config = Config::load_with_roots(None, &global_dir, &cwd)
+                        .expect("load optional-tool setting");
+                    assert_optional_tool_selection(&config, &expected);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn optional_tool_project_flags_merge_independently_and_honor_trust() {
+        let temp = TempDir::new().expect("create tempdir");
+        let cwd = temp.path().join("cwd");
+        let global_dir = temp.path().join("global");
+        let global_path = global_dir.join("settings.json");
+        let project_path = cwd.join(".pi/settings.json");
+        let names: Vec<&str> = OPTIONAL_TOOL_SETTINGS
+            .iter()
+            .map(|(name, _, _)| *name)
+            .collect();
+
+        for global_enabled in [true, false] {
+            write_file(
+                &global_path,
+                &json!({"tools":{
+                    "enableEval":global_enabled,
+                    "enableGithub":global_enabled,
+                    "enableSecurityScan":global_enabled,
+                    "enableSubagent":global_enabled,
+                    "loadMode":{"read":"essential","ast_grep":"discoverable"}
+                }})
+                .to_string(),
+            );
+            for (name, key, _) in OPTIONAL_TOOL_SETTINGS {
+                write_file(
+                    &project_path,
+                    &json!({"tools":{
+                        (key):!global_enabled,
+                        "loadMode":{"ast_grep":"essential"}
+                    }})
+                    .to_string(),
+                );
+                let trusted =
+                    Config::load_with_roots_and_project_trust(None, &global_dir, &cwd, true)
+                        .expect("trusted project settings");
+                let expected: Vec<&str> = names
+                    .iter()
+                    .copied()
+                    .filter(|candidate| {
+                        if global_enabled {
+                            *candidate != name
+                        } else {
+                            *candidate == name
+                        }
+                    })
+                    .collect();
+                assert_optional_tool_selection(&trusted, &expected);
+                let modes = trusted
+                    .tools
+                    .as_ref()
+                    .and_then(|tools| tools.load_mode.as_ref())
+                    .expect("merged tool modes");
+                assert_eq!(modes.get("read").map(String::as_str), Some("essential"));
+                assert_eq!(modes.get("ast_grep").map(String::as_str), Some("essential"));
+
+                let untrusted =
+                    Config::load_with_roots_and_project_trust(None, &global_dir, &cwd, false)
+                        .expect("global settings only");
+                assert_optional_tool_selection(
+                    &untrusted,
+                    if global_enabled { &names } else { &[] },
+                );
+            }
+            for content in [
+                r#"{"tools":{}}"#,
+                r#"{"tools":{"enableEval":null,"enableGithub":null,"enableSecurityScan":null,"enableSubagent":null}}"#,
+            ] {
+                write_file(&project_path, content);
+                let inherited = Config::load_with_roots(None, &global_dir, &cwd)
+                    .expect("inherit unset project flags");
+                assert_optional_tool_selection(
+                    &inherited,
+                    if global_enabled { &names } else { &[] },
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn optional_tool_invalid_types_fail_only_for_loaded_settings_files() {
+        let temp = TempDir::new().expect("create tempdir");
+        let cwd = temp.path().join("cwd");
+        let global_dir = temp.path().join("global");
+        let global_path = global_dir.join("settings.json");
+        let project_path = cwd.join(".pi/settings.json");
+
+        for (_, camel, snake) in OPTIONAL_TOOL_SETTINGS {
+            for key in [camel, snake] {
+                for value in [json!("true"), json!(1), json!([]), json!({})] {
+                    let content = json!({"tools":{(key):value}}).to_string();
+                    write_file(&global_path, &content);
+                    let error =
+                        Config::load_with_roots_and_project_trust(None, &global_dir, &cwd, false)
+                            .expect_err("invalid global setting must fail");
+                    assert!(
+                        error
+                            .to_string()
+                            .contains(global_path.to_str().expect("UTF-8 path"))
+                    );
+
+                    write_file(&global_path, "{}");
+                    write_file(&project_path, &content);
+                    let error =
+                        Config::load_with_roots_and_project_trust(None, &global_dir, &cwd, true)
+                            .expect_err("invalid trusted project setting must fail");
+                    assert!(
+                        error
+                            .to_string()
+                            .contains(project_path.to_str().expect("UTF-8 path"))
+                    );
+                    let ignored =
+                        Config::load_with_roots_and_project_trust(None, &global_dir, &cwd, false)
+                            .expect("untrusted project settings must not be parsed");
+                    assert_optional_tool_selection(&ignored, &[]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn optional_tool_explicit_config_override_replaces_both_settings_scopes() {
+        let temp = TempDir::new().expect("create tempdir");
+        let cwd = temp.path().join("cwd");
+        let global_dir = temp.path().join("global");
+        let all_enabled = r#"{"tools":{"enableEval":true,"enableGithub":true,"enableSecurityScan":true,"enableSubagent":true}}"#;
+        write_file(&global_dir.join("settings.json"), all_enabled);
+        write_file(&cwd.join(".pi/settings.json"), all_enabled);
+        let override_path = std::path::Path::new("custom-settings.json");
+
+        for (name, key, _) in OPTIONAL_TOOL_SETTINGS {
+            write_file(
+                &cwd.join(override_path),
+                &json!({"tools":{(key):true}}).to_string(),
+            );
+            for trusted in [true, false] {
+                let config = Config::load_with_roots_and_project_trust(
+                    Some(override_path),
+                    &global_dir,
+                    &cwd,
+                    trusted,
+                )
+                .expect("explicit configuration override");
+                assert_optional_tool_selection(&config, &[name]);
+            }
+        }
     }
 
     #[test]
@@ -1517,6 +4131,36 @@ mod tests {
             Config::load_with_roots(Some(&override_path), &global_dir, &cwd).expect("load config");
         assert_eq!(config.theme.as_deref(), Some("override"));
         assert_eq!(config.default_provider.as_deref(), Some("openai"));
+    }
+
+    #[test]
+    fn untrusted_load_ignores_project_settings() {
+        let temp = TempDir::new().expect("create tempdir");
+        let cwd = temp.path().join("cwd");
+        let global_dir = temp.path().join("global");
+        write_file(
+            &global_dir.join("settings.json"),
+            r#"{ "theme": "global", "trustAllWorkspaces": false }"#,
+        );
+        write_file(
+            &cwd.join(".pi/settings.json"),
+            r#"{ "theme": "project", "packages": ["npm:evil"] }"#,
+        );
+
+        let trusted = Config::load_with_roots_and_project_trust(None, &global_dir, &cwd, true)
+            .expect("load trusted config");
+        assert_eq!(trusted.theme.as_deref(), Some("project"));
+        assert!(trusted.packages.is_some());
+
+        let untrusted = Config::load_with_roots_and_project_trust(None, &global_dir, &cwd, false)
+            .expect("load untrusted config");
+        assert_eq!(
+            untrusted.theme.as_deref(),
+            Some("global"),
+            "untrusted workspaces must not merge project settings"
+        );
+        assert!(untrusted.packages.is_none());
+        assert_eq!(untrusted.trust_all_workspaces, Some(false));
     }
 
     #[test]
@@ -1599,6 +4243,80 @@ mod tests {
         assert!(!config.compaction_enabled());
         assert_eq!(config.compaction_reserve_tokens(), 1234);
         assert_eq!(config.compaction_keep_recent_tokens(), 5678);
+    }
+
+    #[test]
+    fn load_merges_keyword_settings_fieldwise() {
+        let temp = TempDir::new().expect("create tempdir");
+        let cwd = temp.path().join("cwd");
+        let global_dir = temp.path().join("global");
+        write_file(
+            &global_dir.join("settings.json"),
+            r#"{
+                "keywords": {
+                    "enabled": true,
+                    "ultrathink": true,
+                    "chillax": false,
+                    "orchestrate": false,
+                    "workflowz": false,
+                    "jevify": true,
+                    "extra": [{"word": "deepdive", "directive": "go deep"}]
+                }
+            }"#,
+        );
+        write_file(
+            &cwd.join(".pi/settings.json"),
+            r#"{"magicKeywords":{"ultrathink":false,"jevify":false}}"#,
+        );
+
+        let config = Config::load_with_roots(None, &global_dir, &cwd).expect("load config");
+        let keywords = config.keywords.expect("merged keyword settings");
+        assert_eq!(keywords.enabled, Some(true));
+        assert_eq!(keywords.ultrathink, Some(false));
+        assert_eq!(keywords.chillax, Some(false));
+        assert_eq!(keywords.orchestrate, Some(false));
+        assert_eq!(keywords.workflowz, Some(false));
+        assert_eq!(keywords.jevify, Some(false));
+        let extra = keywords.extra.expect("inherited custom keywords");
+        assert_eq!(extra.len(), 1);
+        assert_eq!(extra[0].word, "deepdive");
+        assert_eq!(extra[0].directive, "go deep");
+    }
+
+    #[test]
+    fn keyword_custom_list_is_explicitly_replaceable() {
+        let base: Config = serde_json::from_str(
+            r#"{"keywords":{"extra":[{"word":"deepdive","directive":"go deep"}]}}"#,
+        )
+        .expect("base config");
+        let other: Config =
+            serde_json::from_str(r#"{"keywords":{"extra":[]}}"#).expect("other config");
+
+        let merged = Config::merge(base, other);
+        assert!(
+            merged
+                .keywords
+                .and_then(|keywords| keywords.extra)
+                .is_some_and(|extra| extra.is_empty()),
+            "an explicit higher-precedence empty list must clear inherited custom words"
+        );
+    }
+
+    #[test]
+    fn keyword_global_and_workflow_aliases_merge_without_resetting_other_flags() {
+        let base: Config = serde_json::from_str(
+            r#"{"keywords":{"enabled":true,"workflowz":true,"chillax":false}}"#,
+        )
+        .expect("base config");
+        let other: Config = serde_json::from_str(
+            r#"{"magic_keywords":{"enabled":false,"workflow":false,"jevify":true}}"#,
+        )
+        .expect("other config");
+        let keywords = Config::merge(base, other).keywords.expect("keywords");
+        assert_eq!(keywords.enabled, Some(false));
+        assert_eq!(keywords.workflowz, Some(false));
+        assert_eq!(keywords.chillax, Some(false));
+        assert_eq!(keywords.jevify, Some(true));
     }
 
     #[test]
@@ -1908,6 +4626,7 @@ mod tests {
         assert_eq!(config.thinking_budget("medium"), 8192);
         assert_eq!(config.thinking_budget("high"), 16384);
         assert_eq!(config.thinking_budget("xhigh"), 32768);
+        assert_eq!(config.thinking_budget("max"), 65536);
         assert_eq!(config.thinking_budget("unknown-level"), 0);
     }
 
@@ -1920,6 +4639,7 @@ mod tests {
                 medium: Some(300),
                 high: Some(400),
                 xhigh: Some(500),
+                max: Some(600),
             }),
             ..Config::default()
         };
@@ -1928,6 +4648,7 @@ mod tests {
         assert_eq!(config.thinking_budget("medium"), 300);
         assert_eq!(config.thinking_budget("high"), 400);
         assert_eq!(config.thinking_budget("xhigh"), 500);
+        assert_eq!(config.thinking_budget("max"), 600);
     }
 
     // ── enable_skill_commands ──────────────────────────────────────────
@@ -1977,6 +4698,35 @@ mod tests {
     }
 
     // ── deep_merge_settings_value ──────────────────────────────────────
+
+    #[test]
+    fn deep_merge_new_objects_consume_nested_deletions() {
+        for mut settings in [
+            json!({ "preserve": 42 }),
+            json!({ "preserve": 42, "images": false }),
+            json!({ "preserve": 42, "images": null }),
+            json!({ "preserve": 42, "images": [] }),
+        ] {
+            deep_merge_settings_value(
+                &mut settings,
+                json!({
+                    "images": {
+                        "auto_resize": false,
+                        "autoResize": null,
+                        "nested": { "keep": true, "remove": null },
+                    },
+                }),
+            )
+            .expect("merge new object");
+            assert_eq!(
+                settings,
+                json!({
+                    "preserve": 42,
+                    "images": { "auto_resize": false, "nested": { "keep": true } },
+                }),
+            );
+        }
+    }
 
     #[test]
     fn deep_merge_null_value_removes_key() {
@@ -2105,6 +4855,221 @@ mod tests {
     }
 
     #[test]
+    fn a_settings_key_this_build_does_not_know_is_reported() {
+        // The failure worth catching is a name that looks right and does
+        // nothing: `hide_thinking_blocks` is the real field, pluralised.
+        let keys = unrecognised_setting_keys(
+            r#"{ "hide_thinking_block": true, "hide_thinking_blocks": true }"#,
+        );
+        assert_eq!(keys, vec!["hide_thinking_blocks".to_string()]);
+    }
+
+    #[test]
+    fn recognised_camel_case_aliases_are_not_reported() {
+        // None of the 73 aliases in this file are named by the detector, which
+        // is the whole reason it asks serde instead of keeping a list.
+        let keys = unrecognised_setting_keys(
+            r#"{
+                "hideThinkingBlock": true,
+                "editorPaddingX": 5,
+                "sessionDurability": "throughput"
+            }"#,
+        );
+        assert!(keys.is_empty(), "recognised aliases reported: {keys:?}");
+    }
+
+    #[test]
+    fn a_nested_struct_key_is_recognised_by_its_own_name() {
+        let keys = unrecognised_setting_keys(r#"{ "retry": { "maxRetries": 9 } }"#);
+        assert!(keys.is_empty(), "reported: {keys:?}");
+    }
+
+    #[test]
+    fn interim_response_settings_preserve_unset_and_explicit_overrides() {
+        let base: Config = serde_json::from_str(r#"{"out":{"enabled":true}}"#).unwrap();
+        for overlay in [r"{}", r#"{"out":{}}"#, r#"{"out":{"enabled":null}}"#] {
+            let merged = Config::merge(base.clone(), serde_json::from_str(overlay).unwrap());
+            assert_eq!(merged.out.unwrap().enabled, Some(true), "{overlay}");
+        }
+        let off: Config = serde_json::from_str(r#"{"out":{"enabled":false}}"#).unwrap();
+        let merged = Config::merge(base, off);
+        assert_eq!(merged.out.as_ref().unwrap().enabled, Some(false));
+        let roundtrip: Config =
+            serde_json::from_str(&serde_json::to_string(&merged).unwrap()).unwrap();
+        assert_eq!(roundtrip.out.unwrap().enabled, Some(false));
+        assert!(Config::default().out.is_none());
+        assert!(unrecognised_setting_keys(r#"{"out":{"enabled":true}}"#).is_empty());
+        assert_eq!(
+            unrecognised_setting_keys(r#"{"out":{"enabledd":true}}"#),
+            vec!["out.enabledd".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_typo_inside_a_settings_object_is_reported_by_its_path() {
+        // The costly version of the same mistake: `bash.mediation` selects a
+        // command-mediation policy, and a misspelling of it is silently no
+        // policy at all.
+        let keys = unrecognised_setting_keys(
+            r#"{ "bash": { "mediation": "block-high", "mediatoin": "block-high" } }"#,
+        );
+        assert_eq!(keys, vec!["bash.mediatoin".to_string()]);
+    }
+
+    #[test]
+    fn nested_aliases_and_nulls_are_as_quiet_as_top_level_ones() {
+        let keys = unrecognised_setting_keys(
+            r#"{
+                "bash": { "mediationDcg": false, "mediation_forced": null },
+                "terminal": { "showImages": true },
+                "thinkingBudgets": { "low": 1024 },
+                "markdown": { "codeBlockIndent": 4 }
+            }"#,
+        );
+        assert!(keys.is_empty(), "reported: {keys:?}");
+    }
+
+    #[test]
+    fn a_map_valued_setting_has_no_typos_below_it() {
+        // `retry.fallbackChains` is keyed by role or `provider/model` spec and
+        // `lsp.servers.<name>.env` by variable, so every name under them is the
+        // user's data. Reporting those would make the warning useless to anyone
+        // who configures failover or a language server. No special case makes
+        // this work: serde keeps these keys, so they move the shape exactly as
+        // a struct field does.
+        let keys = unrecognised_setting_keys(
+            r#"{
+                "retry": {
+                    "fallbackChains": {
+                        "default": ["anthropic/claude-sonnet-5"],
+                        "anything the user likes": ["openai/gpt-5"]
+                    }
+                },
+                "lsp": {
+                    "servers": {
+                        "a server the user named": {
+                            "command": "rust-analyzer",
+                            "rootMarkers": ["Cargo.toml"],
+                            "env": { "RA_LOG": "info", "ANYTHING_AT_ALL": "1" }
+                        }
+                    }
+                }
+            }"#,
+        );
+        assert!(keys.is_empty(), "reported: {keys:?}");
+    }
+
+    #[test]
+    fn the_walk_reaches_a_typo_three_levels_down() {
+        // `lsp.servers.<name>` is a struct inside a map, which is as deep as
+        // the settings schema goes.
+        let keys = unrecognised_setting_keys(
+            r#"{
+                "lsp": {
+                    "servers": {
+                        "rust-analyzer": { "command": "rust-analyzer", "commnad": "typo" }
+                    }
+                }
+            }"#,
+        );
+        assert_eq!(keys, vec!["lsp.servers.rust-analyzer.commnad".to_string()]);
+    }
+
+    #[test]
+    fn a_typo_stops_the_walk_rather_than_raining_paths() {
+        // Everything under an unknown key is equally unread; naming the one
+        // key the user can act on beats naming its whole subtree.
+        let keys = unrecognised_setting_keys(
+            r#"{ "bahs": { "mediation": "block-high", "pty": "always" } }"#,
+        );
+        assert_eq!(keys, vec!["bahs".to_string()]);
+    }
+
+    #[test]
+    fn a_nested_key_with_the_wrong_type_is_left_to_the_parse_error() {
+        let keys = unrecognised_setting_keys(r#"{ "bash": { "mediation": 5 } }"#);
+        assert!(keys.is_empty(), "reported: {keys:?}");
+    }
+
+    #[test]
+    fn editor_metadata_and_explicit_nulls_are_not_typos() {
+        // `$schema` is what an editor writes; `null` is indistinguishable from
+        // "not set" by construction, so neither is a misspelling.
+        let keys = unrecognised_setting_keys(
+            r#"{ "$schema": "https://example.invalid/pi.json", "theme": null }"#,
+        );
+        assert!(keys.is_empty(), "reported: {keys:?}");
+    }
+
+    #[test]
+    fn a_known_key_holding_the_wrong_type_is_not_called_unrecognised() {
+        // The caller has already failed the whole file with a parse error. A
+        // second, wrong diagnosis would send the reader hunting for a spelling
+        // mistake that is not there.
+        let keys = unrecognised_setting_keys(r#"{ "editor_padding_x": "five" }"#);
+        assert!(keys.is_empty(), "reported: {keys:?}");
+    }
+
+    #[test]
+    fn a_diagnostic_is_reported_once_per_process() {
+        // Startup loads settings three times, so without this a single typo
+        // warned three times. The key is unique to this test because the set
+        // is process-global by design.
+        let scope = "test::a_diagnostic_is_reported_once_per_process";
+        assert!(
+            first_report_of(scope, "key"),
+            "the first report was suppressed"
+        );
+        assert!(
+            !first_report_of(scope, "key"),
+            "the second report was not suppressed"
+        );
+        assert!(
+            first_report_of(scope, "another key"),
+            "a different key in the same file was suppressed"
+        );
+        assert!(
+            first_report_of("another scope", "key"),
+            "the same key in a second settings file was suppressed"
+        );
+    }
+
+    #[test]
+    fn a_settings_file_that_is_not_an_object_reports_nothing() {
+        assert!(unrecognised_setting_keys("[1, 2, 3]").is_empty());
+        assert!(unrecognised_setting_keys("not json at all").is_empty());
+        assert!(unrecognised_setting_keys("").is_empty());
+    }
+
+    #[test]
+    fn every_documented_settings_key_survives_the_detector() {
+        // A false positive here is worse than the silence it replaces: it would
+        // tell users their working configuration is misspelled. So the guard is
+        // the canonical name of every field, taken from a serialized Config
+        // rather than typed out, which cannot drift as fields are added.
+        let serialized = serde_json::to_value(Config::default()).expect("serialize config");
+        let object = serialized.as_object().expect("config is an object");
+        assert!(
+            object.len() >= 60,
+            "expected the full field set, got {} keys",
+            object.len()
+        );
+
+        let populated: serde_json::Map<String, serde_json::Value> = object
+            .keys()
+            .map(|key| (key.clone(), serde_json::Value::Bool(true)))
+            .collect();
+        let probe =
+            serde_json::to_string(&serde_json::Value::Object(populated)).expect("serialize probe");
+
+        // Most fields reject `true`, which `moves_config` treats as recognised;
+        // the assertion that matters is that no canonical name is ever reported
+        // as unknown.
+        let reported = unrecognised_setting_keys(&probe);
+        assert!(reported.is_empty(), "canonical keys reported: {reported:?}");
+    }
+
+    #[test]
     fn camel_case_nested_aliases_are_parsed() {
         let temp = TempDir::new().expect("create tempdir");
         let cwd = temp.path().join("cwd");
@@ -2179,6 +5144,8 @@ mod tests {
                 enabled: Some(true),
                 reserve_tokens: Some(1000),
                 keep_recent_tokens: Some(2000),
+                mode: None,
+                ..Default::default()
             }),
             ..Config::default()
         };
@@ -3127,6 +6094,35 @@ mod tests {
         assert_eq!(merged.markdown.as_ref().unwrap().code_block_indent, Some(4));
     }
 
+    // ── markdown.spacing config (issue #202) ──────────────────────────
+
+    #[test]
+    fn markdown_spacing_deserializes_compact() {
+        let json = r#"{"markdown":{"spacing":"compact"}}"#;
+        let config: Config = serde_json::from_str(json).unwrap();
+        assert_eq!(config.markdown_spacing(), MarkdownSpacing::Compact);
+    }
+
+    #[test]
+    fn markdown_spacing_defaults_to_comfortable() {
+        let config: Config = serde_json::from_str(r"{}").unwrap();
+        assert_eq!(config.markdown_spacing(), MarkdownSpacing::Comfortable);
+        let config: Config = serde_json::from_str(r#"{"markdown":{}}"#).unwrap();
+        assert_eq!(config.markdown_spacing(), MarkdownSpacing::Comfortable);
+        let config: Config =
+            serde_json::from_str(r#"{"markdown":{"spacing":"comfortable"}}"#).unwrap();
+        assert_eq!(config.markdown_spacing(), MarkdownSpacing::Comfortable);
+    }
+
+    #[test]
+    fn markdown_spacing_merge_prefers_other_and_survives_partial() {
+        let base: Config = serde_json::from_str(r#"{"markdown":{"spacing":"compact"}}"#).unwrap();
+        let other: Config = serde_json::from_str(r#"{"markdown":{"codeBlockIndent":4}}"#).unwrap();
+        let merged = Config::merge(base, other);
+        assert_eq!(merged.markdown_spacing(), MarkdownSpacing::Compact);
+        assert_eq!(merged.markdown_code_block_indent(), 4);
+    }
+
     // ── check_for_updates config ──────────────────────────────────────
 
     #[test]
@@ -3147,6 +6143,44 @@ mod tests {
         let json = r#"{"check_for_updates": true}"#;
         let config: Config = serde_json::from_str(json).unwrap();
         assert!(config.should_check_for_updates());
+    }
+
+    #[test]
+    fn pi_skip_version_check_silences_the_startup_network_call() {
+        // The lookup is injected rather than set, because these tests share a
+        // process and `std::env::set_var` would reach every other one.
+        let skip = |value: &'static str| {
+            move |name: &str| (name == "PI_SKIP_VERSION_CHECK").then(|| value.to_string())
+        };
+        let unset = |_: &str| None;
+
+        let asked_for_it: Config = serde_json::from_str(r#"{"checkForUpdates": true}"#).unwrap();
+        assert!(
+            asked_for_it.should_check_for_updates_with_lookup(unset),
+            "the setting should still decide when the variable is unset"
+        );
+        assert!(
+            !asked_for_it.should_check_for_updates_with_lookup(skip("1")),
+            "PI_SKIP_VERSION_CHECK must beat checkForUpdates: true"
+        );
+        assert!(
+            !asked_for_it.should_check_for_updates_with_lookup(skip("anything at all")),
+            "pi-mono tests truthiness, not the value"
+        );
+        assert!(
+            asked_for_it.should_check_for_updates_with_lookup(skip("")),
+            "`PI_SKIP_VERSION_CHECK=` is falsy in pi-mono and must not skip here"
+        );
+
+        // The variable only ever turns the check off.
+        let refused: Config = serde_json::from_str(r#"{"checkForUpdates": false}"#).unwrap();
+        assert!(!refused.should_check_for_updates_with_lookup(unset));
+        assert!(!refused.should_check_for_updates_with_lookup(skip("1")));
+
+        assert!(
+            Config::default().should_check_for_updates_with_lookup(unset),
+            "checking for updates is still the default"
+        );
     }
 
     // ── merge function property tests ──────────────────────────────────
@@ -3176,7 +6210,7 @@ mod tests {
                 reserve in prop::option::of(1u32..100_000),
                 keep in prop::option::of(1u32..100_000),
             ) {
-                let base = CompactionSettings { enabled, reserve_tokens: reserve, keep_recent_tokens: keep };
+                let base = CompactionSettings { enabled, reserve_tokens: reserve, keep_recent_tokens: keep, mode: None, ..Default::default() };
                 let result = merge_compaction(Some(base.clone()), None).unwrap();
                 assert_eq!(result.enabled, base.enabled);
                 assert_eq!(result.reserve_tokens, base.reserve_tokens);
@@ -3189,7 +6223,7 @@ mod tests {
                 reserve in prop::option::of(1u32..100_000),
                 keep in prop::option::of(1u32..100_000),
             ) {
-                let other = CompactionSettings { enabled, reserve_tokens: reserve, keep_recent_tokens: keep };
+                let other = CompactionSettings { enabled, reserve_tokens: reserve, keep_recent_tokens: keep, mode: None, ..Default::default() };
                 let result = merge_compaction(None, Some(other.clone())).unwrap();
                 assert_eq!(result.enabled, other.enabled);
                 assert_eq!(result.reserve_tokens, other.reserve_tokens);
@@ -3203,8 +6237,8 @@ mod tests {
                 o_en in prop::option::of(any::<bool>()),
                 o_res in prop::option::of(1u32..100_000),
             ) {
-                let base = CompactionSettings { enabled: b_en, reserve_tokens: b_res, keep_recent_tokens: None };
-                let other = CompactionSettings { enabled: o_en, reserve_tokens: o_res, keep_recent_tokens: None };
+                let base = CompactionSettings { enabled: b_en, reserve_tokens: b_res, keep_recent_tokens: None, mode: None, ..Default::default() };
+                let other = CompactionSettings { enabled: o_en, reserve_tokens: o_res, keep_recent_tokens: None, mode: None, ..Default::default() };
                 let result = merge_compaction(Some(base), Some(other)).unwrap();
                 assert_eq!(result.enabled, o_en.or(b_en));
                 assert_eq!(result.reserve_tokens, o_res.or(b_res));
@@ -3246,8 +6280,8 @@ mod tests {
                 o_en in prop::option::of(any::<bool>()),
                 o_base_delay in prop::option::of(100u32..5000),
             ) {
-                let base = RetrySettings { enabled: b_en, max_retries: b_max, base_delay_ms: None, max_delay_ms: None };
-                let other = RetrySettings { enabled: o_en, max_retries: None, base_delay_ms: o_base_delay, max_delay_ms: None };
+                let base = RetrySettings { enabled: b_en, max_retries: b_max, base_delay_ms: None, max_delay_ms: None, ..Default::default() };
+                let other = RetrySettings { enabled: o_en, max_retries: None, base_delay_ms: o_base_delay, max_delay_ms: None, ..Default::default() };
                 let result = merge_retry(Some(base), Some(other)).unwrap();
                 assert_eq!(result.enabled, o_en.or(b_en));
                 assert_eq!(result.max_retries, b_max); // other had None, base passes through
@@ -3316,8 +6350,8 @@ mod tests {
                 o_med in prop::option::of(1u32..65536),
                 o_high in prop::option::of(1u32..65536),
             ) {
-                let base = ThinkingBudgets { minimal: b_min, low: b_low, medium: None, high: None, xhigh: None };
-                let other = ThinkingBudgets { minimal: None, low: None, medium: o_med, high: o_high, xhigh: None };
+                let base = ThinkingBudgets { minimal: b_min, low: b_low, medium: None, high: None, xhigh: None, max: None };
+                let other = ThinkingBudgets { minimal: None, low: None, medium: o_med, high: o_high, xhigh: None, max: None };
                 let result = merge_thinking_budgets(Some(base), Some(other)).unwrap();
                 assert_eq!(result.minimal, b_min); // only in base
                 assert_eq!(result.low, b_low); // only in base

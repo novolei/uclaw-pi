@@ -1,0 +1,6982 @@
+//! Session-owned background shell jobs and native tasks (bd-cv653.3.10).
+//!
+//! `bash {background: true}` returns immediately with a job id; the process
+//! runs detached under the same timeout/tree-kill discipline as the
+//! foreground path (longer default ceiling). Output streams to a rolling
+//! artifact file plus a bounded in-memory tail; when the job settles the
+//! monitor thread pushes a completion notice into the follow-up queue so
+//! the agent sees it at the next turn boundary.
+//!
+//! Management surface: the `jobs` tool (list/wait/cancel). The future hub
+//! tool's jobs action group (bd-cv653.5.4) wraps this same registry, so
+//! the consolidation costs zero rework.
+//!
+//! Session scoping: the registry lives for the process, but every descriptor,
+//! management operation, and completion notice carries its originating
+//! session id. Cross-session ids fail exactly like unknown ids. `kill_all`
+//! remains the final process-shutdown chokepoint so no child survives exit.
+//! Native tasks share the same admission, cancellation and retention fences;
+//! their complete privacy-protected tool results are available in `result`.
+
+use std::collections::{HashMap, VecDeque};
+use std::ffi::OsStr;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+#[cfg(all(test, unix))]
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
+
+use asupersync::sync::Notify;
+use asupersync::types::Time;
+use futures::FutureExt;
+use serde::Serialize;
+
+use crate::error::{Error, Result};
+use crate::file_identity::FileIdentity;
+use crate::model::{Message, UserContent, UserMessage};
+
+mod host_task;
+pub(crate) use host_task::{
+    NativeTaskOwner, admit_owned_task, clear_owned_task_progress, current_native_task,
+    publish_owned_task_progress, spawn_owned_task, with_owned_task_progress,
+};
+
+/// Future returned by the live session-identity resolver shared by the jobs
+/// tools and their completion-notice fetcher.
+pub type JobSessionIdFuture = futures::future::BoxFuture<'static, Option<String>>;
+
+/// Resolves the session that owns a job operation at the instant it runs.
+///
+/// Reading the live session rather than caching its startup id keeps RPC and
+/// interactive new/switch/fork transitions scoped without special-case
+/// rebinding at every transition site.
+pub type JobSessionIdResolver = Arc<dyn Fn() -> JobSessionIdFuture + Send + Sync>;
+
+/// Shared, dynamically resolved job ownership scope for one tool registry.
+#[derive(Clone)]
+pub struct JobSessionScope {
+    resolver: Arc<Mutex<JobSessionIdResolver>>,
+}
+
+impl JobSessionScope {
+    /// Create a fixed scope, primarily for standalone tool embeddings and
+    /// focused tests that do not have a live [`crate::session::Session`].
+    #[must_use]
+    pub fn fixed(session_id: impl Into<String>) -> Self {
+        let session_id = session_id.into();
+        let resolver: JobSessionIdResolver = Arc::new(move || {
+            let session_id = session_id.clone();
+            Box::pin(async move { Some(session_id) })
+        });
+        Self {
+            resolver: Arc::new(Mutex::new(resolver)),
+        }
+    }
+
+    /// Rebind this shared scope to a live session resolver.
+    pub fn bind(&self, resolver: JobSessionIdResolver) {
+        *self
+            .resolver
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = resolver;
+    }
+
+    /// Resolve a non-empty owner id, failing closed when the live session is
+    /// unavailable instead of falling back to a process-global namespace.
+    pub async fn session_id(&self) -> Result<String> {
+        let resolver = self
+            .resolver
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        resolver()
+            .await
+            .filter(|session_id| !session_id.trim().is_empty())
+            .ok_or_else(|| {
+                Error::tool(
+                    "jobs",
+                    "PI_JOBS_SESSION_UNAVAILABLE: current agent session identity is unavailable"
+                        .to_string(),
+                )
+            })
+    }
+}
+
+impl Default for JobSessionScope {
+    fn default() -> Self {
+        Self::fixed(format!("standalone-{}", uuid::Uuid::new_v4().simple()))
+    }
+}
+
+/// Tool-result schema tag for job descriptors (stable audit contract).
+pub const JOB_SCHEMA: &str = "pi.bash_job.v1";
+
+/// Maximum concurrently running jobs; the next spawn is rejected with a
+/// named capacity error.
+const MAX_CONCURRENT_JOBS: usize = 8;
+
+/// Default per-job ceiling when the caller passes no timeout (30 minutes).
+const DEFAULT_JOB_TIMEOUT_SECS: u64 = 1800;
+
+/// Grace window between TERM and KILL on timeout/cancel, mirroring the
+/// foreground bash escalation.
+const TERMINATE_GRACE: Duration = Duration::from_secs(3);
+
+/// Bounded in-memory output tail kept per job for notices and `wait`.
+const OUTPUT_TAIL_BYTES: usize = 64 * 1024;
+
+/// Hard cap for one job's on-disk artifact. The in-memory tail continues to
+/// update after this point, while the snapshot reports truncation explicitly.
+const MAX_ARTIFACT_BYTES: usize = 16 * 1024 * 1024;
+
+/// The dedicated directory never exceeds this aggregate budget. By default the
+/// oldest unlocked artifacts rotate out to admit a new job;
+/// `PI_JOBS_ARTIFACT_RETENTION=preserve` keeps every artifact and refuses the
+/// job instead.
+const MAX_TOTAL_ARTIFACT_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Bound inode consumption independently from bytes (for example, jobs that
+/// produce no output still create an artifact).
+const MAX_ARTIFACT_FILES: usize = 4096;
+
+/// Rotation always preserves this many newest settled artifacts in
+/// addition to every active artifact whose exclusive file lock is held.
+const MIN_RETAINED_ARTIFACT_FILES: usize = 8;
+
+/// Pipes normally reach EOF immediately after the process tree is reaped. A
+/// bounded drain prevents an escaped descendant that retained a descriptor
+/// from blocking terminal publication forever.
+const OUTPUT_DRAIN_GRACE: Duration = Duration::from_secs(2);
+
+/// Job pipes are nonblocking on Unix and Windows so a sealed pump observes cancellation
+/// within this interval even when an escaped process retains the write end.
+const OUTPUT_PUMP_POLL_INTERVAL: Duration = Duration::from_millis(25);
+
+#[cfg(all(test, unix))]
+static JOB_STREAM_PREPARE_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(all(test, unix))]
+static JOB_PUMP_THREADS_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+
+/// Very large async waits are represented as repeated bounded timer sleeps so
+/// `Instant` overflow never turns a valid request into a panic.
+const MAX_ASYNC_WAIT_SLICE: Duration = Duration::from_hours(1);
+
+/// Maximum completion notices retained per session in each storage tier: the
+/// registry and the Agent's one staged batch. A transition can therefore
+/// temporarily hold two batches; restoring the older staged batch reapplies
+/// this newest-wins cap and emits telemetry for any eviction.
+pub(crate) const MAX_COMPLETION_NOTICES_PER_SESSION: usize = 64;
+
+/// Process-wide backstop across many session identities in a long-lived RPC
+/// host. The per-session cap above preserves fairness; this bound prevents a
+/// client that continually creates sessions from retaining notices forever.
+const MAX_TOTAL_COMPLETION_NOTICES: usize = 512;
+
+/// Bound retained model-visible command metadata independently from the
+/// command passed to the shell. The suffix makes truncation explicit.
+const MAX_RETAINED_COMMAND_BYTES: usize = 64 * 1024;
+
+/// Bound arbitrary host-produced notice text, including `/tan` task text.
+const MAX_COMPLETION_NOTICE_BYTES: usize = 32 * 1024;
+
+/// Settled descriptors remain queryable for recent history, but the process
+/// must not retain every command/tail forever during a long-lived RPC session.
+const MAX_RETAINED_SETTLED_JOBS_PER_SESSION: usize = 128;
+
+/// Process-wide backstop for settled descriptors across many short-lived
+/// session identities. Per-session pruning runs first so one busy session
+/// cannot evict another session's recent descriptor under ordinary load.
+const MAX_TOTAL_RETAINED_SETTLED_JOBS: usize = 512;
+
+/// Bounds both owner-shutdown fence acquisition and job settlement.
+const SESSION_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How a background job settled (or is settling).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum JobStatus {
+    Running,
+    Exited,
+    Killed,
+    TimedOut,
+    Failed,
+}
+
+impl JobStatus {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Exited => "exited",
+            Self::Killed => "killed",
+            Self::TimedOut => "timedOut",
+            Self::Failed => "failed",
+        }
+    }
+
+    const fn settled(self) -> bool {
+        !matches!(self, Self::Running)
+    }
+}
+
+/// Live registry entry. The output tail is shared with the pump threads.
+struct JobEntry {
+    schema: &'static str,
+    result: Option<crate::tools::ToolOutput>,
+    result_bytes: usize,
+    owner_session_id: String,
+    delivery: JobDelivery,
+    id: String,
+    command: String,
+    started_at_ms: i64,
+    sequence: u64,
+    settled_sequence: Option<u64>,
+    status: JobStatus,
+    exit_code: Option<i32>,
+    pid: Option<u32>,
+    artifact_path: PathBuf,
+    artifact_cleanup: ArtifactCleanupOutcome,
+    tail: Arc<Mutex<TailBuffer>>,
+    artifact: Arc<Mutex<ArtifactSink>>,
+    output_complete: bool,
+    cancel_requested: bool,
+    process_live: bool,
+    settled_snapshot: Arc<Mutex<Option<JobSnapshot>>>,
+    settled_notify: Arc<Notify>,
+    cancel_deadline: Arc<CancelDeadline>,
+}
+
+/// A managed command remains an ordinary foreground call until its owner
+/// transfers it to background delivery. Dropping that owner cancels the
+/// command and suppresses a late completion notice.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum JobDelivery {
+    Foreground,
+    Background,
+    Abandoned,
+}
+
+/// Serializable snapshot handed to tool results and notices.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JobSnapshot {
+    pub schema: String,
+    pub id: String,
+    pub command: String,
+    pub started_at_ms: i64,
+    pub status: String,
+    pub exit_code: Option<i32>,
+    pub pid: Option<u32>,
+    pub artifact_path: String,
+    pub artifact_cleanup: ArtifactCleanupOutcome,
+    pub output_tail: String,
+    pub output_bytes: usize,
+    pub output_lines: usize,
+    pub tail_truncated: bool,
+    pub artifact_truncated: bool,
+    pub artifact_error: Option<String>,
+    pub output_complete: bool,
+    /// Protected native result of a host task; shell jobs omit this field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<crate::tools::ToolOutput>,
+}
+
+/// Cleanup performed before this job reserved its artifact file.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ArtifactCleanupOutcome {
+    pub policy: String,
+    pub removed_files: usize,
+    pub reclaimed_bytes: u64,
+}
+
+impl ArtifactCleanupOutcome {
+    fn setup_failure_context(&self) -> String {
+        format!(
+            "; artifact cleanup before setup failure: policy={}, removedFiles={}, reclaimedBytes={}",
+            self.policy, self.removed_files, self.reclaimed_bytes
+        )
+    }
+}
+
+impl JobSnapshot {
+    fn limit_output_tail(&mut self, max_bytes: usize) {
+        if self.output_tail.len() > max_bytes {
+            let mut start = self.output_tail.len() - max_bytes;
+            while !self.output_tail.is_char_boundary(start) {
+                start += 1;
+            }
+            self.output_tail.drain(..start);
+            self.tail_truncated = true;
+        }
+    }
+
+    fn from_source_best_effort(source: &JobSnapshotSource) -> Self {
+        let (output_tail, output_bytes, output_lines, tail_truncated) =
+            source.tail.try_lock().map_or_else(
+                |_| (String::new(), 0, 0, true),
+                |tail| {
+                    (
+                        tail.text(),
+                        tail.total_bytes,
+                        tail.line_count(),
+                        tail.total_bytes > tail.buf.len(),
+                    )
+                },
+            );
+        let (artifact_truncated, artifact_error) = source.artifact.try_lock().map_or_else(
+            |_| {
+                (
+                    true,
+                    Some("artifact state unavailable while snapshotting".to_string()),
+                )
+            },
+            |artifact| (artifact.truncated, artifact.write_error.clone()),
+        );
+        let mut snapshot =
+            Self::from_source_fields(source, output_tail, artifact_truncated, artifact_error);
+        snapshot.output_bytes = output_bytes;
+        snapshot.output_lines = output_lines;
+        snapshot.tail_truncated = tail_truncated;
+        if source.delivery == JobDelivery::Background {
+            snapshot.limit_output_tail(OUTPUT_TAIL_BYTES);
+        }
+        snapshot
+    }
+
+    fn from_source_fields(
+        source: &JobSnapshotSource,
+        output_tail: String,
+        artifact_truncated: bool,
+        artifact_error: Option<String>,
+    ) -> Self {
+        Self {
+            schema: source.schema.to_string(),
+            id: source.id.clone(),
+            command: source.command.clone(),
+            started_at_ms: source.started_at_ms,
+            status: source.status.as_str().to_string(),
+            exit_code: source.exit_code,
+            pid: source.pid,
+            artifact_path: source.artifact_path.display().to_string(),
+            artifact_cleanup: source.artifact_cleanup.clone(),
+            output_tail,
+            output_bytes: 0,
+            output_lines: 0,
+            tail_truncated: false,
+            artifact_truncated,
+            artifact_error,
+            output_complete: source.output_complete,
+            result: source.result.clone(),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct JobSnapshotSource {
+    schema: &'static str,
+    result: Option<crate::tools::ToolOutput>,
+    delivery: JobDelivery,
+    id: String,
+    command: String,
+    started_at_ms: i64,
+    status: JobStatus,
+    exit_code: Option<i32>,
+    pid: Option<u32>,
+    artifact_path: PathBuf,
+    artifact_cleanup: ArtifactCleanupOutcome,
+    tail: Arc<Mutex<TailBuffer>>,
+    artifact: Arc<Mutex<ArtifactSink>>,
+    output_complete: bool,
+}
+
+impl JobSnapshotSource {
+    fn from_entry(entry: &JobEntry) -> Self {
+        Self {
+            schema: entry.schema,
+            result: entry.result.clone(),
+            delivery: entry.delivery,
+            id: entry.id.clone(),
+            command: entry.command.clone(),
+            started_at_ms: entry.started_at_ms,
+            status: entry.status,
+            exit_code: entry.exit_code,
+            pid: entry.pid,
+            artifact_path: entry.artifact_path.clone(),
+            artifact_cleanup: entry.artifact_cleanup.clone(),
+            tail: Arc::clone(&entry.tail),
+            artifact: Arc::clone(&entry.artifact),
+            output_complete: entry.output_complete,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct JobWaitHandle {
+    owner_session_id: String,
+    id: String,
+    settled_snapshot: Arc<Mutex<Option<JobSnapshot>>>,
+    settled_notify: Arc<Notify>,
+    cancel_deadline: Arc<CancelDeadline>,
+}
+
+struct CancelDeadline {
+    started: Mutex<bool>,
+    expired: AtomicBool,
+    settlement: Arc<(Mutex<bool>, Condvar)>,
+    notify: Notify,
+}
+
+impl CancelDeadline {
+    fn new() -> Self {
+        Self {
+            started: Mutex::new(false),
+            expired: AtomicBool::new(false),
+            settlement: Arc::new((Mutex::new(false), Condvar::new())),
+            notify: Notify::new(),
+        }
+    }
+
+    fn start(self: &Arc<Self>, timeout: Duration) -> Result<bool> {
+        self.start_with(timeout, |deadline, timeout| {
+            std::thread::Builder::new()
+                .name("pi-job-cancel-deadline".to_string())
+                .spawn(move || deadline.run(timeout))
+                .map(|_| ())
+        })
+    }
+
+    // Guard scope is deliberate; tightening drops would change lock-hold semantics.
+    #[allow(clippy::significant_drop_tightening)]
+    fn start_with<F>(self: &Arc<Self>, timeout: Duration, spawn: F) -> Result<bool>
+    where
+        F: FnOnce(Arc<Self>, Duration) -> std::io::Result<()>,
+    {
+        // Serialize the state transition through successful thread creation.
+        // A duplicate caller must never observe `started=true` while the first
+        // caller can still fail to create the only deadline monitor.
+        let mut started = self
+            .started
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *started {
+            return Ok(false);
+        }
+        let deadline = Arc::clone(self);
+        spawn(deadline, timeout).map_err(|err| {
+            Error::tool(
+                "jobs",
+                format!("Failed to start cancellation deadline monitor: {err}"),
+            )
+        })?;
+        *started = true;
+        Ok(true)
+    }
+
+    // Guard scope is deliberate; tightening drops would change lock-hold semantics.
+    #[allow(clippy::significant_drop_tightening)]
+    fn run(&self, timeout: Duration) {
+        let (lock, wake) = &*self.settlement;
+        let settled = lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (settled, _) = wake
+            .wait_timeout_while(settled, timeout, |settled| !*settled)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let expired = !*settled;
+        drop(settled);
+        if expired {
+            self.expired.store(true, Ordering::Release);
+            self.notify.notify_waiters();
+        }
+    }
+
+    // Guard scope is deliberate; tightening drops would change lock-hold semantics.
+    #[allow(clippy::significant_drop_tightening)]
+    fn finish(&self) {
+        let (lock, wake) = &*self.settlement;
+        let mut settled = lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *settled = true;
+        wake.notify_one();
+    }
+}
+
+struct ArtifactSink {
+    file: Option<std::fs::File>,
+    bytes_written: usize,
+    cap: usize,
+    truncated: bool,
+    write_error: Option<String>,
+}
+
+impl ArtifactSink {
+    const fn new(file: std::fs::File, cap: usize) -> Self {
+        Self {
+            file: Some(file),
+            bytes_written: 0,
+            cap,
+            truncated: false,
+            write_error: None,
+        }
+    }
+
+    fn write(&mut self, data: &[u8]) {
+        if self.write_error.is_some() || self.file.is_none() {
+            return;
+        }
+        let remaining = self.cap.saturating_sub(self.bytes_written);
+        let to_write = data.len().min(remaining);
+        if to_write < data.len() {
+            self.truncated = true;
+        }
+        if to_write == 0 {
+            return;
+        }
+        let Some(file) = self.file.as_mut() else {
+            return;
+        };
+        if let Err(err) = file.write_all(&data[..to_write]) {
+            self.write_error = Some(err.to_string());
+            return;
+        }
+        self.bytes_written = self.bytes_written.saturating_add(to_write);
+    }
+
+    fn seal(&mut self) {
+        // Dropping the file closes it and releases its live-budget lock. Do
+        // not put an unbounded filesystem flush on the process-reap and
+        // terminal-publication critical path.
+        drop(self.file.take());
+    }
+}
+
+/// Bounded tail: retains the LAST `cap` bytes of job output.
+struct TailBuffer {
+    buf: std::collections::VecDeque<u8>,
+    cap: usize,
+    sealed: bool,
+    total_bytes: usize,
+    newlines: usize,
+    last_byte_was_newline: bool,
+}
+
+impl TailBuffer {
+    fn new(cap: usize) -> Self {
+        Self {
+            buf: std::collections::VecDeque::with_capacity(cap.min(8192)),
+            cap,
+            sealed: false,
+            total_bytes: 0,
+            newlines: 0,
+            last_byte_was_newline: false,
+        }
+    }
+
+    fn push(&mut self, chunk: &[u8]) {
+        if self.sealed {
+            return;
+        }
+        self.total_bytes = self.total_bytes.saturating_add(chunk.len());
+        self.newlines = self
+            .newlines
+            .saturating_add(memchr::memchr_iter(b'\n', chunk).count());
+        if let Some(last) = chunk.last() {
+            self.last_byte_was_newline = *last == b'\n';
+        }
+        if chunk.len() >= self.cap {
+            self.buf.clear();
+            self.buf.extend(&chunk[chunk.len() - self.cap..]);
+            return;
+        }
+        let overflow = (self.buf.len() + chunk.len()).saturating_sub(self.cap);
+        if overflow > 0 {
+            self.buf.drain(..overflow.min(self.buf.len()));
+        }
+        self.buf.extend(chunk);
+    }
+
+    fn text(&self) -> String {
+        let (first, second) = self.buf.as_slices();
+        let mut bytes = Vec::with_capacity(first.len() + second.len());
+        bytes.extend_from_slice(first);
+        bytes.extend_from_slice(second);
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    const fn seal(&mut self) {
+        self.sealed = true;
+    }
+
+    fn line_count(&self) -> usize {
+        if self.total_bytes == 0 {
+            0
+        } else {
+            self.newlines
+                .saturating_add(usize::from(!self.last_byte_was_newline))
+        }
+    }
+}
+
+#[derive(Default)]
+struct JobRegistry {
+    jobs: HashMap<String, JobEntry>,
+    closing_owners: HashMap<String, OwnerShutdownState>,
+    owner_shutdown_generations: HashMap<String, u64>,
+    owner_spawns_in_flight: HashMap<String, usize>,
+    starting_jobs: usize,
+    next_job_sequence: u64,
+    next_settled_sequence: u64,
+    notices: VecDeque<CompletionNotice>,
+}
+
+#[derive(Default)]
+struct OwnerShutdownState {
+    active_attempts: usize,
+}
+
+struct CompletionNotice {
+    owner_session_id: String,
+    text: String,
+}
+
+fn registry() -> &'static Mutex<JobRegistry> {
+    static REGISTRY: std::sync::LazyLock<Mutex<JobRegistry>> =
+        std::sync::LazyLock::new(|| Mutex::new(JobRegistry::default()));
+    &REGISTRY
+}
+
+fn lifecycle_lock() -> &'static Mutex<()> {
+    static LIFECYCLE: Mutex<()> = Mutex::new(());
+    &LIFECYCLE
+}
+
+#[cfg(test)]
+#[derive(Clone, Default)]
+#[allow(clippy::type_complexity)]
+struct SpawnBackgroundTestHooks {
+    owner_session_id: Option<String>,
+    after_initial_owner_check: Option<Arc<dyn Fn() + Send + Sync>>,
+    before_os_spawn: Option<Arc<dyn Fn() + Send + Sync>>,
+    before_registry_publication: Option<Arc<dyn Fn(u32) + Send + Sync>>,
+    after_registry_publication: Option<Arc<dyn Fn(&str) + Send + Sync>>,
+    fail_monitor_spawn: bool,
+    panic_monitor_after_start: bool,
+}
+
+#[cfg(test)]
+fn spawn_background_test_hooks() -> &'static Mutex<SpawnBackgroundTestHooks> {
+    static HOOKS: std::sync::LazyLock<Mutex<SpawnBackgroundTestHooks>> =
+        std::sync::LazyLock::new(|| Mutex::new(SpawnBackgroundTestHooks::default()));
+    &HOOKS
+}
+
+#[cfg(test)]
+fn invoke_after_initial_owner_check_hook(owner_session_id: &str) {
+    let hooks = spawn_background_test_hooks()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let hook = if hooks.owner_session_id.as_deref() == Some(owner_session_id) {
+        hooks.after_initial_owner_check.clone()
+    } else {
+        None
+    };
+    drop(hooks);
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+#[cfg(test)]
+fn invoke_before_os_spawn_hook(owner_session_id: &str) {
+    let hooks = spawn_background_test_hooks()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let hook = if hooks.owner_session_id.as_deref() == Some(owner_session_id) {
+        hooks.before_os_spawn.clone()
+    } else {
+        None
+    };
+    drop(hooks);
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+#[cfg(test)]
+fn invoke_before_registry_publication_hook(owner_session_id: &str, pid: u32) {
+    let hooks = spawn_background_test_hooks()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let hook = if hooks.owner_session_id.as_deref() == Some(owner_session_id) {
+        hooks.before_registry_publication.clone()
+    } else {
+        None
+    };
+    drop(hooks);
+    if let Some(hook) = hook {
+        hook(pid);
+    }
+}
+
+#[cfg(test)]
+fn invoke_after_registry_publication_hook(owner_session_id: &str, id: &str) {
+    let hooks = spawn_background_test_hooks()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let hook = if hooks.owner_session_id.as_deref() == Some(owner_session_id) {
+        hooks.after_registry_publication.clone()
+    } else {
+        None
+    };
+    drop(hooks);
+    if let Some(hook) = hook {
+        hook(id);
+    }
+}
+
+#[cfg(test)]
+fn monitor_spawn_failure_requested(owner_session_id: &str) -> bool {
+    let hooks = spawn_background_test_hooks()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    hooks.owner_session_id.as_deref() == Some(owner_session_id) && hooks.fail_monitor_spawn
+}
+
+#[cfg(test)]
+fn monitor_panic_requested(owner_session_id: &str) -> bool {
+    let hooks = spawn_background_test_hooks()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    hooks.owner_session_id.as_deref() == Some(owner_session_id) && hooks.panic_monitor_after_start
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+}
+
+fn running_count(reg: &JobRegistry) -> usize {
+    reg.jobs
+        .values()
+        .filter(|job| job.status == JobStatus::Running)
+        .count()
+}
+
+fn session_closing_error(owner_session_id: &str) -> Error {
+    Error::tool(
+        "jobs",
+        format!(
+            "PI_JOBS_SESSION_CLOSING: agent session {owner_session_id:?} is shutting down and cannot start background jobs"
+        ),
+    )
+}
+
+fn remove_quiescent_owner_generation(reg: &mut JobRegistry, owner_session_id: &str) {
+    if !reg.closing_owners.contains_key(owner_session_id)
+        && reg
+            .owner_spawns_in_flight
+            .get(owner_session_id)
+            .is_none_or(|count| *count == 0)
+    {
+        reg.owner_shutdown_generations.remove(owner_session_id);
+    }
+}
+
+// Guard scope is deliberate; tightening drops would change lock-hold semantics.
+#[allow(clippy::significant_drop_tightening)]
+fn ensure_session_accepting_jobs(owner_session_id: &str) -> Result<()> {
+    {
+        let reg = registry()
+            .lock()
+            .map_err(|_| Error::tool("jobs", "jobs registry poisoned".to_string()))?;
+        let Some(state) = reg.closing_owners.get(owner_session_id) else {
+            return Ok(());
+        };
+        if state.active_attempts > 0 {
+            return Err(session_closing_error(owner_session_id));
+        }
+    }
+
+    // A failed shutdown keeps a fail-closed owner fence. Reconcile it on the
+    // next spawn only when no earlier spawn owns the lifecycle seam and every
+    // owner job has settled. Older attempts that are still waiting to enter
+    // the seam remain generation-tracked and therefore cannot publish. If
+    // this call already owns the lifecycle lock, `try_lock` deliberately fails
+    // and preserves the fence.
+    let _lifecycle = match lifecycle_lock().try_lock() {
+        Ok(guard) => guard,
+        Err(std::sync::TryLockError::WouldBlock) => {
+            return Err(session_closing_error(owner_session_id));
+        }
+        Err(std::sync::TryLockError::Poisoned(_)) => {
+            return Err(Error::tool(
+                "jobs",
+                "jobs lifecycle lock poisoned".to_string(),
+            ));
+        }
+    };
+    let mut reg = registry()
+        .lock()
+        .map_err(|_| Error::tool("jobs", "jobs registry poisoned".to_string()))?;
+    let Some(state) = reg.closing_owners.get(owner_session_id) else {
+        // Another spawn may have reconciled the same stale fence while this
+        // caller waited for the lifecycle lane. The owner is already open.
+        return Ok(());
+    };
+    let can_reopen = state.active_attempts == 0
+        && !reg
+            .jobs
+            .values()
+            .any(|job| job.owner_session_id == owner_session_id && !job.status.settled());
+    if can_reopen {
+        reg.closing_owners.remove(owner_session_id);
+        remove_quiescent_owner_generation(&mut reg, owner_session_id);
+        Ok(())
+    } else {
+        Err(session_closing_error(owner_session_id))
+    }
+}
+
+struct SessionSpawnAttempt {
+    owner_session_id: String,
+    generation: u64,
+}
+
+impl SessionSpawnAttempt {
+    const fn generation(&self) -> u64 {
+        self.generation
+    }
+}
+
+impl Drop for SessionSpawnAttempt {
+    // Guard scope is deliberate; tightening drops would change lock-hold semantics.
+    #[allow(clippy::significant_drop_tightening)]
+    fn drop(&mut self) {
+        let mut reg = registry()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let remove_counter = reg
+            .owner_spawns_in_flight
+            .get_mut(&self.owner_session_id)
+            .is_some_and(|count| {
+                *count = count.saturating_sub(1);
+                *count == 0
+            });
+        if remove_counter {
+            reg.owner_spawns_in_flight.remove(&self.owner_session_id);
+        }
+        remove_quiescent_owner_generation(&mut reg, &self.owner_session_id);
+    }
+}
+
+// Guard scope is deliberate; tightening drops would change lock-hold semantics.
+#[allow(clippy::significant_drop_tightening)]
+fn capture_session_spawn_generation(owner_session_id: &str) -> Result<SessionSpawnAttempt> {
+    ensure_session_accepting_jobs(owner_session_id)?;
+    let mut reg = registry()
+        .lock()
+        .map_err(|_| Error::tool("jobs", "jobs registry poisoned".to_string()))?;
+    if reg.closing_owners.contains_key(owner_session_id) {
+        return Err(session_closing_error(owner_session_id));
+    }
+    let generation = reg
+        .owner_shutdown_generations
+        .get(owner_session_id)
+        .copied()
+        .unwrap_or_default();
+    let count = reg
+        .owner_spawns_in_flight
+        .entry(owner_session_id.to_string())
+        .or_default();
+    *count = count.checked_add(1).ok_or_else(|| {
+        Error::tool(
+            "jobs",
+            format!(
+                "PI_JOBS_SESSION_SPAWN_OVERFLOW: too many concurrent background spawns for session {owner_session_id:?}"
+            ),
+        )
+    })?;
+    Ok(SessionSpawnAttempt {
+        owner_session_id: owner_session_id.to_string(),
+        generation,
+    })
+}
+
+// Guard scope is deliberate; tightening drops would change lock-hold semantics.
+#[allow(clippy::significant_drop_tightening)]
+fn ensure_session_spawn_generation(owner_session_id: &str, expected: u64) -> Result<()> {
+    ensure_session_accepting_jobs(owner_session_id)?;
+    let reg = registry()
+        .lock()
+        .map_err(|_| Error::tool("jobs", "jobs registry poisoned".to_string()))?;
+    let current = reg
+        .owner_shutdown_generations
+        .get(owner_session_id)
+        .copied()
+        .unwrap_or_default();
+    if reg.closing_owners.contains_key(owner_session_id) || current != expected {
+        return Err(session_closing_error(owner_session_id));
+    }
+    Ok(())
+}
+
+struct StartingJobSlot {
+    active: bool,
+}
+
+impl StartingJobSlot {
+    fn commit(mut self, reg: &mut JobRegistry) {
+        reg.starting_jobs = reg.starting_jobs.saturating_sub(1);
+        self.active = false;
+    }
+}
+
+impl Drop for StartingJobSlot {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        let mut reg = registry()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reg.starting_jobs = reg.starting_jobs.saturating_sub(1);
+    }
+}
+
+// Guard scope is deliberate; tightening drops would change lock-hold semantics.
+#[allow(clippy::significant_drop_tightening)]
+fn reserve_job_slot() -> Result<(String, u64, StartingJobSlot)> {
+    let mut reg = registry()
+        .lock()
+        .map_err(|_| Error::tool("jobs", "jobs registry poisoned".to_string()))?;
+    if running_count(&reg).saturating_add(reg.starting_jobs) >= MAX_CONCURRENT_JOBS {
+        return Err(Error::tool(
+            "bash",
+            format!(
+                "PI_JOBS_AT_CAPACITY: {MAX_CONCURRENT_JOBS} background jobs already running; \
+                 cancel one with the jobs tool or wait for a completion before starting more."
+            ),
+        ));
+    }
+    reg.starting_jobs = reg.starting_jobs.saturating_add(1);
+    let sequence = reg.next_job_sequence;
+    reg.next_job_sequence = reg.next_job_sequence.saturating_add(1);
+    let id = format!("job-{}", uuid::Uuid::new_v4().simple());
+    Ok((id, sequence, StartingJobSlot { active: true }))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArtifactRetentionPolicy {
+    Preserve,
+    Rotate,
+}
+
+impl ArtifactRetentionPolicy {
+    fn from_value(value: Option<&OsStr>) -> Result<Self> {
+        // Rotate by default: preserve eventually refuses every background job
+        // once the budget fills, and nothing but a manual cleanup recovers it.
+        // Rotation removes only the oldest unlocked logs, and only as many as
+        // the next job needs (bd-y84fr).
+        let Some(value) = value else {
+            return Ok(Self::Rotate);
+        };
+        let value = value.to_str().ok_or_else(|| {
+            Error::tool(
+                "bash",
+                "PI_JOBS_ARTIFACT_RETENTION must be valid UTF-8: preserve or rotate".to_string(),
+            )
+        })?;
+        match value.trim().to_ascii_lowercase().as_str() {
+            "preserve" => Ok(Self::Preserve),
+            "" | "rotate" => Ok(Self::Rotate),
+            _ => Err(Error::tool(
+                "bash",
+                format!(
+                    "PI_JOBS_ARTIFACT_RETENTION has unsupported value {value:?}; expected preserve or rotate"
+                ),
+            )),
+        }
+    }
+
+    fn from_environment() -> Result<Self> {
+        Self::from_value(std::env::var_os("PI_JOBS_ARTIFACT_RETENTION").as_deref())
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Preserve => "preserve",
+            Self::Rotate => "rotate",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ArtifactCleanupCandidate {
+    path: PathBuf,
+    modified: std::time::SystemTime,
+    identity: FileIdentity,
+}
+
+fn is_managed_job_artifact_name(name: &OsStr) -> bool {
+    let Some(name) = name.to_str() else {
+        return false;
+    };
+    let Some(id) = name
+        .strip_prefix("job-")
+        .and_then(|name| name.strip_suffix(".log"))
+    else {
+        return false;
+    };
+    id.len() == 32
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn artifact_cleanup_candidates(jobs_dir: &Path) -> std::io::Result<Vec<ArtifactCleanupCandidate>> {
+    let mut candidates = Vec::new();
+    for entry in std::fs::read_dir(jobs_dir)? {
+        let entry = entry?;
+        if !is_managed_job_artifact_name(&entry.file_name()) {
+            continue;
+        }
+        let path = entry.path();
+        let metadata = std::fs::symlink_metadata(&path)?;
+        if !metadata.file_type().is_file() {
+            continue;
+        }
+        let scanned_identity = FileIdentity::of_path_nofollow(&path)?;
+        let artifact = match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+        {
+            Ok(artifact) => artifact,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(err),
+        };
+        match fs4::FileExt::try_lock(&artifact) {
+            Ok(()) => {}
+            Err(fs4::TryLockError::WouldBlock) => continue,
+            Err(fs4::TryLockError::Error(err)) => return Err(err),
+        }
+        let opened = artifact.metadata()?;
+        let opened_identity = FileIdentity::of_open_file(&artifact)?;
+        let current = match std::fs::symlink_metadata(&path) {
+            Ok(current) => current,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                fs4::FileExt::unlock(&artifact)?;
+                continue;
+            }
+            Err(err) => return Err(err),
+        };
+        let current_identity = match FileIdentity::of_path_nofollow(&path) {
+            Ok(identity) => identity,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                fs4::FileExt::unlock(&artifact)?;
+                continue;
+            }
+            Err(err) => return Err(err),
+        };
+        if !current.file_type().is_file()
+            || opened_identity != current_identity
+            || scanned_identity != current_identity
+        {
+            fs4::FileExt::unlock(&artifact)?;
+            continue;
+        }
+        fs4::FileExt::unlock(&artifact)?;
+        let modified = opened.modified()?;
+        candidates.push(ArtifactCleanupCandidate {
+            path,
+            modified,
+            identity: opened_identity,
+        });
+    }
+    candidates.sort_by(|left, right| {
+        left.modified
+            .cmp(&right.modified)
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    Ok(candidates)
+}
+
+fn remove_unlocked_artifact(candidate: &ArtifactCleanupCandidate) -> std::io::Result<Option<u64>> {
+    match std::fs::symlink_metadata(&candidate.path) {
+        Ok(metadata) if metadata.file_type().is_file() => {}
+        Ok(_) => return Ok(None),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err),
+    }
+    let before_identity = match FileIdentity::of_path_nofollow(&candidate.path) {
+        Ok(identity) => identity,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err),
+    };
+    if candidate.identity != before_identity {
+        return Ok(None);
+    }
+    let artifact = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&candidate.path)
+    {
+        Ok(artifact) => artifact,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err),
+    };
+    match fs4::FileExt::try_lock(&artifact) {
+        Ok(()) => {}
+        Err(fs4::TryLockError::WouldBlock) => return Ok(None),
+        Err(fs4::TryLockError::Error(err)) => return Err(err),
+    }
+    let opened = artifact.metadata()?;
+    let opened_identity = FileIdentity::of_open_file(&artifact)?;
+    let current = match std::fs::symlink_metadata(&candidate.path) {
+        Ok(current) => current,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            fs4::FileExt::unlock(&artifact)?;
+            return Ok(None);
+        }
+        Err(err) => return Err(err),
+    };
+    let current_identity = match FileIdentity::of_path_nofollow(&candidate.path) {
+        Ok(identity) => identity,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            fs4::FileExt::unlock(&artifact)?;
+            return Ok(None);
+        }
+        Err(err) => return Err(err),
+    };
+    if !current.file_type().is_file()
+        || before_identity != current_identity
+        || opened_identity != current_identity
+    {
+        fs4::FileExt::unlock(&artifact)?;
+        return Ok(None);
+    }
+    let removed_bytes = opened.len();
+    let remove_result = std::fs::remove_file(&candidate.path);
+    fs4::FileExt::unlock(&artifact)?;
+    remove_result?;
+    Ok(Some(removed_bytes))
+}
+
+/// Managed writers hold their artifact lock until all output has been written.
+/// A directory scan can observe an earlier length just before that lock is
+/// released, so settled logs must be measured again under the acquired lock.
+fn artifact_file_reserved_bytes(
+    path: &Path,
+    scanned_metadata: &std::fs::Metadata,
+) -> std::io::Result<u64> {
+    if path.extension().is_none_or(|extension| extension != "log") {
+        return Ok(scanned_metadata.len());
+    }
+    let scanned_identity = FileIdentity::of_path_nofollow(path)?;
+    let artifact = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)?;
+    let opened_identity = FileIdentity::of_open_file(&artifact)?;
+    let current = std::fs::symlink_metadata(path)?;
+    let current_identity = FileIdentity::of_path_nofollow(path)?;
+    if !current.file_type().is_file()
+        || scanned_identity != current_identity
+        || opened_identity != current_identity
+    {
+        return Err(std::io::Error::other(format!(
+            "artifact identity changed while inspecting {}",
+            path.display()
+        )));
+    }
+    match fs4::FileExt::try_lock(&artifact) {
+        Ok(()) => {
+            let bytes = artifact.metadata().map(|metadata| metadata.len());
+            // Release the acquired lock even when querying the final size
+            // failed; propagate either error without admitting a new job.
+            fs4::FileExt::unlock(&artifact)?;
+            bytes
+        }
+        Err(fs4::TryLockError::WouldBlock) => Ok(artifact
+            .metadata()?
+            .len()
+            .max(u64::try_from(MAX_ARTIFACT_BYTES).unwrap_or(u64::MAX))),
+        Err(fs4::TryLockError::Error(err)) => Err(err),
+    }
+}
+
+fn artifact_directory_usage(jobs_dir: &Path) -> std::io::Result<(u64, usize)> {
+    let mut bytes = 0u64;
+    let mut entries = 0usize;
+    for entry in std::fs::read_dir(jobs_dir)? {
+        let entry = entry?;
+        if entry.file_name() == ".artifact-budget.lock" {
+            continue;
+        }
+        entries = entries.saturating_add(1);
+        let path = entry.path();
+        let metadata = std::fs::symlink_metadata(&path)?;
+        if metadata.file_type().is_file() {
+            bytes = bytes.saturating_add(artifact_file_reserved_bytes(&path, &metadata)?);
+        }
+    }
+    Ok((bytes, entries))
+}
+
+fn artifact_capacity_available(
+    stored_bytes: u64,
+    stored_entries: usize,
+    max_bytes: u64,
+    max_entries: usize,
+) -> bool {
+    let reserved_bytes = u64::try_from(MAX_ARTIFACT_BYTES).unwrap_or(u64::MAX);
+    stored_entries < max_entries && stored_bytes.saturating_add(reserved_bytes) <= max_bytes
+}
+
+fn enforce_artifact_retention(
+    jobs_dir: &Path,
+    policy: ArtifactRetentionPolicy,
+    max_bytes: u64,
+    max_entries: usize,
+    min_retained: usize,
+) -> Result<ArtifactCleanupOutcome> {
+    let (mut stored_bytes, mut stored_entries) =
+        artifact_directory_usage(jobs_dir).map_err(|err| {
+            Error::tool(
+                "bash",
+                format!("Failed to inspect jobs artifact dir: {err}"),
+            )
+        })?;
+    let mut outcome = ArtifactCleanupOutcome {
+        policy: policy.as_str().to_string(),
+        removed_files: 0,
+        reclaimed_bytes: 0,
+    };
+    if artifact_capacity_available(stored_bytes, stored_entries, max_bytes, max_entries) {
+        return Ok(outcome);
+    }
+
+    if policy == ArtifactRetentionPolicy::Rotate {
+        let candidates = artifact_cleanup_candidates(jobs_dir).map_err(|err| {
+            Error::tool(
+                "bash",
+                format!("Failed to inspect jobs artifact retention candidates: {err}"),
+            )
+        })?;
+        let removable = candidates.len().saturating_sub(min_retained);
+        for candidate in candidates.into_iter().take(removable) {
+            if artifact_capacity_available(stored_bytes, stored_entries, max_bytes, max_entries) {
+                break;
+            }
+            let removed_bytes = remove_unlocked_artifact(&candidate).map_err(|err| {
+                Error::tool(
+                    "bash",
+                    format!(
+                        "Failed to rotate jobs artifact {}: {err}",
+                        candidate.path.display()
+                    ),
+                )
+            })?;
+            if let Some(removed_bytes) = removed_bytes {
+                stored_bytes = stored_bytes.saturating_sub(removed_bytes);
+                stored_entries = stored_entries.saturating_sub(1);
+                outcome.removed_files = outcome.removed_files.saturating_add(1);
+                outcome.reclaimed_bytes = outcome.reclaimed_bytes.saturating_add(removed_bytes);
+            }
+        }
+    }
+
+    (stored_bytes, stored_entries) = artifact_directory_usage(jobs_dir)
+        .map_err(|err| Error::tool("bash", format!("Failed to verify jobs artifact dir: {err}")))?;
+    if !artifact_capacity_available(stored_bytes, stored_entries, max_bytes, max_entries) {
+        return Err(Error::tool(
+            "bash",
+            format!(
+                "PI_JOBS_ARTIFACT_CAPACITY: refusing a new background job because {} accounts for {stored_entries} entries and {stored_bytes} bytes (limits: {max_entries} entries, {max_bytes} bytes including live-job reservations; retention policy: {}; cleanup removed {} files and reclaimed {} bytes)",
+                jobs_dir.display(),
+                policy.as_str(),
+                outcome.removed_files,
+                outcome.reclaimed_bytes
+            ),
+        ));
+    }
+    Ok(outcome)
+}
+
+#[cfg(test)]
+fn ensure_artifact_budget(jobs_dir: &Path, max_bytes: u64, max_entries: usize) -> Result<()> {
+    enforce_artifact_retention(
+        jobs_dir,
+        ArtifactRetentionPolicy::Preserve,
+        max_bytes,
+        max_entries,
+        MIN_RETAINED_ARTIFACT_FILES,
+    )
+    .map(|_| ())
+}
+
+#[cfg(unix)]
+fn acquire_artifact_budget_lock(jobs_dir: &Path) -> Result<std::fs::File> {
+    let lock_path = jobs_dir.join(".artifact-budget.lock");
+    let lock = rustix::fs::open(
+        &lock_path,
+        rustix::fs::OFlags::RDWR
+            | rustix::fs::OFlags::CREATE
+            | rustix::fs::OFlags::CLOEXEC
+            | rustix::fs::OFlags::NOFOLLOW,
+        rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+    )
+    .map(std::fs::File::from)
+    .map_err(|err| {
+        Error::tool(
+            "bash",
+            format!("Failed to open jobs artifact budget lock: {err}"),
+        )
+    })?;
+    let metadata = lock.metadata().map_err(|err| {
+        Error::tool(
+            "bash",
+            format!("Failed to inspect jobs artifact budget lock: {err}"),
+        )
+    })?;
+    if !metadata.file_type().is_file() {
+        return Err(Error::tool(
+            "bash",
+            "Failed to open jobs artifact budget lock: path is not a regular file".to_string(),
+        ));
+    }
+    fs4::FileExt::lock(&lock).map_err(|err| {
+        Error::tool(
+            "bash",
+            format!("Failed to acquire jobs artifact budget lock: {err}"),
+        )
+    })?;
+    let locked_identity = FileIdentity::of_open_file(&lock).map_err(|err| {
+        Error::tool(
+            "bash",
+            format!("Failed to re-inspect jobs artifact budget lock: {err}"),
+        )
+    })?;
+    let current = std::fs::symlink_metadata(&lock_path).map_err(|err| {
+        Error::tool(
+            "bash",
+            format!("Failed to re-verify jobs artifact budget lock: {err}"),
+        )
+    })?;
+    let current_identity = FileIdentity::of_path_nofollow(&lock_path).map_err(|err| {
+        Error::tool(
+            "bash",
+            format!("Failed to re-verify jobs artifact budget lock: {err}"),
+        )
+    })?;
+    if !current.file_type().is_file() || locked_identity != current_identity {
+        return Err(Error::tool(
+            "bash",
+            "Failed to acquire jobs artifact budget lock: path identity changed while locking"
+                .to_string(),
+        ));
+    }
+    Ok(lock)
+}
+
+#[cfg(not(unix))]
+fn acquire_artifact_budget_lock(jobs_dir: &Path) -> Result<std::fs::File> {
+    let lock_path = jobs_dir.join(".artifact-budget.lock");
+    let before = std::fs::symlink_metadata(&lock_path).ok();
+    if before
+        .as_ref()
+        .is_some_and(|metadata| !metadata.file_type().is_file())
+    {
+        return Err(Error::tool(
+            "bash",
+            "Failed to open jobs artifact budget lock: path is not a regular file".to_string(),
+        ));
+    }
+    // `None` when the lock file did not exist yet: this open is then expected
+    // to create it, and there is no prior identity to hold it to.
+    let before_identity = match FileIdentity::of_path_nofollow(&lock_path) {
+        Ok(identity) => Some(identity),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+        Err(err) => {
+            return Err(Error::tool(
+                "bash",
+                format!("Failed to identify jobs artifact budget lock: {err}"),
+            ));
+        }
+    };
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|err| {
+            Error::tool(
+                "bash",
+                format!("Failed to open jobs artifact budget lock: {err}"),
+            )
+        })?;
+    let opened_identity = FileIdentity::of_open_file(&lock).map_err(|err| {
+        Error::tool(
+            "bash",
+            format!("Failed to inspect jobs artifact budget lock: {err}"),
+        )
+    })?;
+    let current = std::fs::symlink_metadata(&lock_path).map_err(|err| {
+        Error::tool(
+            "bash",
+            format!("Failed to verify jobs artifact budget lock: {err}"),
+        )
+    })?;
+    let current_identity = FileIdentity::of_path_nofollow(&lock_path).map_err(|err| {
+        Error::tool(
+            "bash",
+            format!("Failed to verify jobs artifact budget lock: {err}"),
+        )
+    })?;
+    if !current.file_type().is_file()
+        || opened_identity != current_identity
+        || before_identity.is_some_and(|before| before != current_identity)
+    {
+        return Err(Error::tool(
+            "bash",
+            "Failed to open jobs artifact budget lock: path identity changed".to_string(),
+        ));
+    }
+    fs4::FileExt::lock(&lock).map_err(|err| {
+        Error::tool(
+            "bash",
+            format!("Failed to acquire jobs artifact budget lock: {err}"),
+        )
+    })?;
+    let locked_identity = FileIdentity::of_open_file(&lock).map_err(|err| {
+        Error::tool(
+            "bash",
+            format!("Failed to re-inspect jobs artifact budget lock: {err}"),
+        )
+    })?;
+    let current = std::fs::symlink_metadata(&lock_path).map_err(|err| {
+        Error::tool(
+            "bash",
+            format!("Failed to re-verify jobs artifact budget lock: {err}"),
+        )
+    })?;
+    let current_identity = FileIdentity::of_path_nofollow(&lock_path).map_err(|err| {
+        Error::tool(
+            "bash",
+            format!("Failed to re-verify jobs artifact budget lock: {err}"),
+        )
+    })?;
+    if !current.file_type().is_file() || locked_identity != current_identity {
+        return Err(Error::tool(
+            "bash",
+            "Failed to acquire jobs artifact budget lock: path identity changed while locking"
+                .to_string(),
+        ));
+    }
+    Ok(lock)
+}
+
+fn create_job_artifact(jobs_dir: &Path, id: &str) -> std::io::Result<(PathBuf, std::fs::File)> {
+    let artifact_path = jobs_dir.join(format!("{id}.log"));
+    let artifact = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&artifact_path)?;
+    fs4::FileExt::lock(&artifact)?;
+    Ok((artifact_path, artifact))
+}
+
+struct BackgroundChild {
+    child: Option<std::process::Child>,
+}
+
+impl BackgroundChild {
+    const fn new(child: std::process::Child) -> Self {
+        Self { child: Some(child) }
+    }
+
+    fn id(&self) -> Option<u32> {
+        self.child.as_ref().map(std::process::Child::id)
+    }
+
+    fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        self.child
+            .as_mut()
+            .map_or(Ok(None), std::process::Child::try_wait)
+    }
+
+    fn kill_and_wait(&mut self) -> Option<i32> {
+        let mut child = self.child.take()?;
+        let pid = child.id();
+        crate::tools::terminate_reaped_child_discipline(pid);
+        crate::tools::kill_process_group_tree(Some(pid));
+        let _ = child.kill();
+        let code = child.wait().ok().and_then(|status| status.code());
+        crate::tools::terminate_reaped_child_discipline(pid);
+        code
+    }
+
+    fn disarm(&mut self) {
+        let _ = self.child.take();
+    }
+}
+
+impl Drop for BackgroundChild {
+    fn drop(&mut self) {
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        let pid = child.id();
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            crate::tools::terminate_reaped_child_discipline(pid);
+            return;
+        }
+        crate::tools::kill_process_group_tree(Some(pid));
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
+/// Spawn a command as a background job. The mediation gate in the bash tool
+/// has already classified the command by the time we get here.
+///
+/// # Errors
+/// Named `PI_JOBS_AT_CAPACITY` when 8 jobs are already running,
+/// `PI_JOBS_SESSION_CLOSING` when owner teardown has started, or tool errors
+/// for spawn/artifact failures.
+pub fn spawn_background(
+    owner_session_id: &str,
+    cwd: &Path,
+    shell_path: Option<&str>,
+    command_prefix: Option<&str>,
+    command: &str,
+    timeout_secs: Option<u64>,
+    artifact_root: Option<&Path>,
+) -> Result<JobSnapshot> {
+    spawn_managed(
+        owner_session_id,
+        cwd,
+        shell_path,
+        command_prefix,
+        command,
+        timeout_secs,
+        artifact_root,
+        JobDelivery::Background,
+        None,
+    )
+    .map(|(snapshot, _)| snapshot)
+}
+
+/// Own a command while the bash tool waits in the foreground. A dropped tool
+/// future requests cancellation; only explicit promotion lets the job outlive
+/// that future. The process monitor remains the sole owner through reap.
+pub(crate) struct ForegroundJob {
+    handle: JobWaitHandle,
+    armed: bool,
+}
+
+pub(crate) enum ForegroundPromotion {
+    Completed(JobSnapshot),
+    Background(JobSnapshot),
+}
+
+impl ForegroundJob {
+    pub(crate) fn snapshot(&self) -> Result<JobSnapshot> {
+        snapshot_now_best_effort(&self.handle)
+    }
+
+    pub(crate) async fn wait(&self, timeout: Duration) -> Result<JobSnapshot> {
+        wait_async_with_handle(&self.handle, timeout, MAX_ASYNC_WAIT_SLICE).await
+    }
+
+    pub(crate) async fn cancel(&self) -> Result<JobSnapshot> {
+        if let Some(snapshot) = settled_snapshot(&self.handle) {
+            return Ok(snapshot);
+        }
+        if let Err(error) = request_cancel(&self.handle.owner_session_id, &self.handle.id) {
+            if let Some(snapshot) = settled_snapshot(&self.handle) {
+                return Ok(snapshot);
+            }
+            if !matches!(&error, Error::Tool { message, .. }
+                if message.starts_with("PI_JOBS_NOT_RUNNING:"))
+            {
+                return Err(error);
+            }
+            // The child may have exited while its output is still draining.
+            // Await that real terminal result instead of relabelling it as
+            // cancellation or returning an unconfirmed cleanup result.
+        }
+        let snapshot = wait_for_settlement_wall(&self.handle, Duration::from_secs(10)).await?;
+        if snapshot.status == JobStatus::Running.as_str() {
+            return Err(Error::tool(
+                "bash",
+                "PI_JOBS_CANCEL_TIMEOUT: foreground command did not settle after cancellation",
+            ));
+        }
+        Ok(snapshot)
+    }
+
+    /// Decide under the same registry lock used for terminal publication.
+    /// Completion that won the race stays inline and cannot emit a duplicate
+    /// follow-up; promotion that won receives the monitor's one later notice.
+    #[allow(clippy::significant_drop_tightening)]
+    pub(crate) fn promote(mut self) -> Result<ForegroundPromotion> {
+        let mut reg = registry()
+            .lock()
+            .map_err(|_| Error::tool("jobs", "jobs registry poisoned"))?;
+        let job = reg
+            .jobs
+            .get_mut(&self.handle.id)
+            .filter(|job| {
+                job.owner_session_id == self.handle.owner_session_id
+                    && job.delivery == JobDelivery::Foreground
+            })
+            .ok_or_else(|| unknown_job_error(&self.handle.id))?;
+        if job.status.settled() {
+            let snapshot = settled_snapshot(&self.handle)
+                .ok_or_else(|| Error::tool("jobs", "foreground settlement snapshot missing"))?;
+            reg.jobs.remove(&self.handle.id);
+            self.armed = false;
+            return Ok(ForegroundPromotion::Completed(snapshot));
+        }
+        job.delivery = JobDelivery::Background;
+        // Tail mutation is memory-only. The pumps release artifact I/O
+        // before acquiring this mutex and never acquire the registry with
+        // the tail held, so promotion cannot inherit a filesystem stall.
+        {
+            let mut tail = job
+                .tail
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            tail.cap = OUTPUT_TAIL_BYTES;
+            let overflow = tail.buf.len().saturating_sub(OUTPUT_TAIL_BYTES);
+            tail.buf.drain(..overflow);
+            tail.buf.shrink_to(OUTPUT_TAIL_BYTES);
+        }
+        let source = JobSnapshotSource::from_entry(job);
+        self.armed = false;
+        drop(reg);
+        let mut snapshot = JobSnapshot::from_source_best_effort(&source);
+        snapshot.limit_output_tail(OUTPUT_TAIL_BYTES);
+        Ok(ForegroundPromotion::Background(snapshot))
+    }
+}
+
+impl Drop for ForegroundJob {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let mut reg = registry()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(job) = reg.jobs.get_mut(&self.handle.id).filter(|job| {
+            job.owner_session_id == self.handle.owner_session_id
+                && job.delivery == JobDelivery::Foreground
+        }) else {
+            return;
+        };
+        if job.status.settled() {
+            reg.jobs.remove(&self.handle.id);
+            drop(reg);
+        } else {
+            job.delivery = JobDelivery::Abandoned;
+            job.cancel_requested = true;
+        }
+    }
+}
+
+// The optional state transaction travels with the same execution description
+// used by explicit jobs, without changing their public spawn contract.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn spawn_foreground(
+    owner_session_id: &str,
+    cwd: &Path,
+    shell_path: Option<&str>,
+    command_prefix: Option<&str>,
+    command: &str,
+    timeout_secs: Option<u64>,
+    artifact_root: Option<&Path>,
+    shell_state: Option<&crate::tools::bash_session::ShellTransaction>,
+) -> Result<ForegroundJob> {
+    let (_, handle) = spawn_managed(
+        owner_session_id,
+        cwd,
+        shell_path,
+        command_prefix,
+        command,
+        // Automatic backgrounding never silently extends the foreground
+        // command's deadline to the explicit-background default.
+        Some(timeout_secs.unwrap_or(crate::tools::DEFAULT_BASH_TIMEOUT_SECS)),
+        artifact_root,
+        JobDelivery::Foreground,
+        shell_state,
+    )?;
+    Ok(ForegroundJob {
+        handle,
+        armed: true,
+    })
+}
+
+// Guard scope is deliberate; tightening drops would change lock-hold semantics.
+#[allow(
+    clippy::too_many_lines,
+    clippy::too_many_arguments,
+    clippy::significant_drop_tightening
+)]
+fn spawn_managed(
+    owner_session_id: &str,
+    cwd: &Path,
+    shell_path: Option<&str>,
+    command_prefix: Option<&str>,
+    command: &str,
+    timeout_secs: Option<u64>,
+    artifact_root: Option<&Path>,
+    delivery: JobDelivery,
+    shell_state: Option<&crate::tools::bash_session::ShellTransaction>,
+) -> Result<(JobSnapshot, JobWaitHandle)> {
+    if owner_session_id.trim().is_empty() {
+        return Err(Error::tool(
+            "jobs",
+            "PI_JOBS_SESSION_UNAVAILABLE: current agent session identity is unavailable"
+                .to_string(),
+        ));
+    }
+    // Fail promptly when teardown is already visible. The check under the
+    // lifecycle lock below closes the race with a newly published fence.
+    let spawn_attempt = capture_session_spawn_generation(owner_session_id)?;
+    let spawn_generation = spawn_attempt.generation();
+    #[cfg(test)]
+    invoke_after_initial_owner_check_hook(owner_session_id);
+    // Serialize the fallible spawn-to-monitor ownership transfer with the
+    // process-wide and owner-scoped shutdown snapshots, so neither can miss
+    // a child between OS spawn and registry publication.
+    let _lifecycle = lifecycle_lock()
+        .lock()
+        .map_err(|_| Error::tool("jobs", "jobs lifecycle lock poisoned".to_string()))?;
+    ensure_session_spawn_generation(owner_session_id, spawn_generation)?;
+    if !cwd.exists() {
+        return Err(Error::tool(
+            "bash",
+            format!(
+                "Working directory does not exist: {}\nCannot execute bash commands.",
+                cwd.display()
+            ),
+        ));
+    }
+
+    let timeout_secs = match timeout_secs {
+        None => Some(DEFAULT_JOB_TIMEOUT_SECS),
+        Some(0) => None,
+        Some(value) => Some(value),
+    };
+
+    let retained_command = truncate_utf8_bytes(command, MAX_RETAINED_COMMAND_BYTES);
+    let shell_command = shell_state.map_or_else(
+        || {
+            command_prefix.filter(|p| !p.trim().is_empty()).map_or_else(
+                || command.to_string(),
+                |prefix| format!("{prefix}\n{command}"),
+            )
+        },
+        |state| state.command().to_owned(),
+    );
+    let shell_command = format!("trap 'code=$?; wait; exit $code' EXIT\n{shell_command}");
+
+    let shell =
+        shell_path.map_or_else(
+            crate::tools::default_bash_shell,
+            |path| Ok(path.to_string()),
+        )?;
+    let shell = shell.as_str();
+
+    let mut cmd = crate::tools::command_with_default_sigpipe_in_dir(shell, cwd)
+        .map_err(|e| Error::tool("bash", format!("Failed to prepare shell {shell}: {e}")))?;
+    cmd.arg("-c")
+        .arg(&shell_command)
+        .current_dir(cwd)
+        .stdin(std::process::Stdio::null());
+    #[cfg(not(windows))]
+    cmd.stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    // Keep configured proxy routing identical to the direct foreground
+    // runner for both managed foreground and explicit background commands.
+    for (key, value) in crate::http::proxy::child_process_env() {
+        cmd.env(key, value);
+    }
+    cmd.envs(crate::bash_mediation::NON_INTERACTIVE_ENV.iter().copied());
+    crate::tools::isolate_command_process_group(&mut cmd);
+
+    let artifact_dir = artifact_root.map_or_else(
+        || crate::config::Config::global_dir().join("tool-output-artifacts"),
+        Path::to_path_buf,
+    );
+    let jobs_dir = artifact_dir.join("jobs");
+    std::fs::create_dir_all(&jobs_dir)
+        .map_err(|e| Error::tool("bash", format!("Failed to create jobs artifact dir: {e}")))?;
+
+    let (id, sequence, slot) = reserve_job_slot()?;
+    let artifact_budget_lock = acquire_artifact_budget_lock(&jobs_dir)?;
+    let retention_policy = ArtifactRetentionPolicy::from_environment()?;
+    let artifact_cleanup = enforce_artifact_retention(
+        &jobs_dir,
+        retention_policy,
+        MAX_TOTAL_ARTIFACT_BYTES,
+        MAX_ARTIFACT_FILES,
+        MIN_RETAINED_ARTIFACT_FILES,
+    )?;
+    let cleanup_failure_context = artifact_cleanup.setup_failure_context();
+    let (artifact_path, artifact) = create_job_artifact(&jobs_dir, &id).map_err(|e| {
+        Error::tool(
+            "bash",
+            format!("Failed to create job artifact: {e}{cleanup_failure_context}"),
+        )
+    })?;
+    drop(artifact_budget_lock);
+    let artifact = Arc::new(Mutex::new(ArtifactSink::new(artifact, MAX_ARTIFACT_BYTES)));
+    let tail_cap = if delivery == JobDelivery::Foreground {
+        crate::tools::DEFAULT_MAX_BYTES.saturating_mul(2)
+    } else {
+        OUTPUT_TAIL_BYTES
+    };
+    let tail = Arc::new(Mutex::new(TailBuffer::new(tail_cap)));
+    let output_sealed = Arc::new(AtomicBool::new(false));
+    let settled_snapshot = Arc::new(Mutex::new(None));
+    let settled_notify = Arc::new(Notify::new());
+    let cancel_deadline = Arc::new(CancelDeadline::new());
+
+    // Reserve the job slot before allocating either pipe. Windows children
+    // receive synchronous writers while their parent readers use overlapped
+    // I/O; using std's anonymous pipes would leave their reads uncancellable.
+    #[cfg(windows)]
+    let (stdout, stderr) = windows_job_pipe::configure(&mut cmd).map_err(|err| {
+        Error::tool(
+            "bash",
+            format!("Failed to prepare job output pipes: {err}{cleanup_failure_context}"),
+        )
+    })?;
+
+    let started_at = Instant::now();
+    let started_at_ms = now_ms();
+    // Owner shutdown marks the registry before waiting for this lifecycle
+    // lock. Recheck after the fallible artifact setup so a stalled pre-spawn
+    // path cannot create a child after its session begins closing.
+    #[cfg(test)]
+    invoke_before_os_spawn_hook(owner_session_id);
+    ensure_session_spawn_generation(owner_session_id, spawn_generation)
+        .map_err(|err| Error::tool("jobs", format!("{err}{cleanup_failure_context}")))?;
+    let child = crate::tools::spawn_command_with_job_discipline(&mut cmd).map_err(|e| {
+        Error::tool(
+            "bash",
+            format!("Failed to spawn shell {shell}: {e}{cleanup_failure_context}"),
+        )
+    })?;
+    // Command retains caller-supplied Stdio handles after spawn. Close those
+    // parent copies immediately so only the child owns the pipe writers.
+    drop(cmd);
+    let pid = child.id();
+    let mut child = BackgroundChild::new(child);
+    #[cfg(not(windows))]
+    let stdout = child
+        .child
+        .as_mut()
+        .and_then(|child| child.stdout.take())
+        .ok_or_else(|| Error::tool("bash", format!("Missing stdout{cleanup_failure_context}")))?;
+    #[cfg(not(windows))]
+    let stderr = child
+        .child
+        .as_mut()
+        .and_then(|child| child.stderr.take())
+        .ok_or_else(|| Error::tool("bash", format!("Missing stderr{cleanup_failure_context}")))?;
+    #[cfg(not(windows))]
+    prepare_job_stream(&stdout).map_err(|err| {
+        Error::tool(
+            "bash",
+            format!("Failed to prepare job stdout: {err}{cleanup_failure_context}"),
+        )
+    })?;
+    #[cfg(not(windows))]
+    prepare_job_stream(&stderr).map_err(|err| {
+        Error::tool(
+            "bash",
+            format!("Failed to prepare job stderr: {err}{cleanup_failure_context}"),
+        )
+    })?;
+
+    // Dedicated threads isolate artifact filesystem I/O from the runtime's
+    // blocking pool. Pipe reads themselves are nonblocking on Unix/Windows.
+    let stdout_tail = Arc::clone(&tail);
+    let stdout_artifact = Arc::clone(&artifact);
+    let stdout_sealed = Arc::clone(&output_sealed);
+    let stdout_pump = std::thread::Builder::new()
+        .name(format!("pi-job-{id}-stdout"))
+        .spawn(move || pump_job_stream(stdout, &stdout_artifact, &stdout_tail, &stdout_sealed))
+        .map_err(|err| {
+            Error::tool(
+                "bash",
+                format!("Failed to start job stdout pump: {err}{cleanup_failure_context}"),
+            )
+        })?;
+    let stderr_tail = Arc::clone(&tail);
+    let stderr_artifact = Arc::clone(&artifact);
+    let stderr_sealed = Arc::clone(&output_sealed);
+    let stderr_pump = match std::thread::Builder::new()
+        .name(format!("pi-job-{id}-stderr"))
+        .spawn(move || pump_job_stream(stderr, &stderr_artifact, &stderr_tail, &stderr_sealed))
+    {
+        Ok(handle) => handle,
+        Err(err) => {
+            child.kill_and_wait();
+            output_sealed.store(true, Ordering::Release);
+            let mut stdout_pump = Some(stdout_pump);
+            let _ = finish_pump(&mut stdout_pump, Instant::now() + OUTPUT_DRAIN_GRACE);
+            return Err(Error::tool(
+                "bash",
+                format!("Failed to start job stderr pump: {err}{cleanup_failure_context}"),
+            ));
+        }
+    };
+
+    #[cfg(test)]
+    invoke_before_registry_publication_hook(owner_session_id, pid);
+    let (snapshot_source, handle) = {
+        let mut reg = registry()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let current_generation = reg
+            .owner_shutdown_generations
+            .get(owner_session_id)
+            .copied()
+            .unwrap_or_default();
+        if reg.closing_owners.contains_key(owner_session_id)
+            || current_generation != spawn_generation
+        {
+            drop(reg);
+            child.kill_and_wait();
+            output_sealed.store(true, Ordering::Release);
+            let drain_deadline = Instant::now() + OUTPUT_DRAIN_GRACE;
+            let mut stdout_pump = Some(stdout_pump);
+            let mut stderr_pump = Some(stderr_pump);
+            let _ = finish_pump(&mut stdout_pump, drain_deadline);
+            let _ = finish_pump(&mut stderr_pump, drain_deadline);
+            return Err(Error::tool(
+                "jobs",
+                format!(
+                    "{}{cleanup_failure_context}",
+                    session_closing_error(owner_session_id)
+                ),
+            ));
+        }
+        let entry = JobEntry {
+            schema: JOB_SCHEMA,
+            result: None,
+            result_bytes: 0,
+            owner_session_id: owner_session_id.to_string(),
+            delivery,
+            id: id.clone(),
+            command: retained_command,
+            started_at_ms,
+            sequence,
+            settled_sequence: None,
+            status: JobStatus::Running,
+            exit_code: None,
+            pid: Some(pid),
+            artifact_path,
+            artifact_cleanup,
+            tail: Arc::clone(&tail),
+            artifact: Arc::clone(&artifact),
+            output_complete: false,
+            cancel_requested: false,
+            process_live: true,
+            settled_snapshot,
+            settled_notify,
+            cancel_deadline,
+        };
+        let snapshot_source = JobSnapshotSource::from_entry(&entry);
+        let handle = JobWaitHandle {
+            owner_session_id: owner_session_id.to_string(),
+            id: id.clone(),
+            settled_snapshot: Arc::clone(&entry.settled_snapshot),
+            settled_notify: Arc::clone(&entry.settled_notify),
+            cancel_deadline: Arc::clone(&entry.cancel_deadline),
+        };
+        reg.jobs.insert(id.clone(), entry);
+        slot.commit(&mut reg);
+        (snapshot_source, handle)
+    };
+    #[cfg(test)]
+    invoke_after_registry_publication_hook(owner_session_id, &id);
+
+    // The monitor is the sole process owner from this point through reap and
+    // bounded output drain. Keep the resources behind a shared take-on-start
+    // slot so a failed thread creation retains them for synchronous RAII
+    // cleanup instead of dropping detached pump handles inside the closure.
+    let monitor_id = id.clone();
+    let monitor_resources = Arc::new(Mutex::new(Some(MonitorResources {
+        id: id.clone(),
+        child,
+        stdout_pump: Some(stdout_pump),
+        stderr_pump: Some(stderr_pump),
+        output_sealed,
+        artifact: Arc::clone(&artifact),
+        tail: Arc::clone(&tail),
+        monitor_started: false,
+        settlement_published: false,
+        shell_state: shell_state.cloned(),
+    })));
+    let thread_resources = Arc::clone(&monitor_resources);
+    #[cfg(test)]
+    let fail_monitor_spawn = monitor_spawn_failure_requested(owner_session_id);
+    #[cfg(not(test))]
+    let fail_monitor_spawn = false;
+    #[cfg(test)]
+    let panic_monitor = monitor_panic_requested(owner_session_id);
+    let monitor_spawn = if fail_monitor_spawn {
+        Err(std::io::Error::other("injected job monitor spawn failure"))
+    } else {
+        std::thread::Builder::new()
+            .name(format!("pi-job-{id}-monitor"))
+            .spawn(move || {
+                let mut resources = thread_resources
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take()
+                    .expect("monitor resources remain available at thread start");
+                resources.monitor_started = true;
+                #[cfg(test)]
+                assert!(!panic_monitor, "injected job monitor panic");
+                monitor_job(&monitor_id, started_at, timeout_secs, resources);
+            })
+    };
+    if let Err(err) = monitor_spawn {
+        let cleanup = monitor_resources
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        drop(cleanup);
+        registry()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .jobs
+            .remove(&id);
+        return Err(Error::tool(
+            "bash",
+            format!("Failed to start job monitor: {err}{cleanup_failure_context}"),
+        ));
+    }
+
+    // Ownership has reached the monitor before inspecting I/O-owned state.
+    // A pump stalled in filesystem I/O must not strand the child, lifecycle
+    // lock, and cancellation path inside this spawn call.
+    Ok((
+        JobSnapshot::from_source_best_effort(&snapshot_source),
+        handle,
+    ))
+}
+
+#[cfg(windows)]
+pub(crate) mod windows_job_pipe {
+    use mio::windows::NamedPipe;
+    use mio::{Events, Interest, Poll, Registry, Token};
+    use std::fs::{File, OpenOptions};
+    use std::io::{self, Read, Write};
+    use std::process::{Command, Stdio};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Condvar, Mutex, OnceLock};
+    use std::time::{Duration, Instant};
+
+    const REACTOR_POLL_INTERVAL: Duration = Duration::from_millis(250);
+    const REACTOR_RETRY_INTERVAL: Duration = Duration::from_millis(100);
+    const STDIN_WRITE_BYTES: usize = 8192;
+
+    /// Mio retains an Arc for every submitted operation until Poll consumes its
+    /// completion, including cancellation. A per-job Poll cannot safely retire
+    /// on a deadline: its last callback may arrive afterward. This one reactor
+    /// lives until process exit and never owns job writers, pumps, or artifacts.
+    struct Reactor {
+        registry: Registry,
+        state: Arc<ReactorState>,
+    }
+
+    struct ReactorState {
+        failed: AtomicBool,
+        progress: Mutex<()>,
+        ready: Condvar,
+    }
+
+    impl ReactorState {
+        fn notify(&self) {
+            let _progress = self
+                .progress
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            self.ready.notify_all();
+        }
+    }
+
+    struct ReactorExit(Arc<ReactorState>);
+
+    impl Drop for ReactorExit {
+        fn drop(&mut self) {
+            self.0.failed.store(true, Ordering::Release);
+            self.0.notify();
+        }
+    }
+
+    impl Reactor {
+        fn start() -> io::Result<Self> {
+            let mut poll = Poll::new()?;
+            let registry = poll.registry().try_clone()?;
+            let state = Arc::new(ReactorState {
+                failed: AtomicBool::new(false),
+                progress: Mutex::new(()),
+                ready: Condvar::new(),
+            });
+            let worker_state = Arc::clone(&state);
+            let _worker = std::thread::Builder::new()
+                .name("pi-job-pipe-reactor".to_string())
+                .spawn(move || {
+                    let _exit = ReactorExit(Arc::clone(&worker_state));
+                    let mut events = Events::with_capacity(128);
+                    loop {
+                        // Poll runs the IOCP callbacks that release cancelled
+                        // I/O. Wake the bounded set of readers together after
+                        // callbacks finish; each consumes its own Mio buffer.
+                        match poll.poll(&mut events, Some(REACTOR_POLL_INTERVAL)) {
+                            Ok(()) => {
+                                if !events.is_empty() {
+                                    worker_state.notify();
+                                }
+                            }
+                            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                            Err(error) => {
+                                if !worker_state.failed.swap(true, Ordering::AcqRel) {
+                                    tracing::error!(
+                                        event = "pi.jobs.pipe_reactor_failed",
+                                        error = %error,
+                                        "Windows job pipe reactor failed; refusing new jobs"
+                                    );
+                                }
+                                worker_state.notify();
+                                // Do not drop Poll with outstanding cancelled
+                                // reads. Keep trying to reclaim their callbacks
+                                // even though admission stays permanently shut.
+                                std::thread::sleep(REACTOR_RETRY_INTERVAL);
+                            }
+                        }
+                    }
+                })?;
+            Ok(Self { registry, state })
+        }
+
+        fn check(&self) -> io::Result<()> {
+            if self.state.failed.load(Ordering::Acquire) {
+                return Err(io::Error::other(
+                    "PI_JOBS_PIPE_REACTOR: Windows job output reactor is unavailable",
+                ));
+            }
+            Ok(())
+        }
+    }
+
+    fn reactor() -> io::Result<&'static Reactor> {
+        static REACTOR: OnceLock<Result<Reactor, String>> = OnceLock::new();
+        match REACTOR.get_or_init(|| Reactor::start().map_err(|error| error.to_string())) {
+            Ok(reactor) => {
+                reactor.check()?;
+                Ok(reactor)
+            }
+            Err(error) => Err(io::Error::other(format!(
+                "PI_JOBS_PIPE_REACTOR: failed to start Windows job output reactor: {error}"
+            ))),
+        }
+    }
+
+    pub(crate) struct Reader {
+        pipe: NamedPipe,
+        reactor: &'static Reactor,
+    }
+
+    impl Reader {
+        /// Poll buffered output without waiting for a readiness notification.
+        /// Async helper runners retain their own byte, work and time budgets;
+        /// an idle pipe returns WouldBlock and must never block their executor.
+        ///
+        /// # Errors
+        ///
+        /// Returns WouldBlock while idle, or an I/O error when the shared
+        /// reactor or pipe fails. With a nonempty buffer, only a closed writer
+        /// produces an empty read.
+        pub(crate) fn try_read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            self.reactor.check()?;
+            self.pipe.read(buffer)
+        }
+    }
+
+    impl Read for Reader {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            let deadline = Instant::now() + super::OUTPUT_PUMP_POLL_INTERVAL;
+            let state = &self.reactor.state;
+            // Lock before checking the pipe, then atomically unlock to wait.
+            // A completion between read and wait cannot lose its notification.
+            // Poll releases Mio's internal locks before acquiring this mutex.
+            let mut progress = state
+                .progress
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            loop {
+                self.reactor.check()?;
+                match self.pipe.read(buffer) {
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        let Some(remaining) = deadline.checked_duration_since(Instant::now())
+                        else {
+                            return Err(error);
+                        };
+                        progress = state
+                            .ready
+                            .wait_timeout(progress, remaining)
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .0;
+                    }
+                    result => return result,
+                }
+            }
+        }
+    }
+
+    impl Drop for Reader {
+        fn drop(&mut self) {
+            // Suppress new readiness notifications before NamedPipe's Drop
+            // cancels its pending read. The shared Poll remains alive to reap
+            // the completion-held Arc and close the actual server handle.
+            let _ = self.reactor.registry.deregister(&mut self.pipe);
+        }
+    }
+
+    pub(crate) struct Writer {
+        pipe: NamedPipe,
+        reactor: &'static Reactor,
+    }
+
+    impl Writer {
+        /// Queue at most one bounded input chunk without waiting for the child.
+        /// Mio owns the submitted bytes until their completion; acceptance here
+        /// is not an RPC acknowledgment or proof that the child consumed them.
+        ///
+        /// # Errors
+        ///
+        /// Returns WouldBlock while a previous chunk remains pending, or an
+        /// I/O error when the shared reactor or pipe fails.
+        pub(crate) fn try_write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            self.reactor.check()?;
+            if buffer.is_empty() {
+                return Ok(0);
+            }
+            self.pipe
+                .write(&buffer[..buffer.len().min(STDIN_WRITE_BYTES)])
+        }
+    }
+
+    impl Drop for Writer {
+        fn drop(&mut self) {
+            let _ = self.reactor.registry.deregister(&mut self.pipe);
+            // Mio's Drop cancels reads and connects, but preserves writes so
+            // they can flush. Disconnect instead: a cancelled RPC must discard
+            // pending input even when duplicated clients remain open and never
+            // read. Never flush here. The shared Poll reaps the outstanding
+            // completions after this endpoint has been retired.
+            let _ = self.pipe.disconnect();
+        }
+    }
+
+    pub(crate) fn stdin_pair() -> io::Result<(Writer, File)> {
+        let reactor = reactor()?;
+        let name = format!(
+            r"\\.\pipe\pi-worker-stdin-{}",
+            uuid::Uuid::new_v4().simple()
+        );
+        let mut pipe = NamedPipe::new(&name)?;
+        // The child receives an ordinary synchronous stdin handle. As with
+        // output pipes, connect the client first so there is no pending connect
+        // completion that could submit fresh I/O after this owner is dropped.
+        let reader = OpenOptions::new().read(true).open(&name)?;
+        reactor
+            .registry
+            .register(&mut pipe, Token(0), Interest::WRITABLE)?;
+        pipe.connect()?;
+        reactor.check()?;
+        Ok((Writer { pipe, reactor }, reader))
+    }
+
+    pub(crate) fn pair() -> io::Result<(Reader, File)> {
+        let reactor = reactor()?;
+        let name = format!(r"\\.\pipe\pi-job-{}", uuid::Uuid::new_v4().simple());
+        let mut pipe = NamedPipe::new(&name)?;
+        // The client must stay synchronous for child stdout/stderr. Opening it
+        // first establishes the connection, so connect below takes the immediate
+        // ERROR_PIPE_CONNECTED path instead of owning a pending connect whose
+        // callback could submit a fresh read after the server has been dropped.
+        let writer = OpenOptions::new().write(true).open(&name)?;
+        reactor
+            .registry
+            .register(&mut pipe, Token(0), Interest::READABLE)?;
+        pipe.connect()?;
+        reactor.check()?;
+        Ok((Reader { pipe, reactor }, writer))
+    }
+
+    pub(super) fn configure(command: &mut Command) -> io::Result<(Reader, Reader)> {
+        let (stdout, stdout_writer) = pair()?;
+        let (stderr, stderr_writer) = pair()?;
+        command
+            .stdout(Stdio::from(stdout_writer))
+            .stderr(Stdio::from(stderr_writer));
+        Ok((stdout, stderr))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn stdin_bytes() -> Vec<u8> {
+            (0_u8..=250).cycle().take(256 * 1024).collect()
+        }
+
+        fn backpressure_stdin(writer: &mut Writer, bytes: &[u8]) -> usize {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut accepted = 0;
+            loop {
+                assert!(accepted < bytes.len(), "fixture never filled the pipe");
+                match writer.try_write(&bytes[accepted..]) {
+                    Ok(count) => {
+                        assert!(count > 0 && count <= STDIN_WRITE_BYTES);
+                        accepted += count;
+                    }
+                    // Mio 1.2.4 creates a 64 KiB pipe buffer. Queue beyond
+                    // that capacity without any client reading, so this is
+                    // actual stdin backpressure, not only a delayed callback.
+                    Err(error)
+                        if error.kind() == io::ErrorKind::WouldBlock && accepted > 64 * 1024 =>
+                    {
+                        return accepted;
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                    Err(error) => panic!("queue worker stdin: {error}"),
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "stdin did not reach backpressure"
+                );
+            }
+        }
+
+        fn assert_disconnected(reader: &mut File) {
+            let read = reader.read(&mut [0]);
+            assert!(
+                matches!(read, Ok(0) | Err(_)),
+                "cancelled stdin delivered buffered command bytes: {read:?}"
+            );
+        }
+
+        #[test]
+        fn try_read_does_not_wait_for_the_readiness_notification_lock() {
+            let _guard = super::super::process_test_guard();
+            let (mut reader, writer) = pair().expect("Windows helper pipe");
+            let state = Arc::clone(&reader.reactor.state);
+            let progress = state
+                .progress
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let (sent, received) = std::sync::mpsc::sync_channel(1);
+            let worker = std::thread::spawn(move || {
+                let result = reader.try_read(&mut [0]).map_err(|error| error.kind());
+                let _ = sent.send(result);
+                reader
+            });
+            // A blocking Read would wait for the mutex above. Always release
+            // it before joining, including when this regression is detected,
+            // so a failure leaves neither a blocked worker nor a locked reactor.
+            let result = received.recv_timeout(Duration::from_secs(2));
+            drop(progress);
+            let reader = worker.join().expect("helper pipe poll worker");
+            assert_eq!(result, Ok(Err(io::ErrorKind::WouldBlock)));
+            drop(reader);
+            drop(writer);
+        }
+
+        #[test]
+        fn try_write_does_not_wait_for_the_readiness_notification_lock() {
+            let _guard = super::super::process_test_guard();
+            let (mut writer, reader) = stdin_pair().expect("Windows worker stdin");
+            let state = Arc::clone(&writer.reactor.state);
+            let progress = state
+                .progress
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let (sent, received) = std::sync::mpsc::sync_channel(1);
+            let worker = std::thread::spawn(move || {
+                let result = writer.try_write(b"x").map_err(|error| error.kind());
+                let _ = sent.send(result);
+                writer
+            });
+            let result = received.recv_timeout(Duration::from_secs(2));
+            drop(progress);
+            let writer = worker.join().expect("worker stdin poll thread");
+            drop(writer);
+            drop(reader);
+            assert_eq!(result, Ok(Ok(1)));
+        }
+
+        #[test]
+        fn dropping_backpressured_stdin_disconnects_duplicated_readers() {
+            let _guard = super::super::process_test_guard();
+            let (mut writer, mut reader) = stdin_pair().expect("Windows worker stdin");
+            let mut retained_reader = reader.try_clone().expect("retained stdin client");
+            backpressure_stdin(&mut writer, &stdin_bytes());
+            let (sent, received) = std::sync::mpsc::sync_channel(1);
+            let worker = std::thread::spawn(move || {
+                drop(writer);
+                let _ = sent.send(());
+            });
+            let retired = received.recv_timeout(Duration::from_secs(2));
+            // Both clients remain open while Drop runs. A mistaken flush is
+            // detected without stranding this test's cleanup: release clients
+            // before joining even when the bounded retirement check fails.
+            let reads = retired
+                .is_ok()
+                .then(|| (reader.read(&mut [0]), retained_reader.read(&mut [0])));
+            drop(reader);
+            drop(retained_reader);
+            worker.join().expect("stdin retirement thread");
+            assert!(retired.is_ok(), "stdin Drop waited for a client to read");
+            let (first, retained) = reads.expect("retired stdin observations");
+            for read in [first, retained] {
+                assert!(
+                    matches!(read, Ok(0) | Err(_)),
+                    "cancelled stdin retained command bytes: {read:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn stdin_bytes_remain_exact_across_backpressure() {
+            let _guard = super::super::process_test_guard();
+            let (mut writer, mut reader) = stdin_pair().expect("Windows worker stdin");
+            let bytes = stdin_bytes();
+            let mut accepted = backpressure_stdin(&mut writer, &bytes);
+            let expected = bytes.len();
+            let (sent, received) = std::sync::mpsc::sync_channel(1);
+            let worker = std::thread::spawn(move || {
+                let mut actual = vec![0; expected];
+                let read = reader.read_exact(&mut actual).map(|()| actual);
+                let _ = sent.send(());
+                read
+            });
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut failure = None;
+            while accepted < bytes.len() && Instant::now() < deadline {
+                match writer.try_write(&bytes[accepted..]) {
+                    Ok(0) => {
+                        failure = Some(io::Error::new(io::ErrorKind::WriteZero, "worker stdin"));
+                        break;
+                    }
+                    Ok(count) => accepted += count,
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                    Err(error) => {
+                        failure = Some(error);
+                        break;
+                    }
+                }
+            }
+            // Acceptance into Mio is not delivery. Keep the writer alive until
+            // the client confirms every byte, or disconnect it to release the
+            // blocked reader before reporting any failed assertion.
+            let wait = if accepted == bytes.len() {
+                Duration::from_secs(10)
+            } else {
+                Duration::ZERO
+            };
+            let delivered = received.recv_timeout(wait);
+            drop(writer);
+            let actual = worker.join().expect("stdin consumer thread");
+            assert!(failure.is_none(), "stdin write failed: {failure:?}");
+            assert_eq!(accepted, bytes.len(), "stdin writes stopped progressing");
+            assert!(delivered.is_ok(), "accepted stdin never reached the client");
+            assert_eq!(actual.expect("complete stdin command"), bytes);
+        }
+
+        #[test]
+        fn repeated_stdin_cancellation_reclaims_completion_handles() {
+            const CHILD: &str = "PI_TEST_WINDOWS_STDIN_HANDLE_RECLAIM";
+            if std::env::var_os(CHILD).is_some() {
+                reactor().expect("warm shared reactor");
+                let pid = sysinfo::get_current_pid().expect("current process");
+                let mut system = sysinfo::System::new();
+                system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
+                let process = system.process(pid).expect("current process handle");
+                let baseline = process.open_files().expect("Windows handle count");
+                let bytes = stdin_bytes();
+                let mut clients = Vec::new();
+                for _ in 0..16 {
+                    let (mut writer, mut reader) = stdin_pair().expect("Windows worker stdin");
+                    let mut retained = reader.try_clone().expect("retained stdin client");
+                    backpressure_stdin(&mut writer, &bytes);
+                    drop(writer);
+                    assert_disconnected(&mut reader);
+                    assert_disconnected(&mut retained);
+                    clients.extend([reader, retained]);
+                }
+                // Retained client handles are intentional. Server handles
+                // held by cancelled read/write completions must still retire.
+                let deadline = Instant::now() + Duration::from_secs(10);
+                loop {
+                    let handles = process.open_files().expect("Windows handle count");
+                    if handles <= baseline + clients.len() {
+                        break;
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "cancelled stdin completions retained server handles: {handles} vs {}",
+                        baseline + clients.len()
+                    );
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                return;
+            }
+            // Run handle accounting in its own process: parallel unit tests
+            // legitimately open unrelated handles and cannot share a baseline.
+            let _guard = super::super::process_test_guard();
+            let mut command = Command::new(std::env::current_exe().expect("test binary"));
+            command
+                .args([
+                    "--exact",
+                    "jobs::windows_job_pipe::tests::repeated_stdin_cancellation_reclaims_completion_handles",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .stdin(Stdio::null());
+            let child = crate::tools::spawn_command_with_job_discipline(&mut command)
+                .expect("isolated stdin handle regression");
+            let mut child = super::super::BackgroundChild::new(child);
+            let deadline = Instant::now() + Duration::from_secs(60);
+            loop {
+                if let Some(status) = child.try_wait().expect("observe handle regression") {
+                    assert!(status.success(), "stdin handle regression failed: {status}");
+                    break;
+                }
+                assert!(Instant::now() < deadline, "stdin handle regression stalled");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn prepare_job_stream(reader: &impl std::os::fd::AsFd) -> std::io::Result<()> {
+    let flags = rustix::fs::fcntl_getfl(reader)?;
+    rustix::fs::fcntl_setfl(reader, flags | rustix::fs::OFlags::NONBLOCK)?;
+    #[cfg(test)]
+    JOB_STREAM_PREPARE_CALLS.fetch_add(1, Ordering::Relaxed);
+    Ok(())
+}
+
+// Mirrors the Unix arm's fallible signature, which really can fail.
+#[cfg(not(any(unix, windows)))]
+#[allow(clippy::unnecessary_wraps, clippy::missing_const_for_fn)]
+fn prepare_job_stream<R>(_reader: &R) -> std::io::Result<()> {
+    Ok(())
+}
+
+#[cfg(all(test, unix))]
+struct JobPumpThreadTestGuard;
+
+#[cfg(all(test, unix))]
+impl JobPumpThreadTestGuard {
+    fn enter() -> Self {
+        JOB_PUMP_THREADS_IN_FLIGHT.fetch_add(1, Ordering::AcqRel);
+        Self
+    }
+}
+
+#[cfg(all(test, unix))]
+impl Drop for JobPumpThreadTestGuard {
+    fn drop(&mut self) {
+        JOB_PUMP_THREADS_IN_FLIGHT.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Output-state contention must not turn a nonblocking pipe reader into an
+/// uncancellable worker. The monitor can seal output without acquiring these
+/// mutexes, so observe that fence while waiting and again after acquisition.
+fn lock_job_output_state<'a, T>(
+    state: &'a Mutex<T>,
+    output_sealed: &AtomicBool,
+    state_name: &str,
+) -> std::io::Result<Option<std::sync::MutexGuard<'a, T>>> {
+    loop {
+        if output_sealed.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        match state.try_lock() {
+            Ok(guard) => {
+                if output_sealed.load(Ordering::Acquire) {
+                    return Ok(None);
+                }
+                return Ok(Some(guard));
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {
+                std::thread::sleep(OUTPUT_PUMP_POLL_INTERVAL);
+            }
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(std::io::Error::other(format!(
+                    "job {state_name} state poisoned"
+                )));
+            }
+        }
+    }
+}
+
+fn pump_job_stream<R: Read>(
+    mut reader: R,
+    artifact: &Mutex<ArtifactSink>,
+    tail: &Mutex<TailBuffer>,
+    output_sealed: &AtomicBool,
+) -> std::io::Result<()> {
+    #[cfg(all(test, unix))]
+    let _thread_guard = JobPumpThreadTestGuard::enter();
+    let mut chunk = [0u8; 8192];
+    loop {
+        if output_sealed.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        #[cfg(windows)]
+        let read_started = Instant::now();
+        match reader.read(&mut chunk) {
+            Ok(0) => return Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                #[cfg(windows)]
+                // Windows waits for readiness inside Read. Do not add another
+                // full idle delay after that bounded wait has already elapsed.
+                std::thread::sleep(
+                    OUTPUT_PUMP_POLL_INTERVAL.saturating_sub(read_started.elapsed()),
+                );
+                #[cfg(not(windows))]
+                std::thread::sleep(OUTPUT_PUMP_POLL_INTERVAL);
+            }
+            Err(err) => return Err(err),
+            Ok(n) => {
+                if output_sealed.load(Ordering::Acquire) {
+                    return Ok(());
+                }
+                let data = &chunk[..n];
+                {
+                    let Some(mut artifact) =
+                        lock_job_output_state(artifact, output_sealed, "artifact")?
+                    else {
+                        return Ok(());
+                    };
+                    artifact.write(data);
+                }
+                match lock_job_output_state(tail, output_sealed, "tail") {
+                    Ok(Some(mut tail)) => tail.push(data),
+                    Ok(None) => return Ok(()),
+                    // A poisoned tail remains best-effort; artifact failures
+                    // retain their existing error path above.
+                    Err(_) => {}
+                }
+            }
+        }
+    }
+}
+
+fn finish_pump(
+    handle: &mut Option<std::thread::JoinHandle<std::io::Result<()>>>,
+    deadline: Instant,
+) -> bool {
+    let Some(pump) = handle.as_ref() else {
+        return true;
+    };
+    while !pump.is_finished() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    if !pump.is_finished() {
+        return false;
+    }
+    let pump = handle.take().expect("finished pump handle remains present");
+    matches!(pump.join(), Ok(Ok(())))
+}
+
+struct MonitorResources {
+    id: String,
+    child: BackgroundChild,
+    stdout_pump: Option<std::thread::JoinHandle<std::io::Result<()>>>,
+    stderr_pump: Option<std::thread::JoinHandle<std::io::Result<()>>>,
+    output_sealed: Arc<AtomicBool>,
+    artifact: Arc<Mutex<ArtifactSink>>,
+    tail: Arc<Mutex<TailBuffer>>,
+    monitor_started: bool,
+    settlement_published: bool,
+    shell_state: Option<crate::tools::bash_session::ShellTransaction>,
+}
+
+impl MonitorResources {
+    fn seal_output_best_effort(&self) {
+        self.output_sealed.store(true, Ordering::Release);
+        if let Ok(mut artifact) = self.artifact.try_lock() {
+            artifact.seal();
+        }
+        if let Ok(mut tail) = self.tail.try_lock() {
+            tail.seal();
+        }
+    }
+
+    fn stop_pumps(&mut self, deadline: Instant) -> (bool, bool) {
+        (
+            finish_pump(&mut self.stdout_pump, deadline),
+            finish_pump(&mut self.stderr_pump, deadline),
+        )
+    }
+}
+
+impl Drop for MonitorResources {
+    fn drop(&mut self) {
+        let _ = self.child.kill_and_wait();
+        self.output_sealed.store(true, Ordering::Release);
+        let deadline = Instant::now() + OUTPUT_DRAIN_GRACE;
+        let _ = self.stop_pumps(deadline);
+        self.seal_output_best_effort();
+        if !self.settlement_published {
+            if let Some(shell_state) = &self.shell_state {
+                shell_state.finish(false);
+            }
+            if self.monitor_started {
+                settle_job_and_enqueue_notice(&self.id, JobStatus::Failed, None, false);
+            } else {
+                settle_job_without_notice(&self.id, JobStatus::Failed, None, false);
+            }
+            self.settlement_published = true;
+        }
+    }
+}
+
+fn last_chars(text: &str, cap: usize) -> String {
+    let char_count = text.chars().count();
+    text.chars().skip(char_count.saturating_sub(cap)).collect()
+}
+
+fn truncate_utf8_bytes(text: &str, max_bytes: usize) -> String {
+    const SUFFIX: &str = "\n...[truncated]";
+    if text.len() <= max_bytes {
+        return text.to_string();
+    }
+    let suffix = &SUFFIX[..SUFFIX.len().min(max_bytes)];
+    let content_cap = max_bytes - suffix.len();
+    let mut end = content_cap.min(text.len());
+    while !text.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+    let mut truncated = String::with_capacity(max_bytes);
+    truncated.push_str(&text[..end]);
+    truncated.push_str(suffix);
+    truncated
+}
+
+// Guard scope is deliberate; tightening drops would change lock-hold semantics.
+#[allow(clippy::too_many_lines, clippy::significant_drop_tightening)]
+fn monitor_job(
+    id: &str,
+    started_at: Instant,
+    timeout_secs: Option<u64>,
+    mut resources: MonitorResources,
+) {
+    let timeout = timeout_secs.map(Duration::from_secs);
+    let mut terminate_at: Option<Instant> = None;
+    let mut termination_status: Option<JobStatus> = None;
+    let root_pid = resources.child.id();
+
+    let exit_code = loop {
+        // Keep the nonblocking reap observation and `process_live` transition
+        // under the same registry lock used by cancellation. Once wait reports
+        // an exit, no concurrent caller can relabel that natural exit as a
+        // cancellation of a recycled numeric PID.
+        let wait_result = {
+            let mut reg = registry()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let result = resources.child.try_wait();
+            if matches!(result, Ok(Some(_)))
+                && let Some(job) = reg.jobs.get_mut(id)
+            {
+                job.pid = None;
+                job.process_live = false;
+            }
+            result
+        };
+        match wait_result {
+            Ok(Some(status)) => {
+                // The root has been reaped, but descendants may still own its
+                // process-group/job handles and inherited output pipes. Close
+                // that discipline before settlement so no child or pump
+                // thread survives a natural root exit.
+                if let Some(root_pid) = root_pid {
+                    crate::tools::terminate_reaped_child_discipline(root_pid);
+                }
+                resources.child.disarm();
+                break status.code();
+            }
+            Ok(None) => {}
+            Err(_) => break resources.child.kill_and_wait(),
+        }
+
+        let now = Instant::now();
+        if let Some(deadline) = terminate_at {
+            if now >= deadline {
+                break resources.child.kill_and_wait();
+            }
+        } else {
+            let cancel_requested = registry()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .jobs
+                .get(id)
+                .is_some_and(|job| job.cancel_requested);
+            if cancel_requested {
+                termination_status = Some(JobStatus::Killed);
+                crate::tools::terminate_process_group_tree(resources.child.id());
+                terminate_at = Some(now + TERMINATE_GRACE);
+            } else if let Some(timeout) = timeout
+                && now.duration_since(started_at) >= timeout
+            {
+                termination_status = Some(JobStatus::TimedOut);
+                crate::tools::terminate_process_group_tree(resources.child.id());
+                terminate_at = Some(now + TERMINATE_GRACE);
+            }
+        }
+
+        std::thread::sleep(Duration::from_millis(25));
+    };
+
+    // KILL/wait and error-recovery paths reap outside the nonblocking seam
+    // above. Clear their process identity before draining output too.
+    {
+        let mut reg = registry()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(job) = reg.jobs.get_mut(id) {
+            job.pid = None;
+            job.process_live = false;
+        }
+    }
+
+    let drain_deadline = Instant::now() + OUTPUT_DRAIN_GRACE;
+    let (stdout_complete, stderr_complete) = resources.stop_pumps(drain_deadline);
+    let output_complete = stdout_complete && stderr_complete;
+    resources.output_sealed.store(true, Ordering::Release);
+    let stop_deadline = Instant::now() + OUTPUT_PUMP_POLL_INTERVAL.saturating_mul(10);
+    let (stdout_stopped, stderr_stopped) = resources.stop_pumps(stop_deadline);
+    if (!stdout_stopped || !stderr_stopped)
+        && let Ok(mut artifact) = resources.artifact.try_lock()
+        && artifact.write_error.is_none()
+    {
+        artifact.write_error =
+            Some("output pump did not stop after the bounded cancellation deadline".to_string());
+    }
+    if output_complete {
+        resources
+            .artifact
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .seal();
+        resources
+            .tail
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .seal();
+    } else {
+        if let Ok(mut artifact) = resources.artifact.try_lock() {
+            artifact.seal();
+        }
+        if let Ok(mut tail) = resources.tail.try_lock() {
+            tail.seal();
+        }
+    }
+
+    // Settle only after reap and bounded pipe drain. Classify by the action
+    // that actually initiated termination, not by a cancellation request that
+    // may have arrived after the OS process exited but before reap observation.
+    let (status, code) = match termination_status {
+        Some(JobStatus::Killed) => (JobStatus::Killed, None),
+        Some(JobStatus::TimedOut) => (JobStatus::TimedOut, exit_code),
+        _ => (
+            if exit_code == Some(0) {
+                JobStatus::Exited
+            } else {
+                JobStatus::Failed
+            },
+            exit_code,
+        ),
+    };
+    if let Some(shell_state) = &resources.shell_state {
+        shell_state.finish(termination_status.is_none() && exit_code.is_some_and(|code| code >= 0));
+    }
+    settle_job_and_enqueue_notice(id, status, code, output_complete);
+    resources.settlement_published = true;
+}
+
+fn settle_job_and_enqueue_notice(
+    id: &str,
+    status: JobStatus,
+    exit_code: Option<i32>,
+    output_complete: bool,
+) {
+    settle_job(id, status, exit_code, output_complete, true);
+}
+
+fn settle_job_without_notice(
+    id: &str,
+    status: JobStatus,
+    exit_code: Option<i32>,
+    output_complete: bool,
+) {
+    settle_job(id, status, exit_code, output_complete, false);
+}
+
+// Guard scope is deliberate; tightening drops would change lock-hold semantics.
+#[allow(clippy::significant_drop_tightening)]
+fn settle_job(
+    id: &str,
+    status: JobStatus,
+    exit_code: Option<i32>,
+    output_complete: bool,
+    emit_notice: bool,
+) {
+    // Build the potentially I/O-contended snapshot without holding the global
+    // registry. The best-effort mode prevents a blocked artifact write from
+    // stalling settlement or unrelated job operations.
+    let source = {
+        let reg = registry()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reg.jobs
+            .get(id)
+            .filter(|job| !job.status.settled())
+            .map(|job| {
+                let mut source = JobSnapshotSource::from_entry(job);
+                source.status = status;
+                source.exit_code = exit_code;
+                source.pid = None;
+                source.output_complete = output_complete;
+                source
+            })
+    };
+    let Some(source) = source else {
+        return;
+    };
+    let snapshot = JobSnapshot::from_source_best_effort(&source);
+    let tail_excerpt = last_chars(&snapshot.output_tail, 4096);
+    let notice = emit_notice.then(|| format!(
+        "[background job {} settled: {} (exit {}; outputComplete={}; artifactTruncated={})]\ncommand: {}\nartifact: {}\noutput tail:\n{}",
+        snapshot.id,
+        snapshot.status,
+        snapshot
+            .exit_code
+            .map_or_else(|| "n/a".to_string(), |code| code.to_string()),
+        snapshot.output_complete,
+        snapshot.artifact_truncated,
+        snapshot.command.lines().next().unwrap_or(&snapshot.command),
+        snapshot.artifact_path,
+        if tail_excerpt.is_empty() {
+            "(no output)"
+        } else {
+            &tail_excerpt
+        }
+    ));
+
+    let notify = {
+        let mut reg = registry()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if reg.jobs.get(id).is_none_or(|job| job.status.settled()) {
+            return;
+        }
+        let settled_sequence = reg.next_settled_sequence;
+        reg.next_settled_sequence = reg.next_settled_sequence.saturating_add(1);
+        let Some(job) = reg.jobs.get_mut(id) else {
+            return;
+        };
+        record_job_settlement(
+            job,
+            status,
+            exit_code,
+            output_complete,
+            settled_sequence,
+            snapshot,
+        );
+        let notify = Arc::clone(&job.settled_notify);
+        let owner_session_id = job.owner_session_id.clone();
+        let delivery = job.delivery;
+        job.cancel_deadline.finish();
+        if delivery == JobDelivery::Background
+            && let Some(notice) = notice
+        {
+            enqueue_completion_notice(&mut reg, &owner_session_id, &notice);
+        }
+        if delivery == JobDelivery::Abandoned {
+            reg.jobs.remove(id);
+        }
+        prune_settled_jobs(&mut reg);
+        notify
+    };
+    notify.notify_waiters();
+}
+
+/// Publish a prepared terminal snapshot while the caller holds the registry
+/// lock. Keeping this boundary explicit also makes the prepare/promote/publish
+/// race reproducible without relying on OS scheduler timing in tests.
+fn record_job_settlement(
+    job: &mut JobEntry,
+    status: JobStatus,
+    exit_code: Option<i32>,
+    output_complete: bool,
+    settled_sequence: u64,
+    mut snapshot: JobSnapshot,
+) {
+    job.status = status;
+    job.exit_code = exit_code;
+    job.pid = None;
+    job.process_live = false;
+    job.output_complete = output_complete;
+    job.settled_sequence = Some(settled_sequence);
+    // The monitor may have captured a foreground-sized snapshot before
+    // promotion won the registry lock. The final delivery mode is decisive.
+    if job.delivery == JobDelivery::Background {
+        snapshot.limit_output_tail(OUTPUT_TAIL_BYTES);
+    }
+    *job.settled_snapshot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(snapshot);
+}
+
+fn prune_settled_jobs(reg: &mut JobRegistry) {
+    // Native task results can contain structured data beyond the shell tail.
+    // Bound their aggregate retention independently from descriptor count.
+    const MAX_RETAINED_TASK_RESULT_BYTES: usize = 32 * 1024 * 1024;
+    let mut task_results: Vec<_> = reg
+        .jobs
+        .values()
+        .filter(|job| job.status.settled() && job.result_bytes > 0)
+        .filter_map(|job| {
+            job.settled_sequence
+                .map(|sequence| (sequence, job.id.clone(), job.result_bytes))
+        })
+        .collect();
+    task_results.sort();
+    // Live progress shares this budget. Only older settled entries are evicted;
+    // a live task's latest observation must remain available to its owner.
+    let mut retained_bytes = reg
+        .jobs
+        .values()
+        .fold(0usize, |total, job| total.saturating_add(job.result_bytes));
+    for (_, id, bytes) in task_results {
+        if retained_bytes <= MAX_RETAINED_TASK_RESULT_BYTES {
+            break;
+        }
+        reg.jobs.remove(&id);
+        retained_bytes = retained_bytes.saturating_sub(bytes);
+    }
+    let mut settled_by_owner: HashMap<String, Vec<(u64, String)>> = HashMap::new();
+    for job in reg
+        .jobs
+        .values()
+        .filter(|job| job.status.settled() && job.delivery == JobDelivery::Background)
+    {
+        if let Some(sequence) = job.settled_sequence {
+            settled_by_owner
+                .entry(job.owner_session_id.clone())
+                .or_default()
+                .push((sequence, job.id.clone()));
+        }
+    }
+
+    let mut remove_ids = Vec::new();
+    for settled in settled_by_owner.values_mut() {
+        settled.sort();
+        let remove_count = settled
+            .len()
+            .saturating_sub(MAX_RETAINED_SETTLED_JOBS_PER_SESSION);
+        remove_ids.extend(settled.iter().take(remove_count).map(|(_, id)| id.clone()));
+    }
+    for id in remove_ids {
+        reg.jobs.remove(&id);
+    }
+
+    let mut settled: Vec<_> = reg
+        .jobs
+        .values()
+        .filter(|job| job.status.settled() && job.delivery == JobDelivery::Background)
+        .filter_map(|job| {
+            job.settled_sequence
+                .map(|sequence| (sequence, job.id.clone()))
+        })
+        .collect();
+    settled.sort();
+    let remove_count = settled
+        .len()
+        .saturating_sub(MAX_TOTAL_RETAINED_SETTLED_JOBS);
+    for (_, id) in settled.into_iter().take(remove_count) {
+        reg.jobs.remove(&id);
+    }
+}
+
+/// List snapshots owned by one session, newest last.
+///
+/// # Errors
+/// Tool error when the registry is poisoned.
+pub fn list(owner_session_id: &str) -> Result<Vec<JobSnapshot>> {
+    let reg = registry()
+        .lock()
+        .map_err(|_| Error::tool("jobs", "jobs registry poisoned".to_string()))?;
+    let mut sources: Vec<_> = reg
+        .jobs
+        .values()
+        .filter(|job| {
+            job.owner_session_id == owner_session_id && job.delivery == JobDelivery::Background
+        })
+        .map(|job| {
+            let settled = job
+                .settled_snapshot
+                .try_lock()
+                .ok()
+                .and_then(|snapshot| snapshot.clone());
+            (job.sequence, settled, JobSnapshotSource::from_entry(job))
+        })
+        .collect();
+    sources.sort_by_key(|(sequence, _, _)| *sequence);
+    drop(reg);
+    Ok(sources
+        .iter()
+        .map(|(_, settled, source)| {
+            settled
+                .clone()
+                .unwrap_or_else(|| JobSnapshot::from_source_best_effort(source))
+        })
+        .collect())
+}
+
+/// Whether one session still owns background work or an undelivered result.
+///
+/// Print mode uses this non-consuming observation before exiting. Inspecting
+/// notices and running jobs under the same lock closes the settlement race:
+/// publication cannot make a job disappear between two separate checks while
+/// its completion notice has yet to be observed. Admissions captured before a
+/// job is registered count too. Published foreground commands and other
+/// sessions do not count.
+///
+/// # Errors
+/// Tool error when the registry is poisoned or the owner is unavailable.
+pub fn has_pending_work(owner_session_id: &str) -> Result<bool> {
+    if owner_session_id.trim().is_empty() {
+        return Err(Error::tool(
+            "jobs",
+            "PI_JOBS_SESSION_UNAVAILABLE: current agent session identity is unavailable"
+                .to_string(),
+        ));
+    }
+    let reg = registry()
+        .lock()
+        .map_err(|_| Error::tool("jobs", "jobs registry poisoned".to_string()))?;
+    Ok(reg
+        .owner_spawns_in_flight
+        .get(owner_session_id)
+        .is_some_and(|count| *count > 0)
+        || reg.jobs.values().any(|job| {
+            job.owner_session_id == owner_session_id
+                && job.delivery == JobDelivery::Background
+                && !job.status.settled()
+        })
+        || reg
+            .notices
+            .iter()
+            .any(|notice| notice.owner_session_id == owner_session_id))
+}
+
+fn unknown_job_error(id: &str) -> Error {
+    Error::tool(
+        "jobs",
+        format!("PI_JOBS_UNKNOWN_ID: no background job named '{id}'"),
+    )
+}
+
+// Guard scope is deliberate; tightening drops would change lock-hold semantics.
+#[allow(clippy::significant_drop_tightening)]
+fn wait_handle(owner_session_id: &str, id: &str) -> Result<JobWaitHandle> {
+    let reg = registry()
+        .lock()
+        .map_err(|_| Error::tool("jobs", "jobs registry poisoned".to_string()))?;
+    let job = reg
+        .jobs
+        .get(id)
+        .filter(|job| job.owner_session_id == owner_session_id)
+        .ok_or_else(|| unknown_job_error(id))?;
+    Ok(JobWaitHandle {
+        owner_session_id: owner_session_id.to_string(),
+        id: id.to_string(),
+        settled_snapshot: Arc::clone(&job.settled_snapshot),
+        settled_notify: Arc::clone(&job.settled_notify),
+        cancel_deadline: Arc::clone(&job.cancel_deadline),
+    })
+}
+
+fn settled_snapshot(handle: &JobWaitHandle) -> Option<JobSnapshot> {
+    handle
+        .settled_snapshot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
+fn snapshot_now_best_effort(handle: &JobWaitHandle) -> Result<JobSnapshot> {
+    if let Some(snapshot) = settled_snapshot(handle) {
+        return Ok(snapshot);
+    }
+    let reg = registry()
+        .lock()
+        .map_err(|_| Error::tool("jobs", "jobs registry poisoned".to_string()))?;
+    if let Some(job) = reg
+        .jobs
+        .get(&handle.id)
+        .filter(|job| job.owner_session_id == handle.owner_session_id)
+    {
+        let source = JobSnapshotSource::from_entry(job);
+        drop(reg);
+        return Ok(JobSnapshot::from_source_best_effort(&source));
+    }
+    drop(reg);
+    if let Some(snapshot) = settled_snapshot(handle) {
+        return Ok(snapshot);
+    }
+    Err(unknown_job_error(&handle.id))
+}
+
+fn wait_with_handle(handle: &JobWaitHandle, timeout: Duration) -> Result<JobSnapshot> {
+    let _dependency = hold_native_job_wait(handle, timeout)?;
+    let started = Instant::now();
+    loop {
+        if let Some(snapshot) = settled_snapshot(handle) {
+            return Ok(snapshot);
+        }
+        if started.elapsed() >= timeout {
+            return snapshot_now_best_effort(handle);
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn hold_native_job_wait(
+    handle: &JobWaitHandle,
+    timeout: Duration,
+) -> Result<Option<Arc<crate::agent_hub::DependencyHold>>> {
+    if timeout.is_zero() || settled_snapshot(handle).is_some() || current_native_task().is_some() {
+        // Background work can wait internally while the parent remains free
+        // to answer. Only the foreground observer owns a parent dependency.
+        return Ok(None);
+    }
+    let native = {
+        let reg = registry()
+            .lock()
+            .map_err(|_| Error::tool("jobs", "jobs registry poisoned"))?;
+        reg.jobs.get(&handle.id).is_some_and(|job| {
+            job.owner_session_id == handle.owner_session_id && job.schema == host_task::TASK_SCHEMA
+        })
+    };
+    if !native {
+        return Ok(None);
+    }
+    crate::agent_hub::registry()
+        .lock()
+        .map_err(|_| Error::tool("hub", "PI_HUB_WAIT_REGISTRY: registry is poisoned"))?
+        .hold_job_results(
+            NativeTaskOwner {
+                session: handle.owner_session_id.clone(),
+                job: handle.id.clone(),
+            },
+            timeout,
+        )
+        .map(Some)
+}
+
+fn remaining_wait_slice(now: Instant, deadline: Option<Instant>) -> Option<Duration> {
+    match deadline {
+        Some(deadline) if now >= deadline => None,
+        Some(deadline) => Some(
+            deadline
+                .saturating_duration_since(now)
+                .min(MAX_ASYNC_WAIT_SLICE),
+        ),
+        None => Some(MAX_ASYNC_WAIT_SLICE),
+    }
+}
+
+/// Wait for a job to settle (bounded), returning its snapshot either way.
+///
+/// # Errors
+/// Named `PI_JOBS_UNKNOWN_ID` for unknown or foreign-session job ids.
+#[allow(clippy::significant_drop_tightening)]
+pub fn wait(owner_session_id: &str, id: &str, timeout: Duration) -> Result<JobSnapshot> {
+    let handle = wait_handle(owner_session_id, id)?;
+    wait_with_handle(&handle, timeout)
+}
+
+/// Async variant used by tool execution so a long wait continues yielding to
+/// abort/steering and unrelated sessions.
+///
+/// # Errors
+/// Named `PI_JOBS_UNKNOWN_ID` for unknown or foreign-session job ids.
+pub async fn wait_async(
+    owner_session_id: &str,
+    id: &str,
+    timeout: Duration,
+) -> Result<JobSnapshot> {
+    wait_async_with_slice(owner_session_id, id, timeout, MAX_ASYNC_WAIT_SLICE).await
+}
+
+// u64 nanoseconds cover centuries of timeout; the truncating cast cannot
+// overflow for any accepted job timeout.
+#[allow(clippy::cast_possible_truncation)]
+async fn wait_async_with_slice(
+    owner_session_id: &str,
+    id: &str,
+    timeout: Duration,
+    max_wait_slice: Duration,
+) -> Result<JobSnapshot> {
+    let handle = wait_handle(owner_session_id, id)?;
+    wait_async_with_handle(&handle, timeout, max_wait_slice).await
+}
+
+#[allow(clippy::cast_possible_truncation)]
+async fn wait_async_with_handle(
+    handle: &JobWaitHandle,
+    timeout: Duration,
+    max_wait_slice: Duration,
+) -> Result<JobSnapshot> {
+    /// Timer-driver variant of remaining_wait_slice.
+    fn remaining_wait_slice_at(now: Time, deadline: Option<Time>) -> Option<Duration> {
+        match deadline {
+            Some(deadline) if now >= deadline => None,
+            Some(deadline) => {
+                Some(Duration::from_nanos(deadline.duration_since(now)).min(MAX_ASYNC_WAIT_SLICE))
+            }
+            None => Some(MAX_ASYNC_WAIT_SLICE),
+        }
+    }
+
+    let cx = crate::agent_cx::AgentCx::for_current_or_request();
+    let dependency = hold_native_job_wait(handle, timeout)?;
+    let max_wait_slice = if dependency.is_some() {
+        // Completion notifications remain the primary wakeup. This bound
+        // also observes cancellation when the child needs the waiting parent.
+        max_wait_slice.min(Duration::from_millis(100))
+    } else {
+        max_wait_slice
+    };
+    let now = cx
+        .cx()
+        .timer_driver()
+        .map_or_else(asupersync::time::wall_now, |timer| timer.now());
+    let deadline = now.saturating_add_nanos(timeout.as_nanos() as u64);
+    loop {
+        if let Some(snapshot) = settled_snapshot(handle) {
+            return Ok(snapshot);
+        }
+        cx.checkpoint().map_err(|_| {
+            Error::tool(
+                "jobs",
+                "PI_JOBS_WAIT_CANCELLED: job wait owner is cancelled",
+            )
+        })?;
+        let now = cx
+            .cx()
+            .timer_driver()
+            .map_or_else(asupersync::time::wall_now, |timer| timer.now());
+        let Some(sleep_for) = remaining_wait_slice_at(now, Some(deadline))
+            .map(|sleep_for| sleep_for.min(max_wait_slice))
+        else {
+            return snapshot_now_best_effort(handle);
+        };
+        let notified = handle
+            .settled_notify
+            .wait_until(|| settled_snapshot(handle).is_some())
+            .fuse();
+        let deadline_sleep = asupersync::time::sleep(now, sleep_for).fuse();
+        futures::pin_mut!(notified, deadline_sleep);
+        match futures::future::select(notified, deadline_sleep).await {
+            futures::future::Either::Left(((), _)) => {}
+            futures::future::Either::Right(((), _)) => {
+                if let Some(snapshot) = settled_snapshot(handle) {
+                    return Ok(snapshot);
+                }
+            }
+        }
+    }
+}
+
+async fn wait_for_settlement_wall(
+    handle: &JobWaitHandle,
+    timeout: Duration,
+) -> Result<JobSnapshot> {
+    if let Some(snapshot) = settled_snapshot(handle) {
+        return Ok(snapshot);
+    }
+    let _started_deadline = handle.cancel_deadline.start(timeout)?;
+    let settlement = handle
+        .settled_notify
+        .wait_until(|| settled_snapshot(handle).is_some())
+        .fuse();
+    let deadline = handle
+        .cancel_deadline
+        .notify
+        .wait_until(|| handle.cancel_deadline.expired.load(Ordering::Acquire))
+        .fuse();
+    futures::pin_mut!(settlement, deadline);
+    match futures::future::select(settlement, deadline).await {
+        futures::future::Either::Left(((), _)) => settled_snapshot(handle)
+            .ok_or_else(|| Error::tool("jobs", "job settlement notification lost".to_string())),
+        futures::future::Either::Right(((), _)) => snapshot_now_best_effort(handle),
+    }
+}
+
+// Guard scope is deliberate; tightening drops would change lock-hold semantics.
+#[allow(clippy::significant_drop_tightening)]
+fn request_cancel(owner_session_id: &str, id: &str) -> Result<JobWaitHandle> {
+    let mut reg = registry()
+        .lock()
+        .map_err(|_| Error::tool("jobs", "jobs registry poisoned".to_string()))?;
+    let Some(job) = reg
+        .jobs
+        .get_mut(id)
+        .filter(|job| job.owner_session_id == owner_session_id)
+    else {
+        return Err(unknown_job_error(id));
+    };
+    if job.status.settled() || !job.process_live {
+        return Err(Error::tool(
+            "jobs",
+            format!(
+                "PI_JOBS_NOT_RUNNING: job '{id}' no longer owns running work ({})",
+                job.status.as_str()
+            ),
+        ));
+    }
+    job.cancel_requested = true;
+    Ok(JobWaitHandle {
+        owner_session_id: owner_session_id.to_string(),
+        id: id.to_string(),
+        settled_snapshot: Arc::clone(&job.settled_snapshot),
+        settled_notify: Arc::clone(&job.settled_notify),
+        cancel_deadline: Arc::clone(&job.cancel_deadline),
+    })
+}
+
+/// Cancel a running job with the bash timeout escalation (TERM → grace →
+/// KILL + tree walk).
+///
+/// # Errors
+/// Named `PI_JOBS_UNKNOWN_ID` for unknown job ids; `PI_JOBS_NOT_RUNNING`
+/// when the job already settled.
+#[allow(clippy::significant_drop_tightening)]
+pub fn cancel(owner_session_id: &str, id: &str) -> Result<JobSnapshot> {
+    let handle = request_cancel(owner_session_id, id)?;
+    // The monitor thread applies the KILL escalation and records the final
+    // status; wait briefly so the snapshot reflects the settle.
+    let snapshot = wait_with_handle(&handle, Duration::from_secs(10))?;
+    if snapshot.status == JobStatus::Running.as_str() {
+        return Err(Error::tool(
+            "jobs",
+            format!("PI_JOBS_CANCEL_TIMEOUT: job '{id}' did not settle after cancellation"),
+        ));
+    }
+    Ok(snapshot)
+}
+
+/// Async cancellation variant for tool entry points. The process monitor owns
+/// TERM → KILL escalation; this wait yields to the runtime instead of pinning an
+/// executor worker for the grace period.
+///
+/// # Errors
+/// Same named errors as [`cancel`], plus `PI_JOBS_CANCEL_TIMEOUT` if the monitor
+/// cannot publish a terminal state within the bounded cleanup window.
+pub async fn cancel_async(owner_session_id: &str, id: &str) -> Result<JobSnapshot> {
+    let handle = request_cancel(owner_session_id, id)?;
+    let snapshot = wait_for_settlement_wall(&handle, Duration::from_secs(10)).await?;
+    if snapshot.status == JobStatus::Running.as_str() {
+        return Err(Error::tool(
+            "jobs",
+            format!("PI_JOBS_CANCEL_TIMEOUT: job '{id}' did not settle after cancellation"),
+        ));
+    }
+    Ok(snapshot)
+}
+
+/// Drain pending completion notices as follow-up messages for the agent.
+/// The Agent's owner-aware job handoff calls this on every poll.
+#[must_use]
+pub fn take_completion_notices(owner_session_id: &str) -> Vec<Message> {
+    let mut reg = registry()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut matched = Vec::new();
+    let mut retained = VecDeque::with_capacity(reg.notices.len());
+    while let Some(notice) = reg.notices.pop_front() {
+        if notice.owner_session_id == owner_session_id {
+            matched.push(completion_notice_message(notice.text));
+        } else {
+            retained.push_back(notice);
+        }
+    }
+    reg.notices = retained;
+    matched
+}
+
+/// Return staged notices to the bounded registry when the live Agent session
+/// changes before delivery. Entries are prepended because they predate notices
+/// that could have settled while they were staged; normal per-owner and global
+/// retention then discards the oldest entries if either bound is exceeded.
+// Guard scope is deliberate; tightening drops would change lock-hold semantics.
+#[allow(clippy::significant_drop_tightening)]
+pub(crate) fn restore_completion_notices(notices: Vec<(String, Message)>) {
+    let restored = notices
+        .into_iter()
+        .filter_map(|(owner_session_id, message)| {
+            if owner_session_id.trim().is_empty() {
+                return None;
+            }
+            let Message::User(UserMessage {
+                content: UserContent::Text(text),
+                ..
+            }) = message
+            else {
+                return None;
+            };
+            Some(CompletionNotice {
+                owner_session_id,
+                text: truncate_utf8_bytes(&text, MAX_COMPLETION_NOTICE_BYTES),
+            })
+        })
+        .collect::<Vec<_>>();
+    if restored.is_empty() {
+        return;
+    }
+
+    let mut reg = registry()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let dropped = restore_completion_notices_into(&mut reg, restored);
+    if dropped > 0 {
+        tracing::warn!(
+            dropped,
+            "restored completion notices exceeded bounded retention; discarded oldest notices"
+        );
+    }
+}
+
+fn restore_completion_notices_into(
+    reg: &mut JobRegistry,
+    restored: Vec<CompletionNotice>,
+) -> usize {
+    for notice in restored.into_iter().rev() {
+        reg.notices.push_front(notice);
+    }
+    prune_completion_notices(reg)
+}
+
+fn prune_completion_notices(reg: &mut JobRegistry) -> usize {
+    let before = reg.notices.len();
+    let mut owner_counts = HashMap::<String, usize>::new();
+    for notice in &reg.notices {
+        *owner_counts
+            .entry(notice.owner_session_id.clone())
+            .or_default() += 1;
+    }
+
+    let mut retained = VecDeque::with_capacity(reg.notices.len());
+    while let Some(notice) = reg.notices.pop_front() {
+        if let Some(owner_count) = owner_counts.get_mut(&notice.owner_session_id)
+            && *owner_count > MAX_COMPLETION_NOTICES_PER_SESSION
+        {
+            *owner_count -= 1;
+            continue;
+        }
+        retained.push_back(notice);
+    }
+    reg.notices = retained;
+    while reg.notices.len() > MAX_TOTAL_COMPLETION_NOTICES {
+        let _ = reg.notices.pop_front();
+    }
+    before.saturating_sub(reg.notices.len())
+}
+
+fn completion_notice_message(text: String) -> Message {
+    Message::User(UserMessage {
+        content: UserContent::Text(text),
+        timestamp: now_ms(),
+    })
+}
+
+/// Enqueue a host-produced background completion for the existing follow-up delivery path.
+///
+/// `/tan` shares this seam with background bash jobs so queue
+/// modes, persistence, RPC behavior, and turn-boundary semantics stay
+/// identical.
+///
+/// # Errors
+/// Returns `PI_JOBS_SESSION_UNAVAILABLE` when the owner identity is empty or
+/// whitespace-only.
+pub fn push_completion_notice(owner_session_id: &str, text: impl Into<String>) -> Result<()> {
+    if owner_session_id.trim().is_empty() {
+        return Err(Error::tool(
+            "jobs",
+            "PI_JOBS_SESSION_UNAVAILABLE: completion notice owner is empty".to_string(),
+        ));
+    }
+    let text = text.into();
+    let text = truncate_utf8_bytes(&text, MAX_COMPLETION_NOTICE_BYTES);
+    let mut reg = registry()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    enqueue_completion_notice(&mut reg, owner_session_id, &text);
+    Ok(())
+}
+
+fn enqueue_completion_notice(reg: &mut JobRegistry, owner_session_id: &str, text: &str) {
+    let owner_notice_count = reg
+        .notices
+        .iter()
+        .filter(|notice| notice.owner_session_id == owner_session_id)
+        .count();
+    if owner_notice_count >= MAX_COMPLETION_NOTICES_PER_SESSION
+        && let Some(oldest) = reg
+            .notices
+            .iter()
+            .position(|notice| notice.owner_session_id == owner_session_id)
+    {
+        let _ = reg.notices.remove(oldest);
+    }
+    reg.notices.push_back(CompletionNotice {
+        owner_session_id: owner_session_id.to_string(),
+        text: truncate_utf8_bytes(text, MAX_COMPLETION_NOTICE_BYTES),
+    });
+    while reg.notices.len() > MAX_TOTAL_COMPLETION_NOTICES {
+        let _ = reg.notices.pop_front();
+    }
+}
+
+struct SessionShutdownAttempt {
+    owner_session_id: String,
+    finished: bool,
+}
+
+impl SessionShutdownAttempt {
+    // Guard scope is deliberate; tightening drops would change lock-hold semantics.
+    #[allow(clippy::significant_drop_tightening)]
+    fn begin(owner_session_id: &str) -> Result<Self> {
+        let mut reg = registry()
+            .lock()
+            .map_err(|_| Error::tool("jobs", "jobs registry poisoned".to_string()))?;
+        let current_generation = reg
+            .owner_shutdown_generations
+            .get(owner_session_id)
+            .copied()
+            .unwrap_or_default();
+        let Some(next_generation) = current_generation.checked_add(1) else {
+            reg.closing_owners
+                .entry(owner_session_id.to_string())
+                .or_default()
+                .active_attempts = usize::MAX;
+            return Err(Error::tool(
+                "jobs",
+                format!(
+                    "PI_JOBS_SESSION_SHUTDOWN_OVERFLOW: shutdown generation exhausted for session {owner_session_id:?}"
+                ),
+            ));
+        };
+        reg.owner_shutdown_generations
+            .insert(owner_session_id.to_string(), next_generation);
+        let state = reg
+            .closing_owners
+            .entry(owner_session_id.to_string())
+            .or_default();
+        state.active_attempts = state.active_attempts.checked_add(1).ok_or_else(|| {
+            Error::tool(
+                "jobs",
+                format!(
+                    "PI_JOBS_SESSION_SHUTDOWN_OVERFLOW: too many concurrent shutdown attempts for session {owner_session_id:?}"
+                ),
+            )
+        })?;
+        Ok(Self {
+            owner_session_id: owner_session_id.to_string(),
+            finished: false,
+        })
+    }
+
+    fn finish_success(mut self) -> Result<()> {
+        self.finished = true;
+        finish_session_shutdown_attempt(&self.owner_session_id, true)
+    }
+}
+
+impl Drop for SessionShutdownAttempt {
+    fn drop(&mut self) {
+        if !self.finished {
+            let _ = finish_session_shutdown_attempt(&self.owner_session_id, false);
+        }
+    }
+}
+
+// Guard scope is deliberate; tightening drops would change lock-hold semantics.
+#[allow(clippy::significant_drop_tightening)]
+fn finish_session_shutdown_attempt(owner_session_id: &str, clear_when_safe: bool) -> Result<()> {
+    let mut reg = registry()
+        .lock()
+        .map_err(|_| Error::tool("jobs", "jobs registry poisoned".to_string()))?;
+    let Some(state) = reg.closing_owners.get_mut(owner_session_id) else {
+        return Err(Error::tool(
+            "jobs",
+            format!(
+                "PI_JOBS_SESSION_SHUTDOWN_STATE_LOST: session {owner_session_id:?} has no shutdown state"
+            ),
+        ));
+    };
+    state.active_attempts = state.active_attempts.checked_sub(1).ok_or_else(|| {
+        Error::tool(
+            "jobs",
+            format!(
+                "PI_JOBS_SESSION_SHUTDOWN_STATE_LOST: session {owner_session_id:?} has no active shutdown attempt"
+            ),
+        )
+    })?;
+    let last_attempt = state.active_attempts == 0;
+    let all_jobs_settled = !reg
+        .jobs
+        .values()
+        .any(|job| job.owner_session_id == owner_session_id && !job.status.settled());
+    if clear_when_safe && last_attempt && all_jobs_settled {
+        reg.closing_owners.remove(owner_session_id);
+        remove_quiescent_owner_generation(&mut reg, owner_session_id);
+    }
+    Ok(())
+}
+
+fn request_session_shutdown(
+    owner_session_id: &str,
+) -> Result<(SessionShutdownAttempt, Vec<JobWaitHandle>)> {
+    request_session_shutdown_with_timeout(owner_session_id, SESSION_SHUTDOWN_TIMEOUT)
+}
+
+// Guard scope is deliberate; tightening drops would change lock-hold semantics.
+#[allow(clippy::significant_drop_tightening)]
+fn request_session_shutdown_with_timeout(
+    owner_session_id: &str,
+    lifecycle_timeout: Duration,
+) -> Result<(SessionShutdownAttempt, Vec<JobWaitHandle>)> {
+    if owner_session_id.trim().is_empty() {
+        return Err(Error::tool(
+            "jobs",
+            "PI_JOBS_SESSION_UNAVAILABLE: current agent session identity is unavailable"
+                .to_string(),
+        ));
+    }
+
+    let attempt = SessionShutdownAttempt::begin(owner_session_id)?;
+    // Publish the closing fence before waiting for a possibly slow spawn.
+    // Spawn checks this both before OS creation and again before registry
+    // publication, so an in-flight owner cannot escape the later snapshot.
+    let deadline = Instant::now()
+        .checked_add(lifecycle_timeout)
+        .unwrap_or_else(Instant::now);
+    let _lifecycle = loop {
+        match lifecycle_lock().try_lock() {
+            Ok(guard) => break guard,
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(Error::tool(
+                    "jobs",
+                    "jobs lifecycle lock poisoned".to_string(),
+                ));
+            }
+            Err(std::sync::TryLockError::WouldBlock) if Instant::now() >= deadline => {
+                return Err(Error::tool(
+                    "jobs",
+                    format!(
+                        "PI_JOBS_SESSION_SHUTDOWN_LOCK_TIMEOUT: session {owner_session_id:?} could not acquire the jobs lifecycle fence within {} seconds",
+                        lifecycle_timeout.as_secs_f64()
+                    ),
+                ));
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    };
+    let mut reg = registry()
+        .lock()
+        .map_err(|_| Error::tool("jobs", "jobs registry poisoned".to_string()))?;
+    let mut handles = Vec::new();
+    for job in reg
+        .jobs
+        .values_mut()
+        .filter(|job| job.owner_session_id == owner_session_id && !job.status.settled())
+    {
+        if job.process_live {
+            job.cancel_requested = true;
+        }
+        handles.push(JobWaitHandle {
+            owner_session_id: owner_session_id.to_string(),
+            id: job.id.clone(),
+            settled_snapshot: Arc::clone(&job.settled_snapshot),
+            settled_notify: Arc::clone(&job.settled_notify),
+            cancel_deadline: Arc::clone(&job.cancel_deadline),
+        });
+    }
+    Ok((attempt, handles))
+}
+
+/// Kill every running background job owned by one agent session.
+///
+/// Session-handle replacement uses this owner-scoped seam so an old session
+/// cannot leave inaccessible children behind and cannot terminate jobs owned
+/// by another live handle in the same process.
+///
+/// # Errors
+/// Named `PI_JOBS_SESSION_UNAVAILABLE` for a blank owner, registry/lifecycle
+/// errors, `PI_JOBS_SESSION_SHUTDOWN_LOCK_TIMEOUT` when the closing fence
+/// cannot be acquired, or `PI_JOBS_SESSION_SHUTDOWN_INCOMPLETE` when any
+/// requested job remains unsettled after the bounded cancellation window.
+pub async fn kill_session(owner_session_id: &str) -> Result<()> {
+    let request_owner = owner_session_id.to_string();
+    let (attempt, handles) =
+        asupersync::runtime::spawn_blocking(move || request_session_shutdown(&request_owner))
+            .await?;
+    let results = futures::future::join_all(
+        handles
+            .iter()
+            .map(|handle| wait_for_settlement_wall(handle, SESSION_SHUTDOWN_TIMEOUT)),
+    )
+    .await;
+    let mut failures = Vec::new();
+    for (handle, result) in handles.iter().zip(results) {
+        match result {
+            Ok(snapshot) if snapshot.status == JobStatus::Running.as_str() => {
+                failures.push(format!("{}: cancellation timed out", handle.id));
+            }
+            Ok(_) => {}
+            Err(err) => failures.push(format!("{}: {err}", handle.id)),
+        }
+    }
+    if failures.is_empty() {
+        attempt.finish_success()?;
+        Ok(())
+    } else {
+        Err(Error::tool(
+            "jobs",
+            format!(
+                "PI_JOBS_SESSION_SHUTDOWN_INCOMPLETE: {}",
+                failures.join("; ")
+            ),
+        ))
+    }
+}
+
+/// Kill every running job (process exit). Called once from the main
+/// shutdown chokepoint; documented behavior — no orphan daemons.
+pub fn kill_all() {
+    let _lifecycle = lifecycle_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let jobs: Vec<(String, String)> = {
+        let mut reg = registry()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for job in reg.jobs.values_mut() {
+            if !job.status.settled() && job.process_live {
+                job.cancel_requested = true;
+            }
+        }
+        reg.jobs
+            .values()
+            .filter(|job| !job.status.settled())
+            .map(|job| (job.owner_session_id.clone(), job.id.clone()))
+            .collect()
+    };
+    for (owner_session_id, id) in jobs {
+        let _ = wait(
+            &owner_session_id,
+            &id,
+            TERMINATE_GRACE + OUTPUT_DRAIN_GRACE + Duration::from_secs(1),
+        );
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn process_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+    TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TEST_SESSION_ID: &str = "jobs-test-session";
+
+    struct SpawnBackgroundTestHookGuard;
+
+    impl Drop for SpawnBackgroundTestHookGuard {
+        fn drop(&mut self) {
+            *spawn_background_test_hooks()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                SpawnBackgroundTestHooks::default();
+        }
+    }
+
+    fn install_spawn_background_test_hooks(
+        hooks: SpawnBackgroundTestHooks,
+    ) -> SpawnBackgroundTestHookGuard {
+        *spawn_background_test_hooks()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = hooks;
+        SpawnBackgroundTestHookGuard
+    }
+
+    #[test]
+    // Guard scope is deliberate; tightening drops would change lock-hold semantics.
+    #[allow(clippy::significant_drop_tightening)]
+    fn spawn_background_test_hooks_are_scoped_to_the_configured_owner() {
+        let _guard = process_test_guard();
+        let after_initial = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let before_spawn = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let before_publication = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let after_publication = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let _hooks = install_spawn_background_test_hooks(SpawnBackgroundTestHooks {
+            owner_session_id: Some("hook-owner".to_string()),
+            after_initial_owner_check: Some({
+                let calls = Arc::clone(&after_initial);
+                Arc::new(move || {
+                    calls.fetch_add(1, Ordering::AcqRel);
+                })
+            }),
+            before_os_spawn: Some({
+                let calls = Arc::clone(&before_spawn);
+                Arc::new(move || {
+                    calls.fetch_add(1, Ordering::AcqRel);
+                })
+            }),
+            before_registry_publication: Some({
+                let calls = Arc::clone(&before_publication);
+                Arc::new(move |_| {
+                    calls.fetch_add(1, Ordering::AcqRel);
+                })
+            }),
+            after_registry_publication: Some({
+                let calls = Arc::clone(&after_publication);
+                Arc::new(move |_| {
+                    calls.fetch_add(1, Ordering::AcqRel);
+                })
+            }),
+            fail_monitor_spawn: true,
+            panic_monitor_after_start: true,
+        });
+
+        invoke_after_initial_owner_check_hook("foreign-owner");
+        invoke_before_os_spawn_hook("foreign-owner");
+        invoke_before_registry_publication_hook("foreign-owner", 1);
+        invoke_after_registry_publication_hook("foreign-owner", "job-foreign");
+        assert!(!monitor_spawn_failure_requested("foreign-owner"));
+        assert!(!monitor_panic_requested("foreign-owner"));
+        assert_eq!(after_initial.load(Ordering::Acquire), 0);
+        assert_eq!(before_spawn.load(Ordering::Acquire), 0);
+        assert_eq!(before_publication.load(Ordering::Acquire), 0);
+        assert_eq!(after_publication.load(Ordering::Acquire), 0);
+
+        invoke_after_initial_owner_check_hook("hook-owner");
+        invoke_before_os_spawn_hook("hook-owner");
+        invoke_before_registry_publication_hook("hook-owner", 1);
+        invoke_after_registry_publication_hook("hook-owner", "job-owned");
+        assert!(monitor_spawn_failure_requested("hook-owner"));
+        assert!(monitor_panic_requested("hook-owner"));
+        assert_eq!(after_initial.load(Ordering::Acquire), 1);
+        assert_eq!(before_spawn.load(Ordering::Acquire), 1);
+        assert_eq!(before_publication.load(Ordering::Acquire), 1);
+        assert_eq!(after_publication.load(Ordering::Acquire), 1);
+    }
+
+    #[derive(Default)]
+    struct SpawnHookGate {
+        state: Mutex<SpawnHookGateState>,
+        changed: Condvar,
+    }
+
+    #[derive(Default)]
+    struct SpawnHookGateState {
+        entered: bool,
+        released: bool,
+        timed_out: bool,
+    }
+
+    // Guard scope is deliberate; these condvar helpers must hold their guards
+    // across the wait, so tightening drops would change lock-hold semantics.
+    #[allow(clippy::significant_drop_tightening)]
+    impl SpawnHookGate {
+        fn enter_and_wait(&self) {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.entered = true;
+            self.changed.notify_all();
+            let (mut state, timeout) = self
+                .changed
+                .wait_timeout_while(state, Duration::from_secs(2), |state| !state.released)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if timeout.timed_out() && !state.released {
+                state.timed_out = true;
+            }
+        }
+
+        fn wait_until_entered(&self) {
+            let state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let (state, timeout) = self
+                .changed
+                .wait_timeout_while(state, Duration::from_secs(2), |state| !state.entered)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert!(
+                state.entered && !timeout.timed_out(),
+                "background spawn did not reach its race hook"
+            );
+        }
+
+        fn release(&self) {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.released = true;
+            self.changed.notify_all();
+        }
+
+        fn assert_not_timed_out(&self) {
+            assert!(
+                !self
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .timed_out,
+                "spawn race hook was not released within its test budget"
+            );
+        }
+    }
+
+    #[derive(Default)]
+    struct CountedSpawnHookGate {
+        state: Mutex<CountedSpawnHookGateState>,
+        changed: Condvar,
+    }
+
+    #[derive(Default)]
+    struct CountedSpawnHookGateState {
+        entered: usize,
+        release_permits: usize,
+        timed_out: bool,
+    }
+
+    // Guard scope is deliberate; these condvar helpers must hold their guards
+    // across the wait, so tightening drops would change lock-hold semantics.
+    #[allow(clippy::significant_drop_tightening)]
+    impl CountedSpawnHookGate {
+        fn enter_and_wait(&self) {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.entered += 1;
+            self.changed.notify_all();
+            let (mut state, timeout) = self
+                .changed
+                .wait_timeout_while(state, Duration::from_secs(2), |state| {
+                    state.release_permits == 0
+                })
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if timeout.timed_out() && state.release_permits == 0 {
+                state.timed_out = true;
+            } else {
+                state.release_permits -= 1;
+            }
+        }
+
+        fn wait_until_entered(&self, expected: usize) {
+            let state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let (state, timeout) = self
+                .changed
+                .wait_timeout_while(state, Duration::from_secs(2), |state| {
+                    state.entered < expected
+                })
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert!(
+                state.entered >= expected && !timeout.timed_out(),
+                "only {} of {expected} background spawns reached their race hook",
+                state.entered
+            );
+        }
+
+        fn release_one(&self) {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.release_permits += 1;
+            self.changed.notify_one();
+        }
+
+        fn assert_not_timed_out(&self) {
+            assert!(
+                !self
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .timed_out,
+                "a counted background spawn hook timed out before release"
+            );
+        }
+    }
+
+    fn temp_root() -> PathBuf {
+        static NEXT_ROOT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let sequence = NEXT_ROOT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("pi-jobs-test-{}-{sequence}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp root");
+        dir
+    }
+
+    pub(super) fn synthetic_entry(
+        id: &str,
+        artifact_path: PathBuf,
+        sequence: u64,
+        process_live: bool,
+    ) -> JobEntry {
+        let file = std::fs::File::create(&artifact_path).expect("synthetic artifact");
+        JobEntry {
+            schema: JOB_SCHEMA,
+            result: None,
+            result_bytes: 0,
+            owner_session_id: TEST_SESSION_ID.to_string(),
+            delivery: JobDelivery::Background,
+            id: id.to_string(),
+            command: "true".to_string(),
+            started_at_ms: 1,
+            sequence,
+            settled_sequence: None,
+            status: JobStatus::Running,
+            exit_code: None,
+            pid: process_live.then_some(123_456),
+            artifact_path,
+            artifact_cleanup: ArtifactCleanupOutcome {
+                policy: ArtifactRetentionPolicy::Preserve.as_str().to_string(),
+                removed_files: 0,
+                reclaimed_bytes: 0,
+            },
+            tail: Arc::new(Mutex::new(TailBuffer::new(8))),
+            artifact: Arc::new(Mutex::new(ArtifactSink::new(file, 16))),
+            output_complete: false,
+            cancel_requested: false,
+            process_live,
+            settled_snapshot: Arc::new(Mutex::new(None)),
+            settled_notify: Arc::new(Notify::new()),
+            cancel_deadline: Arc::new(CancelDeadline::new()),
+        }
+    }
+
+    #[cfg(unix)]
+    fn process_exists(pid: u32) -> bool {
+        std::process::Command::new("/bin/kill")
+            .args(["-0", &pid.to_string()])
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
+    fn wait_for_output(id: &str, marker: &str, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let snapshot = wait(TEST_SESSION_ID, id, Duration::ZERO).expect("job snapshot");
+            if snapshot.output_tail.contains(marker) {
+                return;
+            }
+            assert!(Instant::now() < deadline, "job never emitted {marker:?}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn wait_for_path(path: &Path, timeout: Duration) {
+        let started = Instant::now();
+        while !path.exists() {
+            assert!(
+                started.elapsed() < timeout,
+                "timed out waiting for {}",
+                path.display()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn tail_buffer_keeps_last_bytes() {
+        let mut tail = TailBuffer::new(8);
+        tail.push(b"hello ");
+        tail.push(b"world!");
+        // "hello world!" is 12 bytes; the tail retains the last 8.
+        assert_eq!(tail.text(), "o world!");
+    }
+
+    #[test]
+    fn completion_excerpt_keeps_most_recent_characters() {
+        let text = format!("{}LATEST", "x".repeat(5000));
+        let excerpt = last_chars(&text, 4096);
+        assert_eq!(excerpt.chars().count(), 4096);
+        assert!(excerpt.ends_with("LATEST"));
+    }
+
+    #[test]
+    fn artifact_sink_caps_bytes_and_reports_write_errors() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("artifact.log");
+        let file = std::fs::File::create(&path).expect("create artifact");
+        let mut sink = ArtifactSink::new(file, 4);
+        sink.write(b"abcdef");
+        assert_eq!(sink.bytes_written, 4);
+        assert!(sink.truncated);
+        assert!(sink.write_error.is_none());
+        assert_eq!(std::fs::metadata(&path).expect("metadata").len(), 4);
+
+        let read_only = std::fs::File::open(&path).expect("open read-only");
+        let mut failing = ArtifactSink::new(read_only, 8);
+        failing.write(b"x");
+        assert!(failing.write_error.is_some());
+        failing.write(b"ignored after first failure");
+        assert_eq!(failing.bytes_written, 0);
+
+        sink.seal();
+        assert!(sink.file.is_none(), "settlement must close the artifact fd");
+    }
+
+    #[test]
+    #[allow(clippy::significant_drop_tightening)] // Keep contention through cancellation.
+    fn sealed_pump_joins_while_output_tail_remains_locked() {
+        const OUTPUT: &[u8] = b"buffered output before cancellation";
+        let _guard = process_test_guard();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("contended-pump.log");
+        let file = std::fs::File::create(&path).expect("pump artifact");
+        let artifact = Arc::new(Mutex::new(ArtifactSink::new(file, 64)));
+        let tail = Arc::new(Mutex::new(TailBuffer::new(64)));
+        let sealed = Arc::new(AtomicBool::new(false));
+        let tail_guard = tail.lock().expect("hold output tail");
+        let pump_artifact = Arc::clone(&artifact);
+        let pump_tail = Arc::clone(&tail);
+        let pump_sealed = Arc::clone(&sealed);
+        let mut pump = Some(std::thread::spawn(move || {
+            pump_job_stream(
+                std::io::Cursor::new(OUTPUT),
+                &pump_artifact,
+                &pump_tail,
+                &pump_sealed,
+            )
+        }));
+
+        // Artifact publication proves the real pump passed its post-read seal
+        // check. It must now acquire the tail mutex before it can observe EOF;
+        // sealing before the read would not exercise the original deadlock.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let artifact_written = loop {
+            if artifact
+                .try_lock()
+                .is_ok_and(|sink| sink.bytes_written == OUTPUT.len())
+            {
+                break true;
+            }
+            if Instant::now() >= deadline {
+                break false;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        sealed.store(true, Ordering::Release);
+        let joined_while_locked = finish_pump(&mut pump, Instant::now() + Duration::from_secs(2));
+
+        // Always release contention and reap the worker before assertions, so
+        // the old blocking implementation fails without leaking a test thread.
+        drop(tail_guard);
+        let cleaned_up = finish_pump(&mut pump, Instant::now() + Duration::from_secs(2));
+        assert!(
+            artifact_written,
+            "the pump must consume and persist its input"
+        );
+        assert!(cleaned_up, "the pump must stop after test cleanup");
+        assert!(
+            joined_while_locked,
+            "sealing must join the pump without waiting for the output-state mutex"
+        );
+        assert!(pump.is_none());
+        assert!(
+            tail.lock().expect("output tail").text().is_empty(),
+            "a sealed pump must not publish its buffered chunk after contention clears"
+        );
+        assert_eq!(std::fs::read(&path).expect("artifact output"), OUTPUT);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sealed_nonblocking_pipe_pump_joins_while_writer_remains_open() {
+        let _guard = process_test_guard();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "sleep 30"])
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("pipe-holder child");
+        let stdout = child.stdout.take().expect("child stdout");
+        prepare_job_stream(&stdout).expect("nonblocking child pipe");
+        let artifact_file =
+            std::fs::File::create(temp.path().join("pump.log")).expect("pump artifact");
+        let artifact = Arc::new(Mutex::new(ArtifactSink::new(artifact_file, 64)));
+        let tail = Arc::new(Mutex::new(TailBuffer::new(64)));
+        let sealed = Arc::new(AtomicBool::new(false));
+        let pump_artifact = Arc::clone(&artifact);
+        let pump_tail = Arc::clone(&tail);
+        let pump_sealed = Arc::clone(&sealed);
+        let pump = std::thread::spawn(move || {
+            pump_job_stream(stdout, &pump_artifact, &pump_tail, &pump_sealed)
+        });
+        std::thread::sleep(OUTPUT_PUMP_POLL_INTERVAL.saturating_mul(2));
+        assert!(
+            !pump.is_finished(),
+            "an open writer with no data must keep an unsealed pump pending"
+        );
+
+        sealed.store(true, Ordering::Release);
+        let mut pump = Some(pump);
+        let joined = finish_pump(
+            &mut pump,
+            Instant::now() + OUTPUT_PUMP_POLL_INTERVAL.saturating_mul(10),
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(
+            joined,
+            "sealing must stop and join the reader even while the writer remains open"
+        );
+        assert!(pump.is_none());
+    }
+
+    #[cfg(windows)]
+    fn assert_windows_pipe_bytes(reader: &mut windows_job_pipe::Reader, expected: &[u8]) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut received = vec![0; expected.len()];
+        let mut count = 0;
+        while count < received.len() && Instant::now() < deadline {
+            match reader.read(&mut received[count..]) {
+                Ok(0) => panic!("an open writer must not produce EOF"),
+                Ok(bytes) => count += bytes,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => panic!("read Windows job pipe: {error}"),
+            }
+        }
+        assert_eq!(&received[..count], expected);
+    }
+
+    #[cfg(windows)]
+    fn assert_windows_pipe_writer_closed(writer: &mut std::fs::File) {
+        // Every probe fits in the pipe's 64 KiB buffer even if a cancelled
+        // read leaked its completion-owned Arc. Only server-handle retirement
+        // makes this retained client observe a broken pipe.
+        for _ in 0..64 {
+            match writer.write(b"x") {
+                Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => return,
+                Ok(1) => std::thread::sleep(OUTPUT_PUMP_POLL_INTERVAL),
+                result => panic!("unexpected pipe retirement probe: {result:?}"),
+            }
+        }
+        panic!("cancelled reader retained its Windows server handle");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_job_pipe_distinguishes_idle_data_and_eof() {
+        let _guard = process_test_guard();
+        let (mut reader, mut writer) = windows_job_pipe::pair().expect("Windows job pipe");
+        let mut byte = [0];
+        assert_eq!(
+            reader.read(&mut byte).expect_err("idle pipe").kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        writer.write_all(b"first").expect("first output");
+        assert_windows_pipe_bytes(&mut reader, b"first");
+        assert_eq!(
+            reader.read(&mut byte).expect_err("idle gap").kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        writer.write_all(b"second").expect("second output");
+        assert_windows_pipe_bytes(&mut reader, b"second");
+        drop(writer);
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match reader.read(&mut byte) {
+                Ok(0) => break,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(Instant::now() < deadline, "closed writer must produce EOF");
+                }
+                result => panic!("unexpected result after writer closed: {result:?}"),
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_sealed_pipe_pump_joins_and_closes_server_with_writer_held() {
+        let _guard = process_test_guard();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("pump.log");
+        let file = std::fs::File::create(&path).expect("pump artifact");
+        let artifact = Arc::new(Mutex::new(ArtifactSink::new(file, 64)));
+        let tail = Arc::new(Mutex::new(TailBuffer::new(64)));
+        let sealed = Arc::new(AtomicBool::new(false));
+        let (reader, mut writer) = windows_job_pipe::pair().expect("Windows job pipe");
+        let pump_artifact = Arc::clone(&artifact);
+        let pump_tail = Arc::clone(&tail);
+        let pump_sealed = Arc::clone(&sealed);
+        let mut pump = Some(std::thread::spawn(move || {
+            pump_job_stream(reader, &pump_artifact, &pump_tail, &pump_sealed)
+        }));
+        writer
+            .write_all(&[b'b'; 128])
+            .expect("output beyond artifact cap");
+        writer.write_all(b"before-seal").expect("final output");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !tail.lock().expect("tail").text().ends_with("before-seal") {
+            assert!(Instant::now() < deadline, "pump must consume output");
+            std::thread::sleep(OUTPUT_PUMP_POLL_INTERVAL);
+        }
+        assert!(
+            !pump.as_ref().expect("live pump").is_finished(),
+            "an open writer must leave an unsealed pump pending"
+        );
+        let tail_before = tail.lock().expect("tail").text();
+        let bytes_before = std::fs::read(&path).expect("artifact bytes");
+        assert_eq!(bytes_before.len(), 64);
+        assert!(artifact.lock().expect("artifact").truncated);
+
+        sealed.store(true, Ordering::Release);
+        assert!(
+            finish_pump(&mut pump, Instant::now() + OUTPUT_DRAIN_GRACE),
+            "sealing must join the pump while its writer remains open"
+        );
+        assert!(pump.is_none());
+        assert_windows_pipe_writer_closed(&mut writer);
+        assert_eq!(tail.lock().expect("tail").text(), tail_before);
+        assert_eq!(
+            std::fs::read(&path).expect("settled artifact"),
+            bytes_before
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_repeated_pipe_cancellation_retires_handles_with_writers_held() {
+        let _guard = process_test_guard();
+        let mut writers = Vec::new();
+        for attempt in 0..32 {
+            let (mut reader, mut writer) = windows_job_pipe::pair().expect("Windows job pipe");
+            let result = if attempt % 2 == 0 {
+                reader.try_read(&mut [0])
+            } else {
+                reader.read(&mut [0])
+            };
+            assert_eq!(
+                result.expect_err("pending read").kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+            drop(reader);
+            assert_windows_pipe_writer_closed(&mut writer);
+            writers.push(writer);
+        }
+        assert_eq!(
+            writers.len(),
+            32,
+            "writers stayed open across every retirement"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_job_pipe_output_child() {
+        if std::env::var_os("PI_JOBS_WINDOWS_PIPE_CHILD").is_none() {
+            return;
+        }
+        let mut stdout = std::io::stdout().lock();
+        stdout
+            .write_all(&[b'o'; 32 * 1024])
+            .expect("child stdout burst");
+        stdout
+            .write_all(b"stdout-finished\n")
+            .expect("stdout marker");
+        stdout.flush().expect("flush stdout");
+        let mut stderr = std::io::stderr().lock();
+        stderr
+            .write_all(&[b'e'; 32 * 1024])
+            .expect("child stderr burst");
+        stderr
+            .write_all(b"stderr-finished\n")
+            .expect("stderr marker");
+        stderr.flush().expect("flush stderr");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_configured_child_pipes_drain_both_streams_to_eof() {
+        let _guard = process_test_guard();
+        let mut command = std::process::Command::new(std::env::current_exe().expect("test binary"));
+        command
+            .args([
+                "--exact",
+                "jobs::tests::windows_job_pipe_output_child",
+                "--nocapture",
+            ])
+            .env("PI_JOBS_WINDOWS_PIPE_CHILD", "1")
+            .stdin(std::process::Stdio::null());
+        let (mut stdout, mut stderr) =
+            windows_job_pipe::configure(&mut command).expect("configure child output");
+        let child = crate::tools::spawn_command_with_job_discipline(&mut command)
+            .expect("spawn child with Windows Job discipline");
+        // Command retains the parent writer copies for reuse. Match the
+        // production handoff so EOF proves that these copies were disposed.
+        drop(command);
+        let pid = child.id();
+        let mut child = BackgroundChild::new(child);
+        let mut stdout_bytes = Vec::new();
+        let mut stderr_bytes = Vec::new();
+        let mut stdout_eof = false;
+        let mut stderr_eof = false;
+        let mut buffer = [0; 8192];
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !(stdout_eof && stderr_eof) && Instant::now() < deadline {
+            for (reader, bytes, eof) in [
+                (&mut stdout, &mut stdout_bytes, &mut stdout_eof),
+                (&mut stderr, &mut stderr_bytes, &mut stderr_eof),
+            ] {
+                if *eof {
+                    continue;
+                }
+                match reader.read(&mut buffer) {
+                    Ok(0) => *eof = true,
+                    Ok(count) => bytes.extend_from_slice(&buffer[..count]),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(error) => panic!("read configured child output: {error}"),
+                }
+            }
+        }
+        let status = loop {
+            if let Some(status) = child.try_wait().expect("reap output child") {
+                crate::tools::terminate_reaped_child_discipline(pid);
+                child.disarm();
+                break Some(status);
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill_and_wait();
+                break None;
+            }
+            std::thread::sleep(OUTPUT_PUMP_POLL_INTERVAL);
+        };
+        assert!(
+            status.is_some_and(|status| status.success()),
+            "child must exit successfully"
+        );
+        assert!(
+            stdout_eof && stderr_eof,
+            "both child streams must reach actual EOF"
+        );
+        let stdout_text = String::from_utf8(stdout_bytes).expect("stdout UTF-8");
+        let stderr_text = String::from_utf8(stderr_bytes).expect("stderr UTF-8");
+        assert!(stdout_text.contains(&format!("{}stdout-finished\n", "o".repeat(32 * 1024))));
+        assert!(!stdout_text.contains("stderr-finished"));
+        assert_eq!(
+            stderr_text,
+            format!("{}stderr-finished\n", "e".repeat(32 * 1024))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn artifact_creation_is_exclusive_and_does_not_follow_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let jobs_dir = temp.path().join("jobs");
+        std::fs::create_dir_all(&jobs_dir).expect("jobs dir");
+        let victim = temp.path().join("victim.txt");
+        std::fs::write(&victim, "preserve-me").expect("victim");
+        symlink(&victim, jobs_dir.join("job-planted.log")).expect("planted symlink");
+
+        let error = create_job_artifact(&jobs_dir, "job-planted")
+            .expect_err("create_new must refuse an existing symlink");
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            std::fs::read_to_string(&victim).expect("victim remains readable"),
+            "preserve-me"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn artifact_budget_lock_does_not_follow_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let jobs_dir = temp.path().join("jobs");
+        std::fs::create_dir_all(&jobs_dir).expect("jobs dir");
+        let victim = temp.path().join("victim.txt");
+        std::fs::write(&victim, "preserve-me").expect("victim");
+        symlink(&victim, jobs_dir.join(".artifact-budget.lock")).expect("planted symlink");
+
+        let error = acquire_artifact_budget_lock(&jobs_dir)
+            .expect_err("NOFOLLOW must reject a planted budget-lock symlink");
+        assert!(error.to_string().contains("artifact budget lock"));
+        assert_eq!(
+            std::fs::read_to_string(&victim).expect("victim remains readable"),
+            "preserve-me"
+        );
+    }
+
+    #[test]
+    fn aggregate_artifact_budget_refuses_bytes_and_entries() {
+        let _guard = process_test_guard();
+        let temp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(temp.path().join("one.log"), b"12345").expect("first artifact");
+        let bytes_error = ensure_artifact_budget(temp.path(), 4, 10)
+            .expect_err("stored bytes above the budget must refuse new jobs");
+        assert!(
+            bytes_error
+                .to_string()
+                .contains("PI_JOBS_ARTIFACT_CAPACITY")
+        );
+
+        std::fs::write(temp.path().join("two.log"), b"").expect("second artifact");
+        let entries_error = ensure_artifact_budget(temp.path(), u64::MAX, 2)
+            .expect_err("entry count at the budget must refuse new jobs");
+        assert!(
+            entries_error
+                .to_string()
+                .contains("PI_JOBS_ARTIFACT_CAPACITY")
+        );
+    }
+
+    #[test]
+    fn artifact_budget_counts_growth_before_the_writer_seals() {
+        let _guard = process_test_guard();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (path, file) =
+            create_job_artifact(temp.path(), "job-growing").expect("create and reserve artifact");
+        let scanned_metadata = std::fs::symlink_metadata(&path).expect("initial metadata");
+        assert_eq!(scanned_metadata.len(), 0);
+
+        // Reproduce the scan/write/seal interleaving without scheduler timing:
+        // the scanner retains its old metadata while the real sink grows and
+        // releases the lock before per-file accounting resumes.
+        let mut sink = ArtifactSink::new(file, MAX_ARTIFACT_BYTES);
+        sink.write(b"final output");
+        assert!(sink.write_error.is_none());
+        sink.seal();
+        let final_bytes = std::fs::metadata(&path).expect("final metadata").len();
+        assert!(final_bytes > scanned_metadata.len());
+
+        let reserved = artifact_file_reserved_bytes(&path, &scanned_metadata)
+            .expect("measure artifact after sealing");
+        assert_eq!(reserved, final_bytes);
+        let next_job_reservation = u64::try_from(MAX_ARTIFACT_BYTES).expect("artifact cap fits");
+        assert!(
+            !artifact_capacity_available(reserved, 1, next_job_reservation, 10),
+            "growth after the directory snapshot must count against the next job's budget"
+        );
+        assert!(artifact_capacity_available(
+            reserved,
+            1,
+            next_job_reservation + final_bytes,
+            10,
+        ));
+    }
+
+    #[test]
+    fn aggregate_artifact_budget_reserves_locked_live_files_at_full_cap() {
+        let _guard = process_test_guard();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let live_path = temp.path().join("job-live.log");
+        let mut live = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&live_path)
+            .expect("live artifact");
+        fs4::FileExt::lock(&live).expect("reserve live artifact");
+        live.write_all(b"partial output")
+            .expect("write live artifact");
+
+        let live_reservation = u64::try_from(MAX_ARTIFACT_BYTES).expect("artifact cap fits");
+        assert_eq!(
+            artifact_directory_usage(temp.path()).expect("account for live artifact"),
+            (live_reservation, 1),
+            "stored bytes are part of the live reservation, not an additional charge"
+        );
+        let two_job_budget = live_reservation.saturating_mul(2);
+        ensure_artifact_budget(temp.path(), two_job_budget, 10)
+            .expect("one live artifact and one prospective job fit exactly two caps");
+        let error = ensure_artifact_budget(temp.path(), two_job_budget - 1, 10)
+            .expect_err("live artifact plus prospective job must reserve two full caps");
+        assert!(error.to_string().contains("PI_JOBS_ARTIFACT_CAPACITY"));
+        fs4::FileExt::unlock(&live).expect("release live artifact reservation");
+    }
+
+    #[test]
+    fn artifact_retention_policy_defaults_to_rotate_and_preserve_is_opt_in() {
+        assert_eq!(
+            ArtifactRetentionPolicy::from_value(None).expect("default policy"),
+            ArtifactRetentionPolicy::Rotate
+        );
+        assert_eq!(
+            ArtifactRetentionPolicy::from_value(Some(OsStr::new(""))).expect("empty policy"),
+            ArtifactRetentionPolicy::Rotate
+        );
+        assert_eq!(
+            ArtifactRetentionPolicy::from_value(Some(OsStr::new(" preserve ")))
+                .expect("preserve policy"),
+            ArtifactRetentionPolicy::Preserve
+        );
+        assert_eq!(
+            ArtifactRetentionPolicy::from_value(Some(OsStr::new("ROTATE"))).expect("rotate policy"),
+            ArtifactRetentionPolicy::Rotate
+        );
+        let error = ArtifactRetentionPolicy::from_value(Some(OsStr::new("delete-all")))
+            .expect_err("unknown cleanup policies must fail closed");
+        assert!(error.to_string().contains("expected preserve or rotate"));
+    }
+
+    #[test]
+    fn managed_artifact_name_validation_is_exact() {
+        assert!(is_managed_job_artifact_name(OsStr::new(
+            "job-0123456789abcdef0123456789abcdef.log"
+        )));
+        for invalid in [
+            "job-0123456789abcdef0123456789abcde.log",
+            "job-0123456789abcdef0123456789abcdef0.log",
+            "job-0123456789ABCDEF0123456789ABCDEF.log",
+            "job-0123456789abcdef0123456789abcdef.txt",
+            "../job-0123456789abcdef0123456789abcdef.log",
+            "job-0123456789abcdef/0123456789abcdef.log",
+        ] {
+            assert!(
+                !is_managed_job_artifact_name(OsStr::new(invalid)),
+                "invalid artifact name was accepted: {invalid:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn job_snapshot_serializes_artifact_cleanup_outcome() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let id = "job-cleanup-snapshot";
+        let mut entry = synthetic_entry(id, temp.path().join("snapshot.log"), 0, false);
+        entry.artifact_cleanup = ArtifactCleanupOutcome {
+            policy: "rotate".to_string(),
+            removed_files: 3,
+            reclaimed_bytes: 17,
+        };
+        let snapshot = JobSnapshot::from_source_best_effort(&JobSnapshotSource::from_entry(&entry));
+        let value = serde_json::to_value(snapshot).expect("serialize job snapshot");
+        assert_eq!(value["artifactCleanup"]["policy"], "rotate");
+        assert_eq!(value["artifactCleanup"]["removedFiles"], 3);
+        assert_eq!(value["artifactCleanup"]["reclaimedBytes"], 17);
+    }
+
+    #[test]
+    fn artifact_preservation_policy_never_removes_managed_files() {
+        let _guard = process_test_guard();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("job-00000000000000000000000000000000.log");
+        std::fs::write(&path, b"preserve-me").expect("artifact fixture");
+        let error = enforce_artifact_retention(
+            temp.path(),
+            ArtifactRetentionPolicy::Preserve,
+            u64::try_from(MAX_ARTIFACT_BYTES).expect("artifact cap fits"),
+            10,
+            0,
+        )
+        .expect_err("preservation refuses capacity instead of deleting");
+        assert!(error.to_string().contains("retention policy: preserve"));
+        assert_eq!(
+            std::fs::read_to_string(path).expect("preserved artifact"),
+            "preserve-me"
+        );
+    }
+
+    #[test]
+    fn artifact_cleanup_candidate_identity_rejects_same_name_replacement() {
+        let _guard = process_test_guard();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("job-00000000000000000000000000000000.log");
+        std::fs::write(&path, b"old!").expect("old artifact");
+        let candidate = artifact_cleanup_candidates(temp.path())
+            .expect("candidate inventory")
+            .pop()
+            .expect("managed candidate");
+        std::fs::rename(&path, temp.path().join("displaced.log"))
+            .expect("replace candidate identity");
+        std::fs::write(&path, b"new!").expect("same-name replacement");
+
+        assert_eq!(
+            remove_unlocked_artifact(&candidate).expect("identity check"),
+            None
+        );
+        assert_eq!(
+            std::fs::read_to_string(path).expect("replacement preserved"),
+            "new!"
+        );
+    }
+
+    #[test]
+    fn artifact_rotation_reclaims_oldest_settled_files_and_reports_outcome() {
+        let _guard = process_test_guard();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut paths = Vec::new();
+        for index in 0..4u64 {
+            let path = temp.path().join(format!("job-{index:032x}.log"));
+            std::fs::write(&path, b"data").expect("artifact fixture");
+            filetime::set_file_mtime(
+                &path,
+                filetime::FileTime::from_unix_time(
+                    1_700_000_000 + i64::try_from(index).expect("index fits"),
+                    0,
+                ),
+            )
+            .expect("artifact timestamp");
+            paths.push(path);
+        }
+        let reserved = u64::try_from(MAX_ARTIFACT_BYTES).expect("artifact cap fits");
+        let outcome = enforce_artifact_retention(
+            temp.path(),
+            ArtifactRetentionPolicy::Rotate,
+            reserved + 8,
+            10,
+            2,
+        )
+        .expect("rotation admits one new artifact");
+        assert_eq!(
+            outcome,
+            ArtifactCleanupOutcome {
+                policy: "rotate".to_string(),
+                removed_files: 2,
+                reclaimed_bytes: 8,
+            }
+        );
+        assert!(!paths[0].exists());
+        assert!(!paths[1].exists());
+        assert!(paths[2].exists());
+        assert!(paths[3].exists());
+
+        let restart_outcome = enforce_artifact_retention(
+            temp.path(),
+            ArtifactRetentionPolicy::Rotate,
+            reserved + 8,
+            10,
+            2,
+        )
+        .expect("the retained restart state remains within budget");
+        assert_eq!(restart_outcome.removed_files, 0);
+        assert_eq!(restart_outcome.reclaimed_bytes, 0);
+    }
+
+    #[test]
+    fn failed_rotation_reports_partial_cleanup_outcome() {
+        let _guard = process_test_guard();
+        let temp = tempfile::tempdir().expect("tempdir");
+        for index in 0..3u64 {
+            let path = temp.path().join(format!("job-{index:032x}.log"));
+            std::fs::write(&path, b"data").expect("artifact fixture");
+            filetime::set_file_mtime(
+                &path,
+                filetime::FileTime::from_unix_time(
+                    1_700_000_000 + i64::try_from(index).expect("index fits"),
+                    0,
+                ),
+            )
+            .expect("artifact timestamp");
+        }
+        let reserved = u64::try_from(MAX_ARTIFACT_BYTES).expect("artifact cap fits");
+        let error = enforce_artifact_retention(
+            temp.path(),
+            ArtifactRetentionPolicy::Rotate,
+            reserved.saturating_add(4),
+            10,
+            2,
+        )
+        .expect_err("the recent-artifact floor prevents sufficient reclamation");
+        let message = error.to_string();
+        assert!(message.contains("cleanup removed 1 files"));
+        assert!(message.contains("reclaimed 4 bytes"));
+        assert_eq!(
+            std::fs::read_dir(temp.path())
+                .expect("artifact directory")
+                .filter_map(std::result::Result::ok)
+                .filter(|entry| is_managed_job_artifact_name(&entry.file_name()))
+                .count(),
+            2,
+            "the two newest artifacts remain after partial rotation"
+        );
+    }
+
+    #[test]
+    fn artifact_rotation_preserves_active_and_newest_settled_files() {
+        let _guard = process_test_guard();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut paths = Vec::new();
+        for index in 0..3u64 {
+            let path = temp.path().join(format!("job-{index:032x}.log"));
+            std::fs::write(&path, b"data").expect("artifact fixture");
+            filetime::set_file_mtime(
+                &path,
+                filetime::FileTime::from_unix_time(
+                    1_700_000_000 + i64::try_from(index).expect("index fits"),
+                    0,
+                ),
+            )
+            .expect("artifact timestamp");
+            paths.push(path);
+        }
+        let active = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&paths[0])
+            .expect("active artifact");
+        fs4::FileExt::lock(&active).expect("active artifact lock");
+
+        let reserved = u64::try_from(MAX_ARTIFACT_BYTES).expect("artifact cap fits");
+        let outcome = enforce_artifact_retention(
+            temp.path(),
+            ArtifactRetentionPolicy::Rotate,
+            reserved.saturating_mul(2).saturating_add(4),
+            10,
+            1,
+        )
+        .expect("one unlocked settled artifact is reclaimable");
+        assert_eq!(outcome.removed_files, 1);
+        assert_eq!(outcome.reclaimed_bytes, 4);
+        assert!(paths[0].exists(), "active artifact must be preserved");
+        assert!(!paths[1].exists(), "oldest settled artifact rotates first");
+        assert!(
+            paths[2].exists(),
+            "newest settled artifact must be preserved"
+        );
+        fs4::FileExt::unlock(&active).expect("release active artifact");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn artifact_rotation_never_follows_or_removes_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let _guard = process_test_guard();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let victim = temp.path().join("victim.txt");
+        std::fs::write(&victim, b"preserve-me").expect("victim fixture");
+        let planted = temp.path().join("job-00000000000000000000000000000000.log");
+        symlink(&victim, &planted).expect("planted artifact symlink");
+
+        let error = enforce_artifact_retention(
+            temp.path(),
+            ArtifactRetentionPolicy::Rotate,
+            u64::MAX,
+            1,
+            0,
+        )
+        .expect_err("a symlink cannot become a cleanup candidate");
+        assert!(error.to_string().contains("PI_JOBS_ARTIFACT_CAPACITY"));
+        assert!(planted.symlink_metadata().is_ok());
+        assert_eq!(
+            std::fs::read_to_string(&victim).expect("victim remains readable"),
+            "preserve-me"
+        );
+    }
+
+    #[test]
+    fn artifact_budget_lock_child() {
+        let Ok(mode) = std::env::var("PI_JOBS_BUDGET_LOCK_CHILD") else {
+            return;
+        };
+        let jobs_dir = PathBuf::from(
+            std::env::var_os("PI_JOBS_BUDGET_LOCK_DIR").expect("child lock directory"),
+        );
+        let marker_dir = PathBuf::from(
+            std::env::var_os("PI_JOBS_BUDGET_MARKER_DIR").expect("child marker directory"),
+        );
+        if mode == "probe" {
+            std::fs::write(marker_dir.join("probe-attempted"), b"").expect("probe marker");
+        }
+        let _lock = acquire_artifact_budget_lock(&jobs_dir).expect("child budget lock");
+        match mode.as_str() {
+            "holder" => {
+                std::fs::write(marker_dir.join("holder-acquired"), b"").expect("holder marker");
+                wait_for_path(&marker_dir.join("release-holder"), Duration::from_secs(5));
+            }
+            "probe" => {
+                std::fs::write(marker_dir.join("probe-acquired"), b"")
+                    .expect("probe acquired marker");
+            }
+            other => panic!("unknown child mode {other:?}"),
+        }
+    }
+
+    #[test]
+    fn artifact_budget_lock_serializes_independent_processes() {
+        let _guard = process_test_guard();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let jobs_dir = temp.path().join("jobs");
+        let marker_dir = temp.path().join("markers");
+        std::fs::create_dir_all(&jobs_dir).expect("jobs directory");
+        std::fs::create_dir_all(&marker_dir).expect("marker directory");
+        let test_binary = std::env::current_exe().expect("current test binary");
+        let spawn_child = |mode: &str| {
+            std::process::Command::new(&test_binary)
+                .args(["--exact", "jobs::tests::artifact_budget_lock_child"])
+                .env("PI_JOBS_BUDGET_LOCK_CHILD", mode)
+                .env("PI_JOBS_BUDGET_LOCK_DIR", &jobs_dir)
+                .env("PI_JOBS_BUDGET_MARKER_DIR", &marker_dir)
+                .spawn()
+                .expect("spawn budget-lock child")
+        };
+
+        let mut holder = spawn_child("holder");
+        wait_for_path(&marker_dir.join("holder-acquired"), Duration::from_secs(2));
+        let mut probe = spawn_child("probe");
+        wait_for_path(&marker_dir.join("probe-attempted"), Duration::from_secs(2));
+        std::thread::sleep(Duration::from_millis(100));
+        let probe_was_blocked = !marker_dir.join("probe-acquired").exists();
+        std::fs::write(marker_dir.join("release-holder"), b"").expect("release holder");
+        assert!(holder.wait().expect("wait for holder").success());
+        assert!(probe.wait().expect("wait for probe").success());
+        assert!(
+            probe_was_blocked,
+            "the second process acquired the artifact budget lock concurrently"
+        );
+        assert!(marker_dir.join("probe-acquired").exists());
+    }
+
+    #[test]
+    fn cancellation_deadline_monitor_is_coalesced_per_job() {
+        let deadline = Arc::new(CancelDeadline::new());
+        assert!(
+            deadline
+                .start(Duration::from_secs(2))
+                .expect("start first deadline")
+        );
+        assert!(
+            !deadline
+                .start(Duration::from_secs(2))
+                .expect("reuse first deadline"),
+            "a duplicate cancellation must not create another OS deadline thread"
+        );
+        deadline.finish();
+    }
+
+    #[test]
+    fn cancellation_deadline_spawn_failure_cannot_fool_a_duplicate_starter() {
+        let deadline = Arc::new(CancelDeadline::new());
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let first_deadline = Arc::clone(&deadline);
+        let first = std::thread::spawn(move || {
+            first_deadline.start_with(Duration::from_secs(2), move |_, _| {
+                entered_tx.send(()).expect("announce injected spawn");
+                release_rx.recv().expect("release injected spawn");
+                Err(std::io::Error::other("injected thread spawn failure"))
+            })
+        });
+        entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("first starter reached injected spawn");
+
+        let (second_tx, second_rx) = std::sync::mpsc::channel();
+        let second_deadline = Arc::clone(&deadline);
+        let second = std::thread::spawn(move || {
+            let result = second_deadline.start(Duration::from_secs(2));
+            second_tx.send(result).expect("return second start result");
+        });
+        assert!(
+            second_rx.recv_timeout(Duration::from_millis(25)).is_err(),
+            "duplicate starter must wait until the in-flight spawn succeeds or fails"
+        );
+
+        release_tx.send(()).expect("release first starter");
+        assert!(
+            first.join().expect("first starter thread").is_err(),
+            "the injected spawn must fail"
+        );
+        assert!(
+            second_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("second starter result")
+                .expect("second starter must retry successfully"),
+            "the second starter must create the deadline thread after the failure"
+        );
+        deadline.finish();
+        second.join().expect("second starter thread");
+    }
+
+    #[test]
+    fn session_shutdown_fences_spawns_and_waits_for_reaped_monitor_settlement() {
+        let _guard = process_test_guard();
+        let root = temp_root();
+        let id = format!("job-shutdown-fence-{}", uuid::Uuid::new_v4().simple());
+        let entry = synthetic_entry(&id, root.join(format!("{id}.log")), 0, false);
+        registry()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .jobs
+            .insert(id.clone(), entry);
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let shutdown = std::thread::spawn(move || {
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .expect("shutdown runtime");
+            done_tx
+                .send(runtime.block_on(kill_session(TEST_SESSION_ID)))
+                .expect("return shutdown result");
+        });
+
+        let closing_deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if registry()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .closing_owners
+                .contains_key(TEST_SESSION_ID)
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < closing_deadline,
+                "session shutdown never published its owner fence"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        assert!(
+            done_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "a reaped but unsettled monitor must keep owner shutdown pending"
+        );
+        let spawn_error = spawn_background(
+            TEST_SESSION_ID,
+            &root,
+            None,
+            None,
+            "sleep 300",
+            Some(300),
+            Some(&root),
+        )
+        .expect_err("a closing owner must reject new background jobs");
+        assert!(
+            spawn_error.to_string().contains("PI_JOBS_SESSION_CLOSING"),
+            "unexpected closing-owner error: {spawn_error}"
+        );
+
+        settle_job_and_enqueue_notice(&id, JobStatus::Exited, Some(0), true);
+        done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("owner shutdown completion")
+            .expect("owner shutdown result");
+        shutdown.join().expect("shutdown thread");
+        let mut reg = registry()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(!reg.closing_owners.contains_key(TEST_SESSION_ID));
+        reg.jobs.remove(&id);
+        drop(reg);
+        let _ = take_completion_notices(TEST_SESSION_ID);
+    }
+
+    #[test]
+    // Guard scope is deliberate; tightening drops would change lock-hold semantics.
+    #[allow(clippy::significant_drop_tightening)]
+    fn shutdown_fence_after_initial_check_is_seen_under_lifecycle_lock() {
+        let _guard = process_test_guard();
+        let root = temp_root();
+        let owner = format!("shutdown-under-lock-{}", uuid::Uuid::new_v4().simple());
+        let gate = Arc::new(SpawnHookGate::default());
+        let hook_gate = Arc::clone(&gate);
+        let reached_pre_spawn = Arc::new(AtomicBool::new(false));
+        let hook_reached_pre_spawn = Arc::clone(&reached_pre_spawn);
+        let _hooks = install_spawn_background_test_hooks(SpawnBackgroundTestHooks {
+            owner_session_id: Some(owner.clone()),
+            after_initial_owner_check: Some(Arc::new(move || {
+                hook_gate.enter_and_wait();
+            })),
+            before_os_spawn: Some(Arc::new(move || {
+                hook_reached_pre_spawn.store(true, Ordering::Release);
+            })),
+            ..SpawnBackgroundTestHooks::default()
+        });
+        let spawn_owner = owner.clone();
+        let spawn_root = root;
+        let spawn = std::thread::spawn(move || {
+            spawn_background(
+                &spawn_owner,
+                &spawn_root,
+                None,
+                None,
+                "true",
+                Some(300),
+                Some(&spawn_root),
+            )
+        });
+
+        gate.wait_until_entered();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("shutdown runtime");
+        runtime
+            .block_on(kill_session(&owner))
+            .expect("empty owner shutdown");
+        assert!(
+            !registry()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .closing_owners
+                .contains_key(&owner),
+            "successful empty shutdown should clear its active latch"
+        );
+        assert!(
+            registry()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .owner_shutdown_generations
+                .contains_key(&owner),
+            "the generation must remain while an old captured spawn is paused"
+        );
+        gate.release();
+        let error = match spawn.join().expect("background spawn thread") {
+            Err(error) => error,
+            Ok(snapshot) => {
+                let _ = cancel(&owner, &snapshot.id);
+                panic!("owner spawn escaped a completed shutdown after its early check")
+            }
+        };
+        gate.assert_not_timed_out();
+        assert!(error.to_string().contains("PI_JOBS_SESSION_CLOSING"));
+        assert!(
+            !reached_pre_spawn.load(Ordering::Acquire),
+            "under-lifecycle owner check must reject before artifact and OS-spawn setup"
+        );
+        let reg = registry()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(!reg.owner_spawns_in_flight.contains_key(&owner));
+        assert!(
+            !reg.owner_shutdown_generations.contains_key(&owner),
+            "the final stale spawn departure should reclaim its generation"
+        );
+    }
+
+    #[test]
+    // Guard scope is deliberate; tightening drops would change lock-hold semantics.
+    #[allow(clippy::significant_drop_tightening)]
+    fn shutdown_generation_waits_for_every_stale_spawn_capture() {
+        let _guard = process_test_guard();
+        let root = temp_root();
+        let owner = format!("shutdown-two-captures-{}", uuid::Uuid::new_v4().simple());
+        let gate = Arc::new(CountedSpawnHookGate::default());
+        let hook_gate = Arc::clone(&gate);
+        let _hooks = install_spawn_background_test_hooks(SpawnBackgroundTestHooks {
+            owner_session_id: Some(owner.clone()),
+            after_initial_owner_check: Some(Arc::new(move || {
+                hook_gate.enter_and_wait();
+            })),
+            ..SpawnBackgroundTestHooks::default()
+        });
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let mut spawns = Vec::new();
+        for _ in 0..2 {
+            let result_tx = result_tx.clone();
+            let spawn_owner = owner.clone();
+            let spawn_root = root.clone();
+            spawns.push(std::thread::spawn(move || {
+                let result = spawn_background(
+                    &spawn_owner,
+                    &spawn_root,
+                    None,
+                    None,
+                    "true",
+                    Some(300),
+                    Some(&spawn_root),
+                );
+                result_tx.send(result).expect("return spawn result");
+            }));
+        }
+        drop(result_tx);
+
+        gate.wait_until_entered(2);
+        assert_eq!(
+            registry()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .owner_spawns_in_flight
+                .get(&owner)
+                .copied(),
+            Some(2)
+        );
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("shutdown runtime");
+        runtime
+            .block_on(kill_session(&owner))
+            .expect("empty owner shutdown");
+
+        gate.release_one();
+        match result_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("first stale spawn result")
+        {
+            Err(error) => assert!(error.to_string().contains("PI_JOBS_SESSION_CLOSING")),
+            Ok(snapshot) => {
+                let _ = cancel(&owner, &snapshot.id);
+                panic!("first stale spawn escaped the completed shutdown")
+            }
+        }
+        {
+            let reg = registry()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert_eq!(reg.owner_spawns_in_flight.get(&owner).copied(), Some(1));
+            assert!(
+                reg.owner_shutdown_generations.contains_key(&owner),
+                "one remaining stale capture must keep the generation alive"
+            );
+        }
+
+        gate.release_one();
+        match result_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("second stale spawn result")
+        {
+            Err(error) => assert!(error.to_string().contains("PI_JOBS_SESSION_CLOSING")),
+            Ok(snapshot) => {
+                let _ = cancel(&owner, &snapshot.id);
+                panic!("second stale spawn escaped the completed shutdown")
+            }
+        }
+        gate.assert_not_timed_out();
+        for spawn in spawns {
+            spawn.join().expect("background spawn thread");
+        }
+        let reg = registry()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(!reg.owner_spawns_in_flight.contains_key(&owner));
+        assert!(!reg.owner_shutdown_generations.contains_key(&owner));
+    }
+
+    #[test]
+    fn shutdown_fence_during_artifact_setup_prevents_os_spawn() {
+        let _guard = process_test_guard();
+        let root = temp_root();
+        let owner = format!("shutdown-pre-spawn-{}", uuid::Uuid::new_v4().simple());
+        let gate = Arc::new(SpawnHookGate::default());
+        let hook_gate = Arc::clone(&gate);
+        let reached_os_spawn = Arc::new(AtomicBool::new(false));
+        let hook_reached_os_spawn = Arc::clone(&reached_os_spawn);
+        let _hooks = install_spawn_background_test_hooks(SpawnBackgroundTestHooks {
+            owner_session_id: Some(owner.clone()),
+            before_os_spawn: Some(Arc::new(move || {
+                hook_gate.enter_and_wait();
+            })),
+            before_registry_publication: Some(Arc::new(move |_| {
+                hook_reached_os_spawn.store(true, Ordering::Release);
+            })),
+            ..SpawnBackgroundTestHooks::default()
+        });
+        let starting_jobs_before = registry()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .starting_jobs;
+        let spawn_owner = owner.clone();
+        let spawn_root = root;
+        let spawn = std::thread::spawn(move || {
+            spawn_background(
+                &spawn_owner,
+                &spawn_root,
+                None,
+                None,
+                "sleep 300",
+                Some(300),
+                Some(&spawn_root),
+            )
+        });
+
+        gate.wait_until_entered();
+        let attempt = SessionShutdownAttempt::begin(&owner).expect("publish shutdown fence");
+        gate.release();
+        let error = match spawn.join().expect("background spawn thread") {
+            Err(error) => error,
+            Ok(snapshot) => {
+                let _ = cancel(&owner, &snapshot.id);
+                panic!("owner spawn escaped a fence published before OS spawn")
+            }
+        };
+        gate.assert_not_timed_out();
+        assert!(error.to_string().contains("PI_JOBS_SESSION_CLOSING"));
+        assert!(
+            !reached_os_spawn.load(Ordering::Acquire),
+            "pre-spawn owner check must reject before creating a child"
+        );
+        assert_eq!(
+            registry()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .starting_jobs,
+            starting_jobs_before,
+            "rejected spawn must restore capacity accounting"
+        );
+        attempt.finish_success().expect("finish shutdown attempt");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shutdown_fence_after_os_spawn_reaps_child_before_publication() {
+        let _guard = process_test_guard();
+        let root = temp_root();
+        let owner = format!("shutdown-post-spawn-{}", uuid::Uuid::new_v4().simple());
+        let gate = Arc::new(SpawnHookGate::default());
+        let hook_gate = Arc::clone(&gate);
+        let spawned_pid = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let hook_spawned_pid = Arc::clone(&spawned_pid);
+        let _hooks = install_spawn_background_test_hooks(SpawnBackgroundTestHooks {
+            owner_session_id: Some(owner.clone()),
+            before_registry_publication: Some(Arc::new(move |pid| {
+                hook_spawned_pid.store(pid, Ordering::Release);
+                hook_gate.enter_and_wait();
+            })),
+            ..SpawnBackgroundTestHooks::default()
+        });
+        let starting_jobs_before = registry()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .starting_jobs;
+        let spawn_owner = owner.clone();
+        let spawn_root = root;
+        let spawn = std::thread::spawn(move || {
+            spawn_background(
+                &spawn_owner,
+                &spawn_root,
+                None,
+                None,
+                "sleep 300",
+                Some(300),
+                Some(&spawn_root),
+            )
+        });
+
+        gate.wait_until_entered();
+        let pid = spawned_pid.load(Ordering::Acquire);
+        assert_ne!(pid, 0, "post-spawn hook must observe the child pid");
+        assert!(
+            process_exists(pid),
+            "test child must be live before fencing"
+        );
+        let attempt = SessionShutdownAttempt::begin(&owner).expect("publish shutdown fence");
+        gate.release();
+        let error = match spawn.join().expect("background spawn thread") {
+            Err(error) => error,
+            Ok(snapshot) => {
+                let _ = cancel(&owner, &snapshot.id);
+                panic!("owner child was published after its shutdown fence")
+            }
+        };
+        gate.assert_not_timed_out();
+        assert!(error.to_string().contains("PI_JOBS_SESSION_CLOSING"));
+        assert!(!process_exists(pid), "rejected child must be reaped");
+        let reg = registry()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            reg.jobs.values().all(|job| job.owner_session_id != owner),
+            "rejected child must never enter the registry"
+        );
+        assert_eq!(reg.starting_jobs, starting_jobs_before);
+        drop(reg);
+        attempt.finish_success().expect("finish shutdown attempt");
+    }
+
+    #[test]
+    fn concurrent_session_shutdown_attempts_keep_fence_until_last_success() {
+        let _guard = process_test_guard();
+        let owner = format!("shutdown-overlap-{}", uuid::Uuid::new_v4().simple());
+        let (first, first_handles) =
+            request_session_shutdown_with_timeout(&owner, Duration::from_secs(1))
+                .expect("first shutdown snapshot");
+        let (second, second_handles) =
+            request_session_shutdown_with_timeout(&owner, Duration::from_secs(1))
+                .expect("second shutdown snapshot");
+        assert!(first_handles.is_empty());
+        assert!(second_handles.is_empty());
+        assert_eq!(
+            registry()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .closing_owners
+                .get(&owner)
+                .map(|state| state.active_attempts),
+            Some(2)
+        );
+
+        first.finish_success().expect("first shutdown completion");
+        assert!(
+            ensure_session_accepting_jobs(&owner).is_err(),
+            "one successful caller must not clear another caller's owner fence"
+        );
+        assert_eq!(
+            registry()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .closing_owners
+                .get(&owner)
+                .map(|state| state.active_attempts),
+            Some(1)
+        );
+
+        second.finish_success().expect("second shutdown completion");
+        ensure_session_accepting_jobs(&owner).expect("last success reopens owner");
+        assert!(
+            !registry()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .closing_owners
+                .contains_key(&owner)
+        );
+    }
+
+    #[test]
+    // Guard scope is deliberate; tightening drops would change lock-hold semantics.
+    #[allow(clippy::significant_drop_tightening)]
+    fn quiescent_owner_shutdown_generations_do_not_accumulate() {
+        let _guard = process_test_guard();
+        let generations_before = registry()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .owner_shutdown_generations
+            .len();
+
+        for index in 0..64 {
+            let owner = format!(
+                "shutdown-generation-churn-{index}-{}",
+                uuid::Uuid::new_v4().simple()
+            );
+            SessionShutdownAttempt::begin(&owner)
+                .expect("begin quiescent shutdown")
+                .finish_success()
+                .expect("finish quiescent shutdown");
+            let reg = registry()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert!(!reg.closing_owners.contains_key(&owner));
+            assert!(!reg.owner_spawns_in_flight.contains_key(&owner));
+            assert!(!reg.owner_shutdown_generations.contains_key(&owner));
+        }
+
+        assert_eq!(
+            registry()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .owner_shutdown_generations
+                .len(),
+            generations_before,
+            "short-lived quiescent owners must not grow the process registry"
+        );
+    }
+
+    #[test]
+    fn session_shutdown_lifecycle_fence_acquisition_is_bounded() {
+        let _guard = process_test_guard();
+        let owner = format!("shutdown-lock-{}", uuid::Uuid::new_v4().simple());
+        let lifecycle_guard = lifecycle_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let request_owner = owner.clone();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let request = std::thread::spawn(move || {
+            result_tx
+                .send(request_session_shutdown_with_timeout(
+                    &request_owner,
+                    Duration::from_millis(25),
+                ))
+                .expect("return bounded shutdown request");
+        });
+
+        let request_result = match result_rx.recv_timeout(Duration::from_secs(2)) {
+            Ok(result) => result,
+            Err(err) => {
+                drop(lifecycle_guard);
+                request.join().expect("shutdown-fence request thread");
+                panic!("shutdown fence acquisition did not remain bounded: {err}");
+            }
+        };
+        let error = match request_result {
+            Err(error) => error,
+            Ok((_attempt, _handles)) => {
+                panic!("held lifecycle lock unexpectedly allowed owner shutdown")
+            }
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("PI_JOBS_SESSION_SHUTDOWN_LOCK_TIMEOUT"),
+            "unexpected lifecycle-timeout error: {error}"
+        );
+        assert!(
+            registry()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .closing_owners
+                .contains_key(&owner),
+            "a timed-out fence must keep rejecting late owner spawns"
+        );
+        assert!(
+            ensure_session_accepting_jobs(&owner).is_err(),
+            "an in-flight lifecycle owner must prevent premature fence reconciliation"
+        );
+        drop(lifecycle_guard);
+        request.join().expect("shutdown-fence request thread");
+        ensure_session_accepting_jobs(&owner).expect("safe stale-fence reconciliation");
+        assert!(
+            !registry()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .closing_owners
+                .contains_key(&owner)
+        );
+    }
+
+    #[test]
+    fn settlement_is_bounded_when_artifact_state_is_busy() {
+        let _guard = process_test_guard();
+        let root = temp_root();
+        let id = format!("job-busy-artifact-{}", uuid::Uuid::new_v4().simple());
+        let entry = synthetic_entry(&id, root.join(format!("{id}.log")), 0, false);
+        let artifact = Arc::clone(&entry.artifact);
+        let handle = JobWaitHandle {
+            owner_session_id: TEST_SESSION_ID.to_string(),
+            id: id.clone(),
+            settled_snapshot: Arc::clone(&entry.settled_snapshot),
+            settled_notify: Arc::clone(&entry.settled_notify),
+            cancel_deadline: Arc::clone(&entry.cancel_deadline),
+        };
+        registry()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .jobs
+            .insert(id.clone(), entry);
+
+        let artifact_guard = artifact.lock().expect("artifact lock");
+        settle_job_and_enqueue_notice(&id, JobStatus::Exited, Some(0), false);
+        let snapshot = settled_snapshot(&handle).expect("terminal snapshot");
+        assert_eq!(snapshot.status, "exited");
+        assert!(
+            snapshot.artifact_truncated,
+            "unavailable artifact state must be reported conservatively"
+        );
+        assert_eq!(
+            snapshot.artifact_error.as_deref(),
+            Some("artifact state unavailable while snapshotting")
+        );
+        drop(artifact_guard);
+
+        registry()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .jobs
+            .remove(&id);
+        let _ = take_completion_notices(TEST_SESSION_ID);
+    }
+
+    #[test]
+    fn list_is_bounded_when_artifact_state_is_busy() {
+        let _guard = process_test_guard();
+        let root = temp_root();
+        let id = format!("job-busy-list-{}", uuid::Uuid::new_v4().simple());
+        let entry = synthetic_entry(&id, root.join(format!("{id}.log")), 0, false);
+        let artifact = Arc::clone(&entry.artifact);
+        registry()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .jobs
+            .insert(id.clone(), entry);
+
+        let artifact_guard = artifact.lock().expect("artifact lock");
+        let (listed_tx, listed_rx) = std::sync::mpsc::channel();
+        let listing = std::thread::spawn(move || {
+            listed_tx
+                .send(list(TEST_SESSION_ID))
+                .expect("return list result");
+        });
+        let prompt_result = listed_rx.recv_timeout(Duration::from_secs(2));
+        drop(artifact_guard);
+        listing.join().expect("listing thread");
+        let snapshots = prompt_result
+            .expect("list must not wait for a busy artifact")
+            .expect("list result");
+        let snapshot = snapshots
+            .iter()
+            .find(|snapshot| snapshot.id == id)
+            .expect("busy job remains listed");
+        assert!(snapshot.artifact_truncated);
+        assert!(snapshot.artifact_error.is_some());
+
+        registry()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .jobs
+            .remove(&id);
+    }
+
+    #[test]
+    fn cancellation_refuses_a_reaped_process_identity() {
+        let _guard = process_test_guard();
+        let root = temp_root();
+        let id = format!("job-reaped-{}", uuid::Uuid::new_v4().simple());
+        let entry = synthetic_entry(&id, root.join(format!("{id}.log")), 0, false);
+        registry()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .jobs
+            .insert(id.clone(), entry);
+
+        let error = request_cancel(TEST_SESSION_ID, &id)
+            .err()
+            .expect("reaped process must not be signalled");
+        assert!(error.to_string().contains("PI_JOBS_NOT_RUNNING"));
+        registry()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .jobs
+            .remove(&id);
+    }
+
+    #[test]
+    fn settled_job_retention_is_bounded() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut reg = JobRegistry::default();
+        for index in 0..(MAX_RETAINED_SETTLED_JOBS_PER_SESSION + 3) {
+            let id = format!("job-{index:03}");
+            let file =
+                std::fs::File::create(temp.path().join(format!("{id}.log"))).expect("artifact");
+            let mut artifact = ArtifactSink::new(file, 16);
+            artifact.seal();
+            reg.jobs.insert(
+                id.clone(),
+                JobEntry {
+                    schema: JOB_SCHEMA,
+                    result: None,
+                    result_bytes: 0,
+                    owner_session_id: TEST_SESSION_ID.to_string(),
+                    delivery: JobDelivery::Background,
+                    id,
+                    command: "true".to_string(),
+                    started_at_ms: i64::try_from(index).expect("index fits"),
+                    sequence: u64::try_from(index).expect("index fits"),
+                    settled_sequence: Some(u64::try_from(index).expect("index fits")),
+                    status: JobStatus::Exited,
+                    exit_code: Some(0),
+                    pid: None,
+                    artifact_path: temp.path().join(format!("job-{index:03}.log")),
+                    artifact_cleanup: ArtifactCleanupOutcome {
+                        policy: ArtifactRetentionPolicy::Preserve.as_str().to_string(),
+                        removed_files: 0,
+                        reclaimed_bytes: 0,
+                    },
+                    tail: Arc::new(Mutex::new(TailBuffer::new(8))),
+                    artifact: Arc::new(Mutex::new(artifact)),
+                    output_complete: true,
+                    cancel_requested: false,
+                    process_live: false,
+                    settled_snapshot: Arc::new(Mutex::new(None)),
+                    settled_notify: Arc::new(Notify::new()),
+                    cancel_deadline: Arc::new(CancelDeadline::new()),
+                },
+            );
+        }
+
+        prune_settled_jobs(&mut reg);
+        assert_eq!(reg.jobs.len(), MAX_RETAINED_SETTLED_JOBS_PER_SESSION);
+        assert!(!reg.jobs.contains_key("job-000"));
+        assert!(reg.jobs.contains_key(&format!(
+            "job-{:03}",
+            MAX_RETAINED_SETTLED_JOBS_PER_SESSION + 2
+        )));
+    }
+
+    #[test]
+    fn settled_job_retention_is_fair_across_sessions() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut reg = JobRegistry::default();
+        let owner_a_id = "owner-a-job".to_string();
+        let mut owner_a = synthetic_entry(&owner_a_id, temp.path().join("owner-a.log"), 0, false);
+        owner_a.owner_session_id = "owner-a".to_string();
+        owner_a.status = JobStatus::Exited;
+        owner_a.settled_sequence = Some(0);
+        reg.jobs.insert(owner_a_id.clone(), owner_a);
+
+        for index in 0..MAX_RETAINED_SETTLED_JOBS_PER_SESSION {
+            let id = format!("owner-b-{index:03}");
+            let mut entry = synthetic_entry(
+                &id,
+                temp.path().join(format!("{id}.log")),
+                u64::try_from(index + 1).expect("index fits"),
+                false,
+            );
+            entry.owner_session_id = "owner-b".to_string();
+            entry.status = JobStatus::Exited;
+            entry.settled_sequence = Some(u64::try_from(index + 1).expect("index fits"));
+            reg.jobs.insert(id, entry);
+        }
+
+        prune_settled_jobs(&mut reg);
+        assert!(
+            reg.jobs.contains_key(&owner_a_id),
+            "one session's retained history must not be evicted by another session's ordinary cap"
+        );
+    }
+
+    #[test]
+    fn settled_job_retention_has_a_process_wide_backstop() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut reg = JobRegistry::default();
+        for index in 0..=MAX_TOTAL_RETAINED_SETTLED_JOBS {
+            let id = format!("global-owner-job-{index:03}");
+            let mut entry = synthetic_entry(
+                &id,
+                temp.path().join(format!("{id}.log")),
+                u64::try_from(index).expect("index fits"),
+                false,
+            );
+            entry.owner_session_id = format!("global-owner-{index:03}");
+            entry.status = JobStatus::Exited;
+            entry.settled_sequence = Some(u64::try_from(index).expect("index fits"));
+            reg.jobs.insert(id, entry);
+        }
+
+        prune_settled_jobs(&mut reg);
+        assert_eq!(reg.jobs.len(), MAX_TOTAL_RETAINED_SETTLED_JOBS);
+        assert!(!reg.jobs.contains_key("global-owner-job-000"));
+        assert!(reg.jobs.contains_key(&format!(
+            "global-owner-job-{MAX_TOTAL_RETAINED_SETTLED_JOBS:03}"
+        )));
+    }
+
+    #[test]
+    fn host_completion_notice_uses_follow_up_message_shape() {
+        let marker = "[background tan tan-1 settled: completed]".to_string();
+        let message = completion_notice_message(marker.clone());
+        assert!(matches!(
+            message,
+            Message::User(UserMessage {
+                content: UserContent::Text(text),
+                ..
+            }) if text == marker
+        ));
+    }
+
+    #[test]
+    fn completion_notices_are_drained_only_by_their_owner_session() {
+        let owner_a = format!("owner-a-{}", uuid::Uuid::new_v4().simple());
+        let owner_b = format!("owner-b-{}", uuid::Uuid::new_v4().simple());
+        push_completion_notice(&owner_a, "notice-a").expect("owner-a notice");
+        push_completion_notice(&owner_b, "notice-b").expect("owner-b notice");
+
+        let first = take_completion_notices(&owner_a);
+        assert_eq!(first.len(), 1);
+        assert!(matches!(
+            &first[0],
+            Message::User(UserMessage {
+                content: UserContent::Text(text),
+                ..
+            }) if text == "notice-a"
+        ));
+        assert!(
+            take_completion_notices(&owner_a).is_empty(),
+            "draining one owner must not duplicate its notice"
+        );
+
+        let second = take_completion_notices(&owner_b);
+        assert_eq!(second.len(), 1);
+        assert!(matches!(
+            &second[0],
+            Message::User(UserMessage {
+                content: UserContent::Text(text),
+                ..
+            }) if text == "notice-b"
+        ));
+    }
+
+    #[test]
+    fn pending_work_tracks_owner_admission_and_undelivered_notices() {
+        let owner = format!("pending-work-{}", uuid::Uuid::new_v4().simple());
+        let other = format!("pending-work-other-{}", uuid::Uuid::new_v4().simple());
+        assert!(!has_pending_work(&owner).expect("idle owner"));
+        let admission = capture_session_spawn_generation(&owner).expect("capture admission");
+        assert!(has_pending_work(&owner).expect("admitted owner"));
+        assert!(!has_pending_work(&other).expect("foreign admission is hidden"));
+        drop(admission);
+        assert!(!has_pending_work(&owner).expect("admission finished"));
+
+        push_completion_notice(&owner, "retained result").expect("queue completion");
+        assert!(has_pending_work(&owner).expect("pending notice"));
+        assert!(has_pending_work(&owner).expect("observation does not consume"));
+        assert!(!has_pending_work(&other).expect("foreign notice is hidden"));
+        assert_eq!(take_completion_notices(&owner).len(), 1);
+        assert!(!has_pending_work(&owner).expect("notice delivered"));
+        assert!(has_pending_work(" ").is_err());
+    }
+
+    #[test]
+    fn completion_notice_retention_is_fair_across_sessions() {
+        let mut reg = JobRegistry::default();
+        enqueue_completion_notice(&mut reg, "owner-a", "owner-a-notice");
+        for index in 0..=MAX_COMPLETION_NOTICES_PER_SESSION {
+            enqueue_completion_notice(&mut reg, "owner-b", &format!("owner-b-notice-{index}"));
+        }
+
+        assert_eq!(
+            reg.notices
+                .iter()
+                .filter(|notice| notice.owner_session_id == "owner-a")
+                .count(),
+            1,
+            "one owner's ordinary cap pressure must not evict another owner"
+        );
+        assert_eq!(
+            reg.notices
+                .iter()
+                .filter(|notice| notice.owner_session_id == "owner-b")
+                .count(),
+            MAX_COMPLETION_NOTICES_PER_SESSION
+        );
+        assert!(
+            reg.notices
+                .iter()
+                .all(|notice| notice.text != "owner-b-notice-0")
+        );
+    }
+
+    #[test]
+    fn completion_notice_retention_has_a_process_wide_backstop() {
+        let mut reg = JobRegistry::default();
+        for index in 0..=MAX_TOTAL_COMPLETION_NOTICES {
+            enqueue_completion_notice(
+                &mut reg,
+                &format!("owner-{index}"),
+                &format!("notice-{index}"),
+            );
+        }
+
+        assert_eq!(reg.notices.len(), MAX_TOTAL_COMPLETION_NOTICES);
+        assert!(reg.notices.iter().all(|notice| notice.text != "notice-0"));
+        assert!(
+            reg.notices
+                .iter()
+                .any(|notice| notice.text == format!("notice-{MAX_TOTAL_COMPLETION_NOTICES}"))
+        );
+    }
+
+    #[test]
+    fn restored_completion_notices_preserve_fifo_before_newer_registry_entries() {
+        let mut reg = JobRegistry::default();
+        enqueue_completion_notice(&mut reg, "owner-a", "newer");
+        let restored = ["older-1", "older-2"]
+            .into_iter()
+            .map(|text| CompletionNotice {
+                owner_session_id: "owner-a".to_string(),
+                text: text.to_string(),
+            })
+            .collect();
+
+        assert_eq!(restore_completion_notices_into(&mut reg, restored), 0);
+        assert_eq!(
+            reg.notices
+                .iter()
+                .map(|notice| notice.text.as_str())
+                .collect::<Vec<_>>(),
+            ["older-1", "older-2", "newer"]
+        );
+    }
+
+    #[test]
+    fn saturated_restore_keeps_the_newest_per_owner_batch() {
+        let mut reg = JobRegistry::default();
+        for index in
+            MAX_COMPLETION_NOTICES_PER_SESSION..MAX_COMPLETION_NOTICES_PER_SESSION.saturating_mul(2)
+        {
+            enqueue_completion_notice(&mut reg, "owner-a", &format!("notice-{index}"));
+        }
+        let restored = (0..MAX_COMPLETION_NOTICES_PER_SESSION)
+            .map(|index| CompletionNotice {
+                owner_session_id: "owner-a".to_string(),
+                text: format!("notice-{index}"),
+            })
+            .collect();
+
+        assert_eq!(
+            restore_completion_notices_into(&mut reg, restored),
+            MAX_COMPLETION_NOTICES_PER_SESSION
+        );
+        assert_eq!(reg.notices.len(), MAX_COMPLETION_NOTICES_PER_SESSION);
+        assert_eq!(
+            reg.notices.front().map(|notice| notice.text.as_str()),
+            Some("notice-64")
+        );
+        assert_eq!(
+            reg.notices.back().map(|notice| notice.text.as_str()),
+            Some("notice-127")
+        );
+    }
+
+    #[test]
+    fn host_completion_notice_rejects_empty_owner_without_consuming_capacity() {
+        let valid_owner = format!("valid-owner-{}", uuid::Uuid::new_v4().simple());
+        for (owner, text) in [("", "empty-owner"), ("   ", "blank-owner")] {
+            let error = push_completion_notice(owner, text).expect_err("invalid owner");
+            assert!(error.to_string().contains("PI_JOBS_SESSION_UNAVAILABLE"));
+            assert!(
+                take_completion_notices(owner).is_empty(),
+                "an invalid owner must fail before consuming registry capacity"
+            );
+        }
+        push_completion_notice(&valid_owner, "valid-notice").expect("valid notice");
+
+        let notices = take_completion_notices(&valid_owner);
+        assert_eq!(notices.len(), 1);
+        assert!(matches!(
+            &notices[0],
+            Message::User(UserMessage {
+                content: UserContent::Text(text),
+                ..
+            }) if text == "valid-notice"
+        ));
+    }
+
+    #[test]
+    fn retained_text_limits_are_utf8_safe_and_explicit() {
+        let oversized = "界".repeat(MAX_COMPLETION_NOTICE_BYTES);
+        let truncated = truncate_utf8_bytes(&oversized, MAX_COMPLETION_NOTICE_BYTES);
+        assert!(truncated.len() <= MAX_COMPLETION_NOTICE_BYTES);
+        assert!(truncated.ends_with("\n...[truncated]"));
+
+        let mut reg = JobRegistry::default();
+        enqueue_completion_notice(&mut reg, TEST_SESSION_ID, &oversized);
+        let retained = reg.notices.pop_front().expect("bounded notice");
+        assert!(retained.text.len() <= MAX_COMPLETION_NOTICE_BYTES);
+        assert!(retained.text.ends_with("\n...[truncated]"));
+    }
+
+    #[test]
+    fn cross_session_job_ids_fail_closed_without_metadata() {
+        let _guard = process_test_guard();
+        let root = temp_root();
+        let owner = format!("owner-{}", uuid::Uuid::new_v4().simple());
+        let foreign_owner = format!("foreign-{}", uuid::Uuid::new_v4().simple());
+        let id = format!("job-private-{}", uuid::Uuid::new_v4().simple());
+        let artifact_path = root.join("private-artifact.log");
+        let mut entry = synthetic_entry(&id, artifact_path.clone(), 0, false);
+        entry.owner_session_id.clone_from(&owner);
+        entry.command = "printf private-command".to_string();
+        registry()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .jobs
+            .insert(id.clone(), entry);
+
+        assert_eq!(list(&owner).expect("owner list").len(), 1);
+        assert!(list(&foreign_owner).expect("foreign list").is_empty());
+        for error in [
+            wait(&foreign_owner, &id, Duration::ZERO).expect_err("foreign wait"),
+            request_cancel(&foreign_owner, &id)
+                .err()
+                .expect("foreign cancel"),
+        ] {
+            let rendered = error.to_string();
+            assert!(rendered.contains("PI_JOBS_UNKNOWN_ID"));
+            assert!(!rendered.contains("private-command"));
+            assert!(!rendered.contains(&artifact_path.display().to_string()));
+        }
+
+        registry()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .jobs
+            .remove(&id);
+    }
+
+    #[test]
+    fn spawn_list_wait_cycle() {
+        let _guard = process_test_guard();
+        let root = temp_root();
+        #[cfg(unix)]
+        JOB_STREAM_PREPARE_CALLS.store(0, Ordering::Relaxed);
+        let snapshot = spawn_background(
+            TEST_SESSION_ID,
+            &root,
+            None,
+            None,
+            "echo job-output-marker",
+            Some(30),
+            Some(&root),
+        )
+        .expect("spawn");
+        #[cfg(unix)]
+        assert_eq!(
+            JOB_STREAM_PREPARE_CALLS.load(Ordering::Relaxed),
+            2,
+            "the production spawn path must make both pipe readers cancellation-aware"
+        );
+        assert_eq!(snapshot.status, "running");
+        let settled = wait(TEST_SESSION_ID, &snapshot.id, Duration::from_secs(10)).expect("wait");
+        assert_eq!(settled.status, "exited");
+        assert_eq!(settled.exit_code, Some(0));
+        assert!(settled.output_tail.contains("job-output-marker"));
+        assert!(settled.output_complete);
+        assert!(!settled.artifact_truncated);
+        assert!(settled.artifact_error.is_none());
+        assert!(std::path::Path::new(&settled.artifact_path).exists());
+        let listed = list(TEST_SESSION_ID).expect("list");
+        assert!(listed.iter().any(|job| job.id == settled.id));
+        let notices = take_completion_notices(TEST_SESSION_ID);
+        assert!(
+            notices.iter().any(|message| matches!(
+                message,
+                Message::User(UserMessage {
+                    content: UserContent::Text(text),
+                    ..
+                }) if text.contains(&settled.id) && text.contains("job-output-marker")
+            )),
+            "settled publication and its completion notice must be atomic"
+        );
+    }
+
+    #[test]
+    fn background_metadata_excludes_configured_shell_prefix() {
+        let _guard = process_test_guard();
+        let root = temp_root();
+        let prefix_secret = "PI_PRIVATE_PREFIX_MARKER=must-not-leak";
+        let user_command = "printf prefix-metadata-ok";
+        let snapshot = spawn_background(
+            TEST_SESSION_ID,
+            &root,
+            None,
+            Some(prefix_secret),
+            user_command,
+            Some(30),
+            Some(&root),
+        )
+        .expect("spawn with configured prefix");
+        assert_eq!(snapshot.command, user_command);
+        assert!(!snapshot.command.contains(prefix_secret));
+        let settled = wait(TEST_SESSION_ID, &snapshot.id, Duration::from_secs(10))
+            .expect("prefixed job settles");
+        assert_eq!(settled.command, user_command);
+        assert!(!settled.command.contains(prefix_secret));
+
+        let notices = take_completion_notices(TEST_SESSION_ID);
+        let rendered = notices
+            .iter()
+            .filter_map(|message| match message {
+                Message::User(UserMessage {
+                    content: UserContent::Text(text),
+                    ..
+                }) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains(user_command));
+        assert!(!rendered.contains(prefix_secret));
+    }
+
+    #[test]
+    fn background_metadata_bounds_retained_user_command() {
+        let _guard = process_test_guard();
+        let root = temp_root();
+        let user_command = format!(
+            "printf retained-command-ok\n# {}",
+            "界".repeat(MAX_RETAINED_COMMAND_BYTES / 3 + 100)
+        );
+        assert!(user_command.len() > MAX_RETAINED_COMMAND_BYTES);
+
+        let snapshot = spawn_background(
+            TEST_SESSION_ID,
+            &root,
+            None,
+            None,
+            &user_command,
+            Some(30),
+            Some(&root),
+        )
+        .expect("spawn with oversized user command");
+        assert!(snapshot.command.len() <= MAX_RETAINED_COMMAND_BYTES);
+        assert!(snapshot.command.ends_with("\n...[truncated]"));
+
+        let settled = wait(TEST_SESSION_ID, &snapshot.id, Duration::from_secs(10))
+            .expect("oversized-command job settles");
+        assert_eq!(settled.command, snapshot.command);
+        assert!(settled.output_tail.contains("retained-command-ok"));
+        let _ = take_completion_notices(TEST_SESSION_ID);
+    }
+
+    #[test]
+    fn settled_waits_accept_extreme_durations_without_overflow() {
+        let _guard = process_test_guard();
+        let root = temp_root();
+        let id = format!("job-huge-wait-{}", uuid::Uuid::new_v4().simple());
+        let mut entry = synthetic_entry(&id, root.join(format!("{id}.log")), 0, false);
+        entry.status = JobStatus::Exited;
+        entry.exit_code = Some(0);
+        entry.output_complete = true;
+        let snapshot = JobSnapshot::from_source_best_effort(&JobSnapshotSource::from_entry(&entry));
+        *entry
+            .settled_snapshot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(snapshot);
+        registry()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .jobs
+            .insert(id.clone(), entry);
+
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        let async_snapshot = runtime
+            .block_on(wait_async(TEST_SESSION_ID, &id, Duration::MAX))
+            .expect("async settled wait");
+        assert_eq!(async_snapshot.status, "exited");
+        let sync_snapshot = wait(TEST_SESSION_ID, &id, Duration::MAX).expect("sync settled wait");
+        assert_eq!(sync_snapshot.status, "exited");
+
+        registry()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .jobs
+            .remove(&id);
+    }
+
+    #[test]
+    fn async_wait_slices_do_not_become_premature_deadlines() {
+        let now = Instant::now();
+        let deadline = now.checked_add(Duration::from_hours(3));
+        assert_eq!(
+            remaining_wait_slice(now, deadline),
+            Some(MAX_ASYNC_WAIT_SLICE)
+        );
+        let after_one_slice = now
+            .checked_add(MAX_ASYNC_WAIT_SLICE)
+            .expect("one-hour instant");
+        assert_eq!(
+            remaining_wait_slice(after_one_slice, deadline),
+            Some(MAX_ASYNC_WAIT_SLICE),
+            "an intermediate timer wake must continue waiting"
+        );
+        assert_eq!(
+            remaining_wait_slice(deadline.expect("representable deadline"), deadline),
+            None
+        );
+        assert_eq!(
+            remaining_wait_slice(now, now.checked_add(Duration::MAX)),
+            Some(MAX_ASYNC_WAIT_SLICE),
+            "an unrepresentable deadline must remain a bounded infinite wait"
+        );
+    }
+
+    #[test]
+    fn async_wait_continues_after_intermediate_timer_slice() {
+        let _guard = process_test_guard();
+        let root = temp_root();
+        let id = format!("job-sliced-wait-{}", uuid::Uuid::new_v4().simple());
+        let entry = synthetic_entry(&id, root.join(format!("{id}.log")), 0, false);
+        registry()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .jobs
+            .insert(id.clone(), entry);
+
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        let remained_pending = runtime.block_on(async {
+            let cx = crate::agent_cx::AgentCx::for_current_or_request();
+            let now = cx
+                .cx()
+                .timer_driver()
+                .map_or_else(asupersync::time::wall_now, |timer| timer.now());
+            let waiting = wait_async_with_slice(
+                TEST_SESSION_ID,
+                &id,
+                Duration::from_secs(1),
+                Duration::from_millis(5),
+            )
+            .fuse();
+            let observation = asupersync::time::sleep(now, Duration::from_millis(30)).fuse();
+            futures::pin_mut!(waiting, observation);
+            matches!(
+                futures::future::select(waiting, observation).await,
+                futures::future::Either::Right(((), _))
+            )
+        });
+        assert!(
+            remained_pending,
+            "an intermediate timer slice must not complete a still-running job wait"
+        );
+
+        registry()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .jobs
+            .remove(&id);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancel_kills_running_job() {
+        let _guard = process_test_guard();
+        let root = temp_root();
+        let snapshot = spawn_background(
+            TEST_SESSION_ID,
+            &root,
+            None,
+            None,
+            "trap '' TERM; echo cancel-ready; while :; do sleep 1; done",
+            Some(120),
+            Some(&root),
+        )
+        .expect("spawn");
+        wait_for_output(&snapshot.id, "cancel-ready", Duration::from_secs(2));
+        let started = Instant::now();
+        let cancelled = cancel(TEST_SESSION_ID, &snapshot.id).expect("cancel");
+        assert_eq!(cancelled.status, "killed");
+        assert!(
+            started.elapsed() >= TERMINATE_GRACE,
+            "TERM-ignoring job must reach KILL escalation"
+        );
+        assert!(cancelled.output_complete);
+        #[cfg(unix)]
+        assert!(!process_exists(snapshot.pid.expect("pid")));
+        // Drain the completion notice (pushed asynchronously by the monitor
+        // thread) so it cannot leak into concurrently running agent-loop
+        // tests through the process-global follow-up queue.
+        for _ in 0..200 {
+            let drained = take_completion_notices(TEST_SESSION_ID);
+            if drained.iter().any(|message| {
+                matches!(
+                    message,
+                    Message::User(UserMessage {
+                        content: UserContent::Text(text),
+                        ..
+                    }) if text.contains(&snapshot.id)
+                )
+            }) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    #[test]
+    fn wait_rejects_unknown_id() {
+        let err = wait(
+            TEST_SESSION_ID,
+            "job-does-not-exist",
+            Duration::from_millis(10),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("PI_JOBS_UNKNOWN_ID"));
+    }
+
+    #[test]
+    fn artifact_creation_failure_happens_before_process_spawn() {
+        let _guard = process_test_guard();
+        let root = temp_root();
+        std::fs::write(root.join("jobs"), "not a directory").expect("conflicting jobs path");
+        let marker = root.join("spawned-marker");
+        let command = format!("printf ran > '{}'", marker.display());
+
+        let err = spawn_background(
+            TEST_SESSION_ID,
+            &root,
+            None,
+            None,
+            &command,
+            Some(30),
+            Some(&root),
+        )
+        .expect_err("artifact creation must fail");
+        assert!(
+            err.to_string()
+                .contains("Failed to create jobs artifact dir")
+        );
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            !marker.exists(),
+            "process must not spawn before artifact setup"
+        );
+        assert_eq!(registry().lock().expect("registry").starting_jobs, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn timeout_remains_running_until_term_ignoring_process_is_reaped() {
+        let _guard = process_test_guard();
+        let root = temp_root();
+        let snapshot = spawn_background(
+            TEST_SESSION_ID,
+            &root,
+            None,
+            None,
+            "trap '' TERM; echo timeout-ready; while :; do sleep 1; done",
+            Some(1),
+            Some(&root),
+        )
+        .expect("spawn");
+        wait_for_output(&snapshot.id, "timeout-ready", Duration::from_secs(2));
+        std::thread::sleep(Duration::from_millis(1200));
+        let during_grace =
+            wait(TEST_SESSION_ID, &snapshot.id, Duration::ZERO).expect("snapshot during grace");
+        assert_eq!(during_grace.status, "running");
+
+        let settled = wait(TEST_SESSION_ID, &snapshot.id, Duration::from_secs(8))
+            .expect("timed out job settles");
+        assert_eq!(settled.status, "timedOut");
+        assert!(settled.output_complete);
+        #[cfg(unix)]
+        assert!(!process_exists(snapshot.pid.expect("pid")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn natural_root_exit_reaps_a_descendant_holding_output_pipes() {
+        let _guard = process_test_guard();
+        let root = temp_root();
+        let descendant_pid_path = root.join("descendant.pid");
+        let command = format!(
+            "(sleep 300 & printf '%s' \"$!\" > '{}') &",
+            descendant_pid_path.display()
+        );
+        let snapshot = spawn_background(
+            TEST_SESSION_ID,
+            &root,
+            None,
+            None,
+            &command,
+            Some(30),
+            Some(&root),
+        )
+        .expect("spawn descendant fixture");
+        let settled = wait(TEST_SESSION_ID, &snapshot.id, Duration::from_secs(10))
+            .expect("root and descendant settle");
+        assert_eq!(settled.status, "exited");
+        assert!(
+            settled.output_complete,
+            "descendant pipe holders must be reaped before settlement"
+        );
+
+        let descendant_pid = std::fs::read_to_string(&descendant_pid_path)
+            .expect("descendant pid fixture")
+            .parse::<u32>()
+            .expect("numeric descendant pid");
+        for _ in 0..100 {
+            if !process_exists(descendant_pid) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            !process_exists(descendant_pid),
+            "descendant {descendant_pid} survived natural root exit"
+        );
+        let _ = take_completion_notices(TEST_SESSION_ID);
+    }
+
+    #[test]
+    fn monitor_panic_settles_the_published_job_and_wakes_waiters() {
+        let _guard = process_test_guard();
+        let root = temp_root();
+        let owner = format!("monitor-panic-{}", uuid::Uuid::new_v4().simple());
+        let _hooks = install_spawn_background_test_hooks(SpawnBackgroundTestHooks {
+            owner_session_id: Some(owner.clone()),
+            panic_monitor_after_start: true,
+            ..SpawnBackgroundTestHooks::default()
+        });
+
+        let snapshot = spawn_background(
+            &owner,
+            &root,
+            None,
+            None,
+            "sleep 300",
+            Some(300),
+            Some(&root),
+        )
+        .expect("monitor thread creation succeeds before injected panic");
+        let settled = wait(&owner, &snapshot.id, Duration::from_secs(5))
+            .expect("monitor panic publishes terminal snapshot");
+        assert_eq!(settled.status, JobStatus::Failed.as_str());
+        assert_eq!(settled.pid, None);
+        assert!(!settled.output_complete);
+        #[cfg(unix)]
+        assert_eq!(JOB_PUMP_THREADS_IN_FLIGHT.load(Ordering::Acquire), 0);
+        assert_eq!(take_completion_notices(&owner).len(), 1);
+        assert!(take_completion_notices(&owner).is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn monitor_spawn_failure_joins_pumps_even_with_an_escaped_writer() {
+        struct KillPidOnDrop(u32);
+
+        impl Drop for KillPidOnDrop {
+            fn drop(&mut self) {
+                let _ = std::process::Command::new("/bin/kill")
+                    .args(["-KILL", &self.0.to_string()])
+                    .status();
+            }
+        }
+
+        let _guard = process_test_guard();
+        let root = temp_root();
+        let owner = format!("monitor-spawn-fail-{}", uuid::Uuid::new_v4().simple());
+        let descendant_pid_path = root.join("monitor-spawn-fail-descendant.pid");
+        let script = root.join("monitor-spawn-fail-escape.sh");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\n/bin/sh -c 'printf \"%s\" \"$$\" > \"$1\"; exec /bin/sleep 300' child \"$1\" &\n",
+        )
+        .expect("escaped descriptor fixture");
+        let hook_pid_path = descendant_pid_path.clone();
+        let pumps_observed = Arc::new(AtomicBool::new(false));
+        let hook_pumps_observed = Arc::clone(&pumps_observed);
+        let captured_wait = Arc::new(Mutex::new(None));
+        let hook_captured_wait = Arc::clone(&captured_wait);
+        let hook_owner = owner.clone();
+        let publication_gate = Arc::new(SpawnHookGate::default());
+        let hook_publication_gate = Arc::clone(&publication_gate);
+        let _hooks = install_spawn_background_test_hooks(SpawnBackgroundTestHooks {
+            owner_session_id: Some(owner.clone()),
+            before_registry_publication: Some(Arc::new(move |_| {
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while Instant::now() < deadline {
+                    if hook_pid_path.exists()
+                        && JOB_PUMP_THREADS_IN_FLIGHT.load(Ordering::Acquire) == 2
+                    {
+                        hook_pumps_observed.store(true, Ordering::Release);
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            })),
+            after_registry_publication: Some(Arc::new(move |id| {
+                *hook_captured_wait
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    Some(wait_handle(&hook_owner, id).expect("published wait handle"));
+                hook_publication_gate.enter_and_wait();
+            })),
+            fail_monitor_spawn: true,
+            ..SpawnBackgroundTestHooks::default()
+        });
+        let command = format!(
+            "setsid /bin/sh '{}' '{}' &",
+            script.display(),
+            descendant_pid_path.display()
+        );
+
+        let spawn_owner = owner.clone();
+        let spawn_root = root.clone();
+        let spawn = std::thread::spawn(move || {
+            spawn_background(
+                &spawn_owner,
+                &spawn_root,
+                None,
+                None,
+                &command,
+                Some(300),
+                Some(&spawn_root),
+            )
+        });
+        publication_gate.wait_until_entered();
+        let descendant_pid = std::fs::read_to_string(&descendant_pid_path)
+            .expect("escaped descendant pid")
+            .parse::<u32>()
+            .expect("numeric escaped descendant pid");
+        let descendant_cleanup = KillPidOnDrop(descendant_pid);
+        let captured_wait = captured_wait
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .expect("publication hook captures a wait handle");
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("waiter runtime");
+        let failed_snapshot = runtime.block_on(async {
+            let notification = captured_wait
+                .settled_notify
+                .wait_until(|| settled_snapshot(&captured_wait).is_some())
+                .fuse();
+            futures::pin_mut!(notification);
+            assert!(
+                futures::poll!(notification.as_mut()).is_pending(),
+                "waiter must be registered before monitor creation fails"
+            );
+            publication_gate.release();
+            let now = asupersync::time::wall_now();
+            let timeout = asupersync::time::sleep(now, Duration::from_secs(5)).fuse();
+            futures::pin_mut!(timeout);
+            match futures::future::select(notification, timeout).await {
+                futures::future::Either::Left(((), _)) => settled_snapshot(&captured_wait)
+                    .expect("notification publishes the failed snapshot"),
+                futures::future::Either::Right(((), _)) => {
+                    panic!("monitor-spawn failure did not wake the registered waiter")
+                }
+            }
+        });
+        let error = spawn
+            .join()
+            .expect("monitor-failure spawn thread")
+            .expect_err("monitor creation failure must reject the background job");
+        publication_gate.assert_not_timed_out();
+
+        assert!(error.to_string().contains("Failed to start job monitor"));
+        assert!(
+            pumps_observed.load(Ordering::Acquire),
+            "both pump workers must be live before monitor creation fails"
+        );
+        assert_eq!(JOB_PUMP_THREADS_IN_FLIGHT.load(Ordering::Acquire), 0);
+        assert_eq!(failed_snapshot.status, JobStatus::Failed.as_str());
+        assert!(!failed_snapshot.output_complete);
+        let reg = registry()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            reg.jobs.values().all(|job| job.owner_session_id != owner),
+            "a rejected monitor handoff must remove its published registry entry"
+        );
+        drop(reg);
+        assert!(take_completion_notices(&owner).is_empty());
+
+        let artifacts = std::fs::read_dir(root.join("jobs"))
+            .expect("jobs artifact directory")
+            .filter_map(std::result::Result::ok)
+            .filter(|entry| is_managed_job_artifact_name(&entry.file_name()))
+            .collect::<Vec<_>>();
+        assert_eq!(artifacts.len(), 1);
+        let artifact = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(artifacts[0].path())
+            .expect("rejected job artifact remains inspectable");
+        // flock belongs to the open file description, so a child that another
+        // test thread forked while the artifact was open shares the lock until
+        // its exec closes the descriptor. Only a lock that outlives that is
+        // a leak.
+        let started = Instant::now();
+        while let Err(error) = fs4::FileExt::try_lock(&artifact) {
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "rejected job artifact lock must be released: {error:?}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        fs4::FileExt::unlock(&artifact).expect("release test artifact lock");
+
+        drop(descendant_cleanup);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn escaped_descriptor_holder_cannot_outlive_its_pump_worker() {
+        struct KillPidOnDrop(u32);
+
+        impl Drop for KillPidOnDrop {
+            fn drop(&mut self) {
+                let _ = std::process::Command::new("/bin/kill")
+                    .args(["-KILL", &self.0.to_string()])
+                    .status();
+            }
+        }
+
+        let _guard = process_test_guard();
+        let root = temp_root();
+        let descendant_pid_path = root.join("escaped-descendant.pid");
+        let late_write_trigger = root.join("escaped-descendant-write-now");
+        let script = root.join("escape-pipes.sh");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\n/bin/sh -c 'printf \"%s\" \"$$\" > \"$1\"; while [ ! -e \"$2\" ]; do /bin/sleep 0.05; done; printf \"%s\" \"late-output-marker\"; exec /bin/sleep 300' child \"$1\" \"$2\" &\n",
+        )
+        .expect("escaped descriptor fixture");
+        let command = format!(
+            "setsid /bin/sh '{}' '{}' '{}' &",
+            script.display(),
+            descendant_pid_path.display(),
+            late_write_trigger.display()
+        );
+        let snapshot = spawn_background(
+            TEST_SESSION_ID,
+            &root,
+            None,
+            None,
+            &command,
+            Some(30),
+            Some(&root),
+        )
+        .expect("spawn escaped descriptor fixture");
+        wait_for_path(&descendant_pid_path, Duration::from_secs(2));
+        let descendant_pid = std::fs::read_to_string(&descendant_pid_path)
+            .expect("escaped descendant pid")
+            .parse::<u32>()
+            .expect("numeric escaped descendant pid");
+        let descendant_cleanup = KillPidOnDrop(descendant_pid);
+
+        let started = Instant::now();
+        let settled = wait(TEST_SESSION_ID, &snapshot.id, Duration::from_secs(10))
+            .expect("escaped descriptor job settles");
+        assert_eq!(settled.status, "exited");
+        assert!(
+            !settled.output_complete,
+            "the escaped writer prevents natural EOF and must be reported"
+        );
+        assert!(
+            started.elapsed() < OUTPUT_DRAIN_GRACE + Duration::from_secs(2),
+            "pump cancellation must remain bounded"
+        );
+        assert_eq!(
+            JOB_PUMP_THREADS_IN_FLIGHT.load(Ordering::Acquire),
+            0,
+            "terminal publication must not leave detached pipe workers"
+        );
+        let artifact_before =
+            std::fs::read(&settled.artifact_path).expect("read artifact at terminal publication");
+        std::fs::write(&late_write_trigger, b"").expect("release escaped late writer");
+        std::thread::sleep(Duration::from_millis(200));
+        let after_late_write = wait(TEST_SESSION_ID, &snapshot.id, Duration::ZERO)
+            .expect("terminal snapshot remains queryable");
+        assert_eq!(after_late_write.output_tail, settled.output_tail);
+        assert_eq!(
+            std::fs::read(&settled.artifact_path).expect("re-read terminal artifact"),
+            artifact_before,
+            "an escaped writer cannot mutate the artifact after terminal publication"
+        );
+
+        drop(descendant_cleanup);
+        for _ in 0..100 {
+            if !process_exists(descendant_pid) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            !process_exists(descendant_pid),
+            "escaped descriptor fixture {descendant_pid} survived explicit cleanup"
+        );
+        let _ = take_completion_notices(TEST_SESSION_ID);
+    }
+
+    #[test]
+    #[allow(clippy::significant_drop_tightening)] // `job` borrows from the registry guard
+    fn promotion_bounds_a_terminal_snapshot_prepared_while_foreground() {
+        let _guard = process_test_guard();
+        let root = temp_root();
+        let owner = format!("snapshot-race-{}", uuid::Uuid::new_v4().simple());
+        let id = format!("prepared-{}", uuid::Uuid::new_v4().simple());
+        let mut entry = synthetic_entry(&id, root.join("prepared.log"), 0, false);
+        entry.owner_session_id.clone_from(&owner);
+        entry.delivery = JobDelivery::Foreground;
+        entry.tail = Arc::new(Mutex::new(TailBuffer::new(
+            crate::tools::DEFAULT_MAX_BYTES.saturating_mul(2),
+        )));
+        entry
+            .tail
+            .lock()
+            .expect("foreground tail")
+            .push(&vec![b'x'; 100_000]);
+        let mut source = JobSnapshotSource::from_entry(&entry);
+        source.status = JobStatus::Exited;
+        source.exit_code = Some(0);
+        source.pid = None;
+        source.output_complete = true;
+        // This is the monitor's already-prepared snapshot. It must retain
+        // the inline tail until publication observes the final delivery mode.
+        let prepared = JobSnapshot::from_source_best_effort(&source);
+        assert_eq!(prepared.output_tail.len(), 100_000);
+        registry()
+            .lock()
+            .expect("insert synthetic command")
+            .jobs
+            .insert(id.clone(), entry);
+        let foreground = ForegroundJob {
+            handle: wait_handle(&owner, &id).expect("foreground handle"),
+            armed: true,
+        };
+        let promoted = match foreground.promote().expect("promote prepared command") {
+            ForegroundPromotion::Background(snapshot) => snapshot,
+            ForegroundPromotion::Completed(_) => panic!("terminal publication has not happened"),
+        };
+        assert_eq!(promoted.output_tail.len(), OUTPUT_TAIL_BYTES);
+        assert_eq!(promoted.output_bytes, 100_000);
+        assert!(promoted.tail_truncated);
+        {
+            let mut reg = registry().lock().expect("publish prepared snapshot");
+            let job = reg.jobs.get_mut(&id).expect("promoted command");
+            assert_eq!(
+                job.tail.lock().expect("promoted tail").cap,
+                OUTPUT_TAIL_BYTES
+            );
+            // Force the exact interleaving: prepare foreground snapshot,
+            // promote, then use the production terminal-publication function.
+            record_job_settlement(job, JobStatus::Exited, Some(0), true, 0, prepared);
+        }
+        let waited = wait(&owner, &id, Duration::ZERO).expect("stable wait snapshot");
+        let listed = list(&owner).expect("stable list snapshot");
+        assert_eq!(listed.len(), 1);
+        for snapshot in [&waited, &listed[0]] {
+            assert_eq!(snapshot.status, "exited");
+            assert_eq!(snapshot.output_tail.len(), OUTPUT_TAIL_BYTES);
+            assert_eq!(snapshot.output_bytes, 100_000);
+            assert_eq!(snapshot.output_lines, 1);
+            assert!(snapshot.tail_truncated);
+        }
+        registry()
+            .lock()
+            .expect("release synthetic command")
+            .jobs
+            .remove(&id);
+    }
+
+    #[test]
+    fn completed_foreground_command_wins_promotion_without_a_notice() {
+        let _guard = process_test_guard();
+        let root = temp_root();
+        let owner = format!("completed-foreground-{}", uuid::Uuid::new_v4().simple());
+        let foreground = spawn_foreground(
+            &owner,
+            &root,
+            None,
+            None,
+            "printf done",
+            Some(10),
+            Some(&root),
+            None,
+        )
+        .expect("spawn foreground command");
+        let id = foreground.handle.id.clone();
+        let settled = wait_with_handle(&foreground.handle, Duration::from_secs(10))
+            .expect("foreground completion");
+        assert_eq!(settled.status, "exited");
+        assert_eq!(settled.output_tail, "done");
+        assert_eq!(settled.output_bytes, 4);
+        assert_eq!(settled.output_lines, 1);
+        assert!(!settled.tail_truncated);
+        assert!(list(&owner).expect("hidden foreground list").is_empty());
+        assert!(take_completion_notices(&owner).is_empty());
+        match foreground.promote().expect("resolve completion race") {
+            ForegroundPromotion::Completed(snapshot) => {
+                assert_eq!(snapshot.id, id);
+                assert_eq!(snapshot.exit_code, Some(0));
+            }
+            ForegroundPromotion::Background(_) => {
+                panic!("an already settled foreground command must remain inline");
+            }
+        }
+        assert!(
+            !registry().lock().expect("registry").jobs.contains_key(&id),
+            "consuming inline completion releases its registry metadata"
+        );
+        assert!(take_completion_notices(&owner).is_empty());
+    }
+
+    #[test]
+    fn concurrent_spawns_respect_capacity() {
+        let _guard = process_test_guard();
+        let root = temp_root();
+        let barrier = Arc::new(std::sync::Barrier::new(MAX_CONCURRENT_JOBS + 2));
+        let mut callers = Vec::new();
+        for _ in 0..=MAX_CONCURRENT_JOBS {
+            let caller_root = root.clone();
+            let caller_barrier = Arc::clone(&barrier);
+            callers.push(std::thread::spawn(move || {
+                caller_barrier.wait();
+                spawn_background(
+                    TEST_SESSION_ID,
+                    &caller_root,
+                    None,
+                    None,
+                    "sleep 60",
+                    Some(120),
+                    Some(&caller_root),
+                )
+            }));
+        }
+        barrier.wait();
+        let results: Vec<_> = callers
+            .into_iter()
+            .map(|caller| caller.join().expect("spawn caller"))
+            .collect();
+        let succeeded: Vec<_> = results
+            .iter()
+            .filter_map(|result| result.as_ref().ok())
+            .collect();
+        let rejected: Vec<_> = results
+            .iter()
+            .filter_map(|result| result.as_ref().err())
+            .collect();
+        assert_eq!(succeeded.len(), MAX_CONCURRENT_JOBS);
+        assert_eq!(rejected.len(), 1);
+        assert!(rejected[0].to_string().contains("PI_JOBS_AT_CAPACITY"));
+
+        for snapshot in succeeded {
+            cancel(TEST_SESSION_ID, &snapshot.id).expect("cleanup capacity test job");
+        }
+    }
+}

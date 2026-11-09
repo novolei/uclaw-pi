@@ -23,7 +23,7 @@ use tempfile::NamedTempFile;
 pub const EXTENSION_INDEX_SCHEMA: &str = "pi.ext.index.v1";
 pub const EXTENSION_INDEX_VERSION: u32 = 1;
 pub const EXTENSION_SAFETY_PROVENANCE_SCHEMA: &str = "pi.ext.safety_provenance.v1";
-pub const DEFAULT_INDEX_MAX_AGE: Duration = Duration::from_secs(60 * 60 * 24);
+pub const DEFAULT_INDEX_MAX_AGE: Duration = Duration::new(86_400, 0);
 const DEFAULT_NPM_QUERY: &str = "keywords:pi-extension";
 const DEFAULT_GITHUB_QUERY: &str = "topic:pi-extension";
 const DEFAULT_REMOTE_LIMIT: usize = 100;
@@ -110,17 +110,17 @@ impl ExtensionIndex {
             }
 
             // Convenience: `npm/<name>` or `<name>` for npm entries.
-            if let Some(ExtensionIndexSource::Npm { package, .. }) = &entry.source {
-                if package.to_ascii_lowercase() == q_lc {
-                    sources.insert(install.clone());
-                    continue;
-                }
+            if let Some(ExtensionIndexSource::Npm { package, .. }) = &entry.source
+                && package.to_ascii_lowercase() == q_lc
+            {
+                sources.insert(install.clone());
+                continue;
             }
 
-            if let Some(rest) = entry.id.strip_prefix("npm/") {
-                if rest.eq_ignore_ascii_case(q) {
-                    sources.insert(install.clone());
-                }
+            if let Some(rest) = entry.id.strip_prefix("npm/")
+                && rest.eq_ignore_ascii_case(q)
+            {
+                sources.insert(install.clone());
             }
         }
 
@@ -1247,9 +1247,6 @@ fn non_empty(value: &str) -> Option<String> {
 // Seed Index (Bundled)
 // ============================================================================
 
-const SEED_ARTIFACT_PROVENANCE_JSON: &str =
-    include_str!("../docs/extension-artifact-provenance.json");
-
 #[derive(Debug, Deserialize)]
 struct ArtifactProvenance {
     #[serde(rename = "$schema")]
@@ -1290,7 +1287,8 @@ enum ArtifactProvenanceSource {
 }
 
 pub fn seed_index() -> Result<ExtensionIndex> {
-    let provenance: ArtifactProvenance = serde_json::from_str(SEED_ARTIFACT_PROVENANCE_JSON)?;
+    let provenance: ArtifactProvenance =
+        serde_json::from_str(&crate::embedded_assets::extension_artifact_provenance_json())?;
     let generated_at = provenance.generated;
 
     let mut entries = Vec::with_capacity(provenance.items.len());

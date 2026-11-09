@@ -1,0 +1,682 @@
+//! Explicit, all-or-nothing handoff of unclaimed input after a turn finishes.
+//!
+//! No transcript entry or already-delivered input is replayed. Payloads move,
+//! including native attachments and authored keyword text, under both mailbox
+//! locks. Fresh identities prevent an old turn's receipt retracting new input.
+
+use std::sync::Arc;
+
+use super::{
+    InputId, InputKind, MAX_PENDING_BYTES, MAX_PENDING_INPUTS, PendingInput, RunData,
+    SessionControlHandle, control_error, lock,
+};
+use crate::error::Result;
+use crate::model::UserContent;
+
+/// Identity mapping for one input moved to a new turn's mailbox.
+///
+/// Neither identity acknowledges provider execution or session persistence.
+/// The new identity can be passed to the destination handle's `retract` method.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransferredInput {
+    pub previous_id: InputId,
+    pub new_id: InputId,
+    pub kind: InputKind,
+}
+
+impl SessionControlHandle {
+    /// Move all unclaimed inputs from this FINISHED turn into an accepting one.
+    ///
+    /// Build the next turn and obtain its control handle before awaiting it.
+    /// This call appends after any inputs already queued there, preserving the
+    /// source's admission order and each input's steering/follow-up lane. Text,
+    /// images and media are moved without flattening or re-expansion.
+    ///
+    /// Capacity, same-turn and lifecycle failures leave BOTH queues unchanged.
+    /// A successful call empties this mailbox; repeating it while the target
+    /// still accepts input transfers nothing.
+    /// Concurrent transfers use one lock order and cannot deliver input twice.
+    /// Already handed-off inputs are never transferred: inspect the completed
+    /// turn and history before choosing prompt versus continue_turn.
+    ///
+    /// ```no_run
+    /// use pi::session_control::{ControllableSession, SessionControlHandle};
+    ///
+    /// # async fn recover(session: &mut ControllableSession, old: &SessionControlHandle)
+    /// #     -> Result<(), Box<dyn std::error::Error>> {
+    /// let next = session.continue_turn(|_| {})?;
+    /// let receipts = old.transfer_pending_to(&next.control())?;
+    /// let completion = next.await?;
+    /// # let _ = (receipts, completion);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn transfer_pending_to(&self, destination: &Self) -> Result<Vec<TransferredInput>> {
+        if Arc::ptr_eq(&self.run, &destination.run) {
+            return Err(control_error(
+                "SESSION_CONTROL_SAME_TURN",
+                "pending input cannot be transferred to the same turn",
+            ));
+        }
+        // Arc allocations stay alive throughout this operation. Address order
+        // is used only to order locks, never as a persisted session identity.
+        if Arc::as_ptr(&self.run) < Arc::as_ptr(&destination.run) {
+            let mut source = lock(&self.run.data);
+            let mut target = lock(&destination.run.data);
+            transfer(&mut source, &mut target)
+        } else {
+            let mut target = lock(&destination.run.data);
+            let mut source = lock(&self.run.data);
+            transfer(&mut source, &mut target)
+        }
+    }
+
+    /// Explicitly recover a detached batch, such as GoalRunReport::pending or
+    /// the value previously returned by take_pending(), into this native turn.
+    /// Success empties the supplied vector and returns fresh identities in its
+    /// admission order. Failure leaves both that vector and this queue intact.
+    /// No provider work is started by this operation.
+    ///
+    /// Unlike a live mailbox, PendingInput's public text/content fields may
+    /// have been edited by the host. Revalidate them with the ordinary native
+    /// batch path; never trust their old private byte counts. Duplicate source
+    /// IDs are refused so the returned identity mapping is unambiguous. Empty
+    /// recovery is a no-op only while the destination still accepts input.
+    ///
+    /// Payloads retain their lanes, block order and explicit authored source.
+    /// No files are reread and no templates are expanded. Only admission is
+    /// atomic, not execution. A caller can clone a PendingInput itself, so this
+    /// is not durable exactly-once deduplication or proof of non-delivery. Never
+    /// rebuild this batch from already-delivered transcript messages.
+    pub fn restore_pending(
+        &self,
+        pending: &mut Vec<PendingInput>,
+    ) -> Result<Vec<TransferredInput>> {
+        if pending.len() > MAX_PENDING_INPUTS {
+            return Err(control_error(
+                "SESSION_CONTROL_INPUT",
+                "recovery exceeds the native batch count limit; no input was accepted",
+            ));
+        }
+        if pending.is_empty() {
+            let target = lock(&self.run.data);
+            if !target.accepting_input || target.finished {
+                return Err(control_error(
+                    "SESSION_CONTROL_CLOSED",
+                    "this turn no longer accepts input",
+                ));
+            }
+            drop(target);
+            return Ok(Vec::new());
+        }
+        // Allocate the complete receipt vector BEFORE any target admission.
+        // After enqueue_batch succeeds there must be no fallible allocation
+        // between publishing the batch and relinquishing its detached source.
+        let mut receipts: Vec<TransferredInput> = Vec::new();
+        receipts.try_reserve_exact(pending.len()).map_err(|_| {
+            control_error(
+                "SESSION_CONTROL_CAPACITY",
+                "cannot allocate recovery receipts",
+            )
+        })?;
+        for input in pending.iter() {
+            if receipts
+                .iter()
+                .any(|receipt| receipt.previous_id == input.id)
+            {
+                return Err(control_error(
+                    "SESSION_CONTROL_DUPLICATE_INPUT",
+                    "recovery contains repeated input identities; no input was accepted",
+                ));
+            }
+            receipts.push(TransferredInput {
+                previous_id: input.id,
+                new_id: input.id,
+                kind: input.kind,
+            });
+        }
+        // Move, rather than clone, potentially edited/unbounded input into the
+        // validation view. The native batch implementation bounds it before
+        // copying for admission. Restore the originals on refusal or unwind.
+        let staged = DetachedBatch::stage(pending)?;
+        let ids = self.enqueue_batch_with_content(&staged.inputs)?;
+        for (receipt, id) in receipts.iter_mut().zip(ids) {
+            receipt.new_id = id;
+        }
+        staged.source.clear();
+        Ok(receipts)
+    }
+}
+
+/// Holds detached content out of its source only during synchronous native
+/// validation/admission. Its exclusive borrow prevents observation of empty
+/// placeholders. All staging allocation precedes the first payload move.
+struct DetachedBatch<'a> {
+    source: &'a mut Vec<PendingInput>,
+    inputs: Vec<(InputKind, UserContent, String)>,
+}
+
+impl<'a> DetachedBatch<'a> {
+    fn stage(source: &'a mut Vec<PendingInput>) -> Result<Self> {
+        let mut inputs = Vec::new();
+        inputs.try_reserve_exact(source.len()).map_err(|_| {
+            control_error(
+                "SESSION_CONTROL_CAPACITY",
+                "cannot allocate recovery staging",
+            )
+        })?;
+        for input in source.iter_mut() {
+            inputs.push((
+                input.kind,
+                std::mem::replace(&mut input.content, UserContent::Blocks(Vec::new())),
+                std::mem::take(&mut input.text),
+            ));
+        }
+        Ok(Self { source, inputs })
+    }
+}
+
+impl Drop for DetachedBatch<'_> {
+    fn drop(&mut self) {
+        // On success the source was cleared. Otherwise restore the exact
+        // original values, IDs and position without allocation or validation.
+        for (input, (_, content, text)) in self.source.iter_mut().zip(self.inputs.drain(..)) {
+            input.content = content;
+            input.text = text;
+        }
+    }
+}
+
+fn transfer(source: &mut RunData, target: &mut RunData) -> Result<Vec<TransferredInput>> {
+    if !source.finished || source.accepting_input {
+        return Err(control_error(
+            "SESSION_CONTROL_NOT_FINISHED",
+            "await or drop the source turn before transferring unclaimed input",
+        ));
+    }
+    if source.yield_barrier.is_some() {
+        return Err(control_error(
+            "SESSION_CONTROL_BARRIER",
+            "resolve the source turn's yield barrier before transferring its held input",
+        ));
+    }
+    if !target.accepting_input || target.finished {
+        return Err(control_error(
+            "SESSION_CONTROL_CLOSED",
+            "the destination turn is no longer accepting input",
+        ));
+    }
+    let count = source.pending.len();
+    let bytes = target
+        .pending_bytes
+        .checked_add(source.pending_bytes)
+        .filter(|bytes| *bytes <= MAX_PENDING_BYTES);
+    let total = target
+        .pending
+        .len()
+        .checked_add(count)
+        .filter(|count| *count <= MAX_PENDING_INPUTS);
+    let (Some(bytes), Some(_)) = (bytes, total) else {
+        return Err(control_error(
+            "SESSION_CONTROL_FULL",
+            "the destination cannot hold the entire recovered input batch; neither queue changed",
+        ));
+    };
+    let mut transfers = Vec::new();
+    transfers.try_reserve(count).map_err(|_| {
+        control_error(
+            "SESSION_CONTROL_CAPACITY",
+            "cannot allocate input transfer receipts",
+        )
+    })?;
+    target.pending.try_reserve(count).map_err(|_| {
+        control_error(
+            "SESSION_CONTROL_CAPACITY",
+            "cannot allocate destination input queue",
+        )
+    })?;
+    // Finish allocation and identity generation BEFORE taking any payload.
+    // Even a failure generating an identity cannot leave a partially moved batch.
+    for input in &source.pending {
+        transfers.push(TransferredInput {
+            previous_id: input.id,
+            new_id: InputId(uuid::Uuid::new_v4()),
+            kind: input.kind,
+        });
+    }
+    for (mut input, receipt) in source.pending.drain(..).zip(&transfers) {
+        input.id = receipt.new_id;
+        target.pending.push_back(input);
+    }
+    source.pending_bytes = 0;
+    target.pending_bytes = bytes;
+    Ok(transfers)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{ContentBlock, ImageContent, TextContent, UserContent};
+    use crate::session_control::tests::live;
+    use crate::session_control::{InputKind, MAX_INPUT_BYTES};
+    use std::sync::Barrier;
+
+    #[test]
+    fn recovery_cannot_silently_bypass_an_unresolved_yield_barrier() {
+        let (source, source_guard, _) = live();
+        let barrier = source.insert_yield_barrier().unwrap();
+        source.follow_up("after maintenance").unwrap();
+        drop(source_guard);
+        let (target, _target_guard, _) = live();
+        target.follow_up("already accepted").unwrap();
+        assert!(
+            source
+                .transfer_pending_to(&target)
+                .unwrap_err()
+                .to_string()
+                .contains("SESSION_CONTROL_BARRIER")
+        );
+        assert_eq!(source.snapshot().pending_follow_up, 1);
+        assert_eq!(target.snapshot().pending_follow_up, 1);
+        assert!(source.remove_yield_barrier(barrier));
+        assert_eq!(source.transfer_pending_to(&target).unwrap().len(), 1);
+        assert_eq!(
+            target
+                .take_pending()
+                .iter()
+                .map(|input| input.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["already accepted", "after maintenance"]
+        );
+    }
+
+    #[test]
+    fn recovery_preserves_order_lanes_payloads_and_authored_text() {
+        let (source, guard, _) = live();
+        let first = source.follow_up("first follow-up").unwrap();
+        let content = UserContent::Blocks(vec![
+            ContentBlock::Text(TextContent::new("expanded context")),
+            ContentBlock::Image(ImageContent {
+                data: "aGVsbG8=".to_string(),
+                mime_type: "image/png".to_string(),
+            }),
+        ]);
+        let second = source
+            .steer_with_content(&content, "  authored text  ")
+            .unwrap();
+        let before = source.snapshot().pending_bytes;
+        drop(guard);
+        let (target, _target_guard, _) = live();
+        let existing = target.follow_up("already there").unwrap();
+        let existing_bytes = target.snapshot().pending_bytes;
+        let receipts = source.transfer_pending_to(&target).unwrap();
+        assert_eq!(receipts.len(), 2);
+        assert_eq!(receipts[0].previous_id, first);
+        assert_eq!(receipts[1].previous_id, second);
+        assert_eq!(receipts[0].kind, InputKind::FollowUp);
+        assert_eq!(receipts[1].kind, InputKind::Steering);
+        assert!(
+            receipts
+                .iter()
+                .all(|receipt| receipt.new_id != receipt.previous_id)
+        );
+        assert_eq!(source.snapshot().pending_bytes, 0);
+        assert_eq!(target.snapshot().pending_bytes, before + existing_bytes);
+        assert!(source.transfer_pending_to(&target).unwrap().is_empty());
+        assert!(
+            target.retract(second).is_none(),
+            "old identities are retired"
+        );
+        let recovered = target.take_pending();
+        assert_eq!(recovered[0].id, existing);
+        assert_eq!(recovered[1].id, receipts[0].new_id);
+        assert_eq!(recovered[1].text, "first follow-up");
+        assert_eq!(recovered[2].id, receipts[1].new_id);
+        assert_eq!(recovered[2].text, "  authored text  ");
+        assert_eq!(
+            serde_json::to_value(&recovered[2].content).unwrap(),
+            serde_json::to_value(&content).unwrap()
+        );
+        assert_eq!(target.snapshot().handed_to_agent, 0);
+    }
+
+    #[test]
+    fn handed_off_input_is_never_replayed_by_recovery() {
+        let (source, guard, _) = live();
+        source.steer("already consumed").unwrap();
+        let pending = source.follow_up("not consumed").unwrap();
+        assert_eq!(source.run.fetch(InputKind::Steering).len(), 1);
+        drop(guard);
+        let (target, _target_guard, _) = live();
+        let moved = source.transfer_pending_to(&target).unwrap();
+        assert_eq!(moved.len(), 1);
+        assert_eq!(moved[0].previous_id, pending);
+        assert_eq!(source.snapshot().handed_to_agent, 1);
+        assert_eq!(target.snapshot().handed_to_agent, 0);
+        assert_eq!(
+            target.run.fetch(InputKind::FollowUp)[0].text_for_display(),
+            Some("not consumed")
+        );
+        assert!(target.run.fetch(InputKind::Steering).is_empty());
+        assert_eq!(target.snapshot().pending_bytes, 0);
+    }
+
+    #[test]
+    fn running_source_and_aborted_but_undrained_source_are_refused() {
+        let (source, guard, _) = live();
+        source.steer("retain me").unwrap();
+        let (target, _target_guard, _) = live();
+        for aborted in [false, true] {
+            if aborted {
+                assert!(source.abort());
+            }
+            let before = source.snapshot();
+            let target_before = target.snapshot();
+            let error = source.transfer_pending_to(&target).unwrap_err();
+            assert!(error.to_string().contains("SESSION_CONTROL_NOT_FINISHED"));
+            assert_eq!(source.snapshot(), before);
+            assert_eq!(target.snapshot(), target_before);
+        }
+        drop(guard);
+        assert_eq!(source.transfer_pending_to(&target).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn same_turn_and_closed_destination_leave_source_recoverable() {
+        let (source, guard, _) = live();
+        let id = source.steer("retain me").unwrap();
+        drop(guard);
+        assert!(source.transfer_pending_to(&source).is_err());
+        let (target, target_guard, _) = live();
+        assert!(target.abort());
+        assert!(source.transfer_pending_to(&target).is_err());
+        drop(target_guard);
+        assert!(source.transfer_pending_to(&target).is_err());
+        assert_eq!(source.take_pending()[0].id, id);
+    }
+
+    #[test]
+    fn count_capacity_failure_is_atomic_and_can_be_retried() {
+        let (source, guard, _) = live();
+        let id = source.steer("batch A").unwrap();
+        source.follow_up("batch B").unwrap();
+        drop(guard);
+        let (target, _target_guard, _) = live();
+        for _ in 0..MAX_PENDING_INPUTS - 1 {
+            target.steer("occupied").unwrap();
+        }
+        let source_before = source.snapshot();
+        let target_before = target.snapshot();
+        let error = source.transfer_pending_to(&target).unwrap_err();
+        assert!(error.to_string().contains("SESSION_CONTROL_FULL"));
+        assert_eq!(source.snapshot(), source_before);
+        assert_eq!(target.snapshot(), target_before);
+        assert_eq!(target.run.fetch(InputKind::Steering).len(), 1);
+        let receipts = source.transfer_pending_to(&target).unwrap();
+        assert_eq!(receipts[0].previous_id, id);
+        assert_eq!(
+            target.snapshot().pending_steering + target.snapshot().pending_follow_up,
+            MAX_PENDING_INPUTS
+        );
+    }
+
+    #[test]
+    fn byte_capacity_failure_does_not_partially_move_a_batch() {
+        let (source, guard, _) = live();
+        let text = "x".repeat(MAX_INPUT_BYTES);
+        source.steer(&text).unwrap();
+        source.steer(&text).unwrap();
+        drop(guard);
+        let (target, _target_guard, _) = live();
+        while target.follow_up(&text).is_ok() {}
+        let before = target.snapshot();
+        assert!(source.transfer_pending_to(&target).is_err());
+        assert_eq!(target.snapshot(), before);
+        assert_eq!(source.snapshot().pending_steering, 2);
+        drop(target.take_pending());
+        assert_eq!(source.transfer_pending_to(&target).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn concurrent_recovery_moves_each_payload_exactly_once() {
+        let (source, guard, _) = live();
+        for index in 0..16 {
+            source.steer(&format!("input {index}")).unwrap();
+        }
+        drop(guard);
+        let (target, _target_guard, _) = live();
+        let start = Arc::new(Barrier::new(3));
+        std::thread::scope(|scope| {
+            let a = scope.spawn(|| {
+                start.wait();
+                source.transfer_pending_to(&target).unwrap().len()
+            });
+            let b = scope.spawn(|| {
+                start.wait();
+                source.transfer_pending_to(&target).unwrap().len()
+            });
+            start.wait();
+            assert_eq!(a.join().unwrap() + b.join().unwrap(), 16);
+        });
+        let queued = target.take_pending();
+        assert_eq!(queued.len(), 16);
+        for (index, input) in queued.iter().enumerate() {
+            assert_eq!(input.text, format!("input {index}"));
+        }
+        assert!(source.take_pending().is_empty());
+    }
+
+    fn detached() -> Vec<PendingInput> {
+        let (source, guard, _) = live();
+        source.follow_up("first").unwrap();
+        source
+            .steer_with_content(
+                &UserContent::Blocks(vec![
+                    ContentBlock::Text(TextContent::new("expanded attachment")),
+                    ContentBlock::Image(ImageContent {
+                        data: "aGVsbG8=".into(),
+                        mime_type: "image/png".into(),
+                    }),
+                ]),
+                "  original source  ",
+            )
+            .unwrap();
+        drop(guard);
+        source.take_pending()
+    }
+
+    fn fingerprint(
+        inputs: &[PendingInput],
+    ) -> Vec<(InputId, InputKind, String, serde_json::Value)> {
+        inputs
+            .iter()
+            .map(|input| {
+                (
+                    input.id,
+                    input.kind,
+                    input.text.clone(),
+                    serde_json::to_value(&input.content).unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    fn event(case: &str) {
+        eprintln!(
+            "{}",
+            serde_json::json!({"schema":"pi.session.detached_recovery.test.v1","case":case})
+        );
+    }
+
+    #[test]
+    fn detached_recovery_preserves_order_content_and_authorship_with_fresh_ids() {
+        event("detached_payloads");
+        let mut pending = detached();
+        let before = fingerprint(&pending);
+        let (target, _guard, _) = live();
+        let existing = target.steer("existing").unwrap();
+        let receipts = target.restore_pending(&mut pending).unwrap();
+        assert!(pending.is_empty());
+        assert_eq!(receipts.len(), before.len());
+        assert!(target.restore_pending(&mut pending).unwrap().is_empty());
+        for (receipt, old) in receipts.iter().zip(&before) {
+            assert_eq!(receipt.previous_id, old.0);
+            assert_eq!(receipt.kind, old.1);
+            assert_ne!(receipt.new_id, old.0);
+            assert!(target.retract(old.0).is_none());
+        }
+        let received = target.take_pending();
+        assert_eq!(received[0].id, existing);
+        for ((input, old), receipt) in received[1..].iter().zip(&before).zip(&receipts) {
+            assert_eq!(input.id, receipt.new_id);
+            assert_eq!(input.kind, old.1);
+            assert_eq!(input.text, old.2);
+            assert_eq!(serde_json::to_value(&input.content).unwrap(), old.3);
+        }
+        assert_eq!(target.snapshot().pending_bytes, 0);
+    }
+
+    #[test]
+    fn detached_capacity_failure_keeps_both_sides_and_retry_transfers_all() {
+        event("capacity_atomicity");
+        let mut pending = detached();
+        let original = fingerprint(&pending);
+        let (target, _guard, _) = live();
+        let freeable = target.steer("first occupied slot").unwrap();
+        for _ in 1..MAX_PENDING_INPUTS - 1 {
+            target.steer("occupied").unwrap();
+        }
+        let before = target.snapshot();
+        assert!(
+            target
+                .restore_pending(&mut pending)
+                .unwrap_err()
+                .to_string()
+                .contains("SESSION_CONTROL_FULL")
+        );
+        assert_eq!(target.snapshot(), before);
+        assert_eq!(fingerprint(&pending), original);
+        target.retract(freeable).unwrap();
+        assert_eq!(target.restore_pending(&mut pending).unwrap().len(), 2);
+        assert!(pending.is_empty());
+        assert_eq!(
+            target.snapshot().pending_steering + target.snapshot().pending_follow_up,
+            MAX_PENDING_INPUTS
+        );
+    }
+
+    #[test]
+    fn detached_edited_content_is_revalidated_instead_of_trusting_old_byte_counts() {
+        event("edited_payload_validation");
+        let mut pending = detached();
+        pending[1].content = UserContent::Blocks(Vec::new());
+        let invalid = fingerprint(&pending);
+        let (target, _guard, _) = live();
+        let before = target.snapshot();
+        assert!(target.restore_pending(&mut pending).is_err());
+        assert_eq!(target.snapshot(), before);
+        assert_eq!(
+            fingerprint(&pending),
+            invalid,
+            "even invalid host edits must be returned unchanged"
+        );
+        pending[1].content = UserContent::Text("\u{0001}".repeat(MAX_INPUT_BYTES * 3));
+        let too_large = fingerprint(&pending);
+        assert!(target.restore_pending(&mut pending).is_err());
+        assert_eq!(target.snapshot(), before);
+        assert_eq!(fingerprint(&pending), too_large);
+        pending[1].content = UserContent::Text("a valid changed payload".into());
+        pending[1].text = "new authored source".into();
+        let expected_bytes: usize = pending
+            .iter()
+            .map(|input| serde_json::to_vec(&input.content).unwrap().len() + input.text.len())
+            .sum();
+        let receipts = target.restore_pending(&mut pending).unwrap();
+        assert_eq!(target.snapshot().pending_bytes, expected_bytes);
+        let claimed = target.run.fetch(InputKind::Steering);
+        assert_eq!(
+            claimed[0].keyword_scan_source(),
+            Some("new authored source")
+        );
+        assert!(target.retract(receipts[1].new_id).is_none());
+    }
+
+    #[test]
+    fn detached_duplicate_identities_are_rejected_before_any_admission() {
+        event("duplicate_identity");
+        let mut pending = detached();
+        pending.push(pending[0].clone());
+        let original = fingerprint(&pending);
+        let (target, _guard, _) = live();
+        let before = target.snapshot();
+        assert!(
+            target
+                .restore_pending(&mut pending)
+                .unwrap_err()
+                .to_string()
+                .contains("SESSION_CONTROL_DUPLICATE_INPUT")
+        );
+        assert_eq!(target.snapshot(), before);
+        assert_eq!(fingerprint(&pending), original);
+    }
+
+    #[test]
+    fn closed_destination_never_consumes_detached_input_even_for_empty_recovery() {
+        event("closed_destination");
+        let mut pending = detached();
+        let original = fingerprint(&pending);
+        let (target, guard, _) = live();
+        let mut empty = Vec::new();
+        assert!(target.restore_pending(&mut empty).unwrap().is_empty());
+        assert!(target.abort());
+        assert!(target.restore_pending(&mut pending).is_err());
+        assert_eq!(fingerprint(&pending), original);
+        assert!(target.restore_pending(&mut empty).is_err());
+        drop(guard);
+        assert!(target.restore_pending(&mut pending).is_err());
+        assert_eq!(fingerprint(&pending), original);
+    }
+
+    #[test]
+    fn detached_staging_restores_exact_source_on_early_return_and_unwind() {
+        event("staging_ownership");
+        let mut pending = detached();
+        let original = fingerprint(&pending);
+        {
+            let staged = DetachedBatch::stage(&mut pending).unwrap();
+            assert_eq!(staged.inputs.len(), 2);
+        }
+        assert_eq!(fingerprint(&pending), original);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _staged = DetachedBatch::stage(&mut pending).unwrap();
+            panic!("controlled failure before native admission");
+        }));
+        assert!(result.is_err());
+        assert_eq!(fingerprint(&pending), original);
+    }
+
+    #[test]
+    fn detached_byte_and_count_limits_refuse_whole_batches_without_payload_loss() {
+        event("detached_limits");
+        let (source, guard, _) = live();
+        let text = "x".repeat(MAX_INPUT_BYTES);
+        source.steer(&text).unwrap();
+        source.follow_up(&text).unwrap();
+        drop(guard);
+        let mut pending = source.take_pending();
+        let original = fingerprint(&pending);
+        let (target, _guard, _) = live();
+        while target.follow_up(&text).is_ok() {}
+        let before = target.snapshot();
+        assert!(target.restore_pending(&mut pending).is_err());
+        assert_eq!(target.snapshot(), before);
+        assert_eq!(fingerprint(&pending), original);
+        target.take_pending();
+        let mut excessive = vec![pending[0].clone(); MAX_PENDING_INPUTS + 1];
+        assert!(target.restore_pending(&mut excessive).is_err());
+        assert_eq!(excessive.len(), MAX_PENDING_INPUTS + 1);
+        assert_eq!(target.snapshot().pending_bytes, 0);
+        assert_eq!(target.restore_pending(&mut pending).unwrap().len(), 2);
+        assert!(pending.is_empty());
+    }
+}
