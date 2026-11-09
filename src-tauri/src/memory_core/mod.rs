@@ -46,12 +46,22 @@ pub struct MemoryCore {
     models_root: PathBuf,
     embedder: RwLock<Option<Arc<Embedder>>>,
     reranker: RwLock<Option<Arc<Reranker>>>,
+    /// Held for the whole of `try_load_models` so concurrent callers never load the
+    /// same model twice (each load briefly costs ~1.2 GB extra peak memory).
+    load_lock: Mutex<()>,
     config: MemoryCoreConfig,
 }
 
 impl MemoryCore {
     pub fn new(db: Arc<Mutex<Connection>>, models_root: PathBuf, config: MemoryCoreConfig) -> Self {
-        Self { db, models_root, embedder: RwLock::new(None), reranker: RwLock::new(None), config }
+        Self {
+            db,
+            models_root,
+            embedder: RwLock::new(None),
+            reranker: RwLock::new(None),
+            load_lock: Mutex::new(()),
+            config,
+        }
     }
 
     pub fn db(&self) -> &Arc<Mutex<Connection>> {
@@ -69,6 +79,8 @@ impl MemoryCore {
     /// Load whichever models are on disk and not yet loaded. Idempotent.
     /// Returns true iff the embedder is loaded afterwards.
     pub fn try_load_models(&self) -> bool {
+        // Serialize loads: the second caller waits, then sees the models loaded.
+        let _load = self.load_lock.lock().unwrap_or_else(|p| p.into_inner());
         if self.embedder().is_none() && models::is_ready(&self.models_root, &models::BGE_M3_INT8) {
             match Embedder::load(&self.models_root) {
                 Ok(e) => {
@@ -322,6 +334,15 @@ mod tests {
         let core = core_with(&[]);
         assert!(!core.try_load_models());
         assert!(core.embedder().is_none());
+        // Serialized: a held load lock blocks a concurrent loader until released.
+        let core = Arc::new(core);
+        let guard = core.load_lock.lock().unwrap();
+        let c2 = core.clone();
+        let t = std::thread::spawn(move || c2.try_load_models());
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(!t.is_finished(), "second loader must wait for the load lock");
+        drop(guard);
+        assert!(!t.join().unwrap());
     }
 
     #[test]
