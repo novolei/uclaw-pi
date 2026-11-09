@@ -27,7 +27,12 @@ export default defineConfig({
   projects: [
     {
       name: 'chromium',
-      use: { ...devices['Desktop Chrome'] },
+      // CI installs Playwright's chromium; locally `PW_CHANNEL=chrome` runs the
+      // same suite on the system Chrome when the bundled browser isn't installed.
+      use: {
+        ...devices['Desktop Chrome'],
+        ...(process.env.PW_CHANNEL ? { channel: process.env.PW_CHANNEL } : {}),
+      },
     },
   ],
   webServer: {

@@ -22,6 +22,15 @@ const settingsFixture = {
   safety_mode: 'yolo',
 }
 
+function cachedThemeMode(): string | null {
+  try {
+    const v = typeof localStorage !== 'undefined' ? localStorage.getItem('uclaw-theme-mode') : null
+    return v === 'light' || v === 'dark' || v === 'system' || v === 'special' ? v : null
+  } catch {
+    return null
+  }
+}
+
 const diagnosticsFixture = {
   app_version: 'dev-mock',
   platform: 'browser',
@@ -424,6 +433,10 @@ export function createUclawMockIpcHandler(): MockHandler {
     parseMemoryCoreMockState(typeof window !== 'undefined' ? window.location.search : ''),
     (status: MemoryCoreStatus) => emit('memory-core:status', status),
   )
+  const memoryCoreDelayMs = Math.min(
+    60_000,
+    Number(new URLSearchParams(typeof window !== 'undefined' ? window.location.search : '').get('memoryCoreDelay')) || 0,
+  )
   const memoryRecallMode = parseMemoryRecallMockMode(
     typeof window !== 'undefined' ? window.location.search : '',
   )
@@ -438,7 +451,9 @@ export function createUclawMockIpcHandler(): MockHandler {
     switch (cmd) {
       case 'get_settings':
       case 'patch_settings':
-        return settingsFixture
+        // Honour a theme mode cached by the app (or seeded by a screenshot
+        // script) so named themes survive reloads in the browser mock.
+        return { ...settingsFixture, theme: cachedThemeMode() ?? settingsFixture.theme }
       case 'get_platform':
         return { platform: 'browser', arch: 'mock' }
       case 'get_version':
@@ -585,7 +600,10 @@ export function createUclawMockIpcHandler(): MockHandler {
 
       // ── MemoryCore engine (Settings › 记忆) ──────────────────────────────────
       case 'memory_core_get_status':
-        return memoryCore.getStatus()
+        // `&memoryCoreDelay=<ms>` holds the first read so the skeleton can be inspected.
+        return memoryCoreDelayMs > 0
+          ? sleep(memoryCoreDelayMs).then(() => memoryCore.getStatus())
+          : memoryCore.getStatus()
       case 'memory_core_set_models_enabled':
         return memoryCore.setModelsEnabled(Boolean((payload as { enabled?: boolean })?.enabled))
       case 'memory_core_retry_download':

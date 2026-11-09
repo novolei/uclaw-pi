@@ -84,8 +84,12 @@ sweep — fades ≤120 ms or instant (`motion-safe:` / `motion-reduce:` variants
 - **Progress.** `ProgressBar` — 4 px hairline, `--progress-track` / `--progress-fill`.
   Determinate glides 240 ms; indeterminate (unknown total) sweeps; it must be named
   (`label` or `aria-labelledby`, enforced by the type) ("下载记忆模型") and show the numbers as text next to it (`12.4 / 90 MB`).
-- **Stats.** `StatPill` — muted label, toned value (`neutral | success | warning |
-  danger` on the existing semantic tokens). A row of pills should read as data.
+- **Stats.** `StatPill` — quiet label (`text-foreground/80`), toned value (`neutral |
+  success | warning | danger`). A row of pills should read as data. Text that sits on a
+  tinted surface (pill values, callout titles) uses the `-strong` variants
+  (`text-success-strong` …: the tone mixed 65 % with `--foreground`), and secondary
+  text on a tint uses `text-foreground/75` — plain `--success` / `--muted-foreground`
+  drop below 4.5:1 on their tints in several themes.
 
 ## Kind colors
 
@@ -112,7 +116,7 @@ two free arcs — 60–117 (episode, lesson) and 200–325 (procedure, fact, ent
 preference). warm-paper's success is olive (95), so there lesson moves to 146 and
 episode to 59. Per-theme minimums (pair gap / semantic gap): `:root` 34/34, `.dark`
 34/30, ocean 30/26, forest 34/33–34, slate 36/31, warm-paper 36/29, qingye 34/31,
-black 34/30, the-finals 36/27.
+black 34/26, the-finals 36/27.
 
 Rules: **restrained chroma** (28–45 % saturation; 55 % only on the high-contrast black /
 the-finals themes) — premium means quiet. Each theme pulls the hues ≤4° toward its own
@@ -121,7 +125,8 @@ and sets its own saturation/lightness, so kinds harmonize instead of looking pas
 Badge text is solved per theme for **≥ 4.5:1 on its `-bg` and on the theme card**
 (guarded by `ui/src/styles/memory-tokens.test.ts`, which also enforces the hue budget
 above and progress fill ≥ 3:1 on track). Progress fill is neutral or the theme's brand
-tone, never a status hue (the-finals uses warm cream, not its red). Color is never the only signal: badges always carry the label.
+tone, never a status hue (the-finals uses warm cream, not its red; black uses neutral
+silver, because its gold brand tone is indistinguishable from its warning amber). Color is never the only signal: badges always carry the label.
 Components never use raw palette classes (`blue-500` …) — only these tokens or the
 existing semantic ones (`success`, `warning`, `danger`, `muted`).
 
@@ -138,3 +143,24 @@ Chinese, short, plain. Primary text names the thing the user cares about ("记�
 简洁回答"), not the mechanism — no "embedding", "FTS", "bucket", "vector" in primary
 text; put technical detail in secondary/tooltip text or 高级. Status in 2–6 characters
 (已就绪 / 下载中 / 未启用). Errors: cause + next step. No exclamation marks, no emoji.
+
+## Reference screenshots
+
+Captured from the browser mock (`npm run dev:mock-tauri`; `?memoryCore=<state>` for
+Settings › 记忆, `?memoryRecall=hybrid|keyword` for the chip, `&memoryCoreDelay=<ms>` to
+hold the skeleton) in `docs/design/screenshots/p1-ui/`. File names are
+`settings-<state>-<theme>-<width>.png` and `chip-<mode>-<theme>-1280.png`. Key ones:
+
+| Surface | Light | Dark |
+|---|---|---|
+| Ready | ![](screenshots/p1-ui/settings-ready-light-1280.png) | ![](screenshots/p1-ui/settings-ready-dark-1280.png) |
+| Downloading | ![](screenshots/p1-ui/settings-downloading-light-1280.png) | ![](screenshots/p1-ui/settings-downloading-dark-1280.png) |
+| Failed (callout) | ![](screenshots/p1-ui/settings-failed-light-1280.png) | ![](screenshots/p1-ui/settings-failed-dark-1280.png) |
+| Off (keyword only) | ![](screenshots/p1-ui/settings-off-light-1280.png) | ![](screenshots/p1-ui/settings-off-dark-1280.png) |
+| Loading skeleton | ![](screenshots/p1-ui/settings-skeleton-light-1280.png) | ![](screenshots/p1-ui/settings-skeleton-dark-1280.png) |
+| Recall chip (hybrid) | ![](screenshots/p1-ui/chip-hybrid-light-1280.png) | ![](screenshots/p1-ui/chip-hybrid-dark-1280.png) |
+| Recall chip (keyword) | ![](screenshots/p1-ui/chip-keyword-light-1280.png) | ![](screenshots/p1-ui/chip-keyword-dark-1280.png) |
+
+Named themes (warm-paper, qingye, black, slate-dark) and the ~720 px narrow layout are in
+the same folder.
+
