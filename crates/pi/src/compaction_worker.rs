@@ -3,16 +3,20 @@
 //! This keeps LLM compaction off the foreground turn path by running compaction
 //! on the existing runtime and applying results on subsequent turns.
 
-use crate::compaction::{self, CompactionPreparation, CompactionResult};
+use crate::compaction::{
+    self, CompactionPreparation, CompactionPrivacy, CompactionReader, CompactionResult,
+};
 use crate::error::{Error, Result};
-use crate::provider::Provider;
+use crate::provider::{Provider, StreamOptions};
 use asupersync::runtime::{JoinHandle, RuntimeHandle};
+use asupersync::sync::OwnedMutexGuard;
 use futures::FutureExt;
 use futures::channel::oneshot;
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 pub(crate) const COMPACTION_ADMISSION_SCHEMA_V1: &str = "pi.compaction.admission.v1";
@@ -166,10 +170,21 @@ fn duration_millis_saturating(duration: Duration) -> u64 {
 
 type CompactionOutcome = Result<CompactionResult>;
 
+// The _id suffixes mirror the wire/session vocabulary; renaming would hurt greppability.
+#[allow(clippy::struct_field_names)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CompactionOrigin {
+    pub session_id: String,
+    pub provider_id: String,
+    pub model_id: String,
+    pub snapshot_leaf_id: Option<String>,
+}
+
 struct PendingCompaction {
     join: JoinHandle<CompactionOutcome>,
     abort_tx: Option<oneshot::Sender<()>>,
     started_at: Instant,
+    origin: Option<CompactionOrigin>,
 }
 
 impl PendingCompaction {
@@ -178,10 +193,10 @@ impl PendingCompaction {
     }
 
     fn abort(&mut self) {
-        if let Some(abort_tx) = self.abort_tx.take() {
-            if abort_tx.send(()).is_err() {
-                tracing::debug!("abort signal receiver was already dropped");
-            }
+        if let Some(abort_tx) = self.abort_tx.take()
+            && abort_tx.send(()).is_err()
+        {
+            tracing::debug!("abort signal receiver was already dropped");
         }
     }
 }
@@ -277,20 +292,37 @@ impl CompactionWorkerState {
     }
 
     /// Non-blocking check for a completed compaction result.
-    pub async fn try_recv(&mut self) -> Option<CompactionOutcome> {
-        // Check timeout first (read-only borrow, then drop before mutation).
+    pub async fn try_recv_bound(
+        &mut self,
+    ) -> Option<(Option<CompactionOrigin>, CompactionOutcome)> {
+        // The worker enforces the generation deadline itself. A completed
+        // outcome must survive an idle user or a long foreground turn: time
+        // spent waiting to be collected is not time spent generating a summary.
+        // Keep the defensive timeout only for work that is still unfinished.
         let timed_out = self
             .pending
             .as_ref()
-            .is_some_and(|p| p.started_at.elapsed() > self.quota.timeout);
+            .is_some_and(|p| !p.is_finished() && p.started_at.elapsed() > self.quota.timeout);
 
         if timed_out {
             if let Some(mut pending) = self.pending.take() {
                 pending.abort();
+                let origin = pending.origin;
+                // Join the aborted task before publishing the timeout so its
+                // provider future and admission permit are definitely gone.
+                // The worker task races the same timeout internally; this is
+                // only a defensive path for delayed polling/scheduling.
+                let _ = std::panic::AssertUnwindSafe(pending.join)
+                    .catch_unwind()
+                    .await;
+                return Some((
+                    origin,
+                    Err(Error::session(
+                        "Background compaction timed out".to_string(),
+                    )),
+                ));
             }
-            return Some(Err(Error::session(
-                "Background compaction timed out".to_string(),
-            )));
+            return None;
         }
 
         if !self
@@ -302,18 +334,96 @@ impl CompactionWorkerState {
         }
 
         let pending = self.pending.take()?;
-        Some(pending.join.await)
+        let origin = pending.origin;
+        let outcome = std::panic::AssertUnwindSafe(pending.join)
+            .catch_unwind()
+            .await
+            .unwrap_or_else(|_| {
+                Err(Error::session(
+                    "Background compaction task was cancelled before producing an outcome"
+                        .to_string(),
+                ))
+            });
+        Some((origin, outcome))
+    }
+
+    /// Record a completed background compaction only after its origin was
+    /// accepted and its Session mutation was durably installed.
+    pub(crate) const fn mark_applied_success(&mut self) {
+        self.attempt_count = 0;
+    }
+
+    #[cfg(test)]
+    pub async fn try_recv(&mut self) -> Option<CompactionOutcome> {
+        self.try_recv_bound().await.map(|(_, outcome)| outcome)
     }
 
     /// Spawn a background compaction on the provided runtime.
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_for_origin(
+        &mut self,
+        origin: CompactionOrigin,
+        provider_permit: OwnedMutexGuard<()>,
+        runtime_handle: &RuntimeHandle,
+        preparation: CompactionPreparation,
+        provider: Arc<dyn Provider>,
+        stream_options: StreamOptions,
+        custom_instructions: Option<String>,
+        privacy: CompactionPrivacy,
+        reader: CompactionReader,
+    ) -> Result<()> {
+        self.start_inner(
+            Some(origin),
+            Some(provider_permit),
+            runtime_handle,
+            preparation,
+            provider,
+            stream_options,
+            custom_instructions,
+            privacy,
+            reader,
+        )
+    }
+
+    #[cfg(test)]
     pub fn start(
         &mut self,
         runtime_handle: &RuntimeHandle,
         preparation: CompactionPreparation,
         provider: Arc<dyn Provider>,
-        api_key: String,
+        stream_options: StreamOptions,
         custom_instructions: Option<String>,
     ) {
+        self.start_inner(
+            None,
+            None,
+            runtime_handle,
+            preparation,
+            provider,
+            stream_options,
+            custom_instructions,
+            CompactionPrivacy::default(),
+            CompactionReader {
+                accepts_images: true,
+                source_text_budget: None,
+            },
+        )
+        .expect("test compaction runtime must admit the task");
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn start_inner(
+        &mut self,
+        origin: Option<CompactionOrigin>,
+        provider_permit: Option<OwnedMutexGuard<()>>,
+        runtime_handle: &RuntimeHandle,
+        preparation: CompactionPreparation,
+        provider: Arc<dyn Provider>,
+        stream_options: StreamOptions,
+        custom_instructions: Option<String>,
+        privacy: CompactionPrivacy,
+        reader: CompactionReader,
+    ) -> Result<()> {
         debug_assert!(
             self.can_start(),
             "start() called while can_start() is false"
@@ -321,24 +431,76 @@ impl CompactionWorkerState {
 
         let (abort_tx, abort_rx) = oneshot::channel();
         let now = Instant::now();
-        let join = runtime_handle.spawn(async move {
+        let timeout = self.quota.timeout;
+        let task = async move {
+            let _provider_permit = provider_permit;
             run_compaction_task(
                 preparation,
                 provider,
-                api_key,
+                stream_options,
                 custom_instructions,
                 abort_rx,
+                timeout,
+                privacy,
+                reader,
             )
             .await
-        });
+        };
+        let join =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| runtime_handle.spawn(task)))
+                .map_err(|_| Error::session("Background compaction runtime rejected the task"))?;
 
         self.pending = Some(PendingCompaction {
             join,
             abort_tx: Some(abort_tx),
             started_at: now,
+            origin,
         });
         self.last_start = Some(now);
         self.attempt_count = self.attempt_count.saturating_add(1);
+        Ok(())
+    }
+
+    /// Test-only: force the session attempt counter to simulate quota state.
+    #[cfg(test)]
+    pub(crate) const fn set_attempt_count_for_test(&mut self, attempt_count: u32) {
+        self.attempt_count = attempt_count;
+    }
+
+    /// Whether a background compaction is currently in flight.
+    #[must_use]
+    pub const fn has_pending(&self) -> bool {
+        self.pending.is_some()
+    }
+
+    /// Test helper: inject a parked background compaction task that signals `aborted` if aborted.
+    pub fn park_pending_for_test(
+        &mut self,
+        runtime_handle: &RuntimeHandle,
+        aborted: Option<Arc<AtomicBool>>,
+    ) {
+        let (abort_tx, abort_rx) = oneshot::channel();
+        let join = runtime_handle.spawn(async move {
+            let _ = abort_rx.await;
+            if let Some(flag) = aborted {
+                flag.store(true, Ordering::SeqCst);
+            }
+            Err(Error::session("Background compaction aborted".to_string()))
+        });
+        self.pending = Some(PendingCompaction {
+            join,
+            abort_tx: Some(abort_tx),
+            started_at: Instant::now(),
+            origin: None,
+        });
+    }
+
+    pub(crate) fn invalidate_for_context_switch(&mut self) {
+        if let Some(mut pending) = self.pending.take() {
+            pending.abort();
+        }
+        self.last_start = None;
+        self.attempt_count = 0;
     }
 }
 
@@ -379,13 +541,16 @@ impl Drop for CompactionWorkerState {
     }
 }
 
-#[allow(clippy::needless_pass_by_value)]
+#[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
 async fn run_compaction_task(
     preparation: CompactionPreparation,
     provider: Arc<dyn Provider>,
-    api_key: String,
+    stream_options: StreamOptions,
     custom_instructions: Option<String>,
     abort_rx: oneshot::Receiver<()>,
+    timeout: Duration,
+    privacy: CompactionPrivacy,
+    reader: CompactionReader,
 ) -> CompactionOutcome {
     let abort_fut = async move {
         if abort_rx.await.is_err() {
@@ -394,23 +559,38 @@ async fn run_compaction_task(
         Err(Error::session("Background compaction aborted".to_string()))
     }
     .fuse();
-    let compaction_fut = std::panic::AssertUnwindSafe(compaction::compact(
-        preparation,
-        provider,
-        &api_key,
-        custom_instructions.as_deref(),
-    ))
-    .catch_unwind()
+    // Only this provider future has a panic recovery boundary. Suppress
+    // crash capture during its polls, not while it is suspended or while
+    // polling the abort/timeout machinery.
+    let compaction_fut = pi::crash::suppress_panic_hook_for_future(
+        std::panic::AssertUnwindSafe(compaction::compact_auto(
+            preparation,
+            provider,
+            &stream_options,
+            custom_instructions.as_deref(),
+            &privacy,
+            reader,
+        ))
+        .catch_unwind(),
+    );
+    let timed_compaction_fut = async move {
+        match asupersync::time::timeout(asupersync::time::wall_now(), timeout, compaction_fut).await
+        {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err(Error::session(
+                "Background compaction worker panicked".to_string(),
+            )),
+            Err(_) => Err(Error::session(
+                "Background compaction timed out".to_string(),
+            )),
+        }
+    }
     .fuse();
+    futures::pin_mut!(abort_fut, timed_compaction_fut);
 
-    futures::pin_mut!(abort_fut, compaction_fut);
-
-    match futures::future::select(abort_fut, compaction_fut).await {
+    match futures::future::select(abort_fut, timed_compaction_fut).await {
         futures::future::Either::Left((abort_result, _)) => abort_result,
-        futures::future::Either::Right((Ok(result), _)) => result,
-        futures::future::Either::Right((Err(_), _)) => Err(Error::session(
-            "Background compaction worker panicked".to_string(),
-        )),
+        futures::future::Either::Right((result, _)) => result,
     }
 }
 
@@ -418,6 +598,40 @@ async fn run_compaction_task(
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[derive(Debug)]
+    struct NeverCompletingProvider;
+
+    #[async_trait::async_trait]
+    #[allow(clippy::unnecessary_literal_bound)]
+    impl Provider for NeverCompletingProvider {
+        fn name(&self) -> &str {
+            "never-completing-provider"
+        }
+
+        fn api(&self) -> &str {
+            "test-api"
+        }
+
+        fn model_id(&self) -> &str {
+            "never-completing-model"
+        }
+
+        async fn stream(
+            &self,
+            _context: &crate::provider::Context<'_>,
+            _options: &crate::provider::StreamOptions,
+        ) -> crate::error::Result<
+            std::pin::Pin<
+                Box<
+                    dyn futures::Stream<Item = crate::error::Result<crate::provider::StreamEvent>>
+                        + Send,
+                >,
+            >,
+        > {
+            futures::future::pending().await
+        }
+    }
 
     fn make_worker(quota: CompactionQuota) -> CompactionWorkerState {
         CompactionWorkerState::new(quota)
@@ -427,6 +641,220 @@ mod tests {
         make_worker(CompactionQuota::default())
     }
 
+    struct OptionsDispatchProbe {
+        observed: Arc<std::sync::Mutex<Vec<StreamOptions>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for OptionsDispatchProbe {
+        fn name(&self) -> &'static str {
+            "options-probe"
+        }
+
+        fn api(&self) -> &'static str {
+            "test-api"
+        }
+
+        fn model_id(&self) -> &'static str {
+            "test-model"
+        }
+
+        async fn stream(
+            &self,
+            _context: &crate::provider::Context<'_>,
+            options: &StreamOptions,
+        ) -> Result<
+            std::pin::Pin<
+                Box<dyn futures::Stream<Item = Result<crate::provider::StreamEvent>> + Send>,
+            >,
+        > {
+            self.observed
+                .lock()
+                .expect("record compaction request options")
+                .push(options.clone());
+            let message = crate::model::AssistantMessage {
+                content: vec![crate::model::ContentBlock::Text(
+                    crate::model::TextContent::new("worker summary"),
+                )],
+                api: "test-api".to_string(),
+                provider: "options-probe".to_string(),
+                model: "test-model".to_string(),
+                usage: crate::model::Usage::default(),
+                stop_reason: crate::model::StopReason::Stop,
+                stop_details: None,
+                error_message: None,
+                timestamp: 0,
+            };
+            Ok(Box::pin(futures::stream::iter([Ok(
+                crate::provider::StreamEvent::Done {
+                    reason: crate::model::StopReason::Stop,
+                    message,
+                },
+            )])))
+        }
+    }
+
+    #[test]
+    #[allow(clippy::significant_drop_tightening)]
+    fn background_compaction_preserves_header_auth_and_operation_options() {
+        run_async(|runtime_handle| async move {
+            let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let provider = Arc::new(OptionsDispatchProbe {
+                observed: Arc::clone(&observed),
+            });
+            let options = StreamOptions {
+                api_key: None,
+                headers: std::collections::HashMap::from([
+                    (
+                        "authorization".to_string(),
+                        "Bearer worker-token".to_string(),
+                    ),
+                    ("x-tenant".to_string(), "worker-tenant".to_string()),
+                ]),
+                max_tokens: Some(512),
+                temperature: Some(0.25),
+                thinking_level: Some(crate::model::ThinkingLevel::Low),
+                thinking_budgets: Some(crate::provider::ThinkingBudgets {
+                    low: 128,
+                    ..crate::provider::ThinkingBudgets::default()
+                }),
+                cache_retention: crate::provider::CacheRetention::Long,
+                session_id: Some("worker-session".to_string()),
+                prompt_cache_key: Some("worker-cache".to_string()),
+                service_tier: Some("priority".to_string()),
+                ..StreamOptions::default()
+            };
+            let mut preparation = compaction_admission_preparation(1_000);
+            preparation.messages_to_summarize = vec![crate::session::SessionMessage::User {
+                content: crate::model::UserContent::Text("summarize this work".to_string()),
+                timestamp: Some(1),
+            }];
+            let mut worker = default_worker();
+            worker.start(&runtime_handle, preparation, provider, options, None);
+            let pending = worker.pending.take().expect("owned background task");
+            let abort_owner = pending.abort_tx;
+            let result = pending.join.await.expect("summary completes");
+            drop(abort_owner);
+            assert_eq!(result.summary, "worker summary");
+
+            let calls = observed.lock().expect("read dispatched options");
+            assert_eq!(calls.len(), 1);
+            let options = &calls[0];
+            assert!(options.api_key.is_none(), "header auth must remain keyless");
+            assert_eq!(options.headers["authorization"], "Bearer worker-token");
+            assert_eq!(options.headers["x-tenant"], "worker-tenant");
+            assert_eq!(options.max_tokens, Some(512));
+            assert_eq!(options.temperature, Some(0.25));
+            assert_eq!(
+                options.thinking_level,
+                Some(crate::model::ThinkingLevel::Low)
+            );
+            assert_eq!(options.thinking_budgets.as_ref().expect("budgets").low, 128);
+            assert_eq!(
+                options.cache_retention,
+                crate::provider::CacheRetention::Long
+            );
+            assert_eq!(options.session_id.as_deref(), Some("worker-session"));
+            assert_eq!(options.prompt_cache_key.as_deref(), Some("worker-cache"));
+            assert_eq!(options.service_tier.as_deref(), Some("priority"));
+        });
+    }
+
+    struct PrivacyDispatchProbe(Arc<std::sync::atomic::AtomicUsize>);
+
+    #[async_trait::async_trait]
+    impl Provider for PrivacyDispatchProbe {
+        fn name(&self) -> &'static str {
+            "privacy-probe"
+        }
+
+        fn api(&self) -> &'static str {
+            "test-api"
+        }
+
+        fn model_id(&self) -> &'static str {
+            "test-model"
+        }
+
+        async fn stream(
+            &self,
+            _context: &crate::provider::Context<'_>,
+            _options: &crate::provider::StreamOptions,
+        ) -> Result<
+            std::pin::Pin<
+                Box<dyn futures::Stream<Item = Result<crate::provider::StreamEvent>> + Send>,
+            >,
+        > {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Err(Error::api("privacy probe reached provider admission"))
+        }
+    }
+
+    #[test]
+    fn background_compaction_refuses_a_blocked_prefix_before_dispatch() {
+        run_async(|runtime_handle| async move {
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let mut preparation = compaction_admission_preparation(600_000);
+            preparation.messages_to_summarize = vec![crate::session::SessionMessage::User {
+                content: crate::model::UserContent::Text("clean history".to_string()),
+                timestamp: Some(0),
+            }];
+            preparation.turn_prefix_messages = vec![crate::session::SessionMessage::User {
+                content: crate::model::UserContent::Text("ACME-123456".to_string()),
+                timestamp: Some(1),
+            }];
+            preparation.is_split_turn = true;
+            let privacy =
+                CompactionPrivacy::from_settings(Some(&crate::secrets::SecretsSettings {
+                    mode: Some("block".to_string()),
+                    extra_patterns: Some(vec![r"^ACME-[0-9]{6}$".to_string()]),
+                }));
+            let gate = crate::agent::ProviderAdmissionGate::default();
+            let cx = crate::agent_cx::AgentCx::for_request();
+            let permit = gate.acquire(cx.cx()).await.expect("provider authority");
+            let mut worker = default_worker();
+            let origin = CompactionOrigin {
+                session_id: "origin-session".to_string(),
+                provider_id: "privacy-probe".to_string(),
+                model_id: "test-model".to_string(),
+                snapshot_leaf_id: Some("leaf-kept".to_string()),
+            };
+            worker
+                .start_for_origin(
+                    origin.clone(),
+                    permit,
+                    &runtime_handle,
+                    preparation,
+                    Arc::new(PrivacyDispatchProbe(Arc::clone(&calls))),
+                    StreamOptions {
+                        api_key: Some("auth-kept".to_string()),
+                        ..StreamOptions::default()
+                    },
+                    None,
+                    privacy,
+                    CompactionReader {
+                        accepts_images: true,
+                        source_text_budget: None,
+                    },
+                )
+                .expect("worker starts its owned request");
+            let pending = worker.pending.take().expect("owned background task");
+            assert_eq!(pending.origin, Some(origin));
+            let abort_owner = pending.abort_tx;
+            let error = pending
+                .join
+                .await
+                .expect_err("privacy must refuse before fallback");
+            drop(abort_owner);
+            assert!(error.to_string().contains("PI_SECRET_BLOCK"));
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            let _released = gate
+                .acquire(cx.cx())
+                .await
+                .expect("provider permit released");
+        });
+    }
+
     fn compaction_admission_preparation(tokens_before: u64) -> CompactionPreparation {
         CompactionPreparation {
             first_kept_entry_id: "entry-kept".to_string(),
@@ -434,6 +862,7 @@ mod tests {
             turn_prefix_messages: Vec::new(),
             is_split_turn: false,
             tokens_before,
+            retained_tokens: Some(0),
             previous_summary: None,
             file_ops: compaction::FileOperations::default(),
             settings: compaction::ResolvedCompactionSettings::default(),
@@ -474,6 +903,7 @@ mod tests {
             join,
             abort_tx: None,
             started_at: Instant::now(),
+            origin: None,
         }
     }
 
@@ -495,6 +925,7 @@ mod tests {
             join,
             abort_tx: Some(abort_tx),
             started_at: Instant::now(),
+            origin: None,
         }
     }
 
@@ -833,6 +1264,48 @@ mod tests {
     }
 
     #[test]
+    fn provider_timeout_finishes_without_foreground_polling() {
+        run_async(|runtime_handle| async move {
+            let mut worker = make_worker(CompactionQuota {
+                cooldown: Duration::ZERO,
+                timeout: Duration::from_millis(25),
+                max_attempts_per_session: 1,
+            });
+            let mut preparation = compaction_admission_preparation(1_000);
+            preparation.messages_to_summarize = vec![crate::session::SessionMessage::User {
+                content: crate::model::UserContent::Text("summarize me".to_string()),
+                timestamp: Some(1),
+            }];
+
+            worker.start(
+                &runtime_handle,
+                preparation,
+                Arc::new(NeverCompletingProvider),
+                StreamOptions {
+                    api_key: Some("test-key".to_string()),
+                    ..StreamOptions::default()
+                },
+                None,
+            );
+            asupersync::time::sleep(asupersync::time::wall_now(), Duration::from_millis(100)).await;
+
+            assert!(
+                worker
+                    .pending
+                    .as_ref()
+                    .is_some_and(PendingCompaction::is_finished),
+                "the worker must enforce its own timeout without try_recv polling"
+            );
+            let outcome = worker
+                .try_recv()
+                .await
+                .expect("timed-out compaction result");
+            let error = outcome.expect_err("never-completing provider must time out");
+            assert!(error.to_string().contains("timed out"), "got: {error}");
+        });
+    }
+
+    #[test]
     fn try_recv_success() {
         run_async(|runtime_handle| async move {
             let mut w = default_worker();
@@ -845,7 +1318,9 @@ mod tests {
                 details: compaction::CompactionDetails {
                     read_files: vec![],
                     modified_files: vec![],
+                    mode: None,
                 },
+                snap_payload: None,
             };
             let pending = ready_pending_with_handle(runtime_handle, Ok(result)).await;
             inject_pending(&mut w, pending);
@@ -859,6 +1334,237 @@ mod tests {
             let result = outcome.expect("should be Ok");
             assert_eq!(result.summary, "test summary");
             assert!(w.pending.is_none());
+        });
+    }
+
+    // Wait on a completion barrier rather than guessing how long the runtime
+    // needs. On the current-thread test runtime, the sender's task returns its
+    // outcome in the same poll before the receiver can resume.
+    async fn completed_pending_with_handle(
+        runtime_handle: RuntimeHandle,
+        outcome: CompactionOutcome,
+    ) -> PendingCompaction {
+        let (completed_tx, completed_rx) = oneshot::channel();
+        let join = runtime_handle.spawn(async move {
+            completed_tx.send(()).expect("completion receiver is alive");
+            outcome
+        });
+        completed_rx.await.expect("compaction task completed");
+        assert!(join.is_finished());
+        PendingCompaction {
+            join,
+            abort_tx: None,
+            started_at: Instant::now()
+                .checked_sub(Duration::from_secs(1))
+                .expect("test clock supports a past start"),
+            origin: None,
+        }
+    }
+
+    #[test]
+    fn delayed_poll_preserves_completed_summary_and_origin() {
+        run_async(|runtime_handle| async move {
+            let mut worker = make_worker(CompactionQuota {
+                timeout: Duration::ZERO,
+                ..CompactionQuota::default()
+            });
+            let origin = CompactionOrigin {
+                session_id: "session-a".to_string(),
+                provider_id: "provider-a".to_string(),
+                model_id: "model-a".to_string(),
+                snapshot_leaf_id: Some("leaf-a".to_string()),
+            };
+            let mut pending =
+                completed_pending_with_handle(runtime_handle, ok_compaction_outcome()).await;
+            pending.origin = Some(origin.clone());
+            inject_pending(&mut worker, pending);
+
+            let (actual_origin, outcome) = worker.try_recv_bound().await.expect("completed result");
+            assert_eq!(actual_origin, Some(origin));
+            assert_eq!(
+                outcome.expect("completed summary must not expire").summary,
+                "summary"
+            );
+            assert_eq!(worker.attempt_count, 1, "not durably applied yet");
+            assert!(
+                worker.try_recv_bound().await.is_none(),
+                "consume exactly once"
+            );
+        });
+    }
+
+    #[test]
+    fn delayed_poll_preserves_original_provider_error() {
+        run_async(|runtime_handle| async move {
+            let mut worker = make_worker(CompactionQuota {
+                timeout: Duration::ZERO,
+                ..CompactionQuota::default()
+            });
+            let pending = completed_pending_with_handle(
+                runtime_handle,
+                Err(Error::session("provider returned HTTP 500")),
+            )
+            .await;
+            inject_pending(&mut worker, pending);
+
+            let error = worker
+                .try_recv()
+                .await
+                .expect("completed result")
+                .expect_err("provider failure must be preserved");
+            assert!(error.to_string().contains("HTTP 500"), "got: {error}");
+            assert_eq!(worker.attempt_count, 1);
+            assert!(worker.pending.is_none());
+        });
+    }
+
+    #[test]
+    fn try_recv_bound_preserves_compaction_origin() {
+        run_async(|runtime_handle| async move {
+            let mut worker = default_worker();
+            let origin = CompactionOrigin {
+                session_id: "session-a".to_string(),
+                provider_id: "provider-a".to_string(),
+                model_id: "model-a".to_string(),
+                snapshot_leaf_id: Some("leaf-a".to_string()),
+            };
+            let mut pending =
+                ready_pending_with_handle(runtime_handle, ok_compaction_outcome()).await;
+            pending.origin = Some(origin.clone());
+            inject_pending(&mut worker, pending);
+            asupersync::time::sleep(
+                asupersync::time::wall_now(),
+                std::time::Duration::from_millis(50),
+            )
+            .await;
+
+            let (actual_origin, outcome) = worker
+                .try_recv_bound()
+                .await
+                .expect("completed bound compaction");
+            assert_eq!(actual_origin, Some(origin));
+            assert!(outcome.is_ok());
+        });
+    }
+
+    // Deliberately returns the full outcome type the worker consumes, not a
+    // bare `CompactionResult`.
+    #[allow(clippy::unnecessary_wraps)]
+    fn ok_compaction_outcome() -> CompactionOutcome {
+        Ok(CompactionResult {
+            summary: "summary".to_string(),
+            first_kept_entry_id: "entry-1".to_string(),
+            tokens_before: 1000,
+            details: compaction::CompactionDetails {
+                read_files: vec![],
+                modified_files: vec![],
+                mode: None,
+            },
+            snap_payload: None,
+        })
+    }
+
+    #[test]
+    fn successful_result_resets_attempt_count_only_after_durable_apply() {
+        run_async(|runtime_handle| async move {
+            let mut w = default_worker();
+            w.attempt_count = 41;
+            let pending = ready_pending_with_handle(runtime_handle, ok_compaction_outcome()).await;
+            inject_pending(&mut w, pending);
+            assert_eq!(w.attempt_count, 42);
+            asupersync::time::sleep(
+                asupersync::time::wall_now(),
+                std::time::Duration::from_millis(50),
+            )
+            .await;
+
+            let outcome = w.try_recv().await.expect("should have result");
+            assert!(outcome.is_ok());
+            assert_eq!(
+                w.attempt_count, 42,
+                "provider generation alone must not reset the attempt counter"
+            );
+            w.mark_applied_success();
+            assert_eq!(w.attempt_count, 0);
+        });
+    }
+
+    #[test]
+    fn failed_result_does_not_reset_attempt_count() {
+        run_async(|runtime_handle| async move {
+            let mut w = default_worker();
+            w.attempt_count = 4;
+            let pending = ready_pending_with_handle(
+                runtime_handle,
+                Err(Error::session("provider returned HTTP 500".to_string())),
+            )
+            .await;
+            inject_pending(&mut w, pending);
+            asupersync::time::sleep(
+                asupersync::time::wall_now(),
+                std::time::Duration::from_millis(50),
+            )
+            .await;
+
+            let outcome = w.try_recv().await.expect("should have result");
+            assert!(outcome.is_err());
+            assert_eq!(
+                w.attempt_count, 5,
+                "failed compaction must keep counting toward the attempt quota"
+            );
+        });
+    }
+
+    #[test]
+    fn timeout_does_not_reset_attempt_count() {
+        run_async(|runtime_handle| async move {
+            let mut w = make_worker(CompactionQuota {
+                timeout: Duration::from_millis(0),
+                ..CompactionQuota::default()
+            });
+            w.attempt_count = 6;
+            let mut pending = parked_pending_with_handle(runtime_handle, None).await;
+            pending.started_at = Instant::now()
+                .checked_sub(Duration::from_secs(1))
+                .unwrap_or_else(Instant::now);
+            inject_pending(&mut w, pending);
+
+            let outcome = w.try_recv().await.expect("should return timeout error");
+            assert!(outcome.is_err());
+            assert_eq!(w.attempt_count, 7);
+        });
+    }
+
+    #[test]
+    fn attempt_limit_recovers_after_success() {
+        run_async(|runtime_handle| async move {
+            let mut w = make_worker(CompactionQuota {
+                max_attempts_per_session: 3,
+                cooldown: Duration::from_millis(0),
+                ..CompactionQuota::default()
+            });
+            w.attempt_count = 2;
+            let pending = ready_pending_with_handle(runtime_handle, ok_compaction_outcome()).await;
+            inject_pending(&mut w, pending);
+            // At the limit and pending: blocked.
+            assert!(!w.can_start());
+            asupersync::time::sleep(
+                asupersync::time::wall_now(),
+                std::time::Duration::from_millis(50),
+            )
+            .await;
+
+            let outcome = w.try_recv().await.expect("should have result");
+            assert!(outcome.is_ok());
+            assert!(
+                !w.can_start(),
+                "an unapplied provider result must remain at the attempt limit"
+            );
+            w.mark_applied_success();
+            assert!(
+                w.can_start(),
+                "durably applying a successful result must reopen compaction admission"
+            );
         });
     }
 }

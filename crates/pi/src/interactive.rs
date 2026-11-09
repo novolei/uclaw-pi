@@ -14,7 +14,7 @@
 use asupersync::Cx;
 use asupersync::channel::mpsc;
 use asupersync::runtime::RuntimeHandle;
-use asupersync::sync::Mutex;
+use asupersync::sync::{Mutex, OwnedMutexGuard};
 use async_trait::async_trait;
 use bubbles::cursor::{BlinkCanceledMsg, BlinkMsg as CursorBlinkMsg, InitialBlinkMsg};
 use bubbles::spinner::{SpinnerModel, TickMsg as SpinnerTickMsg, spinners};
@@ -38,10 +38,12 @@ use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use crate::agent::{AbortHandle, Agent, AgentEvent, QueueMode};
+use crate::agent::{
+    AbortHandle, Agent, AgentEvent, AgentSession, QueueMode, QueuedAgentMessage,
+    SessionActionAdmissionGate,
+};
 use crate::autocomplete::{AutocompleteCatalog, AutocompleteItem, AutocompleteItemKind};
 use crate::config::{Config, ExtensionPolicyConfig, SettingsScope, parse_queue_mode_or_default};
-use crate::extension_events::{InputEventOutcome, apply_input_event_response};
 use crate::extensions::{
     EXTENSION_EVENT_TIMEOUT_MS, ExtensionDeliverAs, ExtensionEventName, ExtensionHostActions,
     ExtensionManager, ExtensionSendMessage, ExtensionSendUserMessage, ExtensionSession,
@@ -49,8 +51,8 @@ use crate::extensions::{
 };
 use crate::keybindings::{AppAction, KeyBinding, KeyBindings};
 use crate::model::{
-    AssistantMessageEvent, ContentBlock, CustomMessage, ImageContent, Message as ModelMessage,
-    StopReason, TextContent, ThinkingLevel, Usage, UserContent, UserMessage,
+    AssistantMessageEvent, ContentBlock, CustomMessage, Message as ModelMessage, StopReason,
+    TextContent, ThinkingLevel, Usage, UserContent, UserMessage,
 };
 use crate::models::{ModelEntry, ModelRegistry, default_models_path};
 use crate::package_manager::PackageManager;
@@ -60,27 +62,40 @@ use crate::resources::{DiagnosticKind, ResourceCliOptions, ResourceDiagnostic, R
 use crate::session::{Session, SessionEntry, SessionMessage, bash_execution_to_text};
 use crate::theme::{Theme, TuiStyles};
 use crate::tools::{process_file_arguments, resolve_read_path};
+use crate::workspace::WorkspaceHandle;
 
 #[cfg(all(feature = "clipboard", feature = "image-resize"))]
 use arboard::Clipboard as ArboardClipboard;
 
 mod agent;
+#[cfg(feature = "ftui")]
+pub(crate) use agent::tool_invocation_summary;
 mod commands;
 mod conversation;
 mod ext_session;
 mod file_refs;
 mod keybindings;
+/// Crate-visible because the ftui stack drives the same `/share` implementation
+/// rather than growing a second copy of it (bd-ydz1t.1). Only `run_share` and
+/// `ShareOutcome` are exported; everything else stays private to this stack.
+pub(crate) mod login_flow;
 mod model_selector_ui;
 mod perf;
-mod share;
+pub(crate) mod share;
 mod state;
 mod text_utils;
 mod tool_render;
 mod tree;
 mod tree_ui;
 mod view;
+pub(crate) mod workspace_reports;
 
-use self::agent::{build_user_message, extension_commands_for_catalog};
+use self::agent::build_user_message;
+pub(crate) use self::agent::extension_commands_for_catalog;
+/// Shared with the ftui stack so `/copy` behaves and reports identically on
+/// both; see the function's own note.
+pub(crate) use self::commands::copy_text_to_clipboard;
+pub(crate) use self::commands::running_under_wsl;
 pub use self::commands::{
     SlashCommand, model_entry_matches, parse_scoped_model_patterns, resolve_scoped_model_entries,
     strip_thinking_level_suffix,
@@ -89,12 +104,50 @@ use self::commands::{
     format_startup_oauth_hint, parse_bash_command, parse_extension_command,
     should_show_startup_oauth_hint,
 };
-use self::conversation::conversation_from_session;
+// Session→conversation snapshot; re-exported for the ftui migration stack
+// (bd-cv653.9.1) to rebuild its transcript after /resume.
+pub use self::conversation::conversation_from_session;
+pub(crate) use self::tree::{
+    branch_candidates, fork_candidates, format_branch_candidates, format_fork_candidates,
+    select_branch_candidate, select_fork_candidate,
+};
+
+/// Where `/export` writes when it is given no argument.
+///
+/// Free rather than a `PiApp` method because the ftui stack runs the same
+/// `/export` (bd-cv653) and must not name its files differently: an exported
+/// conversation should land in the same place whichever stack wrote it.
+pub(crate) fn default_export_path(cwd: &Path, session: &Session) -> PathBuf {
+    if let Some(path) = session.path.as_ref() {
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("session");
+        return cwd.join(format!("pi-session-{stem}.html"));
+    }
+    let id = crate::session_picker::truncate_session_id(&session.header.id, 8);
+    cwd.join(format!("pi-session-unsaved-{id}.html"))
+}
+
+/// Resolve an explicit `/export <path>` argument against the working
+/// directory. A relative path is joined; an absolute one is taken as given.
+pub(crate) fn resolve_output_path(cwd: &Path, raw: &str) -> PathBuf {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return cwd.join("pi-session.html");
+    }
+    let path = PathBuf::from(raw);
+    if path.is_absolute() {
+        path
+    } else {
+        cwd.join(path)
+    }
+}
 use self::ext_session::{InteractiveExtensionHostActions, InteractiveExtensionSession};
 pub use self::ext_session::{format_extension_ui_prompt, parse_extension_ui_response};
+pub(crate) use self::file_refs::{extract_file_references, names_an_empty_file};
 use self::file_refs::{
-    file_url_to_path, format_file_ref, is_file_ref_boundary, next_non_whitespace_token,
-    parse_quoted_file_ref, path_for_display, split_trailing_punct, strip_wrapping_quotes,
+    file_url_to_path, format_file_ref, path_for_display, strip_wrapping_quotes,
     unescape_dragged_path,
 };
 use self::perf::{
@@ -102,9 +155,12 @@ use self::perf::{
     RenderBuffers, TuiPressureController, micros_as_u64,
 };
 pub use self::state::{AgentState, InputMode, PendingInput};
+// Shared with the ftui stack (issue #208): one dropdown state machine, one
+// command catalog, so slash-command completion cannot drift between surfaces.
+pub(crate) use self::state::AutocompleteState;
 use self::state::{
-    AutocompleteState, BranchPickerOverlay, CapabilityAction, CapabilityPromptOverlay,
-    ExtensionCustomOverlay, HistoryList, InjectedMessageQueue, InteractiveMessageQueue,
+    BranchPickerOverlay, CapabilityAction, CapabilityPromptOverlay, ExtensionCustomOverlay,
+    HistoryList, InjectedMessageQueue, InteractiveMessageQueue, LoginAttempt, LoginAttemptControl,
     PendingLoginKind, PendingOAuth, QueuedMessageKind, SessionPickerOverlay, SettingsUiEntry,
     SettingsUiState, TOOL_COLLAPSE_PREVIEW_LINES, ThemePickerItem, ThemePickerOverlay,
     ToolProgress, format_count,
@@ -145,10 +201,7 @@ impl TmuxWheelGuard {
     /// - `tmux` binary is not available or returns errors
     fn install() -> Option<Self> {
         // Respect opt-out env var.
-        if std::env::var("PI_TMUX_WHEEL_OVERRIDE")
-            .ok()
-            .is_some_and(|v| v == "0")
-        {
+        if std::env::var("PI_TMUX_WHEEL_OVERRIDE").is_ok_and(|v| v == "0") {
             return None;
         }
 
@@ -240,7 +293,7 @@ impl TmuxWheelGuard {
         }
     }
 
-    fn next_shell_token_bounds(input: &str, from: usize) -> Option<(usize, usize)> {
+    const fn next_shell_token_bounds(input: &str, from: usize) -> Option<(usize, usize)> {
         let bytes = input.as_bytes();
         let mut idx = from;
         while idx < bytes.len() && bytes[idx].is_ascii_whitespace() {
@@ -383,20 +436,6 @@ fn overlay_max_visible(term_height: usize) -> usize {
 // ============================================================================
 
 impl PiApp {
-    /// Returns true when the viewport is currently anchored to the tail of the
-    /// conversation content (i.e. the user has not scrolled away from the bottom).
-    fn is_at_bottom(&self) -> bool {
-        let content = self.build_conversation_content();
-        let trimmed = content.trim_end();
-        let line_count = trimmed.lines().count();
-        let visible_rows = self.view_effective_conversation_height().max(1);
-        if line_count <= visible_rows {
-            return true;
-        }
-        let max_offset = line_count.saturating_sub(visible_rows);
-        self.conversation_viewport.y_offset() >= max_offset
-    }
-
     /// Rebuild viewport content after conversation state changes.
     /// If `follow_tail` is true the viewport is scrolled to the very bottom;
     /// otherwise the current scroll position is preserved.
@@ -538,8 +577,12 @@ impl PiApp {
             self.follow_stream_tail = false;
         } else {
             self.conversation_viewport.scroll_down(1);
-            // Re-enable auto-follow if scrolled back to the bottom.
-            if self.is_at_bottom() {
+            // Re-enable auto-follow if scrolled back to the bottom. The
+            // viewport content/height were synced just above, so its own
+            // at_bottom() is authoritative — rebuilding the whole
+            // conversation again here doubled the cost of every wheel tick
+            // (bd-k4l7w).
+            if self.conversation_viewport.at_bottom() {
                 self.follow_stream_tail = true;
             }
         }
@@ -609,6 +652,143 @@ impl PiApp {
         });
     }
 
+    fn session_transition_blocker(&self) -> Option<&'static str> {
+        if self.agent_state != AgentState::Idle {
+            return Some("Cannot change sessions while processing");
+        }
+        if !self.pending_inputs.is_empty() {
+            return Some(
+                "Queued input is still pending; finish or restore it before changing sessions",
+            );
+        }
+
+        let Ok(agent) = self.agent.try_lock() else {
+            return Some("Session busy; try again");
+        };
+        if agent.queued_message_count() > 0 {
+            return Some(
+                "Queued input is still pending; finish or restore it before changing sessions",
+            );
+        }
+        drop(agent);
+
+        let Ok(user_queue) = self.message_queue.try_lock() else {
+            return Some("Session queue busy; try again");
+        };
+        if user_queue.pending_count() > 0 {
+            return Some(
+                "Queued input is still pending; finish or restore it before changing sessions",
+            );
+        }
+        drop(user_queue);
+
+        let Ok(injected_queue) = self.injected_queue.try_lock() else {
+            return Some("Session queue busy; try again");
+        };
+        (injected_queue.pending_count() > 0).then_some(
+            "Queued input is still pending; finish or restore it before changing sessions",
+        )
+    }
+
+    async fn try_install_session(
+        session: &Arc<Mutex<Session>>,
+        agent: &Arc<Mutex<InteractiveAgent>>,
+        admission: &SessionActionAdmissionGate,
+        mut new_session: Session,
+        messages_for_agent: Vec<ModelMessage>,
+        thinking_level: Option<ThinkingLevel>,
+        preserve_cost: bool,
+    ) -> std::result::Result<(), &'static str> {
+        let cx = crate::agent_cx::AgentCx::for_current_or_request();
+        let _permit = admission
+            .acquire(cx.cx())
+            .await
+            .map_err(|_| "Session busy; session change was not applied")?;
+        // Owned guards are Send: this future is spawned and holds both locks across the saves.
+        let Ok(mut agent_guard) = OwnedMutexGuard::try_lock(Arc::clone(agent)) else {
+            return Err("Agent busy; session change was not applied");
+        };
+        let Ok(mut session_guard) = OwnedMutexGuard::try_lock(Arc::clone(session)) else {
+            return Err("Session busy; session change was not applied");
+        };
+
+        let retiring_session = !crate::cost::same_session_target(&session_guard, &new_session);
+        let save_enabled = agent_guard.handle.session().save_enabled();
+        let preserve_cost = preserve_cost || session_guard.header.id == new_session.header.id;
+        let mut retiring_budget = agent_guard.cost_budget().cloned();
+        if let Some(budget) = &retiring_budget {
+            budget
+                .checkpoint(&mut session_guard)
+                .map_err(|_| "Failed to read model spend; session change was not applied")?;
+            if save_enabled {
+                session_guard
+                    .save()
+                    .await
+                    .map_err(|_| "Failed to save model spend; session change was not applied")?;
+                if retiring_session {
+                    let prepared = budget.prepare_handoff(&session_guard).map_err(
+                        |_| "Failed to prepare model cost ancestry; session change was not applied",
+                    )?;
+                    prepared.checkpoint(&mut session_guard).map_err(
+                        |_| "Failed to retain model cost ancestry; session change was not applied",
+                    )?;
+                    session_guard.save().await.map_err(
+                        |_| "Failed to save model cost ancestry; session change was not applied",
+                    )?;
+                    retiring_budget = Some(prepared);
+                }
+            }
+        }
+        let mut cost_budget = retiring_budget
+            .as_ref()
+            .map(|budget| budget.for_replacement(&new_session, preserve_cost))
+            .transpose()
+            .map_err(|_| "Invalid model spend; session change was not applied")?;
+        if preserve_cost
+            && let (Some(candidate_budget), Some(source_budget)) = (&cost_budget, &retiring_budget)
+        {
+            candidate_budget
+                .checkpoint(&mut new_session)
+                .map_err(|_| "Failed to retain model spend; session change was not applied")?;
+            if save_enabled {
+                new_session.save().await.map_err(
+                    |_| "Failed to save retained model spend; session change was not applied",
+                )?;
+            }
+            let retained = source_budget.for_replacement(&new_session, true).map_err(
+                |_| "Failed to retain active model cost source; session change was not applied",
+            )?;
+            retained.checkpoint(&mut new_session).map_err(
+                |_| "Failed to reconcile retained model spend; session change was not applied",
+            )?;
+            if save_enabled {
+                new_session.save().await.map_err(
+                    |_| "Failed to save reconciled model spend; session change was not applied",
+                )?;
+            }
+            cost_budget = Some(retained);
+        }
+        // The source stays live if any candidate preparation fails. Once
+        // retirement succeeds, install the replacement without another await.
+        if save_enabled
+            && retiring_session
+            && let Some(budget) = &retiring_budget
+        {
+            budget.retire_session(&session_guard, cx.cx()).map_err(
+                |_| "Failed to preserve background model spend; session change was not applied",
+            )?;
+        }
+        *session_guard = new_session;
+        agent_guard.set_cost_budget(cost_budget);
+        agent_guard.replace_messages(messages_for_agent);
+        if let Some(level) = thinking_level {
+            agent_guard.stream_options_mut().thinking_level = Some(level);
+        }
+        agent_guard.session_was_replaced(crate::plan::replayed_plan_mode(&session_guard));
+        admission.advance_generation();
+        Ok(())
+    }
+
     fn toggle_queue_mode_setting(&mut self, entry: SettingsUiEntry) {
         let (key, current) = match entry {
             SettingsUiEntry::SteeringMode => ("steeringMode", self.config.steering_queue_mode()),
@@ -663,11 +843,9 @@ impl PiApp {
     }
 
     fn effective_show_hardware_cursor(&self) -> bool {
-        self.config.show_hardware_cursor.unwrap_or_else(|| {
-            std::env::var("PI_HARDWARE_CURSOR")
-                .ok()
-                .is_some_and(|val| val == "1")
-        })
+        self.config
+            .show_hardware_cursor
+            .unwrap_or_else(|| std::env::var("PI_HARDWARE_CURSOR").is_ok_and(|val| val == "1"))
     }
 
     fn effective_default_permissive(&self) -> bool {
@@ -713,6 +891,81 @@ impl PiApp {
         match entry {
             SettingsUiEntry::SteeringMode | SettingsUiEntry::FollowUpMode => {
                 self.toggle_queue_mode_setting(entry);
+            }
+            SettingsUiEntry::EnableEval => {
+                let next = !self
+                    .config
+                    .tools
+                    .as_ref()
+                    .and_then(|tools| tools.enable_eval)
+                    .unwrap_or(false);
+                if self.persist_project_settings_patch(
+                    "tools.enableEval",
+                    json!({ "tools": { "enable_eval": next, "enableEval": null } }),
+                ) {
+                    self.config.tools.get_or_insert_default().enable_eval = Some(next);
+                    self.status_message = Some(format!(
+                        "Updated tools.enableEval: {} (new session)",
+                        bool_label(next)
+                    ));
+                }
+            }
+            SettingsUiEntry::EnableGithub => {
+                let next = !self
+                    .config
+                    .tools
+                    .as_ref()
+                    .and_then(|tools| tools.enable_github)
+                    .unwrap_or(false);
+                if self.persist_project_settings_patch(
+                    "tools.enableGithub",
+                    json!({ "tools": { "enable_github": next, "enableGithub": null } }),
+                ) {
+                    self.config.tools.get_or_insert_default().enable_github = Some(next);
+                    self.status_message = Some(format!(
+                        "Updated tools.enableGithub: {} (new session)",
+                        bool_label(next)
+                    ));
+                }
+            }
+            SettingsUiEntry::EnableSecurityScan => {
+                let next = !self
+                    .config
+                    .tools
+                    .as_ref()
+                    .and_then(|tools| tools.enable_security_scan)
+                    .unwrap_or(false);
+                if self.persist_project_settings_patch(
+                    "tools.enableSecurityScan",
+                    json!({ "tools": { "enable_security_scan": next, "enableSecurityScan": null } }),
+                ) {
+                    self.config
+                        .tools
+                        .get_or_insert_default()
+                        .enable_security_scan = Some(next);
+                    self.status_message = Some(format!(
+                        "Updated tools.enableSecurityScan: {} (new session)",
+                        bool_label(next)
+                    ));
+                }
+            }
+            SettingsUiEntry::EnableSubagent => {
+                let next = !self
+                    .config
+                    .tools
+                    .as_ref()
+                    .and_then(|tools| tools.enable_subagent)
+                    .unwrap_or(false);
+                if self.persist_project_settings_patch(
+                    "tools.enableSubagent",
+                    json!({ "tools": { "enable_subagent": next, "enableSubagent": null } }),
+                ) {
+                    self.config.tools.get_or_insert_default().enable_subagent = Some(next);
+                    self.status_message = Some(format!(
+                        "Updated tools.enableSubagent: {} (new session)",
+                        bool_label(next)
+                    ));
+                }
             }
             SettingsUiEntry::DefaultPermissive => {
                 let next = !self.effective_default_permissive();
@@ -930,6 +1183,19 @@ impl PiApp {
         let keep_recent = self.config.compaction_keep_recent_tokens();
         let steering = self.config.steering_queue_mode();
         let follow_up = self.config.follow_up_queue_mode();
+        let tool_settings = self.config.tools.as_ref();
+        let enable_eval = tool_settings
+            .and_then(|tools| tools.enable_eval)
+            .unwrap_or(false);
+        let enable_github = tool_settings
+            .and_then(|tools| tools.enable_github)
+            .unwrap_or(false);
+        let enable_security_scan = tool_settings
+            .and_then(|tools| tools.enable_security_scan)
+            .unwrap_or(false);
+        let enable_subagent = tool_settings
+            .and_then(|tools| tools.enable_subagent)
+            .unwrap_or(false);
         let default_permissive = self.effective_default_permissive();
         let quiet_startup = self.config.quiet_startup.unwrap_or(false);
         let collapse_changelog = self.config.collapse_changelog.unwrap_or(false);
@@ -948,13 +1214,33 @@ impl PiApp {
             "  theme: {} (config: {})",
             self.theme.name, theme_setting
         );
-        let _ = writeln!(output, "  model: {}", self.model);
+        let _ = writeln!(output, "  model: {}", session_model_line(&self.model_entry));
         let _ = writeln!(
             output,
             "  compaction: {compaction_enabled} (reserve={reserve_tokens}, keepRecent={keep_recent})"
         );
         let _ = writeln!(output, "  steeringMode: {}", steering.as_str());
         let _ = writeln!(output, "  followUpMode: {}", follow_up.as_str());
+        let _ = writeln!(
+            output,
+            "  tools.enableEval: {} (new session)",
+            bool_label(enable_eval)
+        );
+        let _ = writeln!(
+            output,
+            "  tools.enableGithub: {} (new session)",
+            bool_label(enable_github)
+        );
+        let _ = writeln!(
+            output,
+            "  tools.enableSecurityScan: {} (new session)",
+            bool_label(enable_security_scan)
+        );
+        let _ = writeln!(
+            output,
+            "  tools.enableSubagent: {} (new session)",
+            bool_label(enable_subagent)
+        );
         let _ = writeln!(
             output,
             "  extensionPolicy.defaultPermissive: {}{}",
@@ -1017,28 +1303,11 @@ impl PiApp {
     }
 
     fn default_export_path(&self, session: &Session) -> PathBuf {
-        if let Some(path) = session.path.as_ref() {
-            let stem = path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("session");
-            return self.cwd.join(format!("pi-session-{stem}.html"));
-        }
-        let id = crate::session_picker::truncate_session_id(&session.header.id, 8);
-        self.cwd.join(format!("pi-session-unsaved-{id}.html"))
+        default_export_path(&self.cwd, session)
     }
 
     fn resolve_output_path(&self, raw: &str) -> PathBuf {
-        let raw = raw.trim();
-        if raw.is_empty() {
-            return self.cwd.join("pi-session.html");
-        }
-        let path = PathBuf::from(raw);
-        if path.is_absolute() {
-            path
-        } else {
-            self.cwd.join(path)
-        }
+        resolve_output_path(&self.cwd, raw)
     }
 
     fn spawn_save_session(&self) {
@@ -1046,25 +1315,59 @@ impl PiApp {
             return;
         }
 
-        let session = Arc::clone(&self.session);
+        let Some(owner_session_id) = self
+            .session
+            .try_lock()
+            .ok()
+            .map(|session| session.header.id.clone())
+        else {
+            return;
+        };
+        let agent = Arc::clone(&self.agent);
         let event_tx = self.event_tx.clone();
         let runtime_handle = self.runtime_handle.clone();
         let task_cx = Cx::current().unwrap_or_else(Cx::for_request);
+
+        // Nothing spawned into a cancelled region can report: the runtime
+        // cancels the task at its first await, so neither the lock failure nor
+        // an enqueue ahead of it ever runs. Say so here, where a line of output
+        // still reaches somewhere, instead of spawning a task that vanishes.
+        // See the fuller note in `submit_continue` (bd-k01i6).
+        if task_cx.is_cancel_requested() {
+            tracing::warn!(
+                event = "pi.interactive.save_skipped_cancelled_region",
+                "session save skipped: the request was already cancelled"
+            );
+            return;
+        }
+
         runtime_handle.spawn(async move {
-            let mut session_guard = match session.lock(&task_cx).await {
+            // Owned guard: `MutexGuard` is `!Send` (asupersync 0.3.9), and
+            // `RuntimeHandle::spawn` requires the future to be `Send`.
+            let mut agent_guard = match OwnedMutexGuard::lock(agent, &task_cx).await {
                 Ok(guard) => guard,
                 Err(err) => {
                     let _ = crate::interactive::enqueue_pi_event(
                         &event_tx,
                         &Cx::for_request(),
-                        PiMsg::AgentError(format!("Failed to lock session: {err}")),
+                        PiMsg::AgentError(format!("Failed to lock agent for saving: {err}")),
                     )
                     .await;
                     return;
                 }
             };
 
-            if let Err(err) = session_guard.save().await {
+            let current_session_id = agent_guard
+                .handle
+                .session()
+                .session
+                .try_lock()
+                .ok()
+                .map(|session| session.header.id.clone());
+            if current_session_id.as_deref() != Some(owner_session_id.as_str()) {
+                return;
+            }
+            if let Err(err) = agent_guard.handle.session_mut().persist_session().await {
                 let _ = crate::interactive::enqueue_pi_event(
                     &event_tx,
                     &Cx::for_request(),
@@ -1118,7 +1421,7 @@ impl PiApp {
     /// Once provider text/thinking deltas are streaming, that output already
     /// acts as progress feedback; suppressing the extra animated status row
     /// reduces redraw churn and visible flicker.
-    fn show_processing_status_spinner(&self) -> bool {
+    const fn show_processing_status_spinner(&self) -> bool {
         if matches!(self.agent_state, AgentState::Idle) || self.current_tool.is_some() {
             return false;
         }
@@ -1132,7 +1435,7 @@ impl PiApp {
     ///
     /// The spinner is rendered either for tool execution progress, or for the
     /// generic processing state before visible stream output appears.
-    fn spinner_visible(&self) -> bool {
+    const fn spinner_visible(&self) -> bool {
         if matches!(self.agent_state, AgentState::Idle) {
             return false;
         }
@@ -1143,8 +1446,14 @@ impl PiApp {
     ///
     /// Keeping this in one place prevents overlay/input drift between
     /// rendering, viewport sizing, and keyboard dispatch.
+    ///
+    /// The editor is normally hidden while a turn is running, but an ask or
+    /// approval card only ever arrives mid-turn (the tool that raised it is
+    /// still executing) and is answered through this same editor. Hiding it
+    /// then left the card's "enter a number" instruction pointing at nothing
+    /// (gh #198): keystrokes were accepted invisibly and the card timed out.
     const fn editor_input_is_available(&self) -> bool {
-        matches!(self.agent_state, AgentState::Idle)
+        (matches!(self.agent_state, AgentState::Idle) || self.has_pending_input_card())
             && self.tree_ui.is_none()
             && self.session_picker.is_none()
             && self.settings_ui.is_none()
@@ -1213,6 +1522,11 @@ impl PiApp {
 
         // Status message: "\n  {status}\n" = 2 rows.
         if self.status_message.is_some() {
+            chrome += 2;
+        }
+
+        // Todo footer summary: "\n  todo {summary}\n" = 2 rows.
+        if self.todo_summary.is_some() {
             chrome += 2;
         }
 
@@ -1305,12 +1619,24 @@ impl PiApp {
     /// Rebuild the conversation viewport after a height change (terminal resize or
     /// input area growth). Preserves mouse-wheel settings and scroll position.
     fn resize_conversation_viewport(&mut self) {
+        let follow_tail = self.follow_stream_tail;
+        let saved_offset = self.conversation_viewport.y_offset();
         let viewport_height = self.conversation_viewport_height();
         let mut viewport = Viewport::new(self.term_width.saturating_sub(2), viewport_height);
         viewport.mouse_wheel_enabled = true;
         viewport.mouse_wheel_delta = 1;
         self.conversation_viewport = viewport;
-        self.scroll_to_bottom();
+        if follow_tail {
+            self.scroll_to_bottom();
+        } else {
+            // Issue #206: a resize (or input-area growth, which routes here
+            // too) used to snap the view to the bottom unconditionally,
+            // throwing away the user's reading position. Rebuild the content
+            // at the new size, then restore the offset — set_y_offset clamps
+            // to the new maximum, so a shrunken viewport stays in range.
+            self.refresh_conversation_viewport(false);
+            self.conversation_viewport.set_y_offset(saved_offset);
+        }
     }
 
     pub fn set_terminal_size(&mut self, width: usize, height: usize) {
@@ -1377,128 +1703,32 @@ impl PiApp {
     }
 
     fn extract_file_references(&mut self, message: &str) -> (String, Vec<String>) {
-        let mut cleaned = String::with_capacity(message.len());
-        let mut file_args = Vec::new();
-        let mut idx = 0usize;
-
-        while idx < message.len() {
-            let ch = message[idx..].chars().next().unwrap_or(' ');
-            if ch == '@' && is_file_ref_boundary(message, idx) {
-                let token_start = idx + ch.len_utf8();
-                let parsed = parse_quoted_file_ref(message, token_start);
-                let (path, trailing, token_end) = parsed.unwrap_or_else(|| {
-                    let (token, token_end) = next_non_whitespace_token(message, token_start);
-                    let (path, trailing) = split_trailing_punct(token);
-                    (path.to_string(), trailing.to_string(), token_end)
-                });
-
-                if !path.is_empty() {
-                    let resolved =
-                        self.autocomplete
-                            .provider
-                            .resolve_file_ref(&path)
-                            .or_else(|| {
-                                let resolved_path = resolve_read_path(&path, &self.cwd);
-                                resolved_path.exists().then(|| path.clone())
-                            });
-
-                    if let Some(resolved) = resolved {
-                        file_args.push(resolved);
-                        let mut next_idx = token_end;
-                        if !trailing.is_empty() {
-                            Self::trim_trailing_horizontal_whitespace(&mut cleaned);
-                        } else if message[next_idx..]
-                            .chars()
-                            .next()
-                            .is_some_and(Self::is_horizontal_whitespace)
-                        {
-                            while message[next_idx..]
-                                .chars()
-                                .next()
-                                .is_some_and(Self::is_horizontal_whitespace)
-                            {
-                                next_idx +=
-                                    message[next_idx..].chars().next().map_or(0, char::len_utf8);
-                            }
-                        } else if Self::trailing_line_is_blank(&cleaned)
-                            && message[next_idx..]
-                                .chars()
-                                .next()
-                                .is_some_and(Self::is_linebreak)
-                        {
-                            Self::trim_trailing_horizontal_whitespace(&mut cleaned);
-                            next_idx += Self::consume_single_linebreak(message, next_idx);
-                        }
-                        cleaned.push_str(&trailing);
-                        idx = next_idx;
-                        continue;
-                    }
-                }
-            }
-
-            cleaned.push(ch);
-            idx += ch.len_utf8();
-        }
-
-        (cleaned, file_args)
-    }
-
-    const fn is_linebreak(ch: char) -> bool {
-        matches!(ch, '\n' | '\r')
-    }
-
-    const fn is_horizontal_whitespace(ch: char) -> bool {
-        matches!(ch, ' ' | '\t')
-    }
-
-    fn trim_trailing_horizontal_whitespace(text: &mut String) {
-        while text
-            .chars()
-            .last()
-            .is_some_and(Self::is_horizontal_whitespace)
-        {
-            text.pop();
-        }
-    }
-
-    fn trailing_line_is_blank(text: &str) -> bool {
-        if let Some((line_start, linebreak)) = text
-            .char_indices()
-            .rev()
-            .find(|(_, ch)| Self::is_linebreak(*ch))
-        {
-            let start = line_start + linebreak.len_utf8();
-            return text[start..].chars().all(Self::is_horizontal_whitespace);
-        }
-
-        text.chars().all(Self::is_horizontal_whitespace)
-    }
-
-    fn consume_single_linebreak(text: &str, start: usize) -> usize {
-        if start >= text.len() {
-            return 0;
-        }
-
-        let Some(first) = text[start..].chars().next() else {
-            return 0;
-        };
-        if !Self::is_linebreak(first) {
-            return 0;
-        }
-
-        let first_len = first.len_utf8();
-        if first == '\r' && text[start + first_len..].starts_with('\n') {
-            return first_len + '\n'.len_utf8();
-        }
-
-        first_len
+        let cwd = &self.cwd;
+        let provider = &mut self.autocomplete.provider;
+        file_refs::extract_file_references(message, |path| {
+            provider
+                .resolve_file_ref(path)
+                .or_else(|| {
+                    resolve_read_path(path, cwd)
+                        .exists()
+                        .then(|| path.to_string())
+                })
+                .filter(|resolved| !names_an_empty_file(&resolve_read_path(resolved, cwd)))
+        })
     }
 
     #[allow(clippy::too_many_lines)]
     fn load_session_from_path(&mut self, path: &str) -> Option<Cmd> {
+        if let Some(reason) = self.session_transition_blocker() {
+            self.status_message = Some(reason.to_string());
+            return None;
+        }
+
         let path = path.to_string();
+        let runtime_cwd = self.cwd.clone();
         let session = Arc::clone(&self.session);
         let agent = Arc::clone(&self.agent);
+        let admission = self.session_action_admission.clone();
         let extensions = self.extensions.clone();
         let event_tx = self.event_tx.clone();
         let runtime_handle = self.runtime_handle.clone();
@@ -1513,6 +1743,9 @@ impl PiApp {
                 guard.path.as_ref().map(|p| p.display().to_string()),
             )
         };
+
+        self.agent_state = AgentState::Processing;
+        self.status_message = Some("Loading session...".to_string());
 
         let task_cx = Cx::current().unwrap_or_else(Cx::for_request);
         runtime_handle.spawn(async move {
@@ -1539,7 +1772,12 @@ impl PiApp {
                 }
             }
 
-            let mut loaded_session = match Session::open(&path).await {
+            let mut loaded_session = match crate::session_workdir::open_session_for_runtime(
+                std::path::Path::new(&path),
+                &runtime_cwd,
+            )
+            .await
+            {
                 Ok(session) => session,
                 Err(err) => {
                     let _ = crate::interactive::enqueue_pi_event(
@@ -1555,61 +1793,32 @@ impl PiApp {
             loaded_session.session_dir = session_dir;
 
             let messages_for_agent = loaded_session.to_messages_for_current_path();
-
-            // Replace the session.
+            let (messages, usage) = conversation_from_session(&loaded_session);
+            if let Err(err) = Self::try_install_session(
+                &session,
+                &agent,
+                &admission,
+                loaded_session,
+                messages_for_agent,
+                None,
+                false,
+            )
+            .await
             {
-                let mut session_guard = match session.lock(&task_cx).await {
-                    Ok(guard) => guard,
-                    Err(err) => {
-                        let _ = crate::interactive::enqueue_pi_event(
-                            &event_tx,
-                            &Cx::for_request(),
-                            PiMsg::AgentError(format!("Failed to lock session: {err}")),
-                        )
-                        .await;
-                        return;
-                    }
-                };
-                *session_guard = loaded_session;
+                let _ = crate::interactive::enqueue_pi_event(
+                    &event_tx,
+                    &task_cx,
+                    PiMsg::AgentError(err.to_string()),
+                )
+                .await;
+                return;
             }
-
-            // Update the agent messages.
-            {
-                let mut agent_guard = match agent.lock(&task_cx).await {
-                    Ok(guard) => guard,
-                    Err(err) => {
-                        let _ = crate::interactive::enqueue_pi_event(
-                            &event_tx,
-                            &task_cx,
-                            PiMsg::AgentError(format!("Failed to lock agent: {err}")),
-                        )
-                        .await;
-                        return;
-                    }
-                };
-                agent_guard.replace_messages(messages_for_agent);
-            }
-
-            let (messages, usage) = {
-                let session_guard = match session.lock(&task_cx).await {
-                    Ok(guard) => guard,
-                    Err(err) => {
-                        let _ = crate::interactive::enqueue_pi_event(
-                            &event_tx,
-                            &Cx::for_request(),
-                            PiMsg::AgentError(format!("Failed to lock session: {err}")),
-                        )
-                        .await;
-                        return;
-                    }
-                };
-                conversation_from_session(&session_guard)
-            };
 
             let _ = crate::interactive::enqueue_pi_event(
                 &event_tx,
                 &task_cx,
                 PiMsg::ConversationReset {
+                    session_id: new_session_id.clone(),
                     messages,
                     usage,
                     status: Some("Session resumed".to_string()),
@@ -1632,7 +1841,6 @@ impl PiApp {
             }
         });
 
-        self.status_message = Some("Loading session...".to_string());
         None
     }
 }
@@ -1642,39 +1850,68 @@ const fn bool_label(value: bool) -> &'static str {
 }
 
 /// Run the interactive mode.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::future_not_send,
+    clippy::too_many_arguments,
+    clippy::too_many_lines
+)]
 pub async fn run_interactive(
-    agent: Agent,
-    session: Arc<Mutex<Session>>,
+    agent_session: AgentSession,
     config: Config,
     model_entry: ModelEntry,
     model_scope: Vec<ModelEntry>,
     available_models: Vec<ModelEntry>,
+    title_client: Option<Arc<crate::session_title::TitleClient>>,
     pending_inputs: Vec<PendingInput>,
     save_enabled: bool,
     resources: ResourceLoader,
     resource_cli: ResourceCliOptions,
-    extensions: Option<ExtensionManager>,
+    package_manager: PackageManager,
+    workspace_trust_guard: Option<crate::workspace_trust::WorkspaceTrustGuard>,
     cwd: PathBuf,
     runtime_handle: RuntimeHandle,
+    workspace: WorkspaceHandle,
+    ask_tool: Option<crate::ask::AskTool>,
+    btw_client: Option<Arc<pi::btw::BtwClient>>,
+    btw_factory: Option<pi::btw::BtwClientFactory>,
+    mcp_manager: Option<std::sync::Arc<crate::mcp::McpManager>>,
+    failover: Option<crate::sdk::FailoverOptions>,
 ) -> anyhow::Result<()> {
+    let session = Arc::clone(&agent_session.session);
+    let extensions = agent_session
+        .extensions
+        .as_ref()
+        .map(|region| region.manager().clone());
+    // Resolve the initial transcript before taking ownership of the terminal
+    // or installing request/reply bridges. A lock failure can therefore
+    // return normally without leaving the cursor hidden or UI senders open.
+    let (messages, usage) = {
+        let cx = Cx::for_request();
+        let guard = match session.lock(&cx).await {
+            Ok(guard) => guard,
+            Err(error) => {
+                if let Some(region) = &agent_session.extensions {
+                    region.shutdown().await;
+                }
+                return Err(anyhow::anyhow!("Failed to lock session: {error}"));
+            }
+        };
+        conversation_from_session(&guard)
+    };
+
     let should_check_for_updates = config.should_check_for_updates();
-    let show_hardware_cursor = config.show_hardware_cursor.unwrap_or_else(|| {
-        std::env::var("PI_HARDWARE_CURSOR")
-            .ok()
-            .is_some_and(|val| val == "1")
-    });
+    let show_hardware_cursor = config
+        .show_hardware_cursor
+        .unwrap_or_else(|| std::env::var("PI_HARDWARE_CURSOR").is_ok_and(|val| val == "1"));
     // Mouse capture defaults ON (preserves existing in-app wheel-scroll
     // behaviour). Users on Windows/CMD/Windows Terminal can opt out via
     // `--no-mouse-capture`, `disable_mouse_capture: true` in settings, or
     // `PI_NO_MOUSE_CAPTURE=1` env var to restore terminal-native click-to-
     // select / right-click-paste / Shift-Insert. See pi_agent_rust#78 for
     // the OAuth-flow copy-out problem this solves.
-    let disable_mouse_capture = config.disable_mouse_capture.unwrap_or_else(|| {
-        std::env::var("PI_NO_MOUSE_CAPTURE")
-            .ok()
-            .is_some_and(|val| val == "1")
-    });
+    let disable_mouse_capture = config
+        .disable_mouse_capture
+        .unwrap_or_else(|| std::env::var("PI_NO_MOUSE_CAPTURE").is_ok_and(|val| val == "1"));
     let mut stdout = std::io::stdout();
     if show_hardware_cursor {
         let _ = crossterm::execute!(stdout, cursor::Show);
@@ -1703,16 +1940,42 @@ pub async fn run_interactive(
         });
     }
 
-    let extensions = extensions;
+    let terminal_extensions = extensions.clone();
+    let terminal_ask_tool = ask_tool.clone();
+
+    // Ask-tool picker bridge (bd-cv653.3.8): requests flow through a channel
+    // into the UI loop; answers return via AskTool::respond_ui, mirroring the
+    // extension-UI request/response flow below.
+    if let Some(ask) = &ask_tool {
+        let (ask_ui_tx, mut ask_ui_rx) = mpsc::channel::<crate::ask::AskUiRequest>(4);
+        ask.install_channel_ui(ask_ui_tx);
+        let ask_forwarder = ask.clone();
+        let ask_event_tx = event_tx.clone();
+        let ask_ui_cx = Cx::current().unwrap_or_else(Cx::for_request);
+        runtime_handle.spawn(async move {
+            while let Ok(request) = ask_ui_rx.recv(&ask_ui_cx).await {
+                let request_id = request.id.clone();
+                ask_forwarder.try_forward_channel_ui_request(&request_id, || {
+                    ask_event_tx.try_send(PiMsg::AskUiRequest(request)).is_ok()
+                });
+            }
+        });
+    }
 
     if let Some(manager) = &extensions {
         let (extension_ui_tx, mut extension_ui_rx) = mpsc::channel::<ExtensionUiRequest>(64);
         manager.set_ui_sender(extension_ui_tx);
 
+        let extension_ui_manager = manager.clone();
         let extension_event_tx = event_tx.clone();
         let extension_ui_cx = Cx::current().unwrap_or_else(Cx::for_request);
         runtime_handle.spawn(async move {
             while let Ok(request) = extension_ui_rx.recv(&extension_ui_cx).await {
+                if request.expects_response()
+                    && !extension_ui_manager.ui_request_is_pending(&request.id)
+                {
+                    continue;
+                }
                 if !enqueue_pi_event(
                     &extension_event_tx,
                     &extension_ui_cx,
@@ -1726,25 +1989,16 @@ pub async fn run_interactive(
         });
     }
 
-    let (messages, usage) = {
-        let cx = Cx::for_request();
-        let guard = session
-            .lock(&cx)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to lock session: {e}"))?;
-        conversation_from_session(&guard)
-    };
-
     // Build the bubbletea program. Mouse capture is conditional: ON by
     // default (so in-app mouse-wheel scrolling routes to the TUI), but
     // disabled when the user opts out via --no-mouse-capture / settings /
     // PI_NO_MOUSE_CAPTURE so terminal-native copy/paste keeps working
     // (Windows-specific UX win — see pi_agent_rust#78). When disabled,
     // users scroll with Page Up/Down or arrow keys instead.
-    {
-        let app = Box::new(PiApp::new(
-            agent,
-            session,
+    let shutdown_owner;
+    let program_result = {
+        let mut app = Box::new(PiApp::from_agent_session(
+            agent_session,
             config,
             resources,
             resource_cli,
@@ -1752,24 +2006,67 @@ pub async fn run_interactive(
             model_entry,
             model_scope,
             available_models,
+            title_client,
             pending_inputs,
             event_tx,
             runtime_handle,
             save_enabled,
             true,
-            extensions,
             None,
             messages,
             usage,
+            mcp_manager,
+            failover,
         ));
+        // Keep the actual AgentSession/ExtensionRegion alive until async
+        // shutdown finishes, even after the terminal program drops PiApp.
+        shutdown_owner = Arc::clone(&app.agent);
+        // Retain the actual launch admission so `/reload` cannot resolve
+        // changed project packages under a stale trust decision.
+        app.set_reload_package_manager(package_manager, workspace_trust_guard);
+        app.ask_tool = ask_tool;
+        // The live multi-root handle must reach the app (bd-cv653.3.12) —
+        // without it /add-dir, @-file scope, and autocomplete run on a
+        // disconnected default handle.
+        app.set_workspace(workspace);
+        if let Some(client) = btw_client {
+            app.set_btw_client(client);
+        }
+        if let Some(factory) = btw_factory {
+            app.set_btw_factory(factory);
+        }
         let mut program = Program::new(app)
             .with_alt_screen()
             .with_input_receiver(ui_rx);
         if !disable_mouse_capture {
             program = program.with_mouse_all_motion();
         }
-        program.run()?;
+        // Divert tracing output away from the terminal while the TUI owns it
+        // (bd-trkef): stderr writes would be painted into the alt-screen
+        // frame and corrupt the transcript. Restored on drop, even on error.
+        let _log_guard = crate::tui::TuiLogRedirectGuard::begin();
+        program.run()
+    };
+
+    // Terminally close both request/reply surfaces before bridge teardown.
+    // This runs on normal exit and on `Program::run` errors, so outstanding
+    // tool/extension futures cannot wait for a UI that no longer exists.
+    if let Some(ask_tool) = &terminal_ask_tool {
+        ask_tool.close_channel_ui();
     }
+    if let Some(manager) = &terminal_extensions {
+        manager.close_ui_sender_and_cancel_pending();
+        let _ = manager
+            .dispatch_event(ExtensionEventName::SessionShutdown, None)
+            .await;
+        if !manager
+            .shutdown(ExtensionManager::DEFAULT_CLEANUP_BUDGET)
+            .await
+        {
+            tracing::warn!("classic extension shutdown exceeded its cleanup budget");
+        }
+    }
+    drop(shutdown_owner);
 
     // Tell the async bridge to exit promptly even if some background task still
     // holds an event sender clone after the TUI has already shut down.
@@ -1779,6 +2076,7 @@ pub async fn run_interactive(
     enqueue_ui_shutdown(&shutdown_event_tx, &shutdown_cx).await;
 
     let _ = crossterm::execute!(std::io::stdout(), cursor::Show);
+    program_result?;
     println!("Goodbye!");
     Ok(())
 }
@@ -1791,25 +2089,122 @@ pub(crate) async fn enqueue_ui_shutdown(event_tx: &mpsc::Sender<PiMsg>, cx: &Cx)
     let _ = enqueue_pi_event(event_tx, cx, PiMsg::UiShutdown).await;
 }
 
+/// In-flight ask card (bd-cv653.3.8): one question shown at a time,
+/// accumulating answers until the request completes or is cancelled.
+#[derive(Debug, Clone)]
+pub(crate) struct ActiveAskCard {
+    pub(crate) request: crate::ask::AskUiRequest,
+    pub(crate) question_index: usize,
+    pub(crate) answers: Vec<crate::ask::AskAnswer>,
+}
+
+/// Which kind of input card currently owns the editor (bd-1qol9).
+///
+/// Exactly one may be active at a time; `PiApp::input_card_order` preserves
+/// global arrival order across both kinds so answers can never reorder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InputCardKind {
+    Ask,
+    Extension,
+}
+
 /// Custom message types for async agent events.
+/// What the FTUI powerline status line shows (OMP-style: display name, not
+/// the provider/id identity), captured by the driver after every command.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct FtuiStatusSnapshot {
+    /// The model's display label: catalog/`models.json` name, else the id.
+    pub model: String,
+    pub thinking: Option<String>,
+    /// Plan mode (`act` when off).
+    pub mode: String,
+    pub cwd: String,
+    pub vcs: Option<String>,
+    /// Last prompt's context use as a percentage of the model's window.
+    pub context_pct: u8,
+    pub cost_usd: f64,
+    pub tokens: u64,
+    pub session_name: String,
+}
+
 #[derive(Debug, Clone)]
 pub enum PiMsg {
     /// Agent started processing.
     AgentStart,
+    /// Delimits assistant output so a retry discards only the incomplete
+    /// response, preserving output from completed tool cycles in the turn.
+    AssistantMessageStart,
+    /// Automatic provider recovery is visible without marking the turn idle.
+    ProviderRecovery {
+        message: String,
+        model: Option<(String, String)>,
+        discard_incomplete: bool,
+    },
     /// Trigger processing of the next queued input (CLI startup messages).
     RunPending,
-    /// Enqueue a pending input (extensions may inject while idle).
-    EnqueuePendingInput(PendingInput),
+    /// Enqueue an input only while its originating session remains current.
+    EnqueuePendingInput {
+        session_id: String,
+        input: PendingInput,
+    },
     /// Internal: shut down the async→UI message bridge (used for clean exit).
     UiShutdown,
+    /// Host-driven terminal (tab) title update (issue #200). Emitted by
+    /// driver commands (`/name`, `/resume`, `/new`) for surfaces whose
+    /// renderer cannot embed OSC sequences in frame content (ftui); the
+    /// charmed stack ignores it because its header re-emits the title every
+    /// frame.
+    TerminalTitle(String),
+    /// FTUI `/login` state (the charmed stack keeps its own pending login and
+    /// ignores this). `Some(provider)` routes the next submitted line to the
+    /// login as a code or key, never echoed into the transcript; `None` ends
+    /// that. `accepts_empty_input` is true for device flows, where a bare
+    /// Enter polls.
+    LoginPending {
+        provider: Option<String>,
+        accepts_empty_input: bool,
+    },
+    /// FTUI status-line snapshot from the driver, which owns the session
+    /// state the line shows. The charmed stack renders its own and ignores
+    /// this.
+    StatusSnapshot(FtuiStatusSnapshot),
+    /// Saved/effective preferences for the default stack's settings editor.
+    /// `changed` names the only live display preference to update.
+    #[cfg(feature = "ftui")]
+    Settings {
+        snapshot: crate::interactive_ftui::SettingsSnapshot,
+        changed: Option<crate::interactive_ftui::SettingsKey>,
+    },
+    /// The user messages on the current path, oldest first, as
+    /// `(summary, entry id)`, for the FTUI's `/branch` and double-Esc picker.
+    /// `fork` means the pick forks a new session instead of rewinding in
+    /// place. The charmed stack ignores it.
+    MessagePicker {
+        fork: bool,
+        messages: Vec<(String, String)>,
+    },
     /// Periodic autocomplete refresh tick (background file index).
     AutocompleteRefresh,
+    /// Replacement completion catalog (issue #208). The ftui driver sends it
+    /// once its session exists, so extension-contributed commands join the
+    /// built-in list; the charmed stack builds its catalog inline and
+    /// ignores this.
+    AutocompleteCatalog(crate::autocomplete::AutocompleteCatalog),
+    /// Atomically replace reloaded prompt/skill bodies and their completion
+    /// catalog. Side-command routing must use the same loader as the driver.
+    ResourcesReloadedWithCatalog {
+        resources: Box<crate::resources::ResourceLoader>,
+        catalog: crate::autocomplete::AutocompleteCatalog,
+    },
     /// Text delta from assistant.
     TextDelta(String),
     /// Thinking delta from assistant.
     ThinkingDelta(String),
     /// Tool execution started.
     ToolStart { name: String, tool_id: String },
+    /// Human-readable summary of the running tool's invocation (e.g. the bash
+    /// command line). Sent immediately after `ToolStart` when derivable.
+    ToolInvocation { tool_id: String, summary: String },
     /// Tool execution update (streaming output).
     ToolUpdate {
         name: String,
@@ -1817,17 +2212,45 @@ pub enum PiMsg {
         content: Vec<ContentBlock>,
         details: Option<Value>,
     },
-    /// Tool execution ended.
+    /// FTUI's operation-owned lifecycle and bounded progress mailbox.
+    /// Progress replaces a mailbox snapshot without entering the driver
+    /// queue. The classic interface uses its own stream batcher.
+    #[cfg(feature = "ftui")]
+    FtuiToolProgress(crate::interactive_ftui::tool_progress::Event),
+    /// An accepted out:// write. It is assistant prose within the current
+    /// turn, not a task completion or a tool-output preview.
+    InterimResponse { tool_id: String, text: String },
+    /// Tool execution ended. `output` carries an OPTIONAL size-capped text
+    /// preview of the tool result (bd-cv653.9.2 diff cards); `None` when
+    /// the surface folds output elsewhere (e.g. the ftui bash flow).
+    /// `Some("")` is an authoritative empty result that clears a live preview.
     ToolEnd {
         name: String,
         tool_id: String,
         is_error: bool,
+        output: Option<String>,
     },
+    /// Session todo list changed (bd-cv653.3.9). Carries the compact
+    /// `todo_list.v1` summary line for the footer; `None` clears it.
+    TodoSummary { summary: Option<String> },
+    /// The ask tool needs the user to answer question cards (bd-cv653.3.8).
+    AskUiRequest(crate::ask::AskUiRequest),
     /// Agent finished with final message.
     AgentDone {
         usage: Option<Usage>,
         stop_reason: StopReason,
         error_message: Option<String>,
+    },
+    /// A durably completed turn stopped at its time cap; queued input stays paused.
+    AgentTimeCap {
+        usage: Option<Usage>,
+        message: String,
+    },
+    /// A background title was durably installed. The UI only acknowledges
+    /// it while the same session and name remain current.
+    SessionTitleSuggestion {
+        owner_session_id: String,
+        title: String,
     },
     /// Agent error.
     AgentError(String),
@@ -1837,33 +2260,97 @@ pub enum PiMsg {
     System(String),
     /// System note that does not mutate agent state (safe during streaming).
     SystemNote(String),
+    /// Session-bound system note; discarded if its origin is no longer current.
+    SessionSystemNote {
+        owner_session_id: String,
+        message: String,
+    },
+    /// A durable async selection completed. Read the owning session's current
+    /// model when delivered, so an older completion cannot overwrite a newer
+    /// selection or relabel a replacement session.
+    SessionModelChanged {
+        owner_session_id: String,
+        message: String,
+    },
+    /// Classic terminal review completion, scoped to its session and request.
+    ReviewFinished {
+        owner_session_id: String,
+        request_id: String,
+        message: String,
+    },
+    /// Only the matching operator request can end an MCP authentication wait.
+    McpAuthFinished { request_id: String, message: String },
+    /// A terminal handoff reply can settle only the request that admitted it.
+    HandoffFinished {
+        request_id: String,
+        event: Box<Self>,
+    },
     /// Update last user message content (input transform/redaction).
     UpdateLastUserMessage(String),
-    /// Bash command result (non-agent).
-    BashResult {
-        display: String,
-        content_for_agent: Option<Vec<ContentBlock>>,
+    /// Display driver-submitted input that did not pass through the editor.
+    /// Startup prompts use this once, before the corresponding agent turn.
+    UserInputSubmitted {
+        owner_session_id: String,
+        text: String,
+        /// Authored input only; display text may include generated file bodies.
+        history_text: String,
     },
+    /// Bash command result (non-agent). The run is already recorded in the
+    /// session; this only shows it.
+    BashResult { display: String },
     /// Async OAuth device flow start
     OAuthDeviceFlowStarted {
+        attempt_id: String,
         provider: String,
         device_code: String,
         user_code: String,
         verification_uri: String,
         expires_in: u64,
     },
+    /// Only the login that admitted this work may settle or retry it.
+    LoginFinished {
+        attempt_id: String,
+        error: Option<String>,
+        retry: bool,
+    },
     /// Replace conversation state from session (compaction/fork).
     ConversationReset {
+        session_id: String,
         messages: Vec<ConversationMessage>,
         usage: Usage,
         status: Option<String>,
     },
+    /// Classic `/retry` committed the sibling leaf; reset UI from Session
+    /// and enqueue the abandoned prompt without slash-command reparse.
+    RetryCommitted {
+        session_id: String,
+        messages: Vec<ConversationMessage>,
+        usage: Usage,
+        text: String,
+        status: Option<String>,
+    },
     /// Set the editor contents (used by /tree selection of user/custom messages).
-    SetEditorText(String),
+    SetEditorText {
+        owner_session_id: String,
+        text: String,
+    },
+    /// Return unclaimed turn input without replacing a newer editor draft.
+    RestorePendingInput {
+        owner_session_id: String,
+        text: String,
+    },
     /// Open the session tree selector (async from extension hooks).
     OpenTree {
+        owner_session_id: String,
         initial_selected_id: Option<String>,
         label: Option<String>,
+    },
+    /// Internal bounded retry for a session-scoped event whose authoritative
+    /// Session lock was transiently busy. The boxed event is always the
+    /// original owner-tagged event, never another retry envelope.
+    SessionEventRetry {
+        event: Box<Self>,
+        attempts_remaining: u8,
     },
     /// Reloaded skills/prompts/themes/extensions.
     ResourcesReloaded {
@@ -1873,15 +2360,45 @@ pub enum PiMsg {
     },
     /// Extension UI request (select/confirm/input/editor/custom/notify).
     ExtensionUiRequest(ExtensionUiRequest),
+    /// Periodic redraw or final deadline wake for one capability prompt.
+    ///
+    /// Carries request, prompt, and timer generations so late or duplicated
+    /// wakes cannot resolve or rearm a replacement timer/overlay.
+    CapabilityPromptTick {
+        id: String,
+        generation: u64,
+        timer_generation: u64,
+    },
     /// Extension command finished execution.
     ExtensionCommandDone {
         command: String,
         display: String,
         is_error: bool,
     },
-    /// OAuth callback server received the browser redirect.
-    /// The string is the full callback URL (e.g. `http://localhost:1455/auth/callback?code=abc&state=xyz`).
-    OAuthCallbackReceived(String),
+    /// Poll the callback receiver retained by one live login owner.
+    OAuthCallbackPoll { attempt_id: String },
+    /// A browser redirect can only supply the OAuth attempt that opened it.
+    OAuthCallbackReceived {
+        attempt_id: String,
+        callback_url: String,
+    },
+}
+
+/// Retry a contended session-scoped UI event with at most 80 deliberate 25 ms
+/// sleeps. Scheduler and queue delays are outside this budget, so this bounds
+/// retry work rather than wall-clock age; exhaustion remains observable.
+pub(super) const SESSION_EVENT_LOCK_RETRY_ATTEMPTS: u8 = 80;
+const SESSION_EVENT_LOCK_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(25);
+
+pub(super) fn session_event_retry_cmd(event: PiMsg, attempts_remaining: u8) -> Option<Cmd> {
+    let next_attempts = attempts_remaining.checked_sub(1)?;
+    Some(Cmd::blocking(move || {
+        std::thread::sleep(SESSION_EVENT_LOCK_RETRY_DELAY);
+        Message::new(PiMsg::SessionEventRetry {
+            event: Box::new(event),
+            attempts_remaining: next_attempts,
+        })
+    }))
 }
 
 /// Read the current git branch from `.git/HEAD` in the given directory.
@@ -1958,12 +2475,45 @@ fn read_jj_change(cwd: &Path) -> Option<String> {
     Some(format!("jj:{line}"))
 }
 
+/// Save the clipboard's image as a temporary PNG and return an `@file`
+/// reference to it for the editor, as ctrl+v does on the classic stack.
+/// `None` when the clipboard holds no image (or clipboard support is off).
+pub(crate) fn paste_clipboard_image_ref() -> Option<String> {
+    let path = PiApp::paste_image_from_clipboard()?;
+    Some(format_file_ref(&path.display().to_string()))
+}
+
+/// What to show for a model (gh #214): its models.json `name` when one is set
+/// and differs from the id, else `provider/id`. Display only: selection,
+/// cycling, and lookups keep using `provider/id`.
+pub(crate) fn model_display_label(entry: &ModelEntry) -> String {
+    let name = entry.model.name.trim();
+    if name.is_empty() || name == entry.model.id {
+        format!("{}/{}", entry.model.provider, entry.model.id)
+    } else {
+        name.to_string()
+    }
+}
+
+/// A model for `/session`-style listings: the display name with the
+/// `provider/id` it resolves to, or just `provider/id` when there is no
+/// distinct name.
+pub(crate) fn session_model_line(entry: &ModelEntry) -> String {
+    let identity = format!("{}/{}", entry.model.provider, entry.model.id);
+    let display = model_display_label(entry);
+    if display == identity {
+        identity
+    } else {
+        format!("{display} ({identity})")
+    }
+}
+
 /// Read VCS info for the interactive status bar: prefers jj in colocated
 /// repos (where both `.jj` and `.git` exist) so the status bar reflects
 /// the VCS the user is actually driving, and falls back to the git
 /// branch name in pure-git repos. Returns `None` when neither is
 /// detectable.
-fn read_vcs_info(cwd: &Path) -> Option<String> {
+pub(crate) fn read_vcs_info(cwd: &Path) -> Option<String> {
     read_jj_change(cwd).or_else(|| read_git_branch(cwd))
 }
 
@@ -2013,7 +2563,8 @@ fn build_startup_welcome_message(config: &Config, available_models: &[ModelEntry
         return String::new();
     }
 
-    let mut message = String::from("  Welcome to Pi!\n");
+    let welcome = crate::overlay_system::WelcomeScreen::default();
+    let mut message = format!("  {}\n", welcome.greeting);
     message.push_str("  Type a message to begin, or /help for commands.\n");
 
     if available_models
@@ -2108,7 +2659,7 @@ fn persist_last_changelog_version_with_roots(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn prepare_startup_changelog_with_roots(
+fn prepare_startup_changelog_with_roots<'a>(
     config: &mut Config,
     global_dir: &Path,
     cwd: &Path,
@@ -2116,22 +2667,22 @@ fn prepare_startup_changelog_with_roots(
     has_existing_messages: bool,
     persist_version_updates: bool,
     current_version: &str,
-    changelog_markdown: &str,
+    changelog_markdown: impl FnOnce() -> &'a str,
 ) -> Option<StartupChangelog> {
     if has_existing_messages {
         return None;
     }
 
     let remember_version = |config: &mut Config| {
-        if persist_version_updates {
-            if let Err(err) = persist_last_changelog_version_with_roots(
+        if persist_version_updates
+            && let Err(err) = persist_last_changelog_version_with_roots(
                 global_dir,
                 cwd,
                 config_override,
                 current_version,
-            ) {
-                tracing::warn!("Failed to persist last changelog version: {err}");
-            }
+            )
+        {
+            tracing::warn!("Failed to persist last changelog version: {err}");
         }
         config.last_changelog_version = Some(current_version.to_string());
     };
@@ -2145,8 +2696,11 @@ fn prepare_startup_changelog_with_roots(
         return None;
     }
 
-    let markdown =
-        collect_startup_changelog_sections(changelog_markdown, current_version, last_seen_version)?;
+    let markdown = collect_startup_changelog_sections(
+        changelog_markdown(),
+        current_version,
+        last_seen_version,
+    )?;
     remember_version(config);
 
     if config.quiet_startup.unwrap_or(false) || config.collapse_changelog.unwrap_or(false) {
@@ -2216,7 +2770,7 @@ mod startup_changelog_tests {
             false,
             true,
             "0.1.9",
-            SAMPLE_CHANGELOG,
+            || SAMPLE_CHANGELOG,
         );
 
         let markdown = match result {
@@ -2238,17 +2792,226 @@ mod startup_changelog_tests {
                 .expect("valid settings json");
         assert_eq!(persisted["lastChangelogVersion"], "0.1.9");
     }
+
+    #[test]
+    fn prepare_startup_changelog_does_not_read_current_changelog() {
+        let temp = tempdir();
+        let global_dir = temp.path().join("global");
+        let cwd = temp.path().join("cwd");
+        std::fs::create_dir_all(&global_dir).expect("global dir");
+        std::fs::create_dir_all(&cwd).expect("cwd dir");
+
+        let mut config = Config {
+            last_changelog_version: Some("0.1.9".to_string()),
+            ..Config::default()
+        };
+        let read = std::cell::Cell::new(false);
+        let result = prepare_startup_changelog_with_roots(
+            &mut config,
+            &global_dir,
+            &cwd,
+            None,
+            false,
+            false,
+            "0.1.9",
+            || {
+                read.set(true);
+                SAMPLE_CHANGELOG
+            },
+        );
+
+        assert!(result.is_none());
+        assert!(!read.get(), "current changelog should stay compressed");
+    }
+}
+
+#[cfg(test)]
+mod editor_keybinding_tests {
+    use super::{AppAction, KeyBindings, TextArea, apply_editor_keybinding_overrides};
+
+    fn keys_of(binding: &bubbles::key::Binding) -> Vec<String> {
+        binding.get_keys().to_vec()
+    }
+
+    #[test]
+    fn a_rebound_editor_action_reaches_the_editor() {
+        // The failure this replaces: pi parsed the override, stored it,
+        // matched it against the pressed key, and then handed the raw key to
+        // a TextArea that had never heard of it.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("keybindings.json");
+        std::fs::write(&path, r#"{ "deleteWordBackward": ["ctrl+q"] }"#).expect("write config");
+        let keybindings = KeyBindings::load(&path).expect("load keybindings");
+
+        let mut input = TextArea::new();
+        let before = keys_of(&input.key_map.delete_word_backward);
+        apply_editor_keybinding_overrides(&keybindings, &mut input);
+
+        assert_eq!(
+            keys_of(&input.key_map.delete_word_backward),
+            vec!["ctrl+q".to_string()],
+            "the override did not reach the editor (was {before:?})"
+        );
+    }
+
+    #[test]
+    fn an_untouched_action_keeps_every_key_the_editor_shipped() {
+        // pi's catalog mirrors this widget's defaults but is not identical to
+        // them — the widget also answers ctrl+h here — so overwriting entries
+        // nobody asked about would silently remove working keys.
+        let mut input = TextArea::new();
+        let shipped = keys_of(&input.key_map.delete_character_backward);
+        assert!(
+            shipped.iter().any(|key| key == "ctrl+h"),
+            "test premise changed: the widget no longer ships ctrl+h ({shipped:?})"
+        );
+
+        apply_editor_keybinding_overrides(&KeyBindings::new(), &mut input);
+        assert_eq!(
+            keys_of(&input.key_map.delete_character_backward),
+            shipped,
+            "defaults must pass through untouched"
+        );
+    }
+
+    #[test]
+    fn application_actions_are_not_pushed_into_the_editor() {
+        // Submit belongs to pi's dispatcher; handing it to the editor would
+        // make enter insert a newline instead of sending the message.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("keybindings.json");
+        std::fs::write(&path, r#"{ "submit": ["ctrl+j"] }"#).expect("write config");
+        let keybindings = KeyBindings::load(&path).expect("load keybindings");
+        assert_eq!(
+            keybindings.get_bindings(AppAction::Submit),
+            KeyBindings::load(&path)
+                .expect("reload")
+                .get_bindings(AppAction::Submit),
+            "premise: the override loaded"
+        );
+
+        let mut input = TextArea::new();
+        let shipped = keys_of(&input.key_map.insert_newline);
+        apply_editor_keybinding_overrides(&keybindings, &mut input);
+        assert_eq!(
+            keys_of(&input.key_map.insert_newline),
+            shipped,
+            "Submit must not reach the editor's newline entry"
+        );
+    }
+}
+
+/// The `TextArea` keymap entry an editor action drives, if it drives one.
+///
+/// `None` for everything pi's own dispatcher owns (Submit, Interrupt, the
+/// pickers) and for the editor actions the widget has no entry for: `Yank`,
+/// `YankPop` and `Undo`.
+const fn editor_keymap_entry(
+    key_map: &mut bubbles::textarea::KeyMap,
+    action: AppAction,
+) -> Option<&mut bubbles::key::Binding> {
+    Some(match action {
+        AppAction::CursorLeft => &mut key_map.character_backward,
+        AppAction::CursorRight => &mut key_map.character_forward,
+        AppAction::CursorWordLeft => &mut key_map.word_backward,
+        AppAction::CursorWordRight => &mut key_map.word_forward,
+        AppAction::CursorLineStart => &mut key_map.line_start,
+        AppAction::CursorLineEnd => &mut key_map.line_end,
+        AppAction::CursorUp => &mut key_map.line_previous,
+        AppAction::CursorDown => &mut key_map.line_next,
+        AppAction::JumpBackward => &mut key_map.input_begin,
+        AppAction::JumpForward => &mut key_map.input_end,
+        AppAction::DeleteCharBackward => &mut key_map.delete_character_backward,
+        AppAction::DeleteCharForward => &mut key_map.delete_character_forward,
+        AppAction::DeleteWordBackward => &mut key_map.delete_word_backward,
+        AppAction::DeleteWordForward => &mut key_map.delete_word_forward,
+        AppAction::DeleteToLineStart => &mut key_map.delete_before_cursor,
+        AppAction::DeleteToLineEnd => &mut key_map.delete_after_cursor,
+        AppAction::NewLine => &mut key_map.insert_newline,
+        _ => return None,
+    })
+}
+
+/// Teach the editor the editor keys the user rebound.
+///
+/// `keybindings.json` accepts all 59 actions, and for the editor-native ones
+/// pi stored the override, matched it against the pressed key, and then
+/// forwarded the raw key to a `TextArea` that had never heard of it. So
+/// rebinding `deleteWordBackward` — the example in `load_from_user_config`'s
+/// own documentation — did nothing at all.
+///
+/// Only overridden actions are pushed. pi's defaults were written to mirror
+/// this widget's, but not exactly: the widget also answers `ctrl+h` for
+/// delete-character-backward and `ctrl+home`/`ctrl+end` for the document
+/// jumps, which pi's catalog does not list. Replacing untouched entries would
+/// quietly take those away, so untouched entries are left alone and only a
+/// deliberate override moves anything.
+fn apply_editor_keybinding_overrides(keybindings: &KeyBindings, input: &mut TextArea) {
+    let defaults = KeyBindings::new();
+    for &action in AppAction::all() {
+        let bound = keybindings.get_bindings(action);
+        if bound.is_empty() || bound == defaults.get_bindings(action) {
+            continue;
+        }
+        let Some(entry) = editor_keymap_entry(&mut input.key_map, action) else {
+            continue;
+        };
+        let rendered: Vec<String> = bound.iter().map(ToString::to_string).collect();
+        let keys: Vec<&str> = rendered.iter().map(String::as_str).collect();
+        entry.set_keys(&keys);
+    }
+}
+
+/// The classic UI's live agent and its durable Session have one owner.
+///
+/// Idle editor operations access the Agent through this owner; complete user
+/// turns use its SDK handle so persistence, retry and failover share the same
+/// admission authority and state for the lifetime of the UI.
+pub struct InteractiveAgent {
+    handle: crate::sdk::AgentSessionHandle,
+}
+
+impl InteractiveAgent {
+    /// Called only after a new, loaded, or durably forked Session and its
+    /// matching transcript have been installed together under both locks.
+    fn session_was_replaced(&mut self, plan_mode: crate::plan::PlanMode) {
+        self.handle.session_mut().invalidate_background_compaction();
+        self.handle
+            .session_mut()
+            .agent
+            .reset_session_scoped_state(plan_mode);
+        self.handle
+            .session()
+            .refresh_extension_completion_host_state();
+        self.handle.session().provider_admission_gate().clear();
+    }
+}
+
+impl std::ops::Deref for InteractiveAgent {
+    type Target = Agent;
+
+    fn deref(&self) -> &Self::Target {
+        &self.handle.session().agent
+    }
+}
+
+impl std::ops::DerefMut for InteractiveAgent {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.handle.session_mut().agent
+    }
 }
 
 /// The main interactive TUI application model.
 #[allow(clippy::struct_excessive_bools)]
 #[derive(bubbletea::Model)]
 pub struct PiApp {
-    // Input state
+    // Multi-root workspace state (bd-cv653.3.12); installed post-construction.
+    workspace: WorkspaceHandle,
     input: TextArea,
     history: HistoryList,
     input_mode: InputMode,
     pending_inputs: VecDeque<PendingInput>,
+    pending_inputs_paused_by_time_cap: bool,
     message_queue: Arc<StdMutex<InteractiveMessageQueue>>,
     injected_queue: Arc<StdMutex<InjectedMessageQueue>>,
 
@@ -2258,6 +3021,18 @@ pub struct PiApp {
     /// Set to false when the user manually scrolls up; re-enabled when they
     /// scroll back to the bottom or a new user message is submitted.
     follow_stream_tail: bool,
+    /// Last thinking level successfully read from the session header for the
+    /// input-frame badge. The render path uses `try_lock`, and falling back
+    /// to the config default whenever the agent holds the session lock made
+    /// the badge flicker between the session's real level and the default
+    /// mid-turn (issue #197). `Cell` because the render path takes `&self`.
+    thinking_badge_cache: std::cell::Cell<Option<ThinkingLevel>>,
+    /// `/btw` side-question client on the smol role (bd-cv653.3.16);
+    /// `None` when the role does not resolve or lacks credentials.
+    btw_client: Option<Arc<pi::btw::BtwClient>>,
+    /// Rebinds the `/btw` client when `/model smol <spec>` changes the role
+    /// (bd-9jgrt); absent on surfaces without startup auth context.
+    btw_factory: Option<pi::btw::BtwClientFactory>,
     spinner: SpinnerModel,
     agent_state: AgentState,
 
@@ -2270,29 +3045,62 @@ pub struct PiApp {
     messages: Vec<ConversationMessage>,
     current_response: String,
     current_thinking: String,
+    current_assistant_start: (usize, usize),
+    discard_incomplete_on_next_assistant: bool,
     thinking_visible: bool,
     tools_expanded: bool,
     current_tool: Option<String>,
+    /// One-line invocation summary for the running tool, keyed by tool_id so
+    /// interleaved (parallel) tool events can never stamp one tool's command
+    /// onto another tool's output block. Shown in the status row and
+    /// transcript header. Tuple is `(tool_id, summary)`.
+    /// Invocation summaries keyed by tool_id: parallel batches emit ALL
+    /// ToolStart/ToolInvocation events up front, so a single slot kept only
+    /// the last tool's summary and every other header lost its command line.
+    current_tool_summary: std::collections::HashMap<String, String>,
+    /// tool_id of the most recent ToolStart — the status row shows that
+    /// tool's invocation summary.
+    current_tool_id: Option<String>,
     tool_progress: Option<ToolProgress>,
     pending_tool_output: Option<String>,
+    /// Compact `todo_list.v1` footer summary (bd-cv653.3.9), state-driven
+    /// from the todo tool's result details.
+    todo_summary: Option<String>,
 
     // Session and config
     session: Arc<Mutex<Session>>,
+    /// Shared generation source for extension Session actions. Advanced exactly
+    /// when a new/resume/fork replacement commits so stale JS continuations
+    /// cannot mutate the replacement Session.
+    session_action_admission: SessionActionAdmissionGate,
+    /// Session whose state is currently rendered by this `PiApp`. This is UI
+    /// transition bookkeeping only; security-sensitive event ownership still
+    /// verifies the authoritative Session mutex and fails closed on contention.
+    displayed_session_id: Option<String>,
     config: Config,
     theme: Theme,
     styles: TuiStyles,
     markdown_style: GlamourStyleConfig,
     resources: ResourceLoader,
     resource_cli: ResourceCliOptions,
+    /// Startup-configured package resolver retained for `/reload`. Direct
+    /// `PiApp::new` construction starts fail-closed until its host installs an
+    /// explicitly trusted manager.
+    package_manager: PackageManager,
+    /// Admission for project configuration reread by the retained resolver.
+    workspace_trust_guard: Option<crate::workspace_trust::WorkspaceTrustGuard>,
     cwd: PathBuf,
     model_entry: ModelEntry,
     model_entry_shared: Arc<StdMutex<ModelEntry>>,
     model_scope: Vec<ModelEntry>,
     available_models: Vec<ModelEntry>,
     model: String,
-    agent: Arc<Mutex<Agent>>,
+    agent: Arc<Mutex<InteractiveAgent>>,
     save_enabled: bool,
     abort_handle: Option<AbortHandle>,
+    review_request_id: Option<String>,
+    handoff_request_id: Option<String>,
+    mcp_auth_request_id: Option<String>,
     bash_running: bool,
 
     // Token tracking
@@ -2307,6 +3115,20 @@ pub struct PiApp {
     extension_compacting: Arc<AtomicBool>,
     extension_ui_queue: VecDeque<ExtensionUiRequest>,
     active_extension_ui: Option<ExtensionUiRequest>,
+    /// Ask-tool picker state (bd-cv653.3.8): the shared tool handle for
+    /// answering, queued requests, and the in-flight card.
+    ask_tool: Option<crate::ask::AskTool>,
+    ask_ui_queue: VecDeque<crate::ask::AskUiRequest>,
+    active_ask_ui: Option<ActiveAskCard>,
+    /// bd-1qol9: globally ordered, mutually exclusive input-card state.
+    /// One of {Ask, Extension} matches whichever slot above holds a card.
+    active_input_card_kind: Option<InputCardKind>,
+    /// Global arrival order across BOTH card kinds; activation pops the head
+    /// once its slot frees up.
+    input_card_order: VecDeque<InputCardKind>,
+    /// Draft captured on FIRST card activation of a turn and restored after
+    /// the final card resolves (explicit merge: only into an empty editor).
+    card_draft_snapshot: Option<String>,
     extension_custom_overlay: Option<ExtensionCustomOverlay>,
     extension_custom_active: bool,
     extension_custom_key_queue: VecDeque<String>,
@@ -2316,12 +3138,30 @@ pub struct PiApp {
 
     // Login flow state (awaiting sensitive credential input)
     pending_oauth: Option<PendingOAuth>,
+    login_attempt: Option<LoginAttempt>,
 
     // Extension system
     extensions: Option<ExtensionManager>,
 
+    // MCP client registry (bd-cv653.6.1); None when bootstrap failed.
+    mcp_manager: Option<std::sync::Arc<crate::mcp::McpManager>>,
+
     // Keybindings for action dispatch
     keybindings: crate::keybindings::KeyBindings,
+
+    /// Session-scoped per-role model overrides set via `/model <role> <spec>`
+    /// (bd-cv653.3.1). Values are `(provider, model_id)`. Consumed by
+    /// role-aware features (advisor, plan mode, titling) as they land.
+    role_model_overrides: std::collections::HashMap<crate::models::ModelRole, (String, String)>,
+
+    /// Bounded, authenticated tiny/smol completion for automatic naming.
+    title_client: Option<Arc<crate::session_title::TitleClient>>,
+    /// Guard so titling fires at most once per session.
+    title_requested: bool,
+    /// Dropping the UI or replacing its session cancels provider work.
+    title_cancellation: Option<crate::session_title::TitleCancellation>,
+    /// Do not repeat a failed optional refresh for the same saved prompt.
+    title_refresh_attempted: Option<(String, String)>,
 
     // Track last Ctrl+C time for double-tap quit detection
     last_ctrlc_time: Option<std::time::Instant>,
@@ -2345,6 +3185,12 @@ pub struct PiApp {
 
     // Capability prompt overlay (extension permission request)
     capability_prompt: Option<CapabilityPromptOverlay>,
+
+    /// Ordered FIFO of capability prompts waiting for the active overlay
+    /// to resolve (bd-yllbn). Bounded by MAX_CAPABILITY_PROMPT_QUEUE.
+    capability_prompt_queue: VecDeque<CapabilityPromptOverlay>,
+    /// Monotonic counter assigning one generation per capability request.
+    capability_prompt_generation: u64,
 
     // Branch picker overlay (Ctrl+B quick branch switching)
     branch_picker: Option<BranchPickerOverlay>,
@@ -2394,6 +3240,53 @@ impl BubbleteaModel for Box<PiApp> {
 }
 
 impl PiApp {
+    /// Install the startup-configured resolver used by `/reload`.
+    ///
+    /// Keeping this as one explicit seam prevents reload from reconstructing a
+    /// resolver whose default trust differs from the decision made at startup.
+    pub(crate) fn set_reload_package_manager(
+        &mut self,
+        package_manager: PackageManager,
+        workspace_trust_guard: Option<crate::workspace_trust::WorkspaceTrustGuard>,
+    ) {
+        self.package_manager = match &workspace_trust_guard {
+            Some(guard) => package_manager.with_project_trust(guard.trusted()),
+            None => package_manager,
+        };
+        self.workspace_trust_guard = workspace_trust_guard;
+    }
+
+    /// Attach the session workspace root handle (bd-cv653.3.12). Installed
+    /// after construction by hosts that own the shared root set.
+    pub fn set_workspace(&mut self, workspace: WorkspaceHandle) {
+        self.autocomplete.set_workspace(workspace.clone());
+        self.workspace = workspace;
+    }
+    /// Live workspace root handle for @-file processing and /add-dir.
+    pub const fn workspace(&self) -> &WorkspaceHandle {
+        &self.workspace
+    }
+
+    /// Attach the `/btw` side-question client (bd-cv653.3.16).
+    pub fn set_btw_client(&mut self, client: Arc<pi::btw::BtwClient>) {
+        self.btw_client = Some(client);
+    }
+
+    /// Install the factory used to rebind the `/btw` client on smol-role
+    /// change (bd-9jgrt).
+    pub fn set_btw_factory(&mut self, factory: pi::btw::BtwClientFactory) {
+        self.btw_factory = Some(factory);
+    }
+
+    /// Rebuild the `/btw` side-question client for `entry` (bd-9jgrt).
+    /// Returns `None` when no factory is installed (rebind unsupported on
+    /// this surface); `Some(true)` when rebound; `Some(false)` when the
+    /// factory could not serve the entry (previous binding kept).
+    fn rebuild_btw_client(&mut self, entry: &crate::models::ModelEntry) -> Option<bool> {
+        let client = (self.btw_factory.as_ref()?)(entry)?;
+        self.btw_client = Some(client);
+        Some(true)
+    }
     fn initial_window_size_cmd() -> Cmd {
         Cmd::new(|| {
             let (width, height) = terminal::size().unwrap_or((80, 24));
@@ -2426,13 +3319,14 @@ impl PiApp {
     pub fn new(
         agent: Agent,
         session: Arc<Mutex<Session>>,
-        mut config: Config,
+        config: Config,
         resources: ResourceLoader,
         resource_cli: ResourceCliOptions,
         cwd: PathBuf,
         model_entry: ModelEntry,
         model_scope: Vec<ModelEntry>,
         available_models: Vec<ModelEntry>,
+        title_client: Option<Arc<crate::session_title::TitleClient>>,
         pending_inputs: Vec<PendingInput>,
         event_tx: mpsc::Sender<PiMsg>,
         runtime_handle: RuntimeHandle,
@@ -2442,7 +3336,78 @@ impl PiApp {
         keybindings_override: Option<KeyBindings>,
         messages: Vec<ConversationMessage>,
         total_usage: Usage,
+        mcp_manager: Option<std::sync::Arc<crate::mcp::McpManager>>,
     ) -> Self {
+        let mut agent_session = AgentSession::new(
+            agent,
+            session,
+            save_enabled,
+            config.resolved_compaction_settings(model_entry.model.context_window),
+        )
+        .with_runtime_handle(runtime_handle.clone());
+        agent_session.extensions = extensions.map(crate::extensions::ExtensionRegion::new);
+        Self::from_agent_session(
+            agent_session,
+            config,
+            resources,
+            resource_cli,
+            cwd,
+            model_entry,
+            model_scope,
+            available_models,
+            title_client,
+            pending_inputs,
+            event_tx,
+            runtime_handle,
+            save_enabled,
+            persist_startup_settings,
+            keybindings_override,
+            messages,
+            total_usage,
+            mcp_manager,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    fn from_agent_session(
+        mut agent_session: AgentSession,
+        mut config: Config,
+        resources: ResourceLoader,
+        resource_cli: ResourceCliOptions,
+        cwd: PathBuf,
+        model_entry: ModelEntry,
+        model_scope: Vec<ModelEntry>,
+        available_models: Vec<ModelEntry>,
+        title_client: Option<Arc<crate::session_title::TitleClient>>,
+        pending_inputs: Vec<PendingInput>,
+        event_tx: mpsc::Sender<PiMsg>,
+        runtime_handle: RuntimeHandle,
+        save_enabled: bool,
+        persist_startup_settings: bool,
+        keybindings_override: Option<KeyBindings>,
+        messages: Vec<ConversationMessage>,
+        total_usage: Usage,
+        mcp_manager: Option<std::sync::Arc<crate::mcp::McpManager>>,
+        failover: Option<crate::sdk::FailoverOptions>,
+    ) -> Self {
+        let session = Arc::clone(&agent_session.session);
+        // Keep the authoritative routes, including unready models, and admit
+        // entries supplied by embedders before extensions receive this catalog.
+        let mut registry = agent_session.model_registry().cloned().unwrap_or_default();
+        registry.merge_missing_entries(available_models.clone());
+        registry.merge_missing_entries(vec![model_entry.clone()]);
+        agent_session.set_model_registry(registry);
+        let extensions = agent_session
+            .extensions
+            .as_ref()
+            .map(|region| region.manager().clone());
+        let session_action_admission = agent_session.session_action_admission_gate();
+        let provider_admission = agent_session.provider_admission_gate();
+        let extension_model_catalog = agent_session.extension_model_catalog();
+        if let Some(manager) = &mcp_manager {
+            agent_session.set_mcp_manager(Arc::clone(manager));
+        }
         // Get terminal size
         let (term_width, term_height) =
             terminal::size().map_or((80, 24), |(w, h)| (w as usize, h as usize));
@@ -2498,37 +3463,47 @@ impl PiApp {
             follow_up_mode,
         )));
 
-        let mut agent = agent;
+        let agent = &mut agent_session.agent;
         agent.set_queue_modes(steering_mode, follow_up_mode);
         {
             let steering_queue = Arc::clone(&message_queue);
             let follow_up_queue = Arc::clone(&message_queue);
             let injected_steering_queue = Arc::clone(&injected_queue);
             let injected_follow_up_queue = Arc::clone(&injected_queue);
-            let steering_fetcher = move || -> BoxFuture<'static, Vec<ModelMessage>> {
+            let steering_fetcher = move || -> BoxFuture<'static, Vec<QueuedAgentMessage>> {
                 let steering_queue = Arc::clone(&steering_queue);
                 let injected_steering_queue = Arc::clone(&injected_steering_queue);
                 Box::pin(async move {
                     let mut out = Vec::new();
                     if let Ok(mut queue) = steering_queue.lock() {
-                        out.extend(queue.pop_steering().into_iter().map(build_user_message));
+                        out.extend(queue.pop_steering());
                     }
                     if let Ok(mut queue) = injected_steering_queue.lock() {
-                        out.extend(queue.pop_steering());
+                        out.extend(
+                            queue
+                                .pop_steering()
+                                .into_iter()
+                                .map(QueuedAgentMessage::generated),
+                        );
                     }
                     out
                 })
             };
-            let follow_up_fetcher = move || -> BoxFuture<'static, Vec<ModelMessage>> {
+            let follow_up_fetcher = move || -> BoxFuture<'static, Vec<QueuedAgentMessage>> {
                 let follow_up_queue = Arc::clone(&follow_up_queue);
                 let injected_follow_up_queue = Arc::clone(&injected_follow_up_queue);
                 Box::pin(async move {
                     let mut out = Vec::new();
                     if let Ok(mut queue) = follow_up_queue.lock() {
-                        out.extend(queue.pop_follow_up().into_iter().map(build_user_message));
+                        out.extend(queue.pop_follow_up());
                     }
                     if let Ok(mut queue) = injected_follow_up_queue.lock() {
-                        out.extend(queue.pop_follow_up());
+                        out.extend(
+                            queue
+                                .pop_follow_up()
+                                .into_iter()
+                                .map(QueuedAgentMessage::generated),
+                        );
                     }
                     out
                 })
@@ -2538,18 +3513,21 @@ impl PiApp {
                 Some(Arc::new(follow_up_fetcher)),
             );
         }
-
         let keybindings = keybindings_override.unwrap_or_else(|| {
             // Load keybindings from user config (with defaults as fallback).
             let keybindings_result = KeyBindings::load_from_user_config();
             if keybindings_result.has_warnings() {
                 tracing::warn!(
+                    target: crate::config::USER_DIAGNOSTIC_TARGET,
                     "Keybindings warnings: {}",
                     keybindings_result.format_warnings()
                 );
             }
             keybindings_result.bindings
         });
+        // The editor owns its own key handling, so an override of an
+        // editor-native action only takes effect if it is handed over.
+        apply_editor_keybinding_overrides(&keybindings, &mut input);
 
         // Initialize autocomplete with catalog from resources
         let mut autocomplete_catalog = AutocompleteCatalog::from_resources(&resources);
@@ -2573,18 +3551,38 @@ impl PiApp {
             !messages.is_empty(),
             persist_startup_settings,
             VERSION,
-            include_str!("../CHANGELOG.md"),
+            crate::embedded_assets::changelog,
         );
 
+        let displayed_session_id = session
+            .try_lock()
+            .ok()
+            .map(|session| session.header.id.clone());
+        // A resumed conversation already has an established topic. Automatic
+        // naming is admitted only for a new session's first exchange.
+        let title_requested = !agent_session.agent.messages().is_empty();
+        let agent = InteractiveAgent {
+            handle: crate::sdk::AgentSessionHandle::from_session_with_listeners(
+                agent_session,
+                crate::sdk::EventListeners::default(),
+            )
+            .with_retry(crate::failover::RetryPolicy::from_config(&config))
+            .with_failover(failover),
+        };
         let mut app = Self {
             input,
+            workspace: WorkspaceHandle::default(),
             history: HistoryList::new(),
             input_mode: InputMode::SingleLine,
             pending_inputs: VecDeque::from(pending_inputs),
+            pending_inputs_paused_by_time_cap: false,
             message_queue,
             injected_queue: Arc::clone(&injected_queue),
             conversation_viewport,
             follow_stream_tail: true,
+            thinking_badge_cache: std::cell::Cell::new(None),
+            btw_client: None,
+            btw_factory: None,
             spinner,
             agent_state: AgentState::Idle,
             term_width,
@@ -2593,18 +3591,27 @@ impl PiApp {
             messages,
             current_response: String::new(),
             current_thinking: String::new(),
+            current_assistant_start: (0, 0),
+            discard_incomplete_on_next_assistant: false,
             thinking_visible,
             tools_expanded: true,
             current_tool: None,
+            current_tool_summary: std::collections::HashMap::new(),
+            current_tool_id: None,
             tool_progress: None,
             pending_tool_output: None,
+            todo_summary: None,
             session,
+            session_action_admission,
+            displayed_session_id,
             config,
             theme,
             styles,
             markdown_style,
             resources,
             resource_cli,
+            package_manager: PackageManager::new(cwd.clone()).with_project_trust(false),
+            workspace_trust_guard: None,
             cwd,
             model_entry,
             model_entry_shared: model_entry_shared.clone(),
@@ -2619,16 +3626,32 @@ impl PiApp {
             extension_compacting: extension_compacting.clone(),
             extension_ui_queue: VecDeque::new(),
             active_extension_ui: None,
+            ask_tool: None,
+            ask_ui_queue: VecDeque::new(),
+            active_ask_ui: None,
+            active_input_card_kind: None,
+            input_card_order: VecDeque::new(),
+            card_draft_snapshot: None,
             extension_custom_overlay: None,
             extension_custom_active: false,
             extension_custom_key_queue: VecDeque::new(),
             status_message: None,
             save_enabled,
             abort_handle: None,
+            review_request_id: None,
+            handoff_request_id: None,
+            mcp_auth_request_id: None,
             bash_running: false,
             pending_oauth: None,
+            login_attempt: None,
             extensions,
+            mcp_manager,
             keybindings,
+            role_model_overrides: std::collections::HashMap::new(),
+            title_client,
+            title_requested,
+            title_cancellation: None,
+            title_refresh_attempted: None,
             last_ctrlc_time: None,
             last_escape_time: None,
             autocomplete,
@@ -2637,6 +3660,8 @@ impl PiApp {
             theme_picker: None,
             tree_ui: None,
             capability_prompt: None,
+            capability_prompt_queue: VecDeque::new(),
+            capability_prompt_generation: 0,
             branch_picker: None,
             model_selector: None,
             frame_timing: FrameTimingStats::new(),
@@ -2651,13 +3676,17 @@ impl PiApp {
         };
 
         if let Some(manager) = app.extensions.clone() {
+            manager.set_session_action_origin_source(app.session_action_admission.origin_source());
             let session_handle = Arc::new(InteractiveExtensionSession {
                 session: Arc::clone(&app.session),
                 model_entry: model_entry_shared,
+                model_catalog: extension_model_catalog,
                 is_streaming: extension_streaming,
                 is_compacting: extension_compacting,
                 config: app.config.clone(),
                 save_enabled: app.save_enabled,
+                provider_admission,
+                session_action_admission: app.session_action_admission.clone(),
             });
             manager.set_session(session_handle);
 
@@ -2668,21 +3697,21 @@ impl PiApp {
                 extension_streaming: Arc::clone(&app.extension_streaming),
                 user_queue: Arc::clone(&app.message_queue),
                 injected_queue,
+                session_action_admission: app.session_action_admission.clone(),
             }));
         }
 
         app.scroll_to_bottom();
 
         // Version update check (non-blocking, cache-only on startup)
-        if app.config.should_check_for_updates() {
-            if let crate::version_check::VersionCheckResult::UpdateAvailable { latest } =
+        if app.config.should_check_for_updates()
+            && let crate::version_check::VersionCheckResult::UpdateAvailable { latest } =
                 crate::version_check::check_cached()
-            {
-                app.status_message = Some(format!(
-                    "New version {latest} available (current: {})",
-                    crate::version_check::CURRENT_VERSION
-                ));
-            }
+        {
+            app.status_message = Some(format!(
+                "New version {latest} available (current: {})",
+                crate::version_check::CURRENT_VERSION
+            ));
         }
 
         app
@@ -2694,7 +3723,7 @@ impl PiApp {
     }
 
     #[must_use]
-    pub fn agent_handle(&self) -> Arc<Mutex<Agent>> {
+    pub fn agent_handle(&self) -> Arc<Mutex<InteractiveAgent>> {
         Arc::clone(&self.agent)
     }
 
@@ -2770,7 +3799,7 @@ impl PiApp {
 
     /// Return whether the conversation prefix cache is currently valid for
     /// the current message count (integration test helper for PERF-2).
-    pub fn prefix_cache_valid_for_test(&self) -> bool {
+    pub const fn prefix_cache_valid_for_test(&self) -> bool {
         self.message_render_cache.prefix_valid(self.messages.len())
     }
 
@@ -2782,7 +3811,7 @@ impl PiApp {
 
     /// Return the current view capacity hint from render buffers
     /// (integration test helper for PERF-7).
-    pub fn render_buffer_capacity_hint_for_test(&self) -> usize {
+    pub const fn render_buffer_capacity_hint_for_test(&self) -> usize {
         self.render_buffers.view_capacity_hint()
     }
 
@@ -2843,6 +3872,11 @@ impl PiApp {
     /// Inner update handler (extracted for frame timing instrumentation).
     #[allow(clippy::too_many_lines)]
     fn update_inner(&mut self, msg: Message) -> Option<Cmd> {
+        if self.prune_expired_ask_cards() && msg.is::<KeyMsg>() {
+            // This key belonged to the cancelled card. In particular, Enter
+            // must not submit the pre-card draft restored by pruning.
+            return None;
+        }
         // Memory pressure sampling + progressive collapse (PERF-6)
         self.memory_monitor.maybe_sample();
         self.run_memory_pressure_actions();
@@ -2862,13 +3896,12 @@ impl PiApp {
 
         // Handle mouse wheel events: route to overlays when open, otherwise
         // scroll the conversation viewport.
-        if let Some(mouse) = msg.downcast_ref::<MouseMsg>() {
-            if mouse.is_wheel()
-                && (mouse.button == MouseButton::WheelUp || mouse.button == MouseButton::WheelDown)
-            {
-                let is_up = mouse.button == MouseButton::WheelUp;
-                return self.handle_mouse_wheel(is_up);
-            }
+        if let Some(mouse) = msg.downcast_ref::<MouseMsg>()
+            && mouse.is_wheel()
+            && (mouse.button == MouseButton::WheelUp || mouse.button == MouseButton::WheelDown)
+        {
+            let is_up = mouse.button == MouseButton::WheelUp;
+            return self.handle_mouse_wheel(is_up);
         }
 
         // Ignore spinner ticks when no spinner row is visible so old tick
@@ -3244,10 +4277,10 @@ impl PiApp {
                 // Extension shortcuts: check if unhandled key matches an extension shortcut
                 if matches!(self.agent_state, AgentState::Idle) {
                     let key_id = binding.to_string().to_lowercase();
-                    if let Some(manager) = &self.extensions {
-                        if manager.has_shortcut(&key_id) {
-                            return self.dispatch_extension_shortcut(&key_id);
-                        }
+                    if let Some(manager) = &self.extensions
+                        && manager.has_shortcut(&key_id)
+                    {
+                        return self.dispatch_extension_shortcut(&key_id);
                     }
                 }
             }
@@ -3256,25 +4289,33 @@ impl PiApp {
             // (e.g., text input handled by TextArea)
         }
 
-        // Forward to appropriate component based on state
-        if matches!(self.agent_state, AgentState::Idle) {
+        // Forward to appropriate component based on state. The editor owns
+        // keystrokes while idle and, because an ask/approval card is answered
+        // through this same editor, while such a card is pending mid-turn
+        // (gh #229: the card rendered but every typed character went to the
+        // spinner). Spinner ticks keep flowing to the spinner regardless: a
+        // pending card never hides the tool-progress row.
+        let editor_owns_input = (matches!(self.agent_state, AgentState::Idle)
+            || self.has_pending_input_card())
+            && msg.downcast_ref::<SpinnerTickMsg>().is_none();
+        if editor_owns_input {
             let old_height = self.input.height();
 
-            if let Some(key) = msg.downcast_ref::<KeyMsg>() {
-                if key.key_type == KeyType::Space {
-                    let mut key = key.clone();
-                    key.key_type = KeyType::Runes;
-                    key.runes = vec![' '];
+            if let Some(key) = msg.downcast_ref::<KeyMsg>()
+                && key.key_type == KeyType::Space
+            {
+                let mut key = key.clone();
+                key.key_type = KeyType::Runes;
+                key.runes = vec![' '];
 
-                    let result = BubbleteaModel::update(&mut self.input, Message::new(key));
+                let result = BubbleteaModel::update(&mut self.input, Message::new(key));
 
-                    if self.input.height() != old_height {
-                        self.refresh_conversation_viewport(self.follow_stream_tail);
-                    }
-
-                    self.maybe_trigger_autocomplete();
-                    return result;
+                if self.input.height() != old_height {
+                    self.refresh_conversation_viewport(self.follow_stream_tail);
                 }
+
+                self.maybe_trigger_autocomplete();
+                return result;
             }
             let result = BubbleteaModel::update(&mut self.input, msg);
 

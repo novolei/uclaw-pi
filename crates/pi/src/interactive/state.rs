@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use bubbles::list::{DefaultDelegate, Item as ListItem, List};
 
-use crate::agent::QueueMode;
+use crate::agent::{QueueMode, QueuedAgentMessage};
 use crate::autocomplete::{
     AutocompleteCatalog, AutocompleteItem, AutocompleteProvider, AutocompleteResponse,
 };
@@ -15,6 +15,8 @@ use crate::session_index::{SessionIndex, SessionMeta};
 use crate::session_picker::delete_session_file;
 use crate::theme::Theme;
 use serde_json::Value;
+
+use super::tool_render::{sanitize_terminal_line, sanitize_terminal_text};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum PendingLoginKind {
@@ -35,6 +37,79 @@ pub(super) struct PendingOAuth {
     pub(super) device_code: Option<String>,
     /// The redirect URI used in the authorization request (needed for token exchange per RFC 6749 §4.1.3).
     pub(super) redirect_uri: Option<String>,
+}
+
+/// The UI owns the listener and cancellation. Async workers only borrow a
+/// control handle, so abandoning a login closes its callback socket at once.
+pub(super) struct LoginAttempt {
+    pub(super) id: String,
+    pub(super) session_id: String,
+    pub(super) auth_path: PathBuf,
+    pub(super) callback: Option<crate::auth::OAuthCallbackServer>,
+    pub(super) control: LoginAttemptControl,
+    pub(super) submitting: bool,
+}
+
+impl LoginAttempt {
+    pub(super) fn new(session_id: String, auth_path: PathBuf) -> Self {
+        Self {
+            id: uuid::Uuid::new_v4().to_string(),
+            session_id,
+            auth_path,
+            callback: None,
+            control: LoginAttemptControl::new(),
+            submitting: false,
+        }
+    }
+}
+
+impl Drop for LoginAttempt {
+    fn drop(&mut self) {
+        self.control.cancel();
+    }
+}
+
+#[derive(Clone)]
+pub(super) struct LoginAttemptControl {
+    abort: crate::agent::AbortHandle,
+    save_state: std::sync::Arc<std::sync::atomic::AtomicU8>,
+}
+
+impl LoginAttemptControl {
+    fn new() -> Self {
+        let (abort, _) = crate::agent::AbortHandle::new();
+        Self {
+            abort,
+            save_state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
+        }
+    }
+
+    pub(super) fn signal(&self) -> crate::agent::AbortSignal {
+        self.abort.signal()
+    }
+
+    pub(super) fn cancel(&self) {
+        let _ = self.save_state.compare_exchange(
+            0,
+            1,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        );
+        self.abort.abort();
+    }
+
+    /// Cancellation wins until the blocking save transaction is admitted.
+    /// Once admitted, durable I/O must finish even if its UI owner goes away.
+    pub(super) fn admit_save(&self) -> bool {
+        self.save_state
+            .compare_exchange(
+                0,
+                2,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_ok()
+    }
 }
 
 /// Tool output line count above which blocks auto-collapse.
@@ -107,30 +182,35 @@ pub enum InputMode {
 #[derive(Debug, Clone)]
 pub enum PendingInput {
     Text(String),
+    GeneratedText(String),
     Content(Vec<ContentBlock>),
+    ContentWithKeywordSource {
+        content: Vec<ContentBlock>,
+        keyword_scan_source: String,
+    },
     Continue,
 }
 
 /// Autocomplete dropdown state.
 #[derive(Debug)]
-pub(super) struct AutocompleteState {
+pub struct AutocompleteState {
     /// The autocomplete provider that generates suggestions.
-    pub(super) provider: AutocompleteProvider,
+    pub provider: AutocompleteProvider,
     /// Whether the dropdown is currently visible.
-    pub(super) open: bool,
+    pub open: bool,
     /// Current list of suggestions.
-    pub(super) items: Vec<AutocompleteItem>,
+    pub items: Vec<AutocompleteItem>,
     /// Index of the currently selected item, or `None` when the popup is open
     /// but the user has not yet navigated with arrow keys / Tab.
-    pub(super) selected: Option<usize>,
+    pub selected: Option<usize>,
     /// The range of text to replace when accepting a suggestion.
-    pub(super) replace_range: std::ops::Range<usize>,
+    pub replace_range: std::ops::Range<usize>,
     /// Maximum number of items to display in the dropdown.
-    pub(super) max_visible: usize,
+    pub max_visible: usize,
 }
 
 impl AutocompleteState {
-    pub(super) const fn new(cwd: PathBuf, catalog: AutocompleteCatalog) -> Self {
+    pub const fn new(cwd: PathBuf, catalog: AutocompleteCatalog) -> Self {
         Self {
             provider: AutocompleteProvider::new(cwd, catalog),
             open: false,
@@ -141,14 +221,21 @@ impl AutocompleteState {
         }
     }
 
-    pub(super) fn close(&mut self) {
+    /// Attach the session workspace root handle (bd-cv653.3.12): @-file
+    /// suggestions then span every additional root.
+    pub(super) fn set_workspace(&mut self, workspace: crate::workspace::WorkspaceHandle) {
+        self.provider.set_workspace(workspace);
+        self.close();
+    }
+
+    pub fn close(&mut self) {
         self.open = false;
         self.items.clear();
         self.selected = None;
         self.replace_range = 0..0;
     }
 
-    pub(super) fn open_with(&mut self, response: AutocompleteResponse) {
+    pub fn open_with(&mut self, response: AutocompleteResponse) {
         if response.items.is_empty() {
             self.close();
             return;
@@ -175,7 +262,7 @@ impl AutocompleteState {
         self.replace_range = response.replace;
     }
 
-    pub(super) fn select_next(&mut self) {
+    pub const fn select_next(&mut self) {
         if !self.items.is_empty() {
             self.selected = Some(match self.selected {
                 Some(idx) => (idx + 1) % self.items.len(),
@@ -184,7 +271,7 @@ impl AutocompleteState {
         }
     }
 
-    pub(super) fn select_prev(&mut self) {
+    pub fn select_prev(&mut self) {
         if !self.items.is_empty() {
             self.selected = Some(match self.selected {
                 Some(idx) => idx.checked_sub(1).unwrap_or(self.items.len() - 1),
@@ -193,14 +280,17 @@ impl AutocompleteState {
         }
     }
 
-    pub(super) fn selected_item(&self) -> Option<&AutocompleteItem> {
+    pub fn selected_item(&self) -> Option<&AutocompleteItem> {
         self.selected.and_then(|idx| self.items.get(idx))
     }
 
-    /// Returns the scroll offset for the dropdown view.
-    pub(super) const fn scroll_offset(&self) -> usize {
+    /// Returns the scroll offset for the dropdown view given the number of
+    /// rows actually visible (which the renderer may clamp below
+    /// `max_visible` on short terminals — using `max_visible` here would let
+    /// the highlighted item scroll out of the rendered window).
+    pub const fn scroll_offset(&self, visible: usize) -> usize {
         match self.selected {
-            Some(idx) if idx >= self.max_visible => idx - self.max_visible + 1,
+            Some(idx) if visible > 0 && idx >= visible => idx - visible + 1,
             _ => 0,
         }
     }
@@ -244,7 +334,7 @@ impl SessionPickerOverlay {
         }
     }
 
-    pub(super) fn select_next(&mut self) {
+    pub(super) const fn select_next(&mut self) {
         if !self.sessions.is_empty() {
             self.selected = (self.selected + 1) % self.sessions.len();
         }
@@ -283,7 +373,7 @@ impl SessionPickerOverlay {
         &self.query
     }
 
-    pub(super) fn has_query(&self) -> bool {
+    pub(super) const fn has_query(&self) -> bool {
         !self.query.is_empty()
     }
 
@@ -385,6 +475,10 @@ pub(super) enum SettingsUiEntry {
     Theme,
     SteeringMode,
     FollowUpMode,
+    EnableEval,
+    EnableGithub,
+    EnableSecurityScan,
+    EnableSubagent,
     DefaultPermissive,
     QuietStartup,
     CollapseChangelog,
@@ -433,7 +527,7 @@ impl ThemePickerOverlay {
         }
     }
 
-    pub(super) fn select_next(&mut self) {
+    pub(super) const fn select_next(&mut self) {
         if !self.items.is_empty() {
             self.selected = (self.selected + 1) % self.items.len();
         }
@@ -489,6 +583,10 @@ impl SettingsUiState {
                 SettingsUiEntry::Theme,
                 SettingsUiEntry::SteeringMode,
                 SettingsUiEntry::FollowUpMode,
+                SettingsUiEntry::EnableEval,
+                SettingsUiEntry::EnableGithub,
+                SettingsUiEntry::EnableSecurityScan,
+                SettingsUiEntry::EnableSubagent,
                 SettingsUiEntry::DefaultPermissive,
                 SettingsUiEntry::QuietStartup,
                 SettingsUiEntry::CollapseChangelog,
@@ -503,7 +601,7 @@ impl SettingsUiState {
         }
     }
 
-    pub(super) fn select_next(&mut self) {
+    pub(super) const fn select_next(&mut self) {
         if !self.entries.is_empty() {
             self.selected = (self.selected + 1) % self.entries.len();
         }
@@ -595,38 +693,132 @@ pub(super) struct CapabilityPromptOverlay {
     pub(super) description: String,
     /// Which button is focused.
     pub(super) focused: usize,
-    /// Auto-deny countdown (remaining seconds).  `None` = no timer.
-    pub(super) auto_deny_secs: Option<u32>,
+    /// Monotonic generation bound to exactly one activation slot (bd-yllbn).
+    ///
+    /// Assigned once at enqueue time; expiry messages carry it so a stale or
+    /// late wake can never resolve a different prompt's overlay.
+    pub(super) generation: u64,
+    /// Authoritative absolute expiry shared with the manager-side timeout.
+    /// `None` = request carried no bounded budget (no timer rendered/fired).
+    pub(super) expires_at: Option<std::time::Instant>,
+    /// Cancellation signal for the single outstanding periodic wake owned by
+    /// this request generation. Resolution/reset/quit wakes the command
+    /// thread immediately instead of leaving a long sleeper behind.
+    timer: CapabilityPromptTimer,
+    /// Epoch for the timer command currently owned by this prompt.
+    /// Promotion replaces a queued deadline wake with an active 1 Hz wake;
+    /// already-enqueued messages from the old epoch are therefore inert.
+    timer_generation: u64,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct CapabilityPromptTimer {
+    state: std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+}
+
+impl CapabilityPromptTimer {
+    fn new() -> Self {
+        Self {
+            state: std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new())),
+        }
+    }
+
+    // Guard scope is deliberate; tightening drops would change lock-hold semantics.
+    #[allow(clippy::significant_drop_tightening)]
+    pub(super) fn cancel(&self) {
+        let (cancelled, wake) = &*self.state;
+        let mut cancelled = cancelled
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *cancelled = true;
+        wake.notify_all();
+    }
+
+    /// Wait for one redraw interval. Returns false when lifecycle cleanup
+    /// cancelled this generation before the interval elapsed.
+    // Guard scope is deliberate; tightening drops would change lock-hold semantics.
+    #[allow(clippy::significant_drop_tightening)]
+    pub(super) fn wait(&self, delay: std::time::Duration) -> bool {
+        let (cancelled, wake) = &*self.state;
+        let cancelled = cancelled
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *cancelled {
+            return false;
+        }
+        let (cancelled, timed_out) = wake
+            .wait_timeout_while(cancelled, delay, |cancelled| !*cancelled)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        !*cancelled && timed_out.timed_out()
+    }
 }
 
 impl CapabilityPromptOverlay {
     pub(super) fn from_request(request: ExtensionUiRequest) -> Self {
-        let extension_id = request
-            .payload
-            .get("extension_id")
-            .and_then(Value::as_str)
-            .unwrap_or("<unknown>")
-            .to_string();
-        let capability = request
-            .payload
-            .get("capability")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown")
-            .to_string();
+        let (extension_id, capability) = request
+            .capability_prompt_identity()
+            .map_or(("<unknown>", "unknown"), |(extension_id, capability)| {
+                (extension_id, capability)
+            });
+        // Extension-provided labels and descriptions are rendered directly by
+        // the terminal UI. Strip escape/control sequences at the trust
+        // boundary so a capability prompt cannot move the cursor, rewrite the
+        // screen, or smuggle an OSC/DCS payload into the terminal.
+        let extension_id = sanitize_terminal_line(extension_id).into_owned();
+        let capability = sanitize_terminal_line(capability).into_owned();
         let description = request
             .payload
             .get("message")
             .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
+            .map_or_else(String::new, |message| {
+                sanitize_terminal_text(message).into_owned()
+            });
+        // The manager binds this once before publication. Consuming the exact
+        // monotonic value here prevents channel/queue delay from restarting
+        // the visible countdown after the manager's budget has already run.
+        let expires_at = request.deadline();
         Self {
             request,
             extension_id,
             capability,
             description,
             focused: 0,
-            auto_deny_secs: Some(30),
+            generation: 0,
+            expires_at,
+            timer: CapabilityPromptTimer::new(),
+            timer_generation: 0,
         }
+    }
+
+    pub(super) fn cancel_timer(&self) {
+        self.timer.cancel();
+    }
+
+    pub(super) fn timer(&self) -> CapabilityPromptTimer {
+        self.timer.clone()
+    }
+
+    pub(super) const fn timer_generation(&self) -> u64 {
+        self.timer_generation
+    }
+
+    pub(super) fn restart_timer(&mut self) {
+        self.timer.cancel();
+        self.timer = CapabilityPromptTimer::new();
+        self.timer_generation = self.timer_generation.wrapping_add(1);
+    }
+
+    pub(super) fn has_time_remaining(&self, now: std::time::Instant) -> bool {
+        self.expires_at.is_some_and(|deadline| deadline > now)
+    }
+
+    /// Whole seconds left on the countdown, clamped at zero.
+    pub(super) fn remaining_secs(&self, now: std::time::Instant) -> Option<u32> {
+        let remaining = self.expires_at?.saturating_duration_since(now);
+        let rounded_up = remaining
+            .as_secs()
+            .saturating_add(u64::from(remaining.subsec_nanos() > 0));
+        Some(u32::try_from(rounded_up).unwrap_or(u32::MAX))
     }
 
     pub(super) const fn focus_next(&mut self) {
@@ -646,10 +838,8 @@ impl CapabilityPromptOverlay {
 
     /// Returns `true` if this is a capability-specific confirm prompt (not a
     /// generic extension confirm).
-    pub(super) fn is_capability_prompt(request: &ExtensionUiRequest) -> bool {
-        request.method == "confirm"
-            && request.payload.get("capability").is_some()
-            && request.payload.get("extension_id").is_some()
+    pub(super) const fn is_capability_prompt(request: &ExtensionUiRequest) -> bool {
+        request.is_capability_prompt()
     }
 }
 
@@ -685,7 +875,7 @@ impl BranchPickerOverlay {
         }
     }
 
-    pub(super) fn select_next(&mut self) {
+    pub(super) const fn select_next(&mut self) {
         if !self.branches.is_empty() {
             self.selected = (self.selected + 1) % self.branches.len();
         }
@@ -737,8 +927,8 @@ pub(super) enum QueuedMessageKind {
 
 #[derive(Debug)]
 pub(super) struct InteractiveMessageQueue {
-    pub(super) steering: VecDeque<String>,
-    pub(super) follow_up: VecDeque<String>,
+    pub(super) steering: VecDeque<QueuedAgentMessage>,
+    pub(super) follow_up: VecDeque<QueuedAgentMessage>,
     steering_mode: QueueMode,
     follow_up_mode: QueueMode,
 }
@@ -758,23 +948,23 @@ impl InteractiveMessageQueue {
         self.follow_up_mode = follow_up_mode;
     }
 
-    pub(super) fn push_steering(&mut self, text: String) {
-        self.steering.push_back(text);
+    pub(super) fn push_steering(&mut self, message: QueuedAgentMessage) {
+        self.steering.push_back(message);
     }
 
-    pub(super) fn push_follow_up(&mut self, text: String) {
-        self.follow_up.push_back(text);
+    pub(super) fn push_follow_up(&mut self, message: QueuedAgentMessage) {
+        self.follow_up.push_back(message);
     }
 
-    pub(super) fn pop_steering(&mut self) -> Vec<String> {
+    pub(super) fn pop_steering(&mut self) -> Vec<QueuedAgentMessage> {
         self.pop_kind(QueuedMessageKind::Steering)
     }
 
-    pub(super) fn pop_follow_up(&mut self) -> Vec<String> {
+    pub(super) fn pop_follow_up(&mut self) -> Vec<QueuedAgentMessage> {
         self.pop_kind(QueuedMessageKind::FollowUp)
     }
 
-    fn pop_kind(&mut self, kind: QueuedMessageKind) -> Vec<String> {
+    fn pop_kind(&mut self, kind: QueuedMessageKind) -> Vec<QueuedAgentMessage> {
         let (queue, mode) = match kind {
             QueuedMessageKind::Steering => (&mut self.steering, self.steering_mode),
             QueuedMessageKind::FollowUp => (&mut self.follow_up, self.follow_up_mode),
@@ -785,10 +975,14 @@ impl InteractiveMessageQueue {
         }
     }
 
-    pub(super) fn clear_all(&mut self) -> (Vec<String>, Vec<String>) {
+    pub(super) fn clear_all(&mut self) -> (Vec<QueuedAgentMessage>, Vec<QueuedAgentMessage>) {
         let steering = self.steering.drain(..).collect();
         let follow_up = self.follow_up.drain(..).collect();
         (steering, follow_up)
+    }
+
+    pub(super) fn pending_count(&self) -> usize {
+        self.steering.len().saturating_add(self.follow_up.len())
     }
 
     pub(super) fn steering_len(&self) -> usize {
@@ -799,12 +993,65 @@ impl InteractiveMessageQueue {
         self.follow_up.len()
     }
 
-    pub(super) fn steering_front(&self) -> Option<&String> {
-        self.steering.front()
+    pub(super) fn steering_front(&self) -> Option<&str> {
+        self.steering
+            .front()
+            .and_then(QueuedAgentMessage::text_for_display)
     }
 
-    pub(super) fn follow_up_front(&self) -> Option<&String> {
-        self.follow_up.front()
+    pub(super) fn follow_up_front(&self) -> Option<&str> {
+        self.follow_up
+            .front()
+            .and_then(QueuedAgentMessage::text_for_display)
+    }
+}
+
+#[cfg(test)]
+mod interactive_message_queue_tests {
+    use super::*;
+    use crate::model::{UserContent, UserMessage};
+
+    fn user_message(text: &str) -> ModelMessage {
+        ModelMessage::User(UserMessage {
+            content: UserContent::Text(text.to_string()),
+            timestamp: 0,
+        })
+    }
+
+    #[test]
+    fn queue_keeps_authored_source_separate_from_provider_payload() {
+        let mut queue = InteractiveMessageQueue::new(QueueMode::OneAtATime, QueueMode::OneAtATime);
+        queue.push_steering(QueuedAgentMessage::authored(
+            user_message("generated ultrathink workflowz bytes"),
+            "please orchestrate this",
+        ));
+
+        assert_eq!(queue.steering_front(), Some("please orchestrate this"));
+        let queued = queue.pop_steering();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(
+            queued[0].keyword_scan_source(),
+            Some("please orchestrate this")
+        );
+        assert!(matches!(
+            queued[0].message(),
+            ModelMessage::User(UserMessage {
+                content: UserContent::Text(text),
+                ..
+            }) if text == "generated ultrathink workflowz bytes"
+        ));
+    }
+
+    #[test]
+    fn generated_queue_entry_is_suppressed_but_still_previewable() {
+        let mut queue = InteractiveMessageQueue::new(QueueMode::OneAtATime, QueueMode::OneAtATime);
+        queue.push_follow_up(QueuedAgentMessage::generated(user_message(
+            "ultrathink from extension",
+        )));
+
+        assert_eq!(queue.follow_up_front(), Some("ultrathink from extension"));
+        let queued = queue.pop_follow_up();
+        assert_eq!(queued[0].keyword_scan_source(), None);
     }
 }
 
@@ -863,6 +1110,10 @@ impl InjectedMessageQueue {
 
     pub(super) fn pop_follow_up(&mut self) -> Vec<ModelMessage> {
         self.pop_kind(QueuedMessageKind::FollowUp)
+    }
+
+    pub(super) fn pending_count(&self) -> usize {
+        self.steering.len().saturating_add(self.follow_up.len())
     }
 }
 
@@ -1091,8 +1342,44 @@ mod tests {
     }
 
     #[test]
+    fn autocomplete_scroll_offset_tracks_clamped_visible_window() {
+        let mut state = AutocompleteState::new(PathBuf::from("."), AutocompleteCatalog::default());
+        state.open_with(response(
+            0..1,
+            ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"],
+        ));
+        // Navigate to index 5.
+        for _ in 0..6 {
+            state.select_next();
+        }
+        assert_eq!(state.selected, Some(5));
+        // Full-height window (max_visible = 10): no scrolling needed.
+        assert_eq!(state.scroll_offset(state.max_visible), 0);
+        // Short terminal clamps the window to 3 rows: the offset must follow
+        // the selection so the highlighted item stays inside the window.
+        let offset = state.scroll_offset(3);
+        assert_eq!(offset, 3);
+        assert!((offset..offset + 3).contains(&5));
+        // Degenerate zero-height window must not underflow.
+        assert_eq!(state.scroll_offset(0), 0);
+    }
+
+    #[test]
     fn settings_ui_includes_default_permissive_toggle() {
         let state = SettingsUiState::new();
         assert!(state.entries.contains(&SettingsUiEntry::DefaultPermissive));
+    }
+
+    #[test]
+    fn settings_ui_includes_all_persistent_optional_tool_toggles() {
+        let state = SettingsUiState::new();
+        for entry in [
+            SettingsUiEntry::EnableEval,
+            SettingsUiEntry::EnableGithub,
+            SettingsUiEntry::EnableSecurityScan,
+            SettingsUiEntry::EnableSubagent,
+        ] {
+            assert!(state.entries.contains(&entry), "{entry:?}");
+        }
     }
 }

@@ -57,7 +57,8 @@ pub fn content_block_to_fe(cb: &ContentBlock) -> Option<Value> {
             "name": tc.name,
             "input": tc.arguments,
         })),
-        ContentBlock::Image(_) => None,
+        // pi 0.8 native audio/video payloads: no frontend block type either.
+        ContentBlock::Image(_) | ContentBlock::Media(_) => None,
     }
 }
 

@@ -10,9 +10,18 @@
 //! `asupersync::Cx`; it just centralizes how Pi threads context through async code.
 
 use asupersync::{Budget, Cx};
+use std::ffi::OsStr;
+use std::future::Future;
 use std::ops::Deref;
 use std::path::Path;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use std::time::Duration;
+
+mod http;
+mod process;
+pub use http::{AgentHttpClient, AgentHttpRequest, AgentHttpResponse};
+pub use process::{AgentChild, AgentCommand};
 
 /// A capability-scoped context for agent operations.
 ///
@@ -83,10 +92,27 @@ impl AgentCx {
         &self.cx
     }
 
+    /// Poll and retire ambient-context APIs under this owner, not the caller.
+    ///
+    /// The thread-local guard must end before returning `Pending`: holding it
+    /// across an await would leak authority into other tasks on the same worker
+    /// and could restore the wrong thread's context after task migration.
+    ///
+    /// The native future also retains this owner during synchronous cleanup,
+    /// even if never polled or dropped on another worker. Completion retires
+    /// it before returning its output; ownership of that output passes to the
+    /// caller. Dropping a future does not promise async cleanup or rollback.
+    pub fn with_current<F: Future>(&self, future: F) -> impl Future<Output = F::Output> {
+        ScopedOperation {
+            owner: self,
+            future: Some(Box::pin(future)),
+        }
+    }
+
     /// Filesystem capability accessor.
     #[must_use]
     pub const fn fs(&self) -> AgentFs<'_> {
-        AgentFs { _cx: self }
+        AgentFs { cx: self }
     }
 
     /// Time capability accessor.
@@ -95,16 +121,16 @@ impl AgentCx {
         AgentTime { cx: self }
     }
 
-    /// HTTP capability accessor.
+    /// HTTP capability accessor. Requests and response bodies retain this owner.
     #[must_use]
     pub const fn http(&self) -> AgentHttp<'_> {
-        AgentHttp { _cx: self }
+        AgentHttp { cx: self }
     }
 
-    /// Process capability accessor.
+    /// Process capability accessor. Owned commands check authority at spawn.
     #[must_use]
     pub const fn process(&self) -> AgentProcess<'_> {
-        AgentProcess { _cx: self }
+        AgentProcess { cx: self }
     }
 }
 
@@ -116,14 +142,73 @@ impl Deref for AgentCx {
     }
 }
 
+/// Keep the pinned native future independently droppable while a temporary
+/// owner guard is installed. No thread-local guard is stored across polls or
+/// moved between workers. Pin<Box<F>> supports !Unpin futures without unsafe
+/// projection, and taking the option before drop prevents double retirement
+/// if the native destructor unwinds.
+struct ScopedOperation<'a, F> {
+    owner: &'a AgentCx,
+    future: Option<Pin<Box<F>>>,
+}
+
+impl<F: Future> Future for ScopedOperation<'_, F> {
+    type Output = F::Output;
+
+    fn poll(self: Pin<&mut Self>, task_cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        let _guard = this.owner.cx.clone().set_current_restricted();
+        let output = this
+            .future
+            .as_mut()
+            .expect("completed scoped operation cannot be polled again")
+            .as_mut()
+            .poll(task_cx);
+        if output.is_ready() {
+            drop(this.future.take());
+        }
+        output
+    }
+}
+
+impl<F> Drop for ScopedOperation<'_, F> {
+    fn drop(&mut self) {
+        if self.future.is_some() {
+            let _guard = self.owner.cx.clone().set_current_restricted();
+            drop(self.future.take());
+        }
+    }
+}
+
 /// Filesystem-related operations.
+///
+/// Authority and cancellation are checked when an operation is first polled,
+/// before dispatching any filesystem work. Once dispatched, a blocking syscall
+/// may still complete after cancellation; these methods await its result rather
+/// than claiming that cancellation rolls back a write.
 pub struct AgentFs<'a> {
-    _cx: &'a AgentCx,
+    cx: &'a AgentCx,
 }
 
 impl AgentFs<'_> {
+    fn check_access(&self) -> std::io::Result<()> {
+        if !self.cx.capabilities().io {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "agent context does not permit filesystem I/O",
+            ));
+        }
+        self.cx.checkpoint().map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "agent filesystem operation cancelled before dispatch",
+            )
+        })
+    }
+
     pub async fn read(&self, path: impl AsRef<Path>) -> std::io::Result<Vec<u8>> {
-        asupersync::fs::read(path).await
+        self.check_access()?;
+        self.cx.with_current(asupersync::fs::read(path)).await
     }
 
     pub async fn write(
@@ -131,11 +216,17 @@ impl AgentFs<'_> {
         path: impl AsRef<Path>,
         contents: impl AsRef<[u8]>,
     ) -> std::io::Result<()> {
-        asupersync::fs::write(path, contents).await
+        self.check_access()?;
+        self.cx
+            .with_current(asupersync::fs::write(path, contents))
+            .await
     }
 
     pub async fn create_dir_all(&self, path: impl AsRef<Path>) -> std::io::Result<()> {
-        asupersync::fs::create_dir_all(path).await
+        self.check_access()?;
+        self.cx
+            .with_current(asupersync::fs::create_dir_all(path))
+            .await
     }
 }
 
@@ -146,42 +237,304 @@ pub struct AgentTime<'a> {
 
 impl AgentTime<'_> {
     pub async fn sleep(&self, duration: Duration) {
-        let now = self
-            .cx
-            .cx()
-            .timer_driver()
-            .map_or_else(asupersync::time::wall_now, |timer| timer.now());
-        asupersync::time::sleep(now, duration).await;
+        self.cx
+            .with_current(async {
+                let now = self
+                    .cx
+                    .cx()
+                    .timer_driver()
+                    .map_or_else(asupersync::time::wall_now, |timer| timer.now());
+                // Sleep obtains its timer through the ambient Cx. Both the
+                // clock origin and timer registration must belong to our owner.
+                asupersync::time::sleep(now, duration).await;
+            })
+            .await;
     }
 }
 
-/// HTTP-related operations.
+/// HTTP operations scoped through dispatch and response-body consumption.
+/// A configured client can be bound without losing VCR or transport settings.
 pub struct AgentHttp<'a> {
-    _cx: &'a AgentCx,
+    cx: &'a AgentCx,
 }
 
 impl AgentHttp<'_> {
     #[must_use]
-    pub fn client(&self) -> crate::http::client::Client {
-        crate::http::client::Client::new()
+    pub fn client(&self) -> AgentHttpClient {
+        AgentHttpClient::new(self.cx.clone(), crate::http::client::Client::new())
+    }
+
+    #[must_use]
+    pub fn bind(&self, client: &crate::http::client::Client) -> AgentHttpClient {
+        AgentHttpClient::new(self.cx.clone(), client.clone())
+    }
+
+    /// Attach this owner to an already-configured request. This preserves its
+    /// endpoint, credentials, headers, body, recorder and timeout settings.
+    #[must_use]
+    pub fn request<'a>(
+        &self,
+        request: crate::http::client::RequestBuilder<'a>,
+    ) -> AgentHttpRequest<'a> {
+        AgentHttpRequest::new(self.cx.clone(), request)
     }
 }
 
-/// Process-related operations.
+/// Process operations scoped through dispatch and owned child cleanup.
 pub struct AgentProcess<'a> {
-    _cx: &'a AgentCx,
+    cx: &'a AgentCx,
 }
 
 impl AgentProcess<'_> {
     #[must_use]
-    pub fn command(&self, program: &str) -> std::process::Command {
-        std::process::Command::new(program)
+    pub fn command(&self, program: impl AsRef<OsStr>) -> AgentCommand {
+        AgentCommand::new(self.cx.clone(), program)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::future::poll_fn;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // Deliberately !Unpin: cleanup must retire the same pinned native future,
+    // not rely on moving it out of its allocation after it has been polled.
+    struct CleanupProbe<'a> {
+        cleanup: Option<Box<dyn FnOnce() + Send + 'a>>,
+        output: Poll<Result<u32, &'static str>>,
+        panic_on_poll: bool,
+        _pin: std::marker::PhantomPinned,
+    }
+
+    impl Future for CleanupProbe<'_> {
+        type Output = Result<u32, &'static str>;
+
+        fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Self::Output> {
+            let this = self.as_ref().get_ref();
+            assert!(!this.panic_on_poll, "intentional native poll panic");
+            this.output
+        }
+    }
+
+    impl Drop for CleanupProbe<'_> {
+        fn drop(&mut self) {
+            if let Some(cleanup) = self.cleanup.take() {
+                cleanup();
+            }
+        }
+    }
+
+    fn cleanup_probe<'a>(
+        output: Poll<Result<u32, &'static str>>,
+        cleanup: impl FnOnce() + Send + 'a,
+    ) -> CleanupProbe<'a> {
+        CleanupProbe {
+            cleanup: Some(Box::new(cleanup)),
+            output,
+            panic_on_poll: false,
+            _pin: std::marker::PhantomPinned,
+        }
+    }
+
+    fn restricted_owner(quota: u32) -> AgentCx {
+        let source = Cx::for_request_with_budget(Budget::new().with_poll_quota(quota));
+        let _guard = source
+            .restrict::<asupersync::cx::cap::None>()
+            .set_current_restricted();
+        AgentCx::for_current_or_request()
+    }
+
+    fn assert_current_owner(owner: &Cx) {
+        let current = Cx::current().expect("operation owner installed");
+        assert_eq!(current.budget(), owner.budget());
+        assert_eq!(current.capabilities(), owner.capabilities());
+        assert_eq!(current.is_cancel_requested(), owner.is_cancel_requested());
+    }
+
+    #[test]
+    fn unpolled_scoped_drop_retains_owner_and_restores_parent() {
+        let parent = Cx::for_request_with_budget(Budget::new().with_poll_quota(23));
+        let _parent = parent.clone().set_current_restricted();
+        let owner = restricted_owner(7);
+        let drops = AtomicUsize::new(0);
+        let native = cleanup_probe(Poll::Pending, || {
+            assert_current_owner(owner.cx());
+            drops.fetch_add(1, Ordering::SeqCst);
+        });
+        let scoped = owner.with_current(native);
+        assert_current_owner(&parent);
+        drop(scoped);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert_current_owner(&parent);
+    }
+
+    #[test]
+    fn pending_scoped_drop_retains_cancelled_owner_not_the_dropping_task() {
+        let owner = restricted_owner(7);
+        let drops = AtomicUsize::new(0);
+        let native = cleanup_probe(Poll::Pending, || {
+            assert_current_owner(owner.cx());
+            assert!(Cx::current().unwrap().is_cancel_requested());
+            drops.fetch_add(1, Ordering::SeqCst);
+        });
+        let mut scoped = Box::pin(owner.with_current(native));
+        let mut task = Context::from_waker(futures::task::noop_waker_ref());
+        assert!(scoped.as_mut().poll(&mut task).is_pending());
+        owner.cancel_with(asupersync::types::CancelKind::User, Some("owner cancelled"));
+        let unrelated = Cx::for_request_with_budget(Budget::new().with_poll_quota(99));
+        let _unrelated = unrelated.clone().set_current_restricted();
+        drop(scoped);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert_current_owner(&unrelated);
+        assert!(!unrelated.is_cancel_requested());
+    }
+
+    #[test]
+    fn ready_scoped_operation_retires_native_before_returning_success_or_error() {
+        let parent = Cx::for_request_with_budget(Budget::new().with_poll_quota(23));
+        let _parent = parent.clone().set_current_restricted();
+        let owner = restricted_owner(7);
+        for expected in [Ok(42), Err("native failure")] {
+            let drops = AtomicUsize::new(0);
+            let native = cleanup_probe(Poll::Ready(expected), || {
+                assert_current_owner(owner.cx());
+                drops.fetch_add(1, Ordering::SeqCst);
+            });
+            let mut scoped = Box::pin(owner.with_current(native));
+            let mut task = Context::from_waker(futures::task::noop_waker_ref());
+            assert_eq!(scoped.as_mut().poll(&mut task), Poll::Ready(expected));
+            // The completed wrapper remains alive; native resources do not.
+            assert_eq!(drops.load(Ordering::SeqCst), 1);
+            assert_current_owner(&parent);
+            drop(scoped);
+            assert_eq!(drops.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[test]
+    fn scoped_cleanup_after_worker_migration_restores_both_threads() {
+        let parent = Cx::for_request_with_budget(Budget::new().with_poll_quota(23));
+        let _parent = parent.clone().set_current_restricted();
+        let owner = restricted_owner(7);
+        let drops = AtomicUsize::new(0);
+        let native = cleanup_probe(Poll::Pending, || {
+            assert_current_owner(owner.cx());
+            drops.fetch_add(1, Ordering::SeqCst);
+        });
+        let mut scoped = Box::pin(owner.with_current(native));
+        let mut task = Context::from_waker(futures::task::noop_waker_ref());
+        assert!(scoped.as_mut().poll(&mut task).is_pending());
+        std::thread::scope(|scope| {
+            scope
+                .spawn(move || {
+                    let destination =
+                        Cx::for_request_with_budget(Budget::new().with_poll_quota(57));
+                    let _destination = destination.clone().set_current_restricted();
+                    drop(scoped);
+                    assert_current_owner(&destination);
+                })
+                .join()
+                .expect("cleanup worker");
+        });
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert_current_owner(&parent);
+    }
+
+    #[test]
+    fn native_poll_unwind_drops_under_owner_then_restores_parent() {
+        let parent = Cx::for_request_with_budget(Budget::new().with_poll_quota(23));
+        let _parent = parent.clone().set_current_restricted();
+        let owner = restricted_owner(7);
+        let drops = AtomicUsize::new(0);
+        let observed = std::sync::Mutex::new(None);
+        let mut native = cleanup_probe(Poll::Pending, || {
+            // Record rather than assert during unwinding: a regression must
+            // fail this test, not abort the suite with a second panic.
+            *observed.lock().unwrap() = Cx::current();
+            drops.fetch_add(1, Ordering::SeqCst);
+        });
+        native.panic_on_poll = true;
+        let _panic_guard = crate::crash::SuppressPanicHook::new();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut scoped = Box::pin(owner.with_current(native));
+            let mut task = Context::from_waker(futures::task::noop_waker_ref());
+            let _ = scoped.as_mut().poll(&mut task);
+        }));
+        assert!(result.is_err());
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        let observed = observed.into_inner().unwrap().expect("cleanup context");
+        assert_eq!(observed.budget(), owner.budget());
+        assert_eq!(observed.capabilities(), owner.capabilities());
+        assert_current_owner(&parent);
+    }
+
+    #[test]
+    fn cleanup_unwind_restores_parent_without_double_retirement() {
+        let parent = Cx::for_request_with_budget(Budget::new().with_poll_quota(23));
+        let _parent = parent.clone().set_current_restricted();
+        let owner = restricted_owner(7);
+        let drops = AtomicUsize::new(0);
+        let native = cleanup_probe(Poll::Ready(Ok(42)), || {
+            assert_current_owner(owner.cx());
+            drops.fetch_add(1, Ordering::SeqCst);
+            panic!("intentional native cleanup panic");
+        });
+        let mut scoped = Box::pin(owner.with_current(native));
+        let _panic_guard = crate::crash::SuppressPanicHook::new();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut task = Context::from_waker(futures::task::noop_waker_ref());
+            let _ = scoped.as_mut().poll(&mut task);
+        }));
+        assert!(result.is_err());
+        assert_current_owner(&parent);
+        drop(scoped);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert_current_owner(&parent);
+    }
+
+    #[test]
+    fn nested_scoped_operations_retire_under_their_respective_owners() {
+        let parent = Cx::for_request_with_budget(Budget::new().with_poll_quota(23));
+        let _parent = parent.clone().set_current_restricted();
+        let outer = restricted_owner(7);
+        let inner = restricted_owner(3);
+        let retired = std::sync::Mutex::new(Vec::new());
+        let native = cleanup_probe(Poll::Ready(Ok(42)), || {
+            assert_current_owner(inner.cx());
+            retired.lock().unwrap().push("inner");
+        });
+        let outer_cleanup = cleanup_probe(Poll::Pending, || {
+            assert_current_owner(outer.cx());
+            retired.lock().unwrap().push("outer");
+        });
+        let mut scoped = Box::pin(outer.with_current(async {
+            let _cleanup = outer_cleanup;
+            inner.with_current(native).await
+        }));
+        let mut task = Context::from_waker(futures::task::noop_waker_ref());
+        assert_eq!(scoped.as_mut().poll(&mut task), Poll::Ready(Ok(42)));
+        assert_eq!(*retired.lock().unwrap(), vec!["inner", "outer"]);
+        assert_current_owner(&parent);
+    }
+
+    #[test]
+    fn scoped_drop_restores_absence_of_ambient_context() {
+        std::thread::spawn(|| {
+            assert!(Cx::current().is_none());
+            let owner = restricted_owner(7);
+            let drops = AtomicUsize::new(0);
+            let native = cleanup_probe(Poll::Pending, || {
+                assert_current_owner(owner.cx());
+                drops.fetch_add(1, Ordering::SeqCst);
+            });
+            drop(owner.with_current(native));
+            assert_eq!(drops.load(Ordering::SeqCst), 1);
+            assert!(Cx::current().is_none());
+        })
+        .join()
+        .expect("context-free cleanup worker");
+    }
 
     #[test]
     fn for_request_creates_valid_context() {
@@ -201,6 +554,220 @@ mod tests {
     fn for_current_or_request_creates_valid_context() {
         let cx = AgentCx::for_current_or_request();
         let _ = cx.cx();
+    }
+
+    #[test]
+    fn inherited_context_preserves_restrictions_budget_and_owner_cancellation() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("native runtime");
+        let budget = Budget::new().with_poll_quota(8);
+        let owner = runtime.request_cx_with_budget(budget);
+
+        runtime.block_on(async {
+            let parent = Cx::current().expect("runtime installs its context");
+            let parent_caps = parent.capabilities();
+            let captured = {
+                let restricted = owner.restrict::<asupersync::cx::cap::None>();
+                let _guard = restricted.set_current_restricted();
+                let ambient = Cx::current().expect("restricted context remains present");
+                let cx = AgentCx::for_current_or_request();
+                let caps = cx.capabilities();
+                assert_eq!(caps, ambient.capabilities());
+                assert!(!caps.spawn && !caps.time && !caps.entropy && !caps.io && !caps.remote);
+                assert_eq!(cx.budget(), budget);
+
+                // The explicit constructor must preserve the same attenuated context.
+                let wrapped = AgentCx::from_cx(cx.cx().clone());
+                assert_eq!(wrapped.capabilities(), caps);
+                assert_eq!(wrapped.budget(), budget);
+                wrapped
+            };
+            assert_eq!(
+                Cx::current().expect("parent restored").capabilities(),
+                parent_caps
+            );
+
+            // Exercise the real cancel-aware lock used at Pi's session boundaries.
+            let state = asupersync::sync::Mutex::new(7_u32);
+            {
+                let mut guard = state
+                    .lock(captured.cx())
+                    .await
+                    .expect("live owner admitted");
+                *guard += 1;
+            }
+            let captured_caps = captured.capabilities();
+            owner.cancel_with(asupersync::types::CancelKind::User, Some("owner cancelled"));
+            assert!(matches!(
+                state.lock(captured.cx()).await,
+                Err(asupersync::sync::LockError::Cancelled)
+            ));
+            assert_eq!(*state.try_lock().expect("cancelled lock released"), 8);
+            assert_eq!(captured.capabilities(), captured_caps);
+            assert_eq!(captured.budget(), budget);
+            assert!(!parent.is_cancel_requested());
+            assert_eq!(
+                Cx::current().expect("parent retained").capabilities(),
+                parent_caps
+            );
+        });
+    }
+
+    #[test]
+    fn scoped_poll_preserves_owner_and_restores_parent_between_polls() {
+        let parent = Cx::for_request_with_budget(Budget::new().with_poll_quota(23));
+        let _parent_guard = parent.clone().set_current_restricted();
+        let owner = AgentCx::for_request_with_budget(Budget::new().with_poll_quota(7));
+        let mut first_poll = true;
+        let operation = poll_fn(|_| {
+            let current = Cx::current().expect("scoped owner installed");
+            assert_eq!(current.budget(), owner.budget());
+            assert_eq!(current.capabilities(), owner.capabilities());
+            if first_poll {
+                first_poll = false;
+                assert!(!current.is_cancel_requested());
+                std::task::Poll::Pending
+            } else {
+                assert!(current.is_cancel_requested());
+                std::task::Poll::Ready(())
+            }
+        });
+        let mut scoped = std::pin::pin!(owner.with_current(operation));
+        let mut task_cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
+
+        assert!(scoped.as_mut().poll(&mut task_cx).is_pending());
+        assert_eq!(
+            Cx::current().expect("parent restored").budget(),
+            parent.budget()
+        );
+        assert!(!parent.is_cancel_requested());
+
+        owner.cancel_with(asupersync::types::CancelKind::User, Some("owner cancelled"));
+        assert!(scoped.as_mut().poll(&mut task_cx).is_ready());
+        assert_eq!(
+            Cx::current().expect("parent restored").budget(),
+            parent.budget()
+        );
+        assert!(!parent.is_cancel_requested());
+    }
+
+    #[test]
+    fn scoped_poll_restores_parent_after_unwind() {
+        let parent = Cx::for_request_with_budget(Budget::new().with_poll_quota(23));
+        let _parent_guard = parent.clone().set_current_restricted();
+        let owner = AgentCx::for_request_with_budget(Budget::new().with_poll_quota(7));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            // This panic is intentional; do not pollute another test's crash bundle.
+            let _panic_guard = crate::crash::SuppressPanicHook::new();
+            let mut scoped = std::pin::pin!(owner.with_current(async {
+                assert_eq!(
+                    Cx::current().expect("owner installed").budget(),
+                    owner.budget()
+                );
+                panic!("scoped operation failed");
+            }));
+            let mut task_cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
+            let _ = scoped.as_mut().poll(&mut task_cx);
+        }));
+        assert!(result.is_err());
+        assert_eq!(
+            Cx::current().expect("parent restored").budget(),
+            parent.budget()
+        );
+    }
+
+    #[test]
+    fn restricted_filesystem_operations_do_not_read_or_mutate_paths() {
+        let dir = tempfile::tempdir().expect("test directory");
+        let path = dir.path().join("existing.txt");
+        let new_dir = dir.path().join("new/nested");
+        std::fs::write(&path, b"original").expect("write fixture");
+        let owner = Cx::for_request();
+        let captured = {
+            let _guard = owner
+                .restrict::<asupersync::cx::cap::None>()
+                .set_current_restricted();
+            AgentCx::for_current_or_request()
+        };
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("native runtime");
+
+        runtime.block_on(async {
+            let fs = captured.fs();
+            assert_eq!(
+                fs.read(&path).await.expect_err("read denied").kind(),
+                std::io::ErrorKind::PermissionDenied
+            );
+            assert_eq!(
+                fs.write(&path, b"replacement")
+                    .await
+                    .expect_err("write denied")
+                    .kind(),
+                std::io::ErrorKind::PermissionDenied
+            );
+            assert_eq!(
+                fs.create_dir_all(&new_dir)
+                    .await
+                    .expect_err("mkdir denied")
+                    .kind(),
+                std::io::ErrorKind::PermissionDenied
+            );
+        });
+        assert_eq!(std::fs::read(&path).expect("read original"), b"original");
+        assert!(!dir.path().join("new").exists());
+    }
+
+    #[test]
+    fn cancellation_after_future_creation_prevents_filesystem_dispatch() {
+        let dir = tempfile::tempdir().expect("test directory");
+        let path = dir.path().join("existing.txt");
+        let new_dir = dir.path().join("new/nested");
+        std::fs::write(&path, b"original").expect("write fixture");
+        let owner = AgentCx::for_request();
+        let fs = owner.fs();
+        let read = fs.read(&path);
+        let write = fs.write(&path, b"replacement");
+        let mkdir = fs.create_dir_all(&new_dir);
+        owner.cancel_with(asupersync::types::CancelKind::User, Some("owner cancelled"));
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("native runtime");
+
+        runtime.block_on(async {
+            assert_eq!(
+                read.await.expect_err("read cancelled").kind(),
+                std::io::ErrorKind::Interrupted
+            );
+            assert_eq!(
+                write.await.expect_err("write cancelled").kind(),
+                std::io::ErrorKind::Interrupted
+            );
+            assert_eq!(
+                mkdir.await.expect_err("mkdir cancelled").kind(),
+                std::io::ErrorKind::Interrupted
+            );
+        });
+        assert_eq!(std::fs::read(&path).expect("read original"), b"original");
+        assert!(!dir.path().join("new").exists());
+    }
+
+    #[test]
+    fn live_filesystem_owner_can_create_write_and_read() {
+        let dir = tempfile::tempdir().expect("test directory");
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("native runtime");
+        runtime.block_on(async {
+            let owner = AgentCx::for_current_or_request();
+            let fs = owner.fs();
+            let nested = dir.path().join("nested");
+            let path = nested.join("file.txt");
+            fs.create_dir_all(&nested).await.expect("create directory");
+            fs.write(&path, b"content").await.expect("write file");
+            assert_eq!(fs.read(&path).await.expect("read file"), b"content");
+        });
     }
 
     #[test]

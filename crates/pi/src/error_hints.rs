@@ -43,6 +43,11 @@ pub fn hints_for_error(error: &Error) -> ErrorHint {
         Error::Json(err) => json_hints(err),
         Error::Sqlite(err) => sqlite_hints(err),
         Error::Aborted => aborted_hints(),
+        Error::CostCap { .. } => ErrorHint {
+            summary: "Session model-spend cap reached",
+            hints: &["Raise --max-cost / session.maxCost explicitly to continue this session"],
+            context_fields: &["spent", "cap"],
+        },
         Error::Api(msg) => api_hints(msg),
     }
 }
@@ -172,6 +177,11 @@ fn auth_hints(msg: &str) -> ErrorHint {
 }
 
 fn provider_hints(message: &str) -> ErrorHint {
+    // Connect-path errors re-wrapped by providers keep the original message
+    // text, so match the WSAENOTCONN signature here too (#106).
+    if message.contains("10057") || message.contains("Socket is not connected") {
+        return winsock_not_connected_hints();
+    }
     if message.contains("429") || message.contains("rate limit") {
         return ErrorHint {
             summary: "Rate limit exceeded",
@@ -372,7 +382,32 @@ fn extension_hints(msg: &str) -> ErrorHint {
     }
 }
 
+/// Hint for Windows `WSAENOTCONN` (os error 10057) "Socket is not connected"
+/// failures during connect/TLS handshake (#106, #66, asupersync#35).
+///
+/// Layered Winsock providers (VPN clients, antivirus, firewall LSPs) can
+/// report an outbound connect as complete while the base provider socket has
+/// not finished connecting, so the first send fails with 10057. Pi retries the
+/// connect automatically; if the error still surfaces the interference is
+/// persistent and needs OS-level remediation.
+const fn winsock_not_connected_hints() -> ErrorHint {
+    ErrorHint {
+        summary: "Socket not connected (Windows WSAENOTCONN 10057) - often VPN, antivirus, or Winsock LSP interference",
+        hints: &[
+            "Retry the request; if it persists, temporarily disable VPN/antivirus/firewall software to identify the interfering layer",
+            "Inspect layered providers with 'netsh winsock show catalog'; as a last resort run 'netsh winsock reset' from an elevated prompt and reboot",
+        ],
+        context_fields: &["url"],
+    }
+}
+
 fn io_hints(err: &std::io::Error) -> ErrorHint {
+    // Windows WSAENOTCONN (10057): kind() maps to NotConnected on Windows,
+    // but also check the raw OS code in case the error was synthesized with
+    // an uncategorized kind (#106).
+    if err.kind() == std::io::ErrorKind::NotConnected || err.raw_os_error() == Some(10057) {
+        return winsock_not_connected_hints();
+    }
     match err.kind() {
         std::io::ErrorKind::NotFound => ErrorHint {
             summary: "File or directory not found",
@@ -422,16 +457,28 @@ fn json_hints(err: &serde_json::Error) -> ErrorHint {
     }
 }
 
-fn sqlite_hints(err: &sqlmodel_core::Error) -> ErrorHint {
-    let message = err.to_string();
-    if message.contains("locked") {
+const fn sqlite_hints(err: &fsqlite::FrankenError) -> ErrorHint {
+    if matches!(
+        err,
+        fsqlite::FrankenError::DatabaseLocked { .. }
+            | fsqlite::FrankenError::Busy
+            | fsqlite::FrankenError::BusyRecovery
+            | fsqlite::FrankenError::BusySnapshot { .. }
+            | fsqlite::FrankenError::LockFailed { .. }
+            | fsqlite::FrankenError::MultiProcessContractViolation { .. }
+    ) {
         return ErrorHint {
             summary: "Database locked",
             hints: &["Close other Pi instances using this database"],
             context_fields: &["db_path"],
         };
     }
-    if message.contains("corrupt") {
+    if matches!(
+        err,
+        fsqlite::FrankenError::DatabaseCorrupt { .. }
+            | fsqlite::FrankenError::WalCorrupt { .. }
+            | fsqlite::FrankenError::NotADatabase { .. }
+    ) {
         return ErrorHint {
             summary: "Database corrupted",
             hints: &[
@@ -457,6 +504,12 @@ const fn aborted_hints() -> ErrorHint {
 }
 
 fn api_hints(msg: &str) -> ErrorHint {
+    // TLS connect failures arrive flattened into a message string, e.g.
+    // "TLS connect failed: I/O error: Socket is not connected. (os error
+    // 10057)" (#106).
+    if msg.contains("10057") || msg.contains("Socket is not connected") {
+        return winsock_not_connected_hints();
+    }
     if msg.contains("timed out") || msg.contains("timeout") {
         return ErrorHint {
             summary: "Request timed out",
@@ -523,9 +576,140 @@ pub fn format_error_with_hints(error: &Error) -> String {
     output
 }
 
+/// `type` of the machine-readable fatal-error record (gh #217).
+pub const FATAL_ERROR_RECORD_TYPE: &str = "error";
+
+/// `phase` of a fatal-error record emitted before the JSON/RPC stream opened.
+pub const FATAL_ERROR_PHASE_STARTUP: &str = "startup";
+
+/// `phase` of a fatal-error record emitted after the stream had opened.
+pub const FATAL_ERROR_PHASE_RUN: &str = "run";
+
+/// Stable machine-readable class for a fatal [`Error`] (gh #217).
+///
+/// Auth and provider failures reuse the auth diagnostic codes
+/// (`auth.missing_api_key`, `auth.invalid_api_key`, …) when the message
+/// classifies; every other variant maps to a fixed family name. Hosts key
+/// on this string, so values only ever get added, never renamed.
+#[must_use]
+pub fn error_code(error: &Error) -> &'static str {
+    if let Some(diagnostic) = error.auth_diagnostic() {
+        return diagnostic.code.as_str();
+    }
+    match error {
+        Error::Config(_) => "config",
+        Error::Session(_) | Error::SessionNotFound { .. } => "session",
+        Error::Provider { .. } => "provider",
+        Error::Auth(_) => "auth",
+        Error::Tool { .. } => "tool",
+        Error::Validation(_) => "usage",
+        Error::Extension(_) => "extension",
+        Error::Io(_) => "io",
+        Error::Json(_) => "json",
+        Error::Sqlite(_) => "state_store",
+        Error::Aborted => "aborted",
+        Error::CostCap { .. } => "cost_cap",
+        Error::Api(_) => "api",
+    }
+}
+
+/// The single machine-readable record `--mode json` / `--mode rpc` print on
+/// stdout before a non-zero exit (gh #217):
+/// `{"type":"error","phase":"startup","code":"…","message":"…","exit_code":N}`.
+///
+/// `phase` is [`FATAL_ERROR_PHASE_STARTUP`] when the failure happened before
+/// the session header / RPC loop opened the stream, [`FATAL_ERROR_PHASE_RUN`]
+/// otherwise. The field set is the contract; new fields may be added, these
+/// five never change.
+#[must_use]
+pub fn fatal_error_record(
+    code: &str,
+    phase: &str,
+    message: &str,
+    exit_code: i32,
+) -> serde_json::Value {
+    serde_json::json!({
+        "type": FATAL_ERROR_RECORD_TYPE,
+        "phase": phase,
+        "code": code,
+        "message": message,
+        "exit_code": exit_code,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// gh #217: every variant has a stable code, and auth-classifiable
+    /// messages surface the finer auth diagnostic code.
+    #[test]
+    fn error_code_is_stable_per_variant() {
+        assert_eq!(error_code(&Error::config("bad settings")), "config");
+        assert_eq!(error_code(&Error::session("corrupt")), "session");
+        assert_eq!(
+            error_code(&Error::SessionNotFound {
+                path: "x".to_string()
+            }),
+            "session"
+        );
+        assert_eq!(error_code(&Error::validation("bad flag")), "usage");
+        assert_eq!(error_code(&Error::extension("boom")), "extension");
+        assert_eq!(error_code(&Error::api("500")), "api");
+        assert_eq!(error_code(&Error::Aborted), "aborted");
+        assert_eq!(error_code(&Error::tool("read", "missing")), "tool");
+        assert_eq!(
+            error_code(&Error::Io(Box::new(std::io::Error::other("disk")))),
+            "io"
+        );
+        assert_eq!(
+            error_code(&Error::auth(
+                "No API key found for provider anthropic (set ANTHROPIC_API_KEY)"
+            )),
+            "auth.missing_api_key"
+        );
+        // An auth message the diagnostic classifier does not recognize falls
+        // back to the family name rather than guessing a finer code.
+        assert_eq!(
+            error_code(&Error::auth("something nobody classifies")),
+            "auth"
+        );
+        assert_eq!(
+            error_code(&Error::Provider {
+                provider: "openai".to_string(),
+                message: "401 unauthorized: invalid api key".to_string(),
+            }),
+            "auth.invalid_api_key"
+        );
+        assert_eq!(
+            error_code(&Error::Provider {
+                provider: "openai".to_string(),
+                message: "connection reset".to_string(),
+            }),
+            "provider"
+        );
+    }
+
+    #[test]
+    fn fatal_error_record_has_exactly_the_contract_fields() {
+        let record = fatal_error_record(
+            "auth.missing_api_key",
+            FATAL_ERROR_PHASE_STARTUP,
+            "Authentication error: No API key",
+            1,
+        );
+        let object = record.as_object().expect("object");
+        let mut keys = object.keys().cloned().collect::<Vec<_>>();
+        keys.sort();
+        assert_eq!(keys, ["code", "exit_code", "message", "phase", "type"]);
+        assert_eq!(record["type"], "error");
+        assert_eq!(record["phase"], "startup");
+        assert_eq!(record["code"], "auth.missing_api_key");
+        assert_eq!(record["message"], "Authentication error: No API key");
+        assert_eq!(record["exit_code"], 1);
+        // One line on the wire.
+        assert!(!record.to_string().contains('\n'));
+    }
 
     #[test]
     fn test_config_error_hints() {
@@ -954,6 +1138,28 @@ mod tests {
         assert_eq!(hint.summary, "I/O error");
     }
 
+    #[test]
+    fn test_io_not_connected_hints() {
+        let io_err =
+            std::io::Error::new(std::io::ErrorKind::NotConnected, "Socket is not connected");
+        let error = Error::Io(Box::new(io_err));
+        let hint = hints_for_error(&error);
+        assert!(hint.summary.contains("10057"));
+        assert!(hint.hints.iter().any(|h| h.contains("netsh winsock")));
+        assert!(hint.hints.iter().any(|h| h.contains("VPN")));
+    }
+
+    #[test]
+    fn test_io_wsaenotconn_raw_os_error_hints() {
+        // Raw os error 10057 must map to the Winsock hint even when the
+        // platform does not categorize the kind (non-Windows hosts).
+        let io_err = std::io::Error::from_raw_os_error(10057);
+        let error = Error::Io(Box::new(io_err));
+        let hint = hints_for_error(&error);
+        assert!(hint.summary.contains("10057"));
+        assert!(hint.hints.iter().any(|h| h.contains("netsh winsock")));
+    }
+
     // -----------------------------------------------------------------------
     // json_hints additional branches
     // -----------------------------------------------------------------------
@@ -1010,6 +1216,26 @@ mod tests {
         let error = Error::api("502 Bad Gateway");
         let hint = hints_for_error(&error);
         assert_eq!(hint.summary, "API error");
+    }
+
+    #[test]
+    fn test_api_tls_connect_10057_hints() {
+        let error =
+            Error::api("TLS connect failed: I/O error: Socket is not connected. (os error 10057)");
+        let hint = hints_for_error(&error);
+        assert!(hint.summary.contains("10057"));
+        assert!(hint.hints.iter().any(|h| h.contains("netsh winsock")));
+    }
+
+    #[test]
+    fn test_provider_socket_not_connected_hints() {
+        let error = Error::provider(
+            "anthropic",
+            "TLS connect failed: I/O error: Socket is not connected. (os error 10057)",
+        );
+        let hint = hints_for_error(&error);
+        assert!(hint.summary.contains("10057"));
+        assert!(hint.hints.iter().any(|h| h.contains("netsh winsock")));
     }
 
     // -----------------------------------------------------------------------

@@ -8,21 +8,32 @@
 
 use std::borrow::Cow;
 
+use crate::auth::{
+    AUTH_RESOLUTION_LOCK_TIMEOUT, AuthStorage, AuthStorageLoadFailure,
+    resolve_ambient_sap_auth_token_with_client, resolve_sap_auth_candidate_with_client,
+    resolve_sap_auth_token_with_client,
+};
+use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::http::client::Client;
 use crate::model::{
-    AssistantMessage, ContentBlock, Message, StopReason, StreamEvent, TextContent, ThinkingContent,
-    ToolCall, Usage, UserContent,
+    AssistantMessage, BillingTokenCounts, BillingUsage, ContentBlock, Message, StopReason,
+    StreamEvent, TextContent, ThinkingContent, ThinkingLevel, ToolCall, Usage, UserContent,
 };
 use crate::models::CompatConfig;
 use crate::provider::{Context, Provider, StreamOptions, ToolDef};
+use crate::provider_metadata::canonical_provider_id;
 use crate::sse::SseStream;
 use async_trait::async_trait;
 use futures::StreamExt;
 use futures::stream::{self, Stream};
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
+use std::path::PathBuf;
 use std::pin::Pin;
+
+#[path = "openai_deepseek.rs"]
+mod deepseek;
 
 // ============================================================================
 // Constants
@@ -30,8 +41,88 @@ use std::pin::Pin;
 
 const OPENAI_API_URL: &str = "https://api.openai.com/v1/chat/completions";
 const DEFAULT_MAX_TOKENS: u32 = 4096;
+const MAX_API_ERROR_BODY_BYTES: usize = 64 * 1024;
+const MAX_READY_EVENTS_PER_YIELD: usize = 64;
+// Local transport bounds, independent of the upstream service's limits.
+// Ingress still applies media.maxBytes (5 MiB by default) before session edits.
+const MAX_AUDIO_BLOCK_BYTES: u64 = 10 * 1024 * 1024;
+const MAX_AUDIO_REQUEST_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_AUDIO_BLOCKS: usize = 32;
 const OPENROUTER_DEFAULT_HTTP_REFERER: &str = "https://github.com/Dicklesworthstone/pi_agent_rust";
 const OPENROUTER_DEFAULT_X_TITLE: &str = "Pi Agent Rust";
+
+type EventStream = Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>;
+
+#[derive(Default)]
+struct AudioInputBudget {
+    blocks: usize,
+    bytes: u64,
+}
+
+impl AudioInputBudget {
+    fn admit(&mut self, data: &str) -> Result<()> {
+        if self.blocks == MAX_AUDIO_BLOCKS {
+            return Err(Error::validation(
+                "OpenAI audio input exceeds 32 blocks per request",
+            ));
+        }
+        if data.is_empty() {
+            return Err(Error::validation("OpenAI audio input must not be empty"));
+        }
+        if u64::try_from(data.len()).unwrap_or(u64::MAX) > MAX_AUDIO_BLOCK_BYTES.div_ceil(3) * 4 {
+            return Err(Error::validation(
+                "OpenAI audio input exceeds the 10 MiB per-block transport limit",
+            ));
+        }
+        let engine = if data.ends_with('=') {
+            &base64::engine::general_purpose::STANDARD
+        } else {
+            &base64::engine::general_purpose::STANDARD_NO_PAD
+        };
+        // Validate incrementally, without allocating a decoded payload copy.
+        let mut reader = base64::read::DecoderReader::new(data.as_bytes(), engine);
+        let bytes = std::io::copy(&mut reader, &mut std::io::sink())
+            .map_err(|_| Error::validation("OpenAI audio input is not valid standard base64"))?;
+        if bytes == 0 || bytes > MAX_AUDIO_BLOCK_BYTES {
+            return Err(Error::validation(
+                "OpenAI audio input must contain 1 byte to 10 MiB per block",
+            ));
+        }
+        self.bytes = self
+            .bytes
+            .checked_add(bytes)
+            .filter(|bytes| *bytes <= MAX_AUDIO_REQUEST_BYTES)
+            .ok_or_else(|| Error::validation("OpenAI audio input exceeds 64 MiB per request"))?;
+        self.blocks += 1;
+        Ok(())
+    }
+}
+
+fn native_audio_format(media: &crate::model::MediaContent) -> Option<&'static str> {
+    let mime = media.mime_type.split(';').next()?.trim();
+    match mime.to_ascii_lowercase().as_str() {
+        "audio/wav" | "audio/wave" | "audio/x-wav" | "audio/vnd.wave" => Some("wav"),
+        "audio/mpeg" | "audio/mp3" | "audio/x-mp3" => Some("mp3"),
+        _ => None,
+    }
+}
+
+fn native_audio_part(
+    media: &crate::model::MediaContent,
+    enabled: bool,
+) -> Option<OpenAIContentPart<'_>> {
+    let format = enabled.then(|| native_audio_format(media)).flatten()?;
+    // Persisted unpadded media remains unchanged; only its wire representation
+    // receives the padding required by a strict standard-base64 decoder.
+    let data = match media.data.len() % 4 {
+        2 => Cow::Owned(format!("{}==", media.data)),
+        3 => Cow::Owned(format!("{}=", media.data)),
+        _ => Cow::Borrowed(media.data.as_str()),
+    };
+    Some(OpenAIContentPart::InputAudio {
+        input_audio: OpenAIInputAudio { data, format },
+    })
+}
 
 /// Map a role string (which may come from compat config at runtime) to a `Cow<'_, str>`.
 ///
@@ -74,6 +165,24 @@ fn authorization_override(
         })
 }
 
+fn redacted_api_error_body(body: &str, secrets: &[&str]) -> String {
+    crate::auth::redact_known_secrets_bounded(body, secrets, MAX_API_ERROR_BODY_BYTES)
+}
+
+fn push_api_error_secret(secrets: &mut Vec<String>, value: &str, authorization: bool) {
+    let value = value.trim();
+    if value.is_empty() {
+        return;
+    }
+    secrets.push(value.to_string());
+    if authorization && let Some(separator) = value.find(char::is_whitespace) {
+        let credential = value[separator..].trim();
+        if !credential.is_empty() {
+            secrets.push(credential.to_string());
+        }
+    }
+}
+
 fn first_non_empty_env(keys: &[&str]) -> Option<String> {
     keys.iter().find_map(|key| {
         std::env::var(key)
@@ -104,6 +213,16 @@ pub struct OpenAIProvider {
     base_url: String,
     provider: String,
     compat: Option<CompatConfig>,
+    auth_path_override: Option<PathBuf>,
+    auth_header: bool,
+    /// Whether the model is a reasoning model. Gates the DeepSeek thinking
+    /// dialect so non-reasoning DeepSeek models (e.g. `deepseek-chat`) never
+    /// emit `thinking`/`reasoning_effort` (gh #114). Defaults to `false`; the
+    /// registry sets it from `ModelEntry::model.reasoning` via `with_reasoning`.
+    reasoning: bool,
+    /// Native audio is opt-in per model, never inferred from a compatible URL.
+    audio_input: bool,
+    model_cost: Option<crate::provider::ModelCost>,
 }
 
 impl OpenAIProvider {
@@ -115,7 +234,38 @@ impl OpenAIProvider {
             base_url: OPENAI_API_URL.to_string(),
             provider: "openai".to_string(),
             compat: None,
+            auth_path_override: None,
+            auth_header: true,
+            reasoning: false,
+            audio_input: false,
+            model_cost: None,
         }
+    }
+
+    /// Install the selected model's declared input capabilities.
+    #[must_use]
+    pub fn with_input_types(mut self, input: &[crate::provider::InputType]) -> Self {
+        self.audio_input = input.contains(&crate::provider::InputType::Audio);
+        self
+    }
+
+    /// Keep native audio admission and usage pricing bound to the selected
+    /// model's rates, including an explicitly free audio rate.
+    #[must_use]
+    pub fn with_model_cost(mut self, cost: crate::provider::ModelCost) -> Self {
+        self.model_cost = Some(cost);
+        self
+    }
+
+    /// Set whether the underlying model is a reasoning model.
+    ///
+    /// Only consulted by the DeepSeek thinking dialect (`reasoning_style`): a
+    /// non-reasoning DeepSeek model serializes with no `thinking`/`reasoning_effort`
+    /// (byte-for-byte as before #113), while a reasoning one forwards the level.
+    #[must_use]
+    pub const fn with_reasoning(mut self, reasoning: bool) -> Self {
+        self.reasoning = reasoning;
+        self
     }
 
     /// Override the provider name reported in streamed events.
@@ -142,6 +292,19 @@ impl OpenAIProvider {
         self
     }
 
+    #[cfg(test)]
+    #[must_use]
+    fn with_auth_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.auth_path_override = Some(path.into());
+        self
+    }
+
+    fn auth_path(&self) -> PathBuf {
+        self.auth_path_override
+            .clone()
+            .unwrap_or_else(Config::auth_path)
+    }
+
     /// Attach provider-specific compatibility overrides.
     ///
     /// Overrides are applied during request building (field names, headers,
@@ -150,6 +313,221 @@ impl OpenAIProvider {
     pub fn with_compat(mut self, compat: Option<CompatConfig>) -> Self {
         self.compat = compat;
         self
+    }
+
+    /// Control whether this route generates a Bearer Authorization header.
+    /// Custom Authorization headers remain authoritative regardless of this flag.
+    #[must_use]
+    pub const fn with_auth_header(mut self, enabled: bool) -> Self {
+        self.auth_header = enabled;
+        self
+    }
+
+    /// Detect a provider-specific reasoning dialect for this transport.
+    ///
+    /// The OpenRouter gateway (by provider id or an `openrouter.ai` base URL)
+    /// always uses its normalized `reasoning` object (gh #220): with no
+    /// declared `thinkingFormat` it defaults on for reasoning models, and a
+    /// declared format other than `"openrouter"` opts out entirely — vendor
+    /// dialects such as DeepSeek's `thinking`/`reasoning_effort` never go
+    /// through the gateway, which translates `reasoning` itself.
+    ///
+    /// Elsewhere an explicit catalog `compat.thinkingFormat` declaration wins
+    /// (gh #166): `"deepseek"` opts any custom OpenAI-compatible provider into
+    /// the DeepSeek dialect regardless of provider id or base URL,
+    /// `"openrouter"` opts a proxy into the OpenRouter shape, while any other
+    /// declared format opts out. A provider that explicitly declares
+    /// `supportsReasoningEffort: true` may use the plain OpenAI effort field,
+    /// either with `"openai"` or without a declared format (pi-freeflow).
+    ///
+    /// When no `thinkingFormat` is declared, DeepSeek is identified the same
+    /// way `ModelEntry::is_deepseek_reasoning_model` does it — by the
+    /// canonical provider id (so the `deep-seek` alias also matches) or a
+    /// `deepseek.com` base URL. Either path applies only to reasoning models,
+    /// so a non-reasoning DeepSeek model (e.g. `deepseek-chat`) emits no
+    /// `thinking`/`reasoning_effort` (byte-for-byte as before #113, gh #114).
+    /// Every other OpenAI-compatible provider is left untouched.
+    fn reasoning_style(&self) -> Option<ReasoningStyle> {
+        if !self.reasoning {
+            return None;
+        }
+        let declared = self
+            .compat
+            .as_ref()
+            .and_then(|c| c.thinking_format.as_deref())
+            .map(str::trim)
+            .filter(|format| !format.is_empty());
+        if self.is_openrouter() {
+            return match declared {
+                None => Some(ReasoningStyle::OpenRouter),
+                Some(format) if format.eq_ignore_ascii_case("openrouter") => {
+                    Some(ReasoningStyle::OpenRouter)
+                }
+                Some(_) => None,
+            };
+        }
+        if let Some(format) = declared {
+            if format.eq_ignore_ascii_case("deepseek") {
+                return Some(ReasoningStyle::DeepSeek);
+            }
+            if format.eq_ignore_ascii_case("openrouter") {
+                return Some(ReasoningStyle::OpenRouter);
+            }
+            if format.eq_ignore_ascii_case("openai") && self.supports_plain_reasoning_effort() {
+                return Some(ReasoningStyle::OpenAI);
+            }
+            return None;
+        }
+        let provider_is_deepseek = canonical_provider_id(&self.provider)
+            .is_some_and(|canonical| canonical == "deepseek")
+            || self.provider.eq_ignore_ascii_case("deepseek");
+        let base_is_deepseek = self.base_url.to_ascii_lowercase().contains("deepseek.com");
+        if provider_is_deepseek || base_is_deepseek {
+            Some(ReasoningStyle::DeepSeek)
+        } else if self.supports_plain_reasoning_effort() {
+            Some(ReasoningStyle::OpenAI)
+        } else {
+            None
+        }
+    }
+
+    fn supports_plain_reasoning_effort(&self) -> bool {
+        self.compat
+            .as_ref()
+            .and_then(|compat| compat.supports_reasoning_effort)
+            == Some(true)
+    }
+
+    fn is_sap_ai_core(&self) -> bool {
+        canonical_provider_id(&self.provider).is_some_and(|canonical| canonical == "sap-ai-core")
+    }
+
+    fn require_audio_pricing(&self) -> Result<()> {
+        if self
+            .compat
+            .as_ref()
+            .and_then(|compat| compat.supports_usage_in_streaming)
+            == Some(false)
+        {
+            return Err(Error::validation(
+                "Native OpenAI audio requires streamed usage accounting",
+            ));
+        }
+        let rate = self
+            .model_cost
+            .as_ref()
+            .and_then(|cost| cost.audio.as_ref())
+            .and_then(|audio| audio.input);
+        if !rate.is_some_and(|rate| rate.is_finite() && rate >= 0.0) {
+            return Err(Error::validation(
+                "Native OpenAI audio requires a finite nonnegative cost.audio.input rate in models.json; zero is an explicit free rate",
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_audio_context(&self, context: &Context<'_>) -> Result<()> {
+        if !self.audio_input {
+            return Ok(());
+        }
+        let mut budget = AudioInputBudget::default();
+        for message in context.messages.iter() {
+            let blocks = match message {
+                Message::User(user) => match &user.content {
+                    UserContent::Blocks(blocks) => blocks.as_slice(),
+                    UserContent::Text(_) => continue,
+                },
+                Message::ToolResult(result) => result.content.as_slice(),
+                Message::Assistant(_) | Message::Custom(_) => continue,
+            };
+            for block in blocks {
+                if let ContentBlock::Media(media) = block
+                    && native_audio_format(media).is_some()
+                {
+                    budget.admit(&media.data)?;
+                }
+            }
+        }
+        if budget.blocks > 0 {
+            self.require_audio_pricing()?;
+        }
+        Ok(())
+    }
+
+    /// Inspect the actual selected body after extension rewriting, so a hook
+    /// cannot inject an unbounded payload or switch the priced audio model.
+    fn validate_audio_request(&self, body: &serde_json::Value) -> Result<bool> {
+        let mut budget = AudioInputBudget::default();
+        if let Some(messages) = body.get("messages").and_then(serde_json::Value::as_array) {
+            for message in messages {
+                let Some(parts) = message.get("content").and_then(serde_json::Value::as_array)
+                else {
+                    continue;
+                };
+                for part in parts {
+                    if part.get("type").and_then(serde_json::Value::as_str) != Some("input_audio") {
+                        continue;
+                    }
+                    if !self.audio_input {
+                        return Err(Error::validation(
+                            "The selected model does not declare audio input",
+                        ));
+                    }
+                    if message.get("role").and_then(serde_json::Value::as_str) != Some("user") {
+                        return Err(Error::validation(
+                            "OpenAI input_audio is only valid in user content",
+                        ));
+                    }
+                    let audio = part.get("input_audio").ok_or_else(|| {
+                        Error::validation("OpenAI input_audio is missing its data and format")
+                    })?;
+                    if !matches!(
+                        audio.get("format").and_then(serde_json::Value::as_str),
+                        Some("wav" | "mp3")
+                    ) {
+                        return Err(Error::validation(
+                            "OpenAI input_audio requires wav or mp3 format",
+                        ));
+                    }
+                    let data = audio
+                        .get("data")
+                        .and_then(serde_json::Value::as_str)
+                        .ok_or_else(|| {
+                            Error::validation("OpenAI input_audio requires base64 data")
+                        })?;
+                    budget.admit(data)?;
+                }
+            }
+        }
+        if budget.blocks > 0 {
+            self.require_audio_pricing()?;
+            if body
+                .pointer("/stream_options/include_usage")
+                .and_then(serde_json::Value::as_bool)
+                != Some(true)
+            {
+                return Err(Error::validation(
+                    "Native OpenAI audio requires stream_options.include_usage",
+                ));
+            }
+            if body.get("model").and_then(serde_json::Value::as_str) != Some(self.model.as_str()) {
+                return Err(Error::validation(
+                    "An audio request hook cannot replace the selected priced model",
+                ));
+            }
+        }
+        if self.audio_input
+            && body.get("modalities").is_some_and(|modalities| {
+                modalities
+                    .as_array()
+                    .is_none_or(|values| values.len() != 1 || values[0].as_str() != Some("text"))
+            })
+        {
+            return Err(Error::validation(
+                "Native OpenAI audio input requires text-only output modalities",
+            ));
+        }
+        Ok(budget.blocks > 0)
     }
 
     /// Build the request body for the OpenAI API.
@@ -163,7 +541,6 @@ impl OpenAIProvider {
             .as_ref()
             .and_then(|c| c.system_role_name.as_deref())
             .unwrap_or("system");
-        let messages = Self::build_messages_with_role(context, system_role);
 
         let tools_supported = self
             .compat
@@ -176,6 +553,12 @@ impl OpenAIProvider {
         } else {
             Some(context.tools.iter().map(convert_tool_to_openai).collect())
         };
+        // DeepSeek requires prior reasoning_content to be replayed on requests
+        // that admit tools. Keep this independent of the current thinking-level
+        // override: disabling thinking now must not erase reasoning from history.
+        let replay_reasoning =
+            tools.is_some() && self.reasoning_style() == Some(ReasoningStyle::DeepSeek);
+        let messages = self.build_messages_with_role(context, system_role, replay_reasoning);
 
         // Determine which max-tokens field to populate based on compat config.
         let use_alt_field = self
@@ -198,6 +581,67 @@ impl OpenAIProvider {
             .unwrap_or(true);
 
         let stream_options = Some(OpenAIStreamOptions { include_usage });
+        // OpenRouter usage accounting (gh #221): `usage.include` makes the
+        // final usage chunk carry the billed `cost`, which is the only cost
+        // source for models the local catalog has no pricing for.
+        let usage = self
+            .is_openrouter()
+            .then_some(OpenAIUsageAccounting { include: true });
+
+        // Forward the reasoning level for providers with a request-side reasoning
+        // dialect: DeepSeek's vendor fields, OpenRouter's normalized
+        // `reasoning` object, or an explicitly enabled plain OpenAI effort.
+        // Undeclared transports keep their existing body. DeepSeek collapses `low`/`medium`
+        // into `high` itself, so we only emit the values it documents and let
+        // `off` request the explicit non-thinking path. Both `xhigh` and `max`
+        // map to DeepSeek's top `"max"` tier (xhigh kept its historical mapping
+        // when the first-class `max` level was added; gh #139). A catalog
+        // `thinkingLevelMap` overrides the emitted `reasoning_effort` value for
+        // enabled levels (gh #117/#165), matching the anthropic-messages and
+        // openai-responses transports; `off` never emits an effort.
+        let level = options.thinking_level.unwrap_or_default();
+        let mapped_effort = self
+            .compat
+            .as_ref()
+            .and_then(|compat| compat.thinking_level_map.as_ref())
+            .and_then(|map| map.get(level.to_string().as_str()));
+        let style = if mapped_effort.is_some_and(Option::is_none) {
+            None
+        } else {
+            self.reasoning_style()
+        };
+        let (thinking, reasoning_effort, reasoning) = match style {
+            Some(ReasoningStyle::DeepSeek) => {
+                if level == ThinkingLevel::Off {
+                    (Some(OpenAIThinking { kind: "disabled" }), None, None)
+                } else {
+                    let mapped = mapped_effort.and_then(Option::as_deref);
+                    let effort = mapped.or(match level {
+                        ThinkingLevel::High => Some("high"),
+                        ThinkingLevel::XHigh | ThinkingLevel::Max => Some("max"),
+                        ThinkingLevel::Off
+                        | ThinkingLevel::Minimal
+                        | ThinkingLevel::Low
+                        | ThinkingLevel::Medium => None,
+                    });
+                    (Some(OpenAIThinking { kind: "enabled" }), effort, None)
+                }
+            }
+            Some(ReasoningStyle::OpenRouter) => (None, None, self.openrouter_reasoning(level)),
+            Some(ReasoningStyle::OpenAI) => {
+                let effort = mapped_effort.and_then(Option::as_deref).or(match level {
+                    ThinkingLevel::Off => None,
+                    ThinkingLevel::Minimal => Some("minimal"),
+                    ThinkingLevel::Low => Some("low"),
+                    ThinkingLevel::Medium => Some("medium"),
+                    ThinkingLevel::High => Some("high"),
+                    ThinkingLevel::XHigh => Some("xhigh"),
+                    ThinkingLevel::Max => Some("max"),
+                });
+                (None, effort, None)
+            }
+            None => (None, None, None),
+        };
 
         OpenAIRequest {
             model: &self.model,
@@ -208,7 +652,70 @@ impl OpenAIProvider {
             tools,
             stream: true,
             stream_options,
+            usage,
+            thinking,
+            reasoning_effort,
+            reasoning,
+            modalities: self.audio_input.then_some(["text"]),
+            prompt_cache_key: options.prompt_cache_key.clone(),
+            service_tier: crate::provider::openai_service_tier(
+                &self.provider,
+                "openai-completions",
+                options.service_tier.as_deref(),
+                self.compat
+                    .as_ref()
+                    .and_then(|compat| compat.service_tiers.as_deref()),
+            ),
         }
+    }
+
+    /// OpenRouter's normalized `reasoning` request object for a thinking
+    /// level (gh #220; https://openrouter.ai/docs/use-cases/reasoning-tokens).
+    ///
+    /// pi's level names are OpenRouter's `effort` vocabulary
+    /// (`minimal`/`low`/`medium`/`high`/`xhigh`/`max`), so the level is sent
+    /// as-is and the gateway translates it for models that take a token
+    /// budget instead. A catalog `thinkingLevelMap` entry overrides the value
+    /// per level: a positive integer becomes `reasoning.max_tokens` (the two
+    /// are mutually exclusive on the wire), anything else is sent as
+    /// `reasoning.effort` (e.g. `{"off": "none"}` to force thinking off on a
+    /// model that reasons by default). Unmapped `off` sends no `reasoning`
+    /// key, leaving the model's default.
+    fn openrouter_reasoning(&self, level: ThinkingLevel) -> Option<OpenRouterReasoning<'_>> {
+        let mapped = self
+            .compat
+            .as_ref()
+            .and_then(|c| c.thinking_level_map.as_ref())
+            .and_then(|map| map.get(level.to_string().as_str()))
+            .and_then(Option::as_deref)
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        match mapped {
+            Some(value) => match value.parse::<u32>() {
+                Ok(max_tokens) if max_tokens > 0 => Some(OpenRouterReasoning {
+                    effort: None,
+                    max_tokens: Some(max_tokens),
+                }),
+                _ => Some(OpenRouterReasoning {
+                    effort: Some(Cow::Borrowed(value)),
+                    max_tokens: None,
+                }),
+            },
+            None if level == ThinkingLevel::Off => None,
+            None => Some(OpenRouterReasoning {
+                effort: Some(Cow::Owned(level.to_string())),
+                max_tokens: None,
+            }),
+        }
+    }
+
+    /// True for the OpenRouter gateway, by provider id (canonical or alias)
+    /// or by base URL for custom providers pointed at `openrouter.ai`.
+    fn is_openrouter(&self) -> bool {
+        self.provider.eq_ignore_ascii_case("openrouter")
+            || canonical_provider_id(&self.provider)
+                .is_some_and(|canonical| canonical == "openrouter")
+            || self.base_url.to_ascii_lowercase().contains("openrouter.ai")
     }
 
     fn build_request_json(
@@ -255,8 +762,10 @@ impl OpenAIProvider {
 
     /// Build the messages array with system prompt prepended using the given role name.
     fn build_messages_with_role<'a>(
+        &self,
         context: &'a Context<'_>,
         system_role: &'a str,
+        replay_reasoning: bool,
     ) -> Vec<OpenAIMessage<'a>> {
         let mut messages = Vec::with_capacity(context.messages.len() + 1);
 
@@ -267,13 +776,30 @@ impl OpenAIProvider {
                 content: Some(OpenAIContent::Text(Cow::Borrowed(system))),
                 tool_calls: None,
                 tool_call_id: None,
+                reasoning_content: None,
             });
         }
 
-        // Convert conversation messages
+        // Every tool call in an assistant turn must be answered before a new
+        // user message. Collect images across the consecutive tool-result run
+        // and attach them only after all of its tool replies (GH #248).
+        let mut tool_images = Vec::new();
         for message in context.messages.iter() {
-            messages.extend(convert_message_to_openai(message));
+            if !matches!(message, Message::ToolResult(_)) {
+                append_tool_result_attachments(&mut messages, &mut tool_images);
+            }
+            let mut converted =
+                convert_message_to_openai(message, &mut tool_images, self.audio_input);
+            if replay_reasoning && let Message::Assistant(assistant) = message {
+                converted.reasoning_content = Some(deepseek_replay_reasoning(
+                    assistant,
+                    &self.provider,
+                    &self.model,
+                ));
+            }
+            messages.push(converted);
         }
+        append_tool_result_attachments(&mut messages, &mut tool_images);
 
         messages
     }
@@ -293,29 +819,97 @@ impl Provider for OpenAIProvider {
         &self.model
     }
 
+    fn model_cost(&self) -> Option<crate::provider::ModelCost> {
+        self.model_cost
+            .as_ref()
+            .filter(|cost| cost.is_priced())
+            .cloned()
+    }
+
     #[allow(clippy::too_many_lines)]
     async fn stream(
         &self,
         context: &Context<'_>,
         options: &StreamOptions,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>> {
+        self.validate_audio_context(context)?;
         let authorization_override = authorization_override(options, self.compat.as_ref());
 
-        let auth_value = if authorization_override.is_some() {
+        let auth_value = if authorization_override.is_some() || !self.auth_header {
             None
         } else {
-            Some(
-                options
+            // SAP supports either a direct bearer or a service-key JSON candidate. Classify every
+            // candidate before constructing the Authorization header so legacy ApiKey entries can
+            // never leak a service key verbatim. The explicit lane remains highest precedence and
+            // bypasses auth-file loading when it contains a direct bearer.
+            let resolved = if self.is_sap_ai_core() {
+                if let Some(candidate) = options
                     .api_key
-                    .clone()
-                    .or_else(|| std::env::var("OPENAI_API_KEY").ok())
-                    .ok_or_else(|| {
-                        Error::provider(
-                            self.name(),
-                            "Missing API key for provider. Configure credentials with /login <provider> or set the provider's API key env var.",
-                        )
-                    })?,
-            )
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|key| !key.is_empty())
+                {
+                    resolve_sap_auth_candidate_with_client(&self.client, candidate).await?
+                } else {
+                    match AuthStorage::load_with_lock_timeout_classified(
+                        self.auth_path(),
+                        AUTH_RESOLUTION_LOCK_TIMEOUT,
+                    ) {
+                        Ok(auth) => {
+                            resolve_sap_auth_token_with_client(&self.client, &auth, None).await?
+                        }
+                        Err(failure @ AuthStorageLoadFailure::LockTimeout(_)) => {
+                            return Err(failure.into_error());
+                        }
+                        Err(AuthStorageLoadFailure::Other(load_error)) => {
+                            let ambient =
+                                resolve_ambient_sap_auth_token_with_client(&self.client).await?;
+                            if ambient.is_some() {
+                                tracing::warn!(
+                                    error = %load_error,
+                                    "stored SAP credentials are unavailable; using complete ambient credentials"
+                                );
+                                ambient
+                            } else {
+                                return Err(Error::auth(format!(
+                                    "Failed to load SAP AI Core credentials: {load_error}"
+                                )));
+                            }
+                        }
+                    }
+                }
+            } else if let Some(key) = options
+                .api_key
+                .as_deref()
+                .map(str::trim)
+                .filter(|key| !key.is_empty())
+            {
+                Some(key.to_string())
+            } else {
+                std::env::var("OPENAI_API_KEY")
+                    .ok()
+                    .map(|key| key.trim().to_string())
+                    .filter(|key| !key.is_empty())
+            };
+            match resolved {
+                Some(key) => Some(key),
+                // Local / self-hosted providers (ollama, llamacpp, mistralrs, …)
+                // expose an OpenAI-compatible server on localhost and require NO
+                // API key. For these we proceed without an Authorization header
+                // instead of failing, matching how ollama already works. (#104)
+                None if crate::provider_metadata::provider_is_keyless_local(self.name()) => None,
+                None if self.is_sap_ai_core() => {
+                    return Err(Error::auth(
+                        "SAP AI Core requires AICORE_SERVICE_KEY, the SAP_AI_CORE_* split credential variables, a stored service key, or an explicit bearer token.",
+                    ));
+                }
+                None => {
+                    return Err(Error::provider(
+                        self.name(),
+                        "Missing API key for provider. Configure credentials with /login <provider> or set the provider's API key env var.",
+                    ));
+                }
+            }
         };
 
         let request_body = self.build_request_json(context, options)?;
@@ -327,7 +921,7 @@ impl Provider for OpenAIProvider {
             .post(&self.base_url)
             .header("Accept", "text/event-stream");
 
-        if let Some(auth_value) = auth_value {
+        if let Some(auth_value) = auth_value.as_deref() {
             request = request.header("Authorization", format!("Bearer {auth_value}"));
         }
 
@@ -352,14 +946,14 @@ impl Provider for OpenAIProvider {
         }
 
         // Apply provider-specific custom headers from compat config.
-        if let Some(compat) = &self.compat {
-            if let Some(custom_headers) = &compat.custom_headers {
-                request = super::apply_headers_ignoring_blank_auth_overrides(
-                    request,
-                    custom_headers,
-                    &["authorization"],
-                );
-            }
+        if let Some(compat) = &self.compat
+            && let Some(custom_headers) = &compat.custom_headers
+        {
+            request = super::apply_headers_ignoring_blank_auth_overrides(
+                request,
+                custom_headers,
+                &["authorization"],
+            );
         }
 
         // Per-request headers from StreamOptions (highest priority).
@@ -369,15 +963,80 @@ impl Provider for OpenAIProvider {
             &["authorization"],
         );
 
-        let request = request.json(&request_body)?;
+        let rewritten_body = super::offer_before_provider_request(
+            options,
+            self.name(),
+            self.api(),
+            self.model_id(),
+            &self.base_url,
+            &request_body,
+            |value| {
+                let value = super::validate_streamed_json_rewrite(
+                    value,
+                    &["model"],
+                    &["messages"],
+                    &[("stream", serde_json::Value::Bool(true))],
+                )?;
+                self.validate_audio_request(&value)
+                    .map_err(|error| error.to_string())?;
+                Ok(value)
+            },
+        )
+        .await;
+        let actual_body = rewritten_body.as_ref().unwrap_or(&request_body);
+        let native_audio = self.validate_audio_request(actual_body)?;
+        let request = match &rewritten_body {
+            Some(body) => request.json(body)?,
+            None => request.json(&request_body)?,
+        };
 
         let response = Box::pin(request.send()).await?;
         let status = response.status();
         if !(200..300).contains(&status) {
             let body = response
-                .text()
+                .text_limited(MAX_API_ERROR_BODY_BYTES)
                 .await
                 .unwrap_or_else(|e| format!("<failed to read body: {e}>"));
+            let mut secrets = Vec::new();
+            for value in [auth_value.as_deref(), authorization_override.as_deref()]
+                .into_iter()
+                .flatten()
+            {
+                push_api_error_secret(&mut secrets, value, true);
+            }
+            if let Some(headers) = self
+                .compat
+                .as_ref()
+                .and_then(|compat| compat.custom_headers.as_ref())
+            {
+                for (name, value) in headers {
+                    push_api_error_secret(
+                        &mut secrets,
+                        value,
+                        name.eq_ignore_ascii_case("authorization"),
+                    );
+                }
+            }
+            for (name, value) in &options.headers {
+                push_api_error_secret(
+                    &mut secrets,
+                    value,
+                    name.eq_ignore_ascii_case("authorization"),
+                );
+            }
+            if let Ok(url) = url::Url::parse(&self.base_url) {
+                secrets.extend(
+                    url.query_pairs()
+                        .map(|(_, value)| value.into_owned())
+                        .filter(|value| !value.is_empty()),
+                );
+                push_api_error_secret(&mut secrets, url.username(), false);
+                if let Some(password) = url.password() {
+                    push_api_error_secret(&mut secrets, password, false);
+                }
+            }
+            let secret_refs = secrets.iter().map(String::as_str).collect::<Vec<_>>();
+            let body = redacted_api_error_body(&body, &secret_refs);
             return Err(Error::provider(
                 &self.provider,
                 format!("OpenAI API error (HTTP {status}): {body}"),
@@ -408,87 +1067,124 @@ impl Provider for OpenAIProvider {
             return Err(Error::api(message));
         }
 
-        // Create SSE stream for streaming responses.
-        let event_source = SseStream::new(response.bytes_stream());
-
-        // Create stream state
-        let model = self.model.clone();
-        let api = self.api().to_string();
-        let provider = self.name().to_string();
-
-        let stream = stream::unfold(
-            StreamState::new(event_source, model, api, provider),
-            |mut state| async move {
-                if state.done {
-                    return None;
-                }
-                loop {
-                    if let Some(event) = state.pending_events.pop_front() {
-                        return Some((Ok(event), state));
-                    }
-
-                    match state.event_source.next().await {
-                        Some(Ok(msg)) => {
-                            // A successful chunk resets the consecutive error counter.
-                            state.transient_error_count = 0;
-                            // OpenAI sends "[DONE]" as final message
-                            if msg.data == "[DONE]" {
-                                state.done = true;
-                                let reason = state.partial.stop_reason;
-                                let message = std::mem::take(&mut state.partial);
-                                return Some((Ok(StreamEvent::Done { reason, message }), state));
-                            }
-
-                            if let Err(e) = state.process_event(&msg.data) {
-                                state.done = true;
-                                return Some((Err(e), state));
-                            }
-                        }
-                        Some(Err(e)) => {
-                            // WriteZero, WouldBlock, and TimedOut errors are treated as transient.
-                            // Skip them and keep reading the stream, but cap
-                            // consecutive occurrences to avoid infinite loops.
-                            const MAX_CONSECUTIVE_TRANSIENT_ERRORS: usize = 5;
-                            if e.kind() == std::io::ErrorKind::WriteZero
-                                || e.kind() == std::io::ErrorKind::WouldBlock
-                                || e.kind() == std::io::ErrorKind::TimedOut
-                            {
-                                state.transient_error_count += 1;
-                                if state.transient_error_count <= MAX_CONSECUTIVE_TRANSIENT_ERRORS {
-                                    tracing::warn!(
-                                        kind = ?e.kind(),
-                                        count = state.transient_error_count,
-                                        "Transient error in SSE stream, continuing"
-                                    );
-                                    continue;
-                                }
-                                tracing::warn!(
-                                    kind = ?e.kind(),
-                                    "Error persisted after {MAX_CONSECUTIVE_TRANSIENT_ERRORS} \
-                                     consecutive attempts, treating as fatal"
-                                );
-                            }
-                            state.done = true;
-                            let err = Error::api(format!("SSE error: {e}"));
-                            return Some((Err(err), state));
-                        }
-                        // Stream ended without [DONE] sentinel (e.g.
-                        // premature server disconnect).  Emit a Done event
-                        // so the agent loop receives the accumulated partial
-                        // instead of silently losing it.
-                        None => {
-                            state.done = true;
-                            let reason = state.partial.stop_reason;
-                            let message = std::mem::take(&mut state.partial);
-                            return Some((Ok(StreamEvent::Done { reason, message }), state));
-                        }
-                    }
-                }
-            },
-        );
-
-        Ok(Box::pin(stream))
+        Ok(wire_stream(
+            response.bytes_stream(),
+            self.model.clone(),
+            self.api().to_string(),
+            self.name().to_string(),
+            native_audio,
+            options.usage_observer.clone(),
+        ))
     }
+}
+
+/// Silent metadata and heartbeat frames must not monopolize one executor poll.
+/// Wake the existing consumer without creating a timer or detached task.
+async fn yield_stream_turn() {
+    let mut yielded = false;
+    std::future::poll_fn(|task| {
+        if yielded {
+            std::task::Poll::Ready(())
+        } else {
+            yielded = true;
+            task.waker().wake_by_ref();
+            std::task::Poll::Pending
+        }
+    })
+    .await;
+}
+
+fn wire_stream<S>(
+    source: S,
+    model: String,
+    api: String,
+    provider: String,
+    audio_input_in_request: bool,
+    usage_observer: Option<crate::provider::UsageObserver>,
+) -> EventStream
+where
+    S: Stream<Item = std::io::Result<Vec<u8>>> + Unpin + Send + 'static,
+{
+    let mut state = StreamState::new(SseStream::new(source), model, api, provider);
+    state.audio_input_in_request = audio_input_in_request;
+    state.usage_observer = usage_observer;
+    let output = stream::unfold(Some(state), |active| async move {
+        let mut state = active?;
+        let mut ready_events = 0;
+        loop {
+            if let Some(event) = state.pending_events.pop_front() {
+                let terminal =
+                    matches!(&event, StreamEvent::Done { .. } | StreamEvent::Error { .. });
+                // Drop the socket, captured owner and buffered tail before
+                // exposing the terminal event. The caller may retain this
+                // stream without polling it again.
+                let active = (!terminal).then_some(state);
+                return Some((Ok(event), active));
+            }
+            // A terminal frame can enqueue block-end events before Done.
+            // Drain that queue even after the transport is finished.
+            if state.done {
+                return None;
+            }
+            if ready_events == MAX_READY_EVENTS_PER_YIELD {
+                yield_stream_turn().await;
+                ready_events = 0;
+            }
+            ready_events += 1;
+
+            match state.event_source.next().await {
+                Some(Ok(msg)) => {
+                    state.transient_error_count = 0;
+                    // Final usage may follow finish_reason, so only [DONE]
+                    // seals the response and releases its source.
+                    if msg.data.trim() == "[DONE]" {
+                        state.finish_response();
+                        continue;
+                    }
+                    if let Err(error) = state.process_event(&msg.data) {
+                        return Some((Err(error), None));
+                    }
+                }
+                Some(Err(error)) => {
+                    // Retain the existing bounded transient-error policy.
+                    const MAX_CONSECUTIVE_TRANSIENT_ERRORS: usize = 5;
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WriteZero
+                            | std::io::ErrorKind::WouldBlock
+                            | std::io::ErrorKind::TimedOut
+                    ) {
+                        state.transient_error_count += 1;
+                        if state.transient_error_count <= MAX_CONSECUTIVE_TRANSIENT_ERRORS {
+                            tracing::warn!(
+                                kind = ?error.kind(),
+                                count = state.transient_error_count,
+                                "Transient error in SSE stream, continuing"
+                            );
+                            continue;
+                        }
+                        tracing::warn!(
+                            kind = ?error.kind(),
+                            "Error persisted after {MAX_CONSECUTIVE_TRANSIENT_ERRORS} \
+                             consecutive attempts, treating as fatal"
+                        );
+                    }
+                    return Some((Err(Error::sse(&error)), None));
+                }
+                // A clean EOF is not a completion without [DONE]. The agent
+                // retains the partial content delivered before this error.
+                None => {
+                    return Some((
+                        Err(Error::api(
+                            "OpenAI stream ended before [DONE] sentinel (unexpected EOF)",
+                        )),
+                        None,
+                    ));
+                }
+            }
+        }
+    });
+    Box::pin(output.fuse())
 }
 
 // ============================================================================
@@ -502,11 +1198,44 @@ where
     event_source: SseStream<S>,
     partial: AssistantMessage,
     tool_calls: Vec<ToolCallState>,
+    deepseek_recovery: Option<deepseek::Recovery>,
     pending_events: VecDeque<StreamEvent>,
     started: bool,
     done: bool,
+    /// Block-end events and strict tool arguments have been finalized once.
+    finalized: bool,
     /// Consecutive WriteZero errors seen without a successful event in between.
     transient_error_count: usize,
+    audio_input_in_request: bool,
+    usage_received: bool,
+    complete_billing_received: bool,
+    usage_observer: Option<crate::provider::UsageObserver>,
+}
+
+impl<S> Drop for StreamState<S>
+where
+    S: Stream<Item = std::result::Result<Vec<u8>, std::io::Error>> + Unpin,
+{
+    fn drop(&mut self) {
+        // This state exists only after a successful HTTP response opened an
+        // audio source. Setup refusals (including HTTP 429) keep their normal
+        // recovery behavior. An interrupted accepted request can be billable
+        // without delivering the final usage frame; preserve known spend and
+        // block further capped work rather than treating that omission as free.
+        if self.audio_input_in_request
+            && !self.complete_billing_received
+            && let Some(observer) = &self.usage_observer
+        {
+            let usage = Usage {
+                billing: Some(BillingUsage::Unavailable {
+                    reason: "The native audio stream closed without complete billing evidence"
+                        .to_string(),
+                }),
+                ..Default::default()
+            };
+            let _ = observer.observe(&usage);
+        }
+    }
 }
 
 struct ToolCallState {
@@ -517,11 +1246,165 @@ struct ToolCallState {
     arguments: String,
 }
 
+/// Best-effort completion of a partial JSON document into the most-complete
+/// valid `Value` it can represent (#124).
+///
+/// Streaming tool-call `arguments` arrive as a growing prefix of a JSON object
+/// (e.g. `{"path": "src/li`). Snapshot-based clients render the partial
+/// message's `arguments`, so leaving it `Null` until the terminal event makes a
+/// large tool call pop in all at once instead of streaming like text. This
+/// closes an open string and any open objects/arrays, dropping a dangling
+/// trailing comma or `"key":` (a key with no value yet) so the prefix parses.
+///
+/// Safety: it only ever CLOSES structure that is already open — it never
+/// fabricates content — and returns `None` when the prefix still can't be
+/// parsed, so the caller keeps the last good value. The result is therefore
+/// always either a valid `Value` that is a faithful completion of the prefix,
+/// or `None`; it can never surface wrong data.
+///
+/// Shared with the agent loop (#126): the agent rebuilds the partial message
+/// that RPC/ACP clients actually receive from `StreamEvent`s, so the same
+/// completion must be applied there (for every provider), not only inside this
+/// provider's internal partial.
+pub(crate) fn complete_partial_json(input: &str) -> Option<serde_json::Value> {
+    let s = input.trim();
+    if s.is_empty() {
+        return None;
+    }
+    // Fast path: the accumulated prefix is already valid JSON.
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(s) {
+        return Some(value);
+    }
+
+    // Structural scan to learn what is still open.
+    let mut closers: Vec<char> = Vec::new();
+    let mut in_string = false;
+    let mut escaped = false;
+    for byte in s.bytes() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match byte {
+            b'"' => in_string = true,
+            b'{' => closers.push('}'),
+            b'[' => closers.push(']'),
+            b'}' | b']' => {
+                closers.pop();
+            }
+            _ => {}
+        }
+    }
+
+    let mut out = String::from(s);
+    if in_string {
+        if escaped {
+            // Dangling escape backslash (`..."ab\`) — drop it before closing.
+            out.pop();
+        }
+        out.push('"');
+    }
+
+    // Close each open container, trimming a dangling tail before its closer so
+    // the result parses.
+    while let Some(closer) = closers.pop() {
+        trim_dangling_json_tail(&mut out, closer == '}');
+        out.push(closer);
+    }
+
+    serde_json::from_str::<serde_json::Value>(&out).ok()
+}
+
+/// Before appending a container's closer, drop a trailing comma, and (for an
+/// object) a dangling `"key":` or bare `"key"` (a key with no value yet), so the
+/// closed container is valid JSON. A complete `"key": "value"` member is left
+/// intact — a trailing string preceded by `:` is a value, not a dangling key.
+fn trim_dangling_json_tail(out: &mut String, is_object: bool) {
+    loop {
+        let before = out.len();
+        while out.ends_with(char::is_whitespace) {
+            out.pop();
+        }
+        if out.ends_with(',') {
+            out.pop();
+            continue;
+        }
+        if is_object {
+            // `"key":` with no value yet → drop the colon and the key string.
+            if out.ends_with(':') {
+                out.pop();
+                while out.ends_with(char::is_whitespace) {
+                    out.pop();
+                }
+                remove_trailing_json_string(out);
+                continue;
+            }
+            // A trailing string: a value (preceded by `:`) means the member is
+            // complete — stop and close. Otherwise (preceded by `,`/`{`) it's a
+            // dangling key with no colon yet → drop it.
+            if let Some(start) = trailing_json_string_start(out) {
+                let preceded_by_colon = out[..start].trim_end().ends_with(':');
+                if preceded_by_colon {
+                    break;
+                }
+                out.truncate(start);
+                continue;
+            }
+        }
+        if out.len() == before {
+            break;
+        }
+    }
+}
+
+/// Byte index of the opening quote of the JSON string literal that `out` ends
+/// with (honoring backslash escapes), or `None` if `out` does not end with a
+/// closing quote.
+fn trailing_json_string_start(out: &str) -> Option<usize> {
+    let bytes = out.as_bytes();
+    if bytes.last() != Some(&b'"') {
+        return None;
+    }
+    let mut i = bytes.len() - 1; // the closing quote
+    while i > 0 {
+        i -= 1;
+        if bytes[i] == b'"' {
+            // Count preceding backslashes to tell an escaped quote from the open.
+            let mut backslashes = 0usize;
+            let mut j = i;
+            while j > 0 && bytes[j - 1] == b'\\' {
+                backslashes += 1;
+                j -= 1;
+            }
+            if backslashes.is_multiple_of(2) {
+                return Some(i);
+            }
+        }
+    }
+    None
+}
+
+/// Remove a complete trailing JSON string literal (`"..."`, honoring escapes)
+/// from `out`. No-op if `out` does not end with a closing quote.
+fn remove_trailing_json_string(out: &mut String) {
+    if let Some(start) = trailing_json_string_start(out) {
+        out.truncate(start);
+    }
+}
+
 impl<S> StreamState<S>
 where
     S: Stream<Item = std::result::Result<Vec<u8>, std::io::Error>> + Unpin,
 {
     fn new(event_source: SseStream<S>, model: String, api: String, provider: String) -> Self {
+        let deepseek_recovery =
+            deepseek::is_target(&provider, &model).then(deepseek::Recovery::default);
         Self {
             event_source,
             partial: AssistantMessage {
@@ -531,14 +1414,21 @@ where
                 model,
                 usage: Usage::default(),
                 stop_reason: StopReason::Stop,
+                stop_details: None,
                 error_message: None,
                 timestamp: chrono::Utc::now().timestamp_millis(),
             },
             tool_calls: Vec::new(),
+            deepseek_recovery,
             pending_events: VecDeque::new(),
             started: false,
             done: false,
+            finalized: false,
             transient_error_count: 0,
+            audio_input_in_request: false,
+            usage_received: false,
+            complete_billing_received: false,
+            usage_observer: None,
         }
     }
 
@@ -554,29 +1444,65 @@ where
     fn process_event(&mut self, data: &str) -> Result<()> {
         let chunk: OpenAIStreamChunk = serde_json::from_str(data)
             .map_err(|e| Error::api(format!("JSON parse error: {e}\nData: {data}")))?;
+        let authoritative_usage = self.finalized
+            || chunk
+                .choices
+                .iter()
+                .any(|choice| choice.finish_reason.is_some());
 
         // Handle usage in final chunk
         if let Some(usage) = chunk.usage {
-            self.partial.usage.input = usage.prompt_tokens;
+            self.usage_received = true;
+            let cached = usage
+                .prompt_tokens_details
+                .as_ref()
+                .and_then(|details| details.cached_tokens)
+                .unwrap_or(0);
+            self.partial.usage.cache_read = cached;
+            // Anthropic convention (used across all transports): `usage.input`
+            // EXCLUDES cache reads so that `input + cache_read` reconstructs the
+            // full prompt. OpenAI-style APIs report `prompt_tokens` INCLUDING
+            // cached tokens, so subtract the cached count (saturating to avoid
+            // underflow if a provider ever reports cached > prompt). DeepSeek
+            // exposes the miss count directly via `prompt_cache_miss_tokens`;
+            // prefer it when present as a more robust source.
+            self.partial.usage.input = usage
+                .prompt_cache_miss_tokens
+                .unwrap_or_else(|| usage.prompt_tokens.saturating_sub(cached));
             self.partial.usage.output = usage.completion_tokens.unwrap_or(0);
             self.partial.usage.total_tokens = usage.total_tokens;
-            if let Some(details) = usage.prompt_tokens_details {
-                self.partial.usage.cache_read = details.cached_tokens.unwrap_or(0);
+            self.partial.usage.billing = usage.billing(self.audio_input_in_request);
+            // Provider-reported billed total (OpenRouter). The agent fills the
+            // per-component breakdown from catalog rates when it has them and
+            // keeps this figure as the authoritative total (gh #221).
+            if let Some(cost) = usage.cost.filter(|cost| cost.is_finite() && *cost >= 0.0) {
+                self.partial.usage.cost.total = cost;
+            }
+            if let Some(observer) = &self.usage_observer {
+                if authoritative_usage && self.partial.usage.has_explicit_billing() {
+                    observer.observe_authoritative(&mut self.partial.usage)?;
+                } else {
+                    observer.observe(&self.partial.usage)?;
+                }
+            }
+            if authoritative_usage && self.partial.usage.has_explicit_billing() {
+                self.complete_billing_received = true;
             }
         }
 
         if let Some(error) = chunk.error {
-            self.partial.stop_reason = StopReason::Error;
-            if let Some(message) = error.message {
-                let message = message.trim();
-                if !message.is_empty() {
-                    self.partial.error_message = Some(message.to_string());
-                }
-            }
+            let message = error
+                .message
+                .as_deref()
+                .map(str::trim)
+                .filter(|message| !message.is_empty())
+                .unwrap_or("OpenAI returned an error while streaming");
+            self.record_error(message.to_string());
         }
 
         // Process choices
-        if let Some(choice) = chunk.choices.into_iter().next() {
+        if let Some(mut choice) = chunk.choices.into_iter().next() {
+            choice.delta.normalize_reasoning();
             if !self.started
                 && choice.finish_reason.is_none()
                 && choice.delta.content.is_none()
@@ -593,31 +1519,261 @@ where
         Ok(())
     }
 
-    fn finalize_tool_call_arguments(&mut self) {
-        for tc in &self.tool_calls {
-            let arguments: serde_json::Value = match serde_json::from_str(&tc.arguments) {
-                Ok(args) => args,
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        raw = %tc.arguments,
-                        "Failed to parse tool arguments as JSON"
-                    );
-                    serde_json::Value::Null
-                }
-            };
+    fn record_error(&mut self, message: String) {
+        self.partial.stop_reason = StopReason::Error;
+        // A trailing finish reason or secondary parse error must not conceal
+        // the provider's original failure.
+        if self.partial.error_message.is_none() {
+            self.partial.error_message = Some(message);
+        }
+    }
 
+    fn finalize_tool_call_arguments(&mut self) -> Result<()> {
+        // Validate the whole batch before exposing any completed tool call.
+        // Best-effort streaming snapshots are for display, never execution.
+        let mut ids = HashSet::new();
+        let arguments = self
+            .tool_calls
+            .iter()
+            .map(|tc| {
+                validate_final_tool_identity(&mut ids, &tc.id, &tc.name)
+                    .and_then(|()| parse_final_tool_arguments(&tc.arguments))
+                    .map_err(|message| {
+                        Error::api(format!(
+                            "Invalid OpenAI tool call at index {}: {message}",
+                            tc.index
+                        ))
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        for (tc, arguments) in self.tool_calls.iter().zip(arguments) {
             if let Some(ContentBlock::ToolCall(block)) =
                 self.partial.content.get_mut(tc.content_index)
             {
                 block.arguments = arguments;
             }
         }
+        Ok(())
+    }
+
+    /// Append only text that is safe to expose to streaming clients and replay.
+    fn append_text(&mut self, content: String) {
+        let content_index = if matches!(self.partial.content.last(), Some(ContentBlock::Text(_))) {
+            self.partial.content.len() - 1
+        } else {
+            let index = self.partial.content.len();
+            self.partial
+                .content
+                .push(ContentBlock::Text(TextContent::new("")));
+            self.pending_events.push_back(StreamEvent::TextStart {
+                content_index: index,
+            });
+            index
+        };
+        if let Some(ContentBlock::Text(text)) = self.partial.content.get_mut(content_index) {
+            text.text.push_str(&content);
+        }
+        self.pending_events.push_back(StreamEvent::TextDelta {
+            content_index,
+            delta: content,
+        });
+    }
+
+    fn process_text(&mut self, content: String) {
+        let visible = match &mut self.deepseek_recovery {
+            Some(recovery) => match recovery.feed(&content) {
+                Ok(visible) if visible.is_empty() => return,
+                Ok(visible) => visible,
+                // Defer rejection until terminal: genuine native calls may
+                // still arrive and remain authoritative over the text lane.
+                Err(_) => return,
+            },
+            None => content,
+        };
+        self.append_text(visible);
+    }
+
+    fn finalize_deepseek_content(&mut self) {
+        let Some(mut recovery) = self.deepseek_recovery.take() else {
+            return;
+        };
+        let native_calls = !self.tool_calls.is_empty();
+        if native_calls && self.partial.stop_reason == StopReason::Stop {
+            self.partial.stop_reason = StopReason::ToolUse;
+        }
+        let parts = match recovery.finish() {
+            Ok(parts) => parts,
+            Err(_) if native_calls => {
+                tracing::debug!("Ignored malformed DeepSeek text markup beside native tool calls");
+                return;
+            }
+            Err(message) => {
+                self.record_error(message.to_string());
+                return;
+            }
+        };
+        // Some hosts send the same call through both text and the native lane.
+        // Native deltas are authoritative, even if they arrived after the text.
+        // Interrupted/refused/failed responses never gain executable calls.
+        let recover_calls = !native_calls
+            && matches!(
+                self.partial.stop_reason,
+                StopReason::Stop | StopReason::ToolUse
+            );
+        for part in parts {
+            match part {
+                deepseek::Part::Text(text) => self.append_text(text),
+                deepseek::Part::Call { name, arguments } if recover_calls => {
+                    let content_index = self.partial.content.len();
+                    let id = format!("call_{}", uuid::Uuid::new_v4().simple());
+                    let raw_arguments = arguments.to_string();
+                    self.partial.content.push(ContentBlock::ToolCall(ToolCall {
+                        id: id.clone(),
+                        name: name.clone(),
+                        arguments,
+                        thought_signature: None,
+                    }));
+                    self.pending_events.push_back(StreamEvent::ToolCallStart {
+                        content_index,
+                        id: id.clone(),
+                        name: name.clone(),
+                    });
+                    self.pending_events.push_back(StreamEvent::ToolCallDelta {
+                        content_index,
+                        delta: raw_arguments.clone(),
+                    });
+                    self.tool_calls.push(ToolCallState {
+                        index: self.tool_calls.len(),
+                        content_index,
+                        id,
+                        name,
+                        arguments: raw_arguments,
+                    });
+                    if self.partial.stop_reason == StopReason::Stop {
+                        self.partial.stop_reason = StopReason::ToolUse;
+                    }
+                }
+                deepseek::Part::Call { .. } => {}
+            }
+        }
+    }
+
+    fn finalize_content(&mut self) {
+        if self.finalized {
+            return;
+        }
+        self.finalized = true;
+        self.finalize_deepseek_content();
+
+        if let Err(error) = self.finalize_tool_call_arguments() {
+            self.record_error(error.to_string());
+            // Do not persist a synthetically completed argument snapshot as
+            // the final arguments of an invalid response.
+            for tc in &self.tool_calls {
+                if let Some(ContentBlock::ToolCall(block)) =
+                    self.partial.content.get_mut(tc.content_index)
+                {
+                    block.arguments = serde_json::Value::Null;
+                }
+            }
+        }
+
+        for (content_index, block) in self.partial.content.iter().enumerate() {
+            match block {
+                ContentBlock::Text(text) => {
+                    self.pending_events.push_back(StreamEvent::TextEnd {
+                        content_index,
+                        content: text.text.clone(),
+                    });
+                }
+                ContentBlock::Thinking(thinking) => {
+                    self.pending_events.push_back(StreamEvent::ThinkingEnd {
+                        content_index,
+                        content: thinking.thinking.clone(),
+                    });
+                }
+                _ => {}
+            }
+        }
+
+        if self.partial.stop_reason != StopReason::Error {
+            for tc in &self.tool_calls {
+                if let Some(ContentBlock::ToolCall(tool_call)) =
+                    self.partial.content.get(tc.content_index)
+                {
+                    self.pending_events.push_back(StreamEvent::ToolCallEnd {
+                        content_index: tc.content_index,
+                        tool_call: tool_call.clone(),
+                    });
+                }
+            }
+        }
+    }
+
+    fn finish_response(&mut self) {
+        if self.done {
+            return;
+        }
+        if self.audio_input_in_request && !self.usage_received {
+            self.partial.usage.billing = Some(BillingUsage::Unavailable {
+                reason: "The completed audio request did not report token usage or a billed total"
+                    .to_string(),
+            });
+            if let Some(observer) = &self.usage_observer
+                && let Err(error) = observer.observe(&self.partial.usage)
+            {
+                self.record_error(error.to_string());
+            }
+        }
+        if self.partial.usage.has_explicit_billing() {
+            if let Some(observer) = &self.usage_observer {
+                match observer.observe_authoritative(&mut self.partial.usage) {
+                    Ok(()) => self.complete_billing_received = true,
+                    Err(error) => self.record_error(error.to_string()),
+                }
+            } else {
+                self.complete_billing_received = true;
+            }
+        }
+        self.ensure_started();
+        self.finalize_content();
+        self.done = true;
+        let reason = self.partial.stop_reason;
+        let message = std::mem::take(&mut self.partial);
+        self.pending_events
+            .push_back(StreamEvent::Done { reason, message });
     }
 
     #[allow(clippy::too_many_lines)]
     fn process_choice(&mut self, choice: OpenAIChoice) {
         let delta = choice.delta;
+        if self.finalized {
+            if matches!(
+                choice.finish_reason.as_deref(),
+                Some("content_filter" | "error")
+            ) {
+                self.record_error("OpenAI reported a terminal stream failure".to_string());
+            }
+            let has_content = delta
+                .content
+                .as_deref()
+                .is_some_and(|text| !text.is_empty())
+                || delta
+                    .reasoning_content
+                    .as_deref()
+                    .is_some_and(|text| !text.is_empty())
+                || delta
+                    .tool_calls
+                    .as_ref()
+                    .is_some_and(|calls| !calls.is_empty());
+            if has_content {
+                self.record_error("OpenAI sent content after a terminal finish reason".to_string());
+            }
+            // Empty duplicate terminal frames are harmless, but must not
+            // overwrite a failure or emit duplicate block-end events.
+            return;
+        }
         if delta.content.is_some()
             || delta.tool_calls.is_some()
             || delta.reasoning_content.is_some()
@@ -664,37 +1820,10 @@ where
             });
         }
 
-        // Handle text content
-
+        // Handle text content. DeepSeek markup stays out of client snapshots
+        // until the entire terminal tool batch has been validated.
         if let Some(content) = delta.content {
-            // Update partial content
-
-            let last_is_text = matches!(self.partial.content.last(), Some(ContentBlock::Text(_)));
-
-            let content_index = if last_is_text {
-                self.partial.content.len() - 1
-            } else {
-                let idx = self.partial.content.len();
-
-                self.partial
-                    .content
-                    .push(ContentBlock::Text(TextContent::new("")));
-
-                self.pending_events
-                    .push_back(StreamEvent::TextStart { content_index: idx });
-
-                idx
-            };
-
-            if let Some(ContentBlock::Text(t)) = self.partial.content.get_mut(content_index) {
-                t.text.push_str(&content);
-            }
-
-            self.pending_events.push_back(StreamEvent::TextDelta {
-                content_index,
-
-                delta: content,
-            });
+            self.process_text(content);
         }
 
         // Handle tool calls
@@ -738,8 +1867,20 @@ where
                         thought_signature: None,
                     }));
 
-                    self.pending_events
-                        .push_back(StreamEvent::ToolCallStart { content_index });
+                    // #129: the opening chunk carries the tool-call id and
+                    // (usually) the function name — surface them on the start
+                    // event so agent-side partials are correlatable from the
+                    // first delta. The accumulation below remains the source
+                    // of truth for the provider-side partial.
+                    self.pending_events.push_back(StreamEvent::ToolCallStart {
+                        content_index,
+                        id: tc_delta.id.clone().unwrap_or_default(),
+                        name: tc_delta
+                            .function
+                            .as_ref()
+                            .and_then(|f| f.name.clone())
+                            .unwrap_or_default(),
+                    });
 
                     self.tool_calls.len() - 1
                 };
@@ -776,14 +1917,22 @@ where
                     if let Some(args) = function.arguments {
                         tc.arguments.push_str(&args);
 
-                        // Update arguments in partial (best effort parse, or just raw string if we supported it)
+                        // #124: keep the partial block's `arguments` growing as
+                        // deltas arrive, so snapshot-based clients (RPC/ACP IDE
+                        // frontends) render a large tool call as it streams
+                        // instead of a pause then a pop-in. `complete_partial_json`
+                        // best-effort closes the accumulated prefix into valid
+                        // JSON; on an un-completable fragment it returns None and
+                        // we keep the last good value (never wrong data). The
+                        // terminal event still sets the fully-parsed arguments.
+                        if let Some(partial_args) = complete_partial_json(&tc.arguments)
+                            && let Some(ContentBlock::ToolCall(block)) =
+                                self.partial.content.get_mut(content_index)
+                        {
+                            block.arguments = partial_args;
+                        }
 
-                        // Note: We don't update partial.arguments here because it requires valid JSON.
-
-                        // We only update it at the end or if we switched to storing raw string args.
-
-                        // But we MUST emit the delta.
-
+                        // The delta is still emitted for streaming consumers.
                         self.pending_events.push_back(StreamEvent::ToolCallDelta {
                             content_index,
 
@@ -797,53 +1946,133 @@ where
         // Handle finish reason (MUST happen after delta processing to capture final chunks)
 
         if let Some(reason) = choice.finish_reason {
-            self.partial.stop_reason = match reason.as_str() {
-                "length" => StopReason::Length,
-
-                "tool_calls" => StopReason::ToolUse,
-
-                "content_filter" | "error" => StopReason::Error,
-
-                _ => StopReason::Stop,
-            };
-
-            // Emit TextEnd/ThinkingEnd for all open text/thinking blocks (not just the last one,
-            // since text/thinking may precede tool calls).
-
-            for (content_index, block) in self.partial.content.iter().enumerate() {
-                if let ContentBlock::Text(t) = block {
-                    self.pending_events.push_back(StreamEvent::TextEnd {
-                        content_index,
-                        content: t.text.clone(),
-                    });
-                } else if let ContentBlock::Thinking(t) = block {
-                    self.pending_events.push_back(StreamEvent::ThinkingEnd {
-                        content_index,
-                        content: t.thinking.clone(),
-                    });
-                }
+            if self.partial.stop_reason != StopReason::Error {
+                self.partial.stop_reason = match reason.as_str() {
+                    "length" => StopReason::Length,
+                    "tool_calls" => StopReason::ToolUse,
+                    "content_filter" | "error" => StopReason::Error,
+                    _ => StopReason::Stop,
+                };
             }
-
-            // Finalize tool call arguments
-
-            self.finalize_tool_call_arguments();
-
-            // Emit ToolCallEnd for each accumulated tool call
-
-            for tc in &self.tool_calls {
-                if let Some(ContentBlock::ToolCall(tool_call)) =
-                    self.partial.content.get(tc.content_index)
-                {
-                    self.pending_events.push_back(StreamEvent::ToolCallEnd {
-                        content_index: tc.content_index,
-
-                        tool_call: tool_call.clone(),
-                    });
-                }
-            }
+            self.finalize_content();
         }
     }
 }
+
+/// Each completed call needs an unambiguous result identity and a function
+/// name. Validate the accumulated wire values without repairing them: changing
+/// an ID here would no longer answer the call the provider actually emitted.
+/// Diagnostics exclude the values, which can contain sensitive provider data.
+pub(super) fn validate_final_tool_identity<'a>(
+    ids: &mut HashSet<&'a str>,
+    id: &'a str,
+    name: &str,
+) -> std::result::Result<(), &'static str> {
+    if id.trim().is_empty() {
+        return Err("tool call ID is empty");
+    }
+    if name.trim().is_empty() {
+        return Err("tool function name is empty");
+    }
+    if !ids.insert(id) {
+        return Err("tool call ID is duplicated");
+    }
+    Ok(())
+}
+
+/// Parse final tool arguments without the repairs used for streaming previews.
+/// Empty arguments remain compatible with providers that omit an empty object.
+/// Every nonempty payload must be a complete JSON object with unique decoded
+/// keys in every nested object. Error text deliberately excludes the payload,
+/// which may contain secrets.
+pub(super) fn parse_final_tool_arguments(
+    raw: &str,
+) -> std::result::Result<serde_json::Value, &'static str> {
+    if raw.trim().is_empty() {
+        return Ok(serde_json::json!({}));
+    }
+    let arguments: serde_json::Value =
+        serde_json::from_str(raw).map_err(|_| "arguments are not complete JSON")?;
+    if !arguments.is_object() {
+        return Err("arguments must be a JSON object");
+    }
+    serde_json::from_str::<UniqueToolArgumentKeys>(raw)
+        .map_err(|_| "arguments contain duplicate JSON object keys")?;
+    Ok(arguments)
+}
+
+/// Validation-only JSON traversal that rejects duplicate decoded object keys
+/// before serde_json::Value can silently keep the last occurrence.
+struct UniqueToolArgumentKeys;
+
+impl<'de> Deserialize<'de> for UniqueToolArgumentKeys {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(Self)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for UniqueToolArgumentKeys {
+    type Value = Self;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("JSON with unique object keys")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> std::result::Result<Self, A::Error>
+    where
+        A: serde::de::MapAccess<'de>,
+    {
+        let mut keys = HashSet::new();
+        while let Some(key) = map.next_key::<String>()? {
+            if !keys.insert(key) {
+                return Err(serde::de::Error::custom("duplicate JSON object key"));
+            }
+            map.next_value::<Self>()?;
+        }
+        Ok(self)
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> std::result::Result<Self, A::Error>
+    where
+        A: serde::de::SeqAccess<'de>,
+    {
+        while sequence.next_element::<Self>()?.is_some() {}
+        Ok(self)
+    }
+
+    fn visit_bool<E: serde::de::Error>(self, _: bool) -> std::result::Result<Self, E> {
+        Ok(self)
+    }
+    fn visit_i64<E: serde::de::Error>(self, _: i64) -> std::result::Result<Self, E> {
+        Ok(self)
+    }
+    fn visit_u64<E: serde::de::Error>(self, _: u64) -> std::result::Result<Self, E> {
+        Ok(self)
+    }
+    fn visit_f64<E: serde::de::Error>(self, _: f64) -> std::result::Result<Self, E> {
+        Ok(self)
+    }
+    fn visit_str<E: serde::de::Error>(self, _: &str) -> std::result::Result<Self, E> {
+        Ok(self)
+    }
+    fn visit_string<E: serde::de::Error>(self, _: String) -> std::result::Result<Self, E> {
+        Ok(self)
+    }
+    fn visit_unit<E: serde::de::Error>(self) -> std::result::Result<Self, E> {
+        Ok(self)
+    }
+}
+
+#[cfg(test)]
+#[path = "openai_terminal_safety_tests.rs"]
+mod terminal_safety_tests;
+
+#[cfg(test)]
+#[path = "openai_deepseek_tests.rs"]
+mod deepseek_tests;
 
 // ============================================================================
 // OpenAI API Types
@@ -853,6 +2082,10 @@ where
 pub struct OpenAIRequest<'a> {
     model: &'a str,
     messages: Vec<OpenAIMessage<'a>>,
+    /// This transport consumes audio input and produces ordinary text/tool
+    /// output; audio generation is a separate feature.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    modalities: Option<[&'static str; 1]>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
     /// Some providers (e.g., o1-series) use `max_completion_tokens` instead of `max_tokens`.
@@ -865,11 +2098,86 @@ pub struct OpenAIRequest<'a> {
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     stream_options: Option<OpenAIStreamOptions>,
+    /// OpenRouter usage accounting (`{"include": true}`), gh #221. Omitted for
+    /// every other provider so their wire format is unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    usage: Option<OpenAIUsageAccounting>,
+    /// DeepSeek-only thinking toggle (`{"type": "enabled" | "disabled"}`). Other
+    /// OpenAI-compatible providers never set this, so it serializes away.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<OpenAIThinking>,
+    /// Plain reasoning effort, enabled explicitly or by the DeepSeek dialect.
+    /// DeepSeek maps
+    /// `low`/`medium` to `high` and `xhigh` to `max` itself, so we only emit the
+    /// two values it documents — unless a catalog `thinkingLevelMap` remaps the
+    /// level, in which case the mapped value (borrowed from the provider's
+    /// compat config) is sent verbatim.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<&'a str>,
+    /// OpenRouter's normalized reasoning control (`{"effort": …}` or
+    /// `{"max_tokens": …}`), gh #220. Only the OpenRouter dialect sets it; a
+    /// `compat.openRouterRouting` object carrying its own `reasoning` key
+    /// still wins because routing overrides are merged after serialization.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning: Option<OpenRouterReasoning<'a>>,
+    /// Cache-affinity key (OpenAI `prompt_cache_key`, gh #188). Omitted when
+    /// unset so backends that reject unknown params never see it. See
+    /// `StreamOptions::prompt_cache_key`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prompt_cache_key: Option<String>,
+    /// Processing tier (`/fast` → `priority`). Set only for backends that
+    /// honor it; see `provider::openai_service_tier`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    service_tier: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
 struct OpenAIStreamOptions {
     include_usage: bool,
+}
+
+/// OpenRouter request-level usage accounting toggle (gh #221).
+#[derive(Debug, Serialize)]
+struct OpenAIUsageAccounting {
+    include: bool,
+}
+
+/// OpenRouter's `reasoning` request object (gh #220). `effort` and
+/// `max_tokens` are mutually exclusive per the OpenRouter docs, so exactly one
+/// is populated.
+#[derive(Debug, Serialize)]
+struct OpenRouterReasoning<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    effort: Option<Cow<'a, str>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_tokens: Option<u32>,
+}
+
+/// DeepSeek's `thinking` request object on the chat-completions transport.
+/// `{"type": "enabled"}` turns on thinking mode; `{"type": "disabled"}` forces
+/// the non-thinking path. Serialized only for DeepSeek (see `ReasoningStyle`).
+#[derive(Debug, Serialize)]
+struct OpenAIThinking {
+    #[serde(rename = "type")]
+    kind: &'static str,
+}
+
+/// Request-side reasoning dialect for OpenAI-compatible providers that take
+/// non-standard reasoning controls. The plain Chat Completions transport has no
+/// reasoning toggle, so this is `None` for OpenAI/Groq/etc. and the emitted
+/// body is byte-for-byte unchanged for them. Kept as an enum so other dialects
+/// (zai/qwen) can be added without touching the `build_request` call site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReasoningStyle {
+    /// Plain `reasoning_effort`, only for an explicit capability declaration.
+    OpenAI,
+    /// DeepSeek: `thinking: {type: enabled|disabled}` + `reasoning_effort`
+    /// (`high`|`max`). Mirrors the legacy `@earendil-works/pi-ai` `thinkingFormat`.
+    DeepSeek,
+    /// OpenRouter: the gateway's normalized `reasoning: {effort | max_tokens}`
+    /// object (`compat.thinkingFormat: "openrouter"`, the default on the
+    /// OpenRouter transport; gh #220).
+    OpenRouter,
 }
 
 #[derive(Debug, Serialize)]
@@ -881,6 +2189,9 @@ struct OpenAIMessage<'a> {
     tool_calls: Option<Vec<OpenAIToolCallRef<'a>>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_call_id: Option<&'a str>,
+    /// Native DeepSeek reasoning replay; omitted for other dialects and roles.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_content: Option<Cow<'a, str>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -895,6 +2206,13 @@ enum OpenAIContent<'a> {
 enum OpenAIContentPart<'a> {
     Text { text: Cow<'a, str> },
     ImageUrl { image_url: OpenAIImageUrl<'a> },
+    InputAudio { input_audio: OpenAIInputAudio<'a> },
+}
+
+#[derive(Debug, Serialize)]
+struct OpenAIInputAudio<'a> {
+    data: Cow<'a, str>,
+    format: &'static str,
 }
 
 #[derive(Debug, Serialize)]
@@ -958,8 +2276,40 @@ struct OpenAIDelta {
     content: Option<String>,
     #[serde(default)]
     reasoning_content: Option<String>,
+    /// Gateways disagree on the name of the streamed reasoning field:
+    /// `reasoning_content` (DeepSeek), `reasoning` (OpenRouter) and
+    /// `reasoning_text`. The two alternatives are read as raw JSON so that a
+    /// gateway sending a non-string there cannot fail the whole chunk.
+    #[serde(default)]
+    reasoning: Option<serde_json::Value>,
+    #[serde(default)]
+    reasoning_text: Option<serde_json::Value>,
     #[serde(default)]
     tool_calls: Option<Vec<OpenAIToolCallDelta>>,
+}
+
+impl OpenAIDelta {
+    /// Fold a non-empty `reasoning` or `reasoning_text` string into
+    /// `reasoning_content` when that field carries no text itself.
+    fn normalize_reasoning(&mut self) {
+        if self
+            .reasoning_content
+            .as_deref()
+            .is_some_and(|text| !text.is_empty())
+        {
+            return;
+        }
+        let alternative = [self.reasoning.take(), self.reasoning_text.take()]
+            .into_iter()
+            .flatten()
+            .find_map(|value| match value {
+                serde_json::Value::String(text) if !text.is_empty() => Some(text),
+                _ => None,
+            });
+        if alternative.is_some() {
+            self.reasoning_content = alternative;
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -988,12 +2338,123 @@ struct OpenAIUsage {
     total_tokens: u64,
     #[serde(default)]
     prompt_tokens_details: Option<OpenAIPromptTokensDetails>,
+    #[serde(default)]
+    completion_tokens_details: Option<OpenAICompletionTokensDetails>,
+    /// DeepSeek reports the cache-miss (uncached) prompt token count directly.
+    /// When present it is the authoritative source for `usage.input`.
+    #[serde(default)]
+    prompt_cache_miss_tokens: Option<u64>,
+    /// OpenRouter usage accounting: the billed cost in USD for this request
+    /// (present when the request asked for `usage: {include: true}`, gh #221).
+    #[serde(default)]
+    cost: Option<f64>,
 }
 
 #[derive(Debug, Deserialize)]
 struct OpenAIPromptTokensDetails {
     #[serde(default)]
     cached_tokens: Option<u64>,
+    #[serde(default)]
+    audio_tokens: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAICompletionTokensDetails {
+    #[serde(default)]
+    audio_tokens: Option<u64>,
+}
+
+impl OpenAIUsage {
+    fn billing(&self, audio_input_in_request: bool) -> Option<BillingUsage> {
+        let unavailable = |reason: &str| BillingUsage::Unavailable {
+            reason: reason.to_string(),
+        };
+        if self
+            .cost
+            .is_some_and(|cost| !cost.is_finite() || cost < 0.0)
+        {
+            return Some(unavailable("The provider reported an invalid billed total"));
+        }
+        let reported_total = self.cost;
+        let input_audio = self
+            .prompt_tokens_details
+            .as_ref()
+            .and_then(|details| details.audio_tokens);
+        let output_audio = self
+            .completion_tokens_details
+            .as_ref()
+            .and_then(|details| details.audio_tokens)
+            .unwrap_or(0);
+        let cached = self
+            .prompt_tokens_details
+            .as_ref()
+            .and_then(|details| details.cached_tokens)
+            .unwrap_or(0);
+        let cannot_partition = |reason: &str| {
+            Some(reported_total.map_or_else(
+                || unavailable(reason),
+                |total| BillingUsage::ReportedTotal { total },
+            ))
+        };
+        if audio_input_in_request && input_audio.is_none() {
+            return cannot_partition(
+                "Audio input usage is missing prompt_tokens_details.audio_tokens",
+            );
+        }
+        let input_audio = input_audio.unwrap_or(0);
+        if (audio_input_in_request || input_audio > 0 || output_audio > 0)
+            && self.completion_tokens.is_none()
+        {
+            return cannot_partition("Audio request usage is missing completion_tokens");
+        }
+        let output = self.completion_tokens.unwrap_or(0);
+        if input_audio > self.prompt_tokens || output_audio > output {
+            return cannot_partition("Audio token counts exceed the provider's total token counts");
+        }
+        if input_audio > 0 && cached > 0 {
+            // Chat Completions exposes aggregate cached tokens, without the
+            // Realtime API's modality cache split. Guessing all cache reads
+            // were text can discount the more expensive audio incorrectly.
+            return cannot_partition("Cached audio/text tokens have no exact modality partition");
+        }
+        if audio_input_in_request || input_audio > 0 || output_audio > 0 {
+            let Some(input) = self
+                .prompt_tokens
+                .checked_sub(input_audio)
+                .and_then(|tokens| tokens.checked_sub(cached))
+            else {
+                return cannot_partition(
+                    "Cached token counts exceed the provider's prompt token counts",
+                );
+            };
+            return Some(BillingUsage::Tokens {
+                text: BillingTokenCounts {
+                    input,
+                    output: output - output_audio,
+                    cache_read: cached,
+                    cache_write: 0,
+                },
+                audio: BillingTokenCounts {
+                    input: input_audio,
+                    output: output_audio,
+                    ..Default::default()
+                },
+                reported_total,
+            });
+        }
+        reported_total.map(|total| BillingUsage::Tokens {
+            text: BillingTokenCounts {
+                input: self
+                    .prompt_cache_miss_tokens
+                    .unwrap_or_else(|| self.prompt_tokens.saturating_sub(cached)),
+                output,
+                cache_read: cached,
+                cache_write: 0,
+            },
+            audio: BillingTokenCounts::default(),
+            reported_total: Some(total),
+        })
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1006,24 +2467,62 @@ struct OpenAIChunkError {
 // Conversion Functions
 // ============================================================================
 
+/// Reconstruct the exact native DeepSeek reasoning text from already-screened
+/// same-provider history. Signed or foreign reasoning is never downgraded into
+/// DeepSeek's unsigned replay field.
+fn deepseek_replay_reasoning<'a>(
+    assistant: &'a AssistantMessage,
+    provider: &str,
+    model: &str,
+) -> Cow<'a, str> {
+    if assistant.api != "openai-completions"
+        || !crate::provider_metadata::provider_ids_match(&assistant.provider, provider)
+        || assistant.model != model
+    {
+        return Cow::Borrowed("");
+    }
+    let mut parts = assistant.content.iter().filter_map(|block| match block {
+        ContentBlock::Thinking(thinking) if thinking.thinking_signature.is_none() => {
+            Some(thinking.thinking.as_str())
+        }
+        _ => None,
+    });
+    let Some(first) = parts.next() else {
+        return Cow::Borrowed("");
+    };
+    let Some(second) = parts.next() else {
+        return Cow::Borrowed(first);
+    };
+    let mut reasoning = String::from(first);
+    reasoning.push_str(second);
+    for part in parts {
+        reasoning.push_str(part);
+    }
+    Cow::Owned(reasoning)
+}
+
 #[allow(clippy::too_many_lines)]
-fn convert_message_to_openai(message: &Message) -> Vec<OpenAIMessage<'_>> {
+fn convert_message_to_openai<'a>(
+    message: &'a Message,
+    tool_images: &mut Vec<OpenAIContentPart<'a>>,
+    audio_input: bool,
+) -> OpenAIMessage<'a> {
     match message {
-        Message::User(user) => vec![OpenAIMessage {
+        Message::User(user) => OpenAIMessage {
             role: Cow::Borrowed("user"),
-            content: Some(convert_user_content(&user.content)),
+            content: Some(convert_user_content(&user.content, audio_input)),
             tool_calls: None,
             tool_call_id: None,
-        }],
-        Message::Custom(custom) => vec![OpenAIMessage {
+            reasoning_content: None,
+        },
+        Message::Custom(custom) => OpenAIMessage {
             role: Cow::Borrowed("user"),
             content: Some(OpenAIContent::Text(Cow::Borrowed(&custom.content))),
             tool_calls: None,
             tool_call_id: None,
-        }],
+            reasoning_content: None,
+        },
         Message::Assistant(assistant) => {
-            let mut messages = Vec::new();
-
             // Collect text content
             let text: String = assistant
                 .content
@@ -1069,22 +2568,21 @@ fn convert_message_to_openai(message: &Message) -> Vec<OpenAIMessage<'_>> {
                 Some(tool_calls)
             };
 
-            messages.push(OpenAIMessage {
+            OpenAIMessage {
                 role: Cow::Borrowed("assistant"),
                 content,
                 tool_calls,
                 tool_call_id: None,
-            });
-
-            messages
+                reasoning_content: None,
+            }
         }
         Message::ToolResult(result) => {
-            let mut text_parts = Vec::new();
+            let mut text_parts: Vec<Cow<'_, str>> = Vec::new();
             let mut image_parts = Vec::new();
 
             for block in &result.content {
                 match block {
-                    ContentBlock::Text(t) => text_parts.push(t.text.as_str()),
+                    ContentBlock::Text(t) => text_parts.push(Cow::Borrowed(t.text.as_str())),
                     ContentBlock::Image(img) => {
                         let url = format!("data:{};base64,{}", img.mime_type, img.data);
                         image_parts.push(OpenAIContentPart::ImageUrl {
@@ -1094,46 +2592,87 @@ fn convert_message_to_openai(message: &Message) -> Vec<OpenAIMessage<'_>> {
                             },
                         });
                     }
+                    ContentBlock::Media(media) => {
+                        if let Some(part) = native_audio_part(media, audio_input) {
+                            image_parts.push(part);
+                        } else {
+                            text_parts.push(Cow::Owned(media.placeholder()));
+                        }
+                    }
                     _ => {}
                 }
             }
 
+            let has_audio = image_parts
+                .iter()
+                .any(|part| matches!(part, OpenAIContentPart::InputAudio { .. }));
             let text_content = if text_parts.is_empty() {
                 if image_parts.is_empty() {
                     Some(OpenAIContent::Text(Cow::Borrowed("")))
                 } else {
-                    Some(OpenAIContent::Text(Cow::Borrowed("(see attached image)")))
+                    Some(OpenAIContent::Text(Cow::Borrowed(if has_audio {
+                        "(see attached media)"
+                    } else {
+                        "(see attached image)"
+                    })))
                 }
             } else {
                 Some(OpenAIContent::Text(Cow::Owned(text_parts.join("\n"))))
             };
 
-            let mut messages = vec![OpenAIMessage {
+            if !image_parts.is_empty() {
+                tool_images.push(OpenAIContentPart::Text {
+                    text: Cow::Owned(format!(
+                        "{} from {} (tool call {}):",
+                        if has_audio { "Attachments" } else { "Images" },
+                        result.tool_name,
+                        result.tool_call_id
+                    )),
+                });
+                tool_images.extend(image_parts);
+            }
+            OpenAIMessage {
                 role: Cow::Borrowed("tool"),
                 content: text_content,
                 tool_calls: None,
                 tool_call_id: Some(&result.tool_call_id),
-            }];
-
-            if !image_parts.is_empty() {
-                let mut parts = vec![OpenAIContentPart::Text {
-                    text: Cow::Borrowed("Attached image(s) from tool result:"),
-                }];
-                parts.extend(image_parts);
-                messages.push(OpenAIMessage {
-                    role: Cow::Borrowed("user"),
-                    content: Some(OpenAIContent::Parts(parts)),
-                    tool_calls: None,
-                    tool_call_id: None,
-                });
+                reasoning_content: None,
             }
-
-            messages
         }
     }
 }
 
-fn convert_user_content(content: &UserContent) -> OpenAIContent<'_> {
+fn append_tool_result_attachments<'a>(
+    messages: &mut Vec<OpenAIMessage<'a>>,
+    images: &mut Vec<OpenAIContentPart<'a>>,
+) {
+    if images.is_empty() {
+        return;
+    }
+    let mut parts = Vec::with_capacity(images.len() + 1);
+    parts.push(OpenAIContentPart::Text {
+        text: Cow::Borrowed(
+            if images
+                .iter()
+                .any(|part| matches!(part, OpenAIContentPart::InputAudio { .. }))
+            {
+                "Attached media from tool results:"
+            } else {
+                "Attached image(s) from tool results:"
+            },
+        ),
+    });
+    parts.append(images);
+    messages.push(OpenAIMessage {
+        role: Cow::Borrowed("user"),
+        content: Some(OpenAIContent::Parts(parts)),
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+    });
+}
+
+fn convert_user_content(content: &UserContent, audio_input: bool) -> OpenAIContent<'_> {
     match content {
         UserContent::Text(text) => OpenAIContent::Text(Cow::Borrowed(text)),
         UserContent::Blocks(blocks) => {
@@ -1152,6 +2691,13 @@ fn convert_user_content(content: &UserContent) -> OpenAIContent<'_> {
                                 _phantom: std::marker::PhantomData,
                             },
                         })
+                    }
+                    ContentBlock::Media(media) => {
+                        Some(native_audio_part(media, audio_input).unwrap_or_else(|| {
+                            OpenAIContentPart::Text {
+                                text: Cow::Owned(media.placeholder()),
+                            }
+                        }))
                     }
                     _ => None,
                 })
@@ -1179,16 +2725,690 @@ fn convert_tool_to_openai(tool: &ToolDef) -> OpenAITool<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::AuthCredential;
     use asupersync::runtime::RuntimeBuilder;
     use futures::{StreamExt, stream};
     use serde::{Deserialize, Serialize};
     use serde_json::{Value, json};
     use std::collections::HashMap;
     use std::io::{Read, Write};
+
+    /// #124: the partial-JSON completer gives snapshot clients live tool-call
+    /// arguments. Each accumulated prefix must complete to a valid `Value` that
+    /// faithfully reflects the content so far (closing open structure only),
+    /// and an un-completable fragment yields `None` (caller keeps last value).
+    #[test]
+    fn complete_partial_json_streams_tool_call_arguments() {
+        // Growing prefixes of `{"path": "src/lib.rs", "content": "hello"}`.
+        assert_eq!(complete_partial_json(""), None);
+        assert_eq!(complete_partial_json("{"), Some(json!({})));
+        assert_eq!(
+            complete_partial_json(r#"{"path": "src/li"#),
+            Some(json!({"path": "src/li"}))
+        );
+        assert_eq!(
+            complete_partial_json(r#"{"path": "src/lib.rs""#),
+            Some(json!({"path": "src/lib.rs"}))
+        );
+        // Complete member — must be kept, not stripped.
+        assert_eq!(
+            complete_partial_json(r#"{"path": "src/lib.rs""#),
+            Some(json!({"path": "src/lib.rs"}))
+        );
+        // Trailing comma dropped.
+        assert_eq!(
+            complete_partial_json(r#"{"path": "src/lib.rs", "#),
+            Some(json!({"path": "src/lib.rs"}))
+        );
+        // Dangling `"key":` (no value yet) dropped; complete member kept.
+        assert_eq!(
+            complete_partial_json(r#"{"path": "src/lib.rs", "content":"#),
+            Some(json!({"path": "src/lib.rs"}))
+        );
+        // Dangling bare key (no colon yet) dropped.
+        assert_eq!(
+            complete_partial_json(r#"{"path": "src/lib.rs", "content"#),
+            Some(json!({"path": "src/lib.rs"}))
+        );
+        // Complete document round-trips.
+        assert_eq!(
+            complete_partial_json(r#"{"path": "src/lib.rs", "content": "hello"}"#),
+            Some(json!({"path": "src/lib.rs", "content": "hello"}))
+        );
+    }
+
+    #[test]
+    fn complete_partial_json_handles_arrays_escapes_and_unparseable() {
+        // Open array + trailing comma.
+        assert_eq!(
+            complete_partial_json(r#"{"items": [1, 2, "#),
+            Some(json!({"items": [1, 2]}))
+        );
+        assert_eq!(
+            complete_partial_json(r#"{"items": [1, 2"#),
+            Some(json!({"items": [1, 2]}))
+        );
+        // Escaped quote inside an open string is preserved.
+        assert_eq!(
+            complete_partial_json(r#"{"a": "b\"c"#),
+            Some(json!({"a": "b\"c"}))
+        );
+        // Dangling escape backslash is dropped before closing.
+        assert_eq!(
+            complete_partial_json(r#"{"a": "bc\"#),
+            Some(json!({"a": "bc"}))
+        );
+        // A partially-typed bare literal can't be closed safely → None.
+        assert_eq!(complete_partial_json(r#"{"a": tr"#), None);
+    }
     use std::net::TcpListener;
     use std::path::PathBuf;
     use std::sync::mpsc;
     use std::time::Duration;
+
+    fn audio_test_rates() -> crate::provider::ModelCost {
+        crate::provider::ModelCost {
+            input: 2.5,
+            output: 10.0,
+            cache_read: 0.0,
+            cache_write: 0.0,
+            audio: Some(crate::provider::AudioModelCost {
+                input: Some(32.0),
+                output: Some(64.0),
+                cache_read: None,
+                cache_write: None,
+            }),
+        }
+    }
+
+    fn audio_test_provider() -> OpenAIProvider {
+        OpenAIProvider::new("gpt-audio-1.5")
+            .with_input_types(&[
+                crate::provider::InputType::Text,
+                crate::provider::InputType::Audio,
+            ])
+            .with_model_cost(audio_test_rates())
+    }
+
+    fn audio_test_media(data: &str, mime_type: &str) -> ContentBlock {
+        ContentBlock::Media(crate::model::MediaContent {
+            data: data.to_string(),
+            mime_type: mime_type.to_string(),
+            name: Some("voice".to_string()),
+        })
+    }
+
+    fn audio_test_context(blocks: Vec<ContentBlock>) -> Context<'static> {
+        Context::owned(
+            None,
+            vec![Message::User(crate::model::UserMessage {
+                content: UserContent::Blocks(blocks),
+                timestamp: 0,
+            })],
+            Vec::new(),
+        )
+    }
+
+    #[test]
+    fn openai_audio_declared_capability_controls_native_parts() {
+        let context = audio_test_context(vec![
+            ContentBlock::Text(TextContent::new("listen")),
+            audio_test_media("YQ", "Audio/X-WAV; codecs=pcm"),
+            audio_test_media("Yg==", "audio/mpeg"),
+            audio_test_media("Yw==", "audio/flac"),
+            audio_test_media("ZA==", "video/mp4"),
+        ]);
+        let native = audio_test_provider();
+        native.validate_audio_context(&context).unwrap();
+        let wire = native
+            .build_request_json(&context, &StreamOptions::default())
+            .unwrap();
+        assert_eq!(wire["modalities"], json!(["text"]));
+        assert_eq!(
+            wire["messages"][0]["content"][1],
+            json!({"type":"input_audio", "input_audio":{"data":"YQ==","format":"wav"}})
+        );
+        assert_eq!(
+            wire["messages"][0]["content"][2],
+            json!({"type":"input_audio", "input_audio":{"data":"Yg==","format":"mp3"}})
+        );
+        assert!(
+            wire["messages"][0]["content"][3]["text"]
+                .as_str()
+                .unwrap()
+                .contains("media omitted")
+        );
+        assert!(
+            wire["messages"][0]["content"][4]["text"]
+                .as_str()
+                .unwrap()
+                .contains("media omitted")
+        );
+
+        let text_only = native.with_input_types(&[crate::provider::InputType::Text]);
+        let wire = text_only
+            .build_request_json(&context, &StreamOptions::default())
+            .unwrap();
+        assert!(wire.get("modalities").is_none());
+        assert!(!wire.to_string().contains("input_audio"));
+        assert!(!wire.to_string().contains("Yg=="));
+        assert!(
+            matches!(&context.messages[0], Message::User(user) if matches!(&user.content, UserContent::Blocks(blocks) if matches!(&blocks[1], ContentBlock::Media(media) if media.data == "YQ")))
+        );
+    }
+
+    #[test]
+    fn openai_audio_tool_results_follow_all_sibling_tool_replies() {
+        let result = |id: &str, data: &str| {
+            Message::tool_result(crate::model::ToolResultMessage {
+                tool_call_id: id.to_string(),
+                tool_name: "read_media".to_string(),
+                content: vec![audio_test_media(data, "audio/wav")],
+                details: None,
+                is_error: false,
+                timestamp: 0,
+            })
+        };
+        let context = Context::owned(
+            None,
+            vec![
+                tool_call_message(&["a", "b"]),
+                result("a", "YQ=="),
+                result("b", "Yg=="),
+                Message::User(crate::model::UserMessage {
+                    content: UserContent::Text("compare".to_string()),
+                    timestamp: 0,
+                }),
+            ],
+            Vec::new(),
+        );
+        let wire = audio_test_provider()
+            .build_request_json(&context, &StreamOptions::default())
+            .unwrap();
+        let messages = wire["messages"].as_array().unwrap();
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| message["role"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["assistant", "tool", "tool", "user", "user"]
+        );
+        assert_eq!(messages[1]["tool_call_id"], "a");
+        assert_eq!(messages[2]["tool_call_id"], "b");
+        let data = messages[3]["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|part| part.pointer("/input_audio/data").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+        assert_eq!(data, ["YQ==", "Yg=="]);
+        assert_eq!(messages[4]["content"], "compare");
+    }
+
+    #[test]
+    fn openai_audio_rejects_invalid_or_oversized_payloads_before_dispatch() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let provider = audio_test_provider().with_base_url(format!(
+            "http://{}/v1/chat/completions",
+            listener.local_addr().unwrap()
+        ));
+        let runtime = RuntimeBuilder::current_thread().build().unwrap();
+        runtime.block_on(async {
+            let options = StreamOptions {
+                api_key: Some("fixture-key".to_string()),
+                ..Default::default()
+            };
+            for data in [
+                String::new(),
+                "not base64!".to_string(),
+                "A".repeat(usize::try_from(MAX_AUDIO_BLOCK_BYTES.div_ceil(3) * 4 + 4).unwrap()),
+            ] {
+                let context = audio_test_context(vec![audio_test_media(&data, "audio/wav")]);
+                let error = match provider.stream(&context, &options).await {
+                    Ok(_) => panic!("invalid audio reached dispatch"),
+                    Err(error) => error,
+                };
+                assert!(error.to_string().contains("OpenAI audio input"));
+            }
+            let context = audio_test_context(vec![
+                audio_test_media("YQ==", "audio/wav");
+                MAX_AUDIO_BLOCKS + 1
+            ]);
+            assert!(provider.stream(&context, &options).await.is_err());
+            let mut unpriced = audio_test_rates();
+            unpriced.audio = None;
+            let missing_price = audio_test_provider()
+                .with_model_cost(unpriced)
+                .with_base_url(provider.base_url.clone());
+            assert!(
+                missing_price
+                    .stream(
+                        &audio_test_context(vec![audio_test_media("YQ==", "audio/wav")]),
+                        &options
+                    )
+                    .await
+                    .is_err()
+            );
+        });
+        assert!(
+            // ubs:ignore[rust.security.constant-time-compare] Compare a public I/O error enum to prove that validation prevented network dispatch.
+            matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+        );
+    }
+
+    #[test]
+    fn openai_audio_usage_prices_modalities_once() {
+        let mut state = StreamState::new(
+            SseStream::new(stream::empty()),
+            "gpt-audio-1.5".to_string(),
+            "openai-completions".to_string(),
+            "openai".to_string(),
+        );
+        state.audio_input_in_request = true;
+        state.process_event(r#"{"choices":[],"usage":{"prompt_tokens":1010,"completion_tokens":10,"total_tokens":1020,"prompt_tokens_details":{"audio_tokens":1000,"cached_tokens":0}}}"#).unwrap();
+        assert_eq!(state.partial.usage.input, 1010);
+        assert_eq!(state.partial.usage.output, 10);
+        assert_eq!(state.partial.usage.total_tokens, 1020);
+        let rates = audio_test_rates();
+        rates.price_usage(&mut state.partial.usage).unwrap();
+        let expected = 0.032_125;
+        assert!((state.partial.usage.cost.total - expected).abs() < 1e-12);
+        rates.price_usage(&mut state.partial.usage).unwrap();
+        assert!((state.partial.usage.cost.total - expected).abs() < 1e-12);
+        assert!(matches!(
+            state.partial.usage.billing,
+            Some(BillingUsage::Tokens {
+                text: BillingTokenCounts {
+                    input: 10,
+                    output: 10,
+                    ..
+                },
+                audio: BillingTokenCounts { input: 1000, .. },
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn openai_audio_billing_distinguishes_missing_ambiguous_and_authoritative_zero() {
+        for (usage, reported) in [
+            (
+                json!({"prompt_tokens":100,"completion_tokens":2,"total_tokens":102}),
+                None,
+            ),
+            (
+                json!({"prompt_tokens":100,"completion_tokens":2,"total_tokens":102,"prompt_tokens_details":{"audio_tokens":80,"cached_tokens":10}}),
+                None,
+            ),
+            (
+                json!({"prompt_tokens":100,"completion_tokens":2,"total_tokens":102,"cost":0}),
+                Some(0.0),
+            ),
+        ] {
+            let usage: OpenAIUsage = serde_json::from_value(usage).unwrap();
+            match (usage.billing(true).unwrap(), reported) {
+                (BillingUsage::Unavailable { .. }, None) => {}
+                (BillingUsage::ReportedTotal { total }, Some(expected)) => {
+                    assert_eq!(total, expected);
+                }
+                other => panic!("unexpected accounting evidence: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn openai_audio_hook_rewrites_cannot_bypass_admission() {
+        let response = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"heard\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2,\"prompt_tokens_details\":{\"audio_tokens\":1}}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        for mutation in ["model", "format", "output", "data", "usage"] {
+            let (url, captured) = spawn_test_server(200, "text/event-stream", response);
+            let provider = audio_test_provider().with_base_url(url);
+            let options = StreamOptions {
+                api_key: Some("fixture-key".to_string()),
+                before_provider_request: Some(crate::provider::BeforeProviderRequestHook::new(
+                    move |event| {
+                        Box::pin(async move {
+                            let mut body = event.payload;
+                            match mutation {
+                                "model" => body["model"] = json!("unpriced-replacement"),
+                                "format" => {
+                                    body["messages"][0]["content"][0]["input_audio"]["format"] =
+                                        json!("flac");
+                                }
+                                "output" => body["modalities"] = json!(["audio"]),
+                                "data" => {
+                                    body["messages"][0]["content"][0]["input_audio"]["data"] =
+                                        json!("not base64!");
+                                }
+                                "usage" => body["stream_options"]["include_usage"] = json!(false),
+                                _ => unreachable!(),
+                            }
+                            Some(body)
+                        })
+                    },
+                )),
+                ..Default::default()
+            };
+            let runtime = RuntimeBuilder::current_thread().build().unwrap();
+            runtime.block_on(async {
+                let context = audio_test_context(vec![audio_test_media("YQ==", "audio/wav")]);
+                let mut stream = provider.stream(&context, &options).await.unwrap();
+                while let Some(event) = stream.next().await {
+                    event.unwrap();
+                }
+            });
+            let request: Value =
+                serde_json::from_str(&captured.recv_timeout(Duration::from_secs(2)).unwrap().body)
+                    .unwrap();
+            assert_eq!(request["model"], "gpt-audio-1.5", "{mutation}");
+            assert_eq!(request["modalities"], json!(["text"]), "{mutation}");
+            assert_eq!(
+                request["stream_options"]["include_usage"], true,
+                "{mutation}"
+            );
+            assert_eq!(
+                request["messages"][0]["content"][0]["input_audio"],
+                json!({"data":"YQ==","format":"wav"}),
+                "{mutation}"
+            );
+        }
+    }
+
+    #[test]
+    fn openai_audio_missing_or_ambiguous_billing_fences_capped_followups() {
+        use std::sync::Arc;
+
+        for usage in [
+            None,
+            Some(json!({"prompt_tokens":100,"completion_tokens":2,"total_tokens":102})),
+            Some(
+                json!({"prompt_tokens":100,"completion_tokens":2,"total_tokens":102,"prompt_tokens_details":{"audio_tokens":80,"cached_tokens":10}}),
+            ),
+        ] {
+            let mut terminal =
+                json!({"choices":[{"delta":{"content":"heard"},"finish_reason":"stop"}]});
+            if let Some(usage) = usage {
+                terminal["usage"] = usage;
+            }
+            let response = format!("data: {terminal}\n\ndata: [DONE]\n\n");
+            let (url, captured) = spawn_test_server(200, "text/event-stream", &response);
+            let budget = crate::cost::CostBudget::new(None, Some(1.0), 0.0).unwrap();
+            let provider = crate::provider::guard_with_cost_budget(
+                Arc::new(audio_test_provider().with_base_url(url)),
+                budget.clone(),
+            );
+            let runtime = RuntimeBuilder::current_thread().build().unwrap();
+            runtime.block_on(async {
+                let context = audio_test_context(vec![audio_test_media("YQ==", "audio/wav")]);
+                let options = StreamOptions {
+                    api_key: Some("fixture-key".to_string()),
+                    ..Default::default()
+                };
+                let mut stream = provider.stream(&context, &options).await.unwrap();
+                let mut rejected = false;
+                while let Some(event) = stream.next().await {
+                    if let Err(error) = event {
+                        assert!(
+                            error.to_string().contains("account")
+                                || error.to_string().contains("billing")
+                        );
+                        rejected = true;
+                    }
+                }
+                assert!(rejected, "capped audio requires usable billing evidence");
+                assert!(provider.stream(&context, &options).await.is_err());
+            });
+            assert!(captured.recv_timeout(Duration::from_secs(2)).is_ok());
+            assert!(budget.admit().is_err());
+            assert_eq!(
+                budget.spent(),
+                0.0,
+                "missing accounting must not fabricate a dollar charge"
+            );
+        }
+    }
+
+    #[test]
+    fn openai_audio_final_zero_bill_replaces_partial_before_done_is_consumed() {
+        use std::sync::Arc;
+
+        let response = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"heard\"},\"finish_reason\":null}],\"usage\":{\"prompt_tokens\":1000,\"completion_tokens\":0,\"total_tokens\":1000,\"prompt_tokens_details\":{\"audio_tokens\":1000}}}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1000,\"completion_tokens\":1,\"total_tokens\":1001,\"cost\":0}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let (url, captured) = spawn_test_server(200, "text/event-stream", response);
+        let budget = crate::cost::CostBudget::new(None, Some(0.1), 0.0).unwrap();
+        let provider = crate::provider::guard_with_cost_budget(
+            Arc::new(audio_test_provider().with_base_url(url)),
+            budget.clone(),
+        );
+        let runtime = RuntimeBuilder::current_thread().build().unwrap();
+        runtime.block_on(async {
+            let context = audio_test_context(vec![audio_test_media("YQ==", "audio/wav")]);
+            let options = StreamOptions {
+                api_key: Some("fixture-key".to_string()),
+                ..Default::default()
+            };
+            let mut stream = provider.stream(&context, &options).await.unwrap();
+            let mut saw_partial = false;
+            let mut saw_final_content = false;
+            while let Some(event) = stream.next().await {
+                match event.unwrap() {
+                    StreamEvent::TextDelta { .. } => {
+                        assert!((budget.snapshot().pending - 0.032).abs() < 1e-12);
+                        saw_partial = true;
+                    }
+                    StreamEvent::TextEnd { .. } => {
+                        saw_final_content = true;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            assert!(saw_partial && saw_final_content);
+            drop(stream);
+            assert_eq!(budget.spent(), 0.0);
+            assert_eq!(budget.snapshot().pending, 0.0);
+            budget.admit().unwrap();
+        });
+        assert!(captured.recv_timeout(Duration::from_secs(2)).is_ok());
+    }
+
+    #[test]
+    fn native_audio_replays_from_saved_session_and_enforces_cost_cap() {
+        use base64::Engine as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        // A PCM WAV large enough to exercise the actual attachment sidecar.
+        let pcm = vec![0_u8; 96_000];
+        let mut wav = Vec::with_capacity(pcm.len() + 44);
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&u32::try_from(pcm.len() + 36).unwrap().to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        wav.extend_from_slice(&16_u32.to_le_bytes());
+        wav.extend_from_slice(&1_u16.to_le_bytes());
+        wav.extend_from_slice(&1_u16.to_le_bytes());
+        wav.extend_from_slice(&16_000_u32.to_le_bytes());
+        wav.extend_from_slice(&32_000_u32.to_le_bytes());
+        wav.extend_from_slice(&2_u16.to_le_bytes());
+        wav.extend_from_slice(&16_u16.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&u32::try_from(pcm.len()).unwrap().to_le_bytes());
+        wav.extend_from_slice(&pcm);
+        let data = base64::engine::general_purpose::STANDARD.encode(&wav);
+        let response = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"heard fixture\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1010,\"completion_tokens\":10,\"total_tokens\":1020,\"prompt_tokens_details\":{\"audio_tokens\":1000,\"cached_tokens\":0}}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let (url, captured) = spawn_test_server(200, "text/event-stream", response);
+        let mut entry = crate::models::ad_hoc_model_entry("openai", "gpt-audio-1.5").unwrap();
+        entry.model.api = "openai-completions".to_string();
+        entry.model.base_url = url;
+        entry.model.input = vec![
+            crate::provider::InputType::Text,
+            crate::provider::InputType::Audio,
+        ];
+        entry.model.cost = audio_test_rates();
+        let budget = crate::cost::CostBudget::new(None, Some(0.02), 0.0).unwrap();
+        let provider = crate::provider::guard_with_cost_budget(
+            crate::providers::create_provider(&entry, None).unwrap(),
+            budget.clone(),
+        );
+        let runtime = RuntimeBuilder::current_thread().build().unwrap();
+        runtime.block_on(async {
+            let mut stored =
+                crate::session::Session::create_with_dir(Some(directory.path().join("sessions")));
+            stored.header.cwd = directory.path().display().to_string();
+            stored.append_model_message(Message::User(crate::model::UserMessage {
+                content: UserContent::Blocks(vec![audio_test_media(&data, "audio/wav")]),
+                timestamp: 0,
+            }));
+            stored.save().await.unwrap();
+            let path = stored.path.clone().unwrap();
+            assert!(std::fs::read_to_string(&path).unwrap().contains("$piBlob"));
+            let mut replayed = crate::session::Session::open(path.to_str().unwrap())
+                .await
+                .unwrap();
+            let context = Context::owned(None, replayed.to_messages(), Vec::new());
+            let options = StreamOptions {
+                api_key: Some("fixture-key".to_string()),
+                ..Default::default()
+            };
+            let mut events = provider.stream(&context, &options).await.unwrap();
+            let mut completed = None;
+            while let Some(event) = events.next().await {
+                if let StreamEvent::Done { message, .. } = event.unwrap() {
+                    completed = Some(message);
+                }
+            }
+            let message = completed.expect("complete native audio reply");
+            assert!((message.usage.cost.total - 0.032_125).abs() < 1e-12);
+            assert!((budget.spent() - 0.032_125).abs() < 1e-12);
+            assert!(matches!(
+                provider.stream(&context, &options).await,
+                Err(Error::CostCap { .. })
+            ));
+
+            replayed.append_model_message(Message::assistant(message));
+            replayed.save().await.unwrap();
+            let restored = crate::session::Session::open(path.to_str().unwrap())
+                .await
+                .unwrap();
+            let restored_budget = budget.for_replacement(&restored, false).unwrap();
+            assert!(matches!(
+                restored_budget.admit(),
+                Err(Error::CostCap { .. })
+            ));
+            let assistant = restored
+                .to_messages()
+                .into_iter()
+                .find_map(|message| match message {
+                    Message::Assistant(message) => Some(message),
+                    _ => None,
+                })
+                .unwrap();
+            assert!(assistant.usage.has_explicit_billing());
+        });
+        let request: Value =
+            serde_json::from_str(&captured.recv_timeout(Duration::from_secs(2)).unwrap().body)
+                .unwrap();
+        assert_eq!(
+            request["messages"][0]["content"][0]["input_audio"]["format"],
+            "wav"
+        );
+        assert_eq!(
+            request["messages"][0]["content"][0]["input_audio"]["data"],
+            data
+        );
+        assert_eq!(request["stream_options"]["include_usage"], true);
+        assert_eq!(request["modalities"], json!(["text"]));
+    }
+
+    #[test]
+    fn openai_audio_final_billing_remains_open_for_trailing_usage() {
+        use std::sync::Arc;
+
+        let response = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"heard\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1000,\"completion_tokens\":0,\"total_tokens\":1000,\"cost\":0}}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":2000,\"completion_tokens\":0,\"total_tokens\":2000,\"prompt_tokens_details\":{\"audio_tokens\":2000}}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let (url, captured) = spawn_test_server(200, "text/event-stream", response);
+        let budget = crate::cost::CostBudget::new(None, Some(0.1), 0.0).unwrap();
+        let provider = crate::provider::guard_with_cost_budget(
+            Arc::new(audio_test_provider().with_base_url(url)),
+            budget.clone(),
+        );
+        let runtime = RuntimeBuilder::current_thread().build().unwrap();
+        runtime.block_on(async {
+            let context = audio_test_context(vec![audio_test_media("YQ==", "audio/wav")]);
+            let options = StreamOptions {
+                api_key: Some("fixture-key".to_string()),
+                ..Default::default()
+            };
+            let mut stream = provider.stream(&context, &options).await.unwrap();
+            let mut completed = false;
+            while let Some(event) = stream.next().await {
+                if let StreamEvent::Done { message, .. } = event.unwrap() {
+                    assert!((message.usage.cost.total - 0.064).abs() < 1e-12);
+                    completed = true;
+                }
+            }
+            assert!(completed);
+        });
+        assert!((budget.spent() - 0.064).abs() < 1e-12);
+        assert!(captured.recv_timeout(Duration::from_secs(2)).is_ok());
+    }
+
+    /// Unsupported media remains an explicit notice on both user content and
+    /// tool results, without disclosing its payload to an incompatible model.
+    #[test]
+    fn test_convert_media_block_degrades_to_placeholder() {
+        let media = crate::model::MediaContent {
+            data: "AAAA".to_string(),
+            mime_type: "video/mp4".to_string(),
+            name: Some("clip.mp4".to_string()),
+        };
+        let content = UserContent::Blocks(vec![
+            ContentBlock::Text(TextContent::new("look")),
+            ContentBlock::Media(media.clone()),
+        ]);
+        let wire = serde_json::to_value(convert_user_content(&content, false)).expect("serialize");
+        assert_eq!(
+            wire,
+            json!([
+                { "type": "text", "text": "look" },
+                { "type": "text", "text": "[media omitted: clip.mp4, video/mp4, 3 B]" },
+            ])
+        );
+        assert!(!wire.to_string().contains("AAAA"));
+
+        let result = Message::tool_result(crate::model::ToolResultMessage {
+            tool_call_id: "call_media".to_string(),
+            tool_name: "read_media".to_string(),
+            content: vec![
+                ContentBlock::Text(TextContent::new("Read media file clip.mp4")),
+                ContentBlock::Media(media),
+            ],
+            details: None,
+            is_error: false,
+            timestamp: 0,
+        });
+        let mut tool_images = Vec::new();
+        let message = convert_message_to_openai(&result, &mut tool_images, false);
+        assert!(tool_images.is_empty(), "no trailing image turn for media");
+        let wire = serde_json::to_value(&message).expect("serialize");
+        assert_eq!(wire["role"], "tool");
+        assert_eq!(
+            wire["content"],
+            "Read media file clip.mp4\n[media omitted: clip.mp4, video/mp4, 3 B]"
+        );
+    }
 
     #[test]
     fn test_convert_user_text_message() {
@@ -1197,9 +3417,200 @@ mod tests {
             timestamp: 0,
         });
 
-        let converted = convert_message_to_openai(&message);
-        assert_eq!(converted.len(), 1);
-        assert_eq!(converted[0].role, "user");
+        let mut tool_images = Vec::new();
+        let converted = convert_message_to_openai(&message, &mut tool_images, false);
+        assert_eq!(converted.role, "user");
+        assert!(tool_images.is_empty());
+    }
+
+    fn tool_call_message(ids: &[&str]) -> Message {
+        Message::assistant(AssistantMessage {
+            content: ids
+                .iter()
+                .map(|id| {
+                    ContentBlock::ToolCall(ToolCall {
+                        id: (*id).to_string(),
+                        name: "read".to_string(),
+                        arguments: json!({"path": id}),
+                        thought_signature: None,
+                    })
+                })
+                .collect(),
+            stop_reason: StopReason::ToolUse,
+            ..AssistantMessage::default()
+        })
+    }
+
+    fn image_block(data: &str, mime_type: &str) -> ContentBlock {
+        ContentBlock::Image(crate::model::ImageContent {
+            data: data.to_string(),
+            mime_type: mime_type.to_string(),
+        })
+    }
+
+    fn tool_result_message(id: &str, content: Vec<ContentBlock>) -> Message {
+        Message::tool_result(crate::model::ToolResultMessage {
+            tool_call_id: id.to_string(),
+            tool_name: "read".to_string(),
+            content,
+            details: None,
+            is_error: false,
+            timestamp: 0,
+        })
+    }
+
+    fn request_messages(messages: Vec<Message>) -> Value {
+        let provider = OpenAIProvider::new("gpt-4o");
+        let context = Context {
+            system_prompt: None,
+            messages: messages.into(),
+            tools: Vec::new().into(),
+        };
+        let options = StreamOptions::default();
+        let request = provider.build_request(&context, &options);
+        serde_json::to_value(request).expect("serialize request")["messages"].clone()
+    }
+
+    #[test]
+    fn parallel_tool_results_precede_one_ordered_image_bundle() {
+        let wire = request_messages(vec![
+            tool_call_message(&["call_a", "call_b", "call_c", "call_empty"]),
+            tool_result_message(
+                "call_a",
+                vec![
+                    ContentBlock::Text(TextContent::new("first result")),
+                    image_block("AQ==", "image/png"),
+                    image_block("Ag==", "image/jpeg"),
+                ],
+            ),
+            tool_result_message(
+                "call_b",
+                vec![ContentBlock::Text(TextContent::new("text-only result"))],
+            ),
+            tool_result_message("call_c", vec![image_block("Aw==", "image/webp")]),
+            tool_result_message("call_empty", Vec::new()),
+        ]);
+        let messages = wire.as_array().expect("messages");
+        assert_eq!(
+            messages
+                .iter()
+                .map(|m| m["role"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["assistant", "tool", "tool", "tool", "tool", "user"]
+        );
+        for (index, id) in ["call_a", "call_b", "call_c", "call_empty"]
+            .iter()
+            .enumerate()
+        {
+            assert_eq!(messages[0]["tool_calls"][index]["id"], *id);
+            assert_eq!(messages[index + 1]["tool_call_id"], *id);
+        }
+        assert_eq!(messages[1]["content"], "first result");
+        assert_eq!(messages[2]["content"], "text-only result");
+        assert_eq!(messages[3]["content"], "(see attached image)");
+        assert_eq!(messages[4]["content"], "");
+        assert_eq!(
+            messages[5]["content"],
+            json!([
+                {"type": "text", "text": "Attached image(s) from tool results:"},
+                {"type": "text", "text": "Images from read (tool call call_a):"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AQ=="}},
+                {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,Ag=="}},
+                {"type": "text", "text": "Images from read (tool call call_c):"},
+                {"type": "image_url", "image_url": {"url": "data:image/webp;base64,Aw=="}}
+            ])
+        );
+    }
+
+    #[test]
+    fn tool_image_bundles_stay_with_their_run_and_preserve_user_images() {
+        let wire = request_messages(vec![
+            Message::User(crate::model::UserMessage {
+                content: UserContent::Blocks(vec![image_block("AQ==", "image/png")]),
+                timestamp: 0,
+            }),
+            tool_call_message(&["call_a"]),
+            tool_result_message("call_a", vec![image_block("Ag==", "image/jpeg")]),
+            tool_call_message(&["call_b"]),
+            tool_result_message("call_b", vec![image_block("Aw==", "image/webp")]),
+            Message::User(crate::model::UserMessage {
+                content: UserContent::Blocks(vec![image_block("BA==", "image/png")]),
+                timestamp: 0,
+            }),
+        ]);
+        let messages = wire.as_array().expect("messages");
+        assert_eq!(
+            messages
+                .iter()
+                .map(|m| m["role"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            [
+                "user",
+                "assistant",
+                "tool",
+                "user",
+                "assistant",
+                "tool",
+                "user",
+                "user"
+            ]
+        );
+        for (message_index, part_index, expected) in [
+            (0, 0, "data:image/png;base64,AQ=="),
+            (3, 2, "data:image/jpeg;base64,Ag=="),
+            (6, 2, "data:image/webp;base64,Aw=="),
+            (7, 0, "data:image/png;base64,BA=="),
+        ] {
+            assert_eq!(
+                messages[message_index]["content"][part_index]["image_url"]["url"],
+                expected
+            );
+        }
+        assert_eq!(messages[3]["content"].as_array().unwrap().len(), 3);
+        assert_eq!(messages[6]["content"].as_array().unwrap().len(), 3);
+        assert_eq!(
+            messages[3]["content"][1]["text"],
+            "Images from read (tool call call_a):"
+        );
+        assert_eq!(
+            messages[6]["content"][1]["text"],
+            "Images from read (tool call call_b):"
+        );
+    }
+
+    #[test]
+    fn text_and_media_tool_results_do_not_add_an_image_turn() {
+        let wire = request_messages(vec![
+            tool_call_message(&["call_text", "call_media", "call_empty"]),
+            tool_result_message(
+                "call_text",
+                vec![ContentBlock::Text(TextContent::new("plain result"))],
+            ),
+            tool_result_message(
+                "call_media",
+                vec![ContentBlock::Media(crate::model::MediaContent {
+                    data: "AAAA".to_string(),
+                    mime_type: "video/mp4".to_string(),
+                    name: Some("clip.mp4".to_string()),
+                })],
+            ),
+            tool_result_message("call_empty", Vec::new()),
+        ]);
+        let messages = wire.as_array().expect("messages");
+        assert_eq!(
+            messages
+                .iter()
+                .map(|m| m["role"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["assistant", "tool", "tool", "tool"]
+        );
+        assert_eq!(messages[1]["content"], "plain result");
+        assert_eq!(
+            messages[2]["content"],
+            "[media omitted: clip.mp4, video/mp4, 3 B]"
+        );
+        assert_eq!(messages[3]["content"], "");
+        assert!(!wire.to_string().contains("AAAA"));
     }
 
     #[test]
@@ -1235,6 +3646,97 @@ mod tests {
         let provider = OpenAIProvider::new("gpt-4o");
         assert_eq!(provider.name(), "openai");
         assert_eq!(provider.api(), "openai-completions");
+    }
+
+    #[test]
+    fn test_build_request_prompt_cache_key_serialize_and_omit() {
+        let provider = OpenAIProvider::new("gpt-4o");
+        let context = Context {
+            system_prompt: None,
+            messages: vec![Message::User(crate::model::UserMessage {
+                content: UserContent::Text("Ping".to_string()),
+                timestamp: 0,
+            })]
+            .into(),
+            tools: Vec::new().into(),
+        };
+
+        // Set → serialized verbatim (gh #188).
+        let options = StreamOptions {
+            prompt_cache_key: Some("sess-123".to_string()),
+            ..Default::default()
+        };
+        let value = serde_json::to_value(provider.build_request(&context, &options))
+            .expect("serialize request");
+        assert_eq!(value["prompt_cache_key"], "sess-123");
+
+        // Unset → field absent, wire format byte-identical to before.
+        let value =
+            serde_json::to_value(provider.build_request(&context, &StreamOptions::default()))
+                .expect("serialize request");
+        assert!(value.get("prompt_cache_key").is_none());
+    }
+
+    #[test]
+    fn test_build_request_service_tier_only_for_backends_that_honor_it() {
+        let context = Context {
+            system_prompt: None,
+            messages: vec![Message::User(crate::model::UserMessage {
+                content: UserContent::Text("Ping".to_string()),
+                timestamp: 0,
+            })]
+            .into(),
+            tools: Vec::new().into(),
+        };
+        let fast = StreamOptions {
+            service_tier: Some("priority".to_string()),
+            ..Default::default()
+        };
+        let tier_for = |provider: OpenAIProvider, options: &StreamOptions| {
+            serde_json::to_value(provider.build_request(&context, options))
+                .expect("serialize request")
+                .get("service_tier")
+                .cloned()
+        };
+
+        assert_eq!(
+            tier_for(OpenAIProvider::new("gpt-5"), &fast),
+            Some(json!("priority"))
+        );
+        assert_eq!(
+            tier_for(
+                OpenAIProvider::new("x").with_provider_name("openrouter"),
+                &fast
+            ),
+            Some(json!("priority"))
+        );
+        // OpenAI-compatible backends that never documented the field don't
+        // get it: many reject unknown parameters with a 400.
+        assert_eq!(
+            tier_for(OpenAIProvider::new("x").with_provider_name("groq"), &fast),
+            None
+        );
+        // `auto` is OpenAI's default, and OpenRouter forwards no `default`.
+        let auto = StreamOptions {
+            service_tier: Some("auto".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(tier_for(OpenAIProvider::new("gpt-5"), &auto), None);
+        let default = StreamOptions {
+            service_tier: Some("default".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            tier_for(
+                OpenAIProvider::new("x").with_provider_name("openrouter"),
+                &default
+            ),
+            None
+        );
+        assert_eq!(
+            tier_for(OpenAIProvider::new("gpt-5"), &StreamOptions::default()),
+            None
+        );
     }
 
     #[test]
@@ -1293,6 +3795,486 @@ mod tests {
                 "required": ["q"]
             })
         );
+    }
+
+    #[test]
+    fn deepseek_tool_requests_replay_same_origin_reasoning_exactly() {
+        let provider = OpenAIProvider::new("deepseek-reasoner")
+            .with_provider_name("deepseek")
+            .with_reasoning(true);
+        let assistant = AssistantMessage {
+            api: "openai-completions".to_string(),
+            provider: "deepseek".to_string(),
+            model: "deepseek-reasoner".to_string(),
+            content: vec![
+                ContentBlock::Thinking(ThinkingContent {
+                    thinking: " first\n".to_string(),
+                    thinking_signature: None,
+                }),
+                ContentBlock::Text(TextContent::new("visible")),
+                ContentBlock::Thinking(ThinkingContent {
+                    thinking: "日本語🙂 last ".to_string(),
+                    thinking_signature: None,
+                }),
+            ],
+            ..AssistantMessage::default()
+        };
+        let context = Context {
+            system_prompt: None,
+            messages: vec![Message::assistant(assistant)].into(),
+            tools: vec![ToolDef {
+                name: "read".to_string(),
+                description: "Read".to_string(),
+                parameters: json!({"type":"object"}),
+            }]
+            .into(),
+        };
+        let body = serde_json::to_value(provider.build_request(
+            &context,
+            &StreamOptions {
+                thinking_level: Some(ThinkingLevel::High),
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+        assert_eq!(
+            body["messages"][0]["reasoning_content"],
+            " first\n日本語🙂 last "
+        );
+        assert_eq!(body["messages"][0]["content"], "visible");
+    }
+
+    #[test]
+    fn deepseek_replay_survives_current_thinking_off_but_requires_tools() {
+        let provider = OpenAIProvider::new("deepseek-reasoner")
+            .with_provider_name("deepseek")
+            .with_reasoning(true);
+        let message = Message::assistant(AssistantMessage {
+            api: "openai-completions".to_string(),
+            provider: "deepseek".to_string(),
+            model: "deepseek-reasoner".to_string(),
+            content: vec![ContentBlock::Thinking(ThinkingContent {
+                thinking: "prior".to_string(),
+                thinking_signature: None,
+            })],
+            ..AssistantMessage::default()
+        });
+        let options = StreamOptions {
+            thinking_level: Some(ThinkingLevel::Off),
+            ..Default::default()
+        };
+        let with_tools = Context {
+            system_prompt: None,
+            messages: vec![message.clone()].into(),
+            tools: vec![ToolDef {
+                name: "read".to_string(),
+                description: "Read".to_string(),
+                parameters: json!({"type":"object"}),
+            }]
+            .into(),
+        };
+        let body = serde_json::to_value(provider.build_request(&with_tools, &options)).unwrap();
+        assert_eq!(body["thinking"]["type"], "disabled");
+        assert_eq!(body["messages"][0]["reasoning_content"], "prior");
+
+        let without_tools = Context {
+            system_prompt: None,
+            messages: vec![message].into(),
+            tools: Vec::<ToolDef>::new().into(),
+        };
+        let body = serde_json::to_value(provider.build_request(&without_tools, &options)).unwrap();
+        assert!(body["messages"][0].get("reasoning_content").is_none());
+    }
+
+    #[test]
+    fn deepseek_replay_never_exports_foreign_or_signed_reasoning() {
+        let provider = OpenAIProvider::new("deepseek-reasoner")
+            .with_provider_name("deepseek")
+            .with_reasoning(true);
+        for (source_provider, signature) in [("other-provider", None), ("deepseek", Some("opaque"))]
+        {
+            let context = Context {
+                system_prompt: None,
+                messages: vec![Message::assistant(AssistantMessage {
+                    api: "openai-completions".to_string(),
+                    provider: source_provider.to_string(),
+                    model: "deepseek-reasoner".to_string(),
+                    content: vec![ContentBlock::Thinking(ThinkingContent {
+                        thinking: "private-reasoning".to_string(),
+                        thinking_signature: signature.map(str::to_string),
+                    })],
+                    ..AssistantMessage::default()
+                })]
+                .into(),
+                tools: vec![ToolDef {
+                    name: "read".to_string(),
+                    description: "Read".to_string(),
+                    parameters: json!({"type":"object"}),
+                }]
+                .into(),
+            };
+            let body =
+                serde_json::to_value(provider.build_request(&context, &StreamOptions::default()))
+                    .unwrap();
+            assert_eq!(body["messages"][0]["reasoning_content"], "");
+            assert!(!body.to_string().contains("private-reasoning"));
+            assert!(!body.to_string().contains("opaque"));
+        }
+    }
+
+    #[test]
+    fn non_deepseek_transport_never_adds_reasoning_content() {
+        let provider = OpenAIProvider::new("gpt-test").with_reasoning(true);
+        let context = Context {
+            system_prompt: None,
+            messages: vec![Message::assistant(AssistantMessage {
+                api: "openai-completions".to_string(),
+                provider: "openai".to_string(),
+                model: "gpt-test".to_string(),
+                content: vec![ContentBlock::Thinking(ThinkingContent {
+                    thinking: "local display thought".to_string(),
+                    thinking_signature: None,
+                })],
+                ..AssistantMessage::default()
+            })]
+            .into(),
+            tools: vec![ToolDef {
+                name: "read".to_string(),
+                description: "Read".to_string(),
+                parameters: json!({"type":"object"}),
+            }]
+            .into(),
+        };
+        let body =
+            serde_json::to_value(provider.build_request(&context, &StreamOptions::default()))
+                .unwrap();
+        assert!(body["messages"][0].get("reasoning_content").is_none());
+    }
+
+    #[test]
+    fn test_build_request_deepseek_forwards_thinking_and_reasoning_effort() {
+        // Builds the serialized request body for a given thinking level.
+        let body = |provider: &OpenAIProvider, level: crate::model::ThinkingLevel| {
+            let context = Context {
+                system_prompt: None,
+                messages: vec![Message::User(crate::model::UserMessage {
+                    content: UserContent::Text("Solve it".to_string()),
+                    timestamp: 0,
+                })]
+                .into(),
+                tools: Vec::<ToolDef>::new().into(),
+            };
+            let options = StreamOptions {
+                thinking_level: Some(level),
+                ..Default::default()
+            };
+            serde_json::to_value(provider.build_request(&context, &options))
+                .expect("serialize request")
+        };
+
+        // Detected via the provider id. `with_reasoning(true)` mirrors the
+        // registry wiring for a DeepSeek reasoning model (deepseek-v4-pro).
+        let ds = OpenAIProvider::new("deepseek-v4-pro")
+            .with_provider_name("deepseek")
+            .with_reasoning(true);
+
+        let off = body(&ds, crate::model::ThinkingLevel::Off);
+        assert_eq!(off["thinking"]["type"], "disabled");
+        assert!(
+            off.get("reasoning_effort").is_none(),
+            "off must not send reasoning_effort"
+        );
+
+        let high = body(&ds, crate::model::ThinkingLevel::High);
+        assert_eq!(high["thinking"]["type"], "enabled");
+        assert_eq!(high["reasoning_effort"], "high");
+
+        let xhigh = body(&ds, crate::model::ThinkingLevel::XHigh);
+        assert_eq!(xhigh["thinking"]["type"], "enabled");
+        assert_eq!(xhigh["reasoning_effort"], "max");
+
+        // medium/low/minimal enable thinking but let DeepSeek pick the effort.
+        let medium = body(&ds, crate::model::ThinkingLevel::Medium);
+        assert_eq!(medium["thinking"]["type"], "enabled");
+        assert!(medium.get("reasoning_effort").is_none());
+
+        // Detected via the base URL even when the provider id is generic.
+        let ds_by_url = OpenAIProvider::new("deepseek-v4-pro")
+            .with_base_url("https://api.deepseek.com/v1/chat/completions".to_string())
+            .with_reasoning(true);
+        let high_url = body(&ds_by_url, crate::model::ThinkingLevel::High);
+        assert_eq!(high_url["thinking"]["type"], "enabled");
+        assert_eq!(high_url["reasoning_effort"], "high");
+    }
+
+    #[test]
+    fn test_build_request_compat_thinking_format_deepseek_custom_provider() {
+        // gh #166: a custom openai-completions provider (non-deepseek id, non
+        // deepseek.com URL) that declares `compat.thinkingFormat: "deepseek"`
+        // must get the full DeepSeek mapping — identical to native detection.
+        let body = |provider: &OpenAIProvider, level: crate::model::ThinkingLevel| {
+            let context = Context {
+                system_prompt: None,
+                messages: vec![Message::User(crate::model::UserMessage {
+                    content: UserContent::Text("Solve it".to_string()),
+                    timestamp: 0,
+                })]
+                .into(),
+                tools: Vec::<ToolDef>::new().into(),
+            };
+            let options = StreamOptions {
+                thinking_level: Some(level),
+                ..Default::default()
+            };
+            serde_json::to_value(provider.build_request(&context, &options))
+                .expect("serialize request")
+        };
+
+        let custom = OpenAIProvider::new("deepseek-v4-flash")
+            .with_provider_name("opencode-go")
+            .with_base_url("https://opencode.ai/zen/go/v1".to_string())
+            .with_reasoning(true)
+            .with_compat(Some(CompatConfig {
+                thinking_format: Some("deepseek".to_string()),
+                ..Default::default()
+            }));
+
+        let off = body(&custom, crate::model::ThinkingLevel::Off);
+        assert_eq!(off["thinking"]["type"], "disabled");
+        assert!(
+            off.get("reasoning_effort").is_none(),
+            "off must not send reasoning_effort"
+        );
+
+        let high = body(&custom, crate::model::ThinkingLevel::High);
+        assert_eq!(high["thinking"]["type"], "enabled");
+        assert_eq!(high["reasoning_effort"], "high");
+
+        let xhigh = body(&custom, crate::model::ThinkingLevel::XHigh);
+        assert_eq!(xhigh["thinking"]["type"], "enabled");
+        assert_eq!(xhigh["reasoning_effort"], "max");
+
+        let max = body(&custom, crate::model::ThinkingLevel::Max);
+        assert_eq!(max["thinking"]["type"], "enabled");
+        assert_eq!(max["reasoning_effort"], "max");
+
+        // The reasoning gate still applies: a non-reasoning model with the
+        // same declaration emits neither field.
+        let non_reasoning = OpenAIProvider::new("deepseek-v4-flash")
+            .with_provider_name("opencode-go")
+            .with_base_url("https://opencode.ai/zen/go/v1".to_string())
+            .with_reasoning(false)
+            .with_compat(Some(CompatConfig {
+                thinking_format: Some("deepseek".to_string()),
+                ..Default::default()
+            }));
+        let quiet = body(&non_reasoning, crate::model::ThinkingLevel::High);
+        assert!(quiet.get("thinking").is_none());
+        assert!(quiet.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn test_build_request_thinking_level_map_overrides_deepseek_effort() {
+        // gh #165/#166 interaction: a catalog `thinkingLevelMap` is
+        // authoritative over the DeepSeek dialect's built-in effort
+        // vocabulary, matching the anthropic-messages and openai-responses
+        // transports. Unmapped levels keep the documented defaults, and `off`
+        // never emits an effort even if mapped.
+        let provider = OpenAIProvider::new("deepseek-v4-pro")
+            .with_provider_name("deepseek")
+            .with_base_url("https://api.deepseek.com/v1/chat/completions".to_string())
+            .with_reasoning(true)
+            .with_compat(Some(CompatConfig {
+                thinking_level_map: Some(HashMap::from([
+                    ("xhigh".to_string(), Some("high".to_string())),
+                    ("medium".to_string(), Some("medium".to_string())),
+                    ("off".to_string(), Some("none".to_string())),
+                ])),
+                ..Default::default()
+            }));
+        let body = |level: crate::model::ThinkingLevel| {
+            let context = Context {
+                system_prompt: None,
+                messages: vec![Message::User(crate::model::UserMessage {
+                    content: UserContent::Text("Solve it".to_string()),
+                    timestamp: 0,
+                })]
+                .into(),
+                tools: Vec::<ToolDef>::new().into(),
+            };
+            let options = StreamOptions {
+                thinking_level: Some(level),
+                ..Default::default()
+            };
+            serde_json::to_value(provider.build_request(&context, &options))
+                .expect("serialize request")
+        };
+
+        let xhigh = body(crate::model::ThinkingLevel::XHigh);
+        assert_eq!(xhigh["thinking"]["type"], "enabled");
+        assert_eq!(xhigh["reasoning_effort"], "high", "map overrides max");
+
+        let medium = body(crate::model::ThinkingLevel::Medium);
+        assert_eq!(
+            medium["reasoning_effort"], "medium",
+            "map can emit an effort for a level with no default"
+        );
+
+        let max = body(crate::model::ThinkingLevel::Max);
+        assert_eq!(
+            max["reasoning_effort"], "max",
+            "unmapped level keeps default"
+        );
+
+        let high = body(crate::model::ThinkingLevel::High);
+        assert_eq!(high["reasoning_effort"], "high");
+
+        let off = body(crate::model::ThinkingLevel::Off);
+        assert_eq!(off["thinking"]["type"], "disabled");
+        assert!(
+            off.get("reasoning_effort").is_none(),
+            "off never emits an effort, mapped or not"
+        );
+    }
+
+    #[test]
+    fn test_build_request_compat_thinking_format_explicit_declaration_wins() {
+        // gh #166: an explicit non-deepseek `thinkingFormat` opts a provider
+        // out of the DeepSeek dialect even when the id/URL heuristic would
+        // have enabled it — the explicit catalog declaration is authoritative.
+        let provider = OpenAIProvider::new("deepseek-v4-pro")
+            .with_provider_name("deepseek")
+            .with_base_url("https://api.deepseek.com/v1/chat/completions".to_string())
+            .with_reasoning(true)
+            .with_compat(Some(CompatConfig {
+                thinking_format: Some("openai".to_string()),
+                ..Default::default()
+            }));
+        let context = Context {
+            system_prompt: None,
+            messages: vec![Message::User(crate::model::UserMessage {
+                content: UserContent::Text("hi".to_string()),
+                timestamp: 0,
+            })]
+            .into(),
+            tools: Vec::<ToolDef>::new().into(),
+        };
+        let options = StreamOptions {
+            thinking_level: Some(crate::model::ThinkingLevel::High),
+            ..Default::default()
+        };
+        let value = serde_json::to_value(provider.build_request(&context, &options))
+            .expect("serialize request");
+        assert!(value.get("thinking").is_none());
+        assert!(value.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn test_build_request_compat_without_thinking_format_keeps_custom_provider_unchanged() {
+        // gh #166: a custom provider whose compat config carries no
+        // `thinkingFormat` serializes exactly as before — the heuristic still
+        // finds no DeepSeek identity, so no reasoning controls are emitted.
+        let provider = OpenAIProvider::new("some-model")
+            .with_provider_name("opencode-go")
+            .with_base_url("https://opencode.ai/zen/go/v1".to_string())
+            .with_reasoning(true)
+            .with_compat(Some(CompatConfig::default()));
+        let context = Context {
+            system_prompt: None,
+            messages: vec![Message::User(crate::model::UserMessage {
+                content: UserContent::Text("hi".to_string()),
+                timestamp: 0,
+            })]
+            .into(),
+            tools: Vec::<ToolDef>::new().into(),
+        };
+        let options = StreamOptions {
+            thinking_level: Some(crate::model::ThinkingLevel::High),
+            ..Default::default()
+        };
+        let value = serde_json::to_value(provider.build_request(&context, &options))
+            .expect("serialize request");
+        assert!(value.get("thinking").is_none());
+        assert!(value.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn test_build_request_non_reasoning_deepseek_omits_thinking() {
+        // A non-reasoning DeepSeek model (e.g. deepseek-chat) must NOT emit the
+        // `thinking` toggle or `reasoning_effort`, even though the provider is
+        // deepseek — pre-#113 wire behavior is preserved (gh #114, finding 2).
+        let provider = OpenAIProvider::new("deepseek-chat")
+            .with_provider_name("deepseek")
+            .with_reasoning(false);
+        let context = Context {
+            system_prompt: None,
+            messages: vec![Message::User(crate::model::UserMessage {
+                content: UserContent::Text("hi".to_string()),
+                timestamp: 0,
+            })]
+            .into(),
+            tools: Vec::<ToolDef>::new().into(),
+        };
+        // Even at Off (the default/clamped level) there must be no thinking field.
+        let options = StreamOptions {
+            thinking_level: Some(crate::model::ThinkingLevel::Off),
+            ..Default::default()
+        };
+        let value = serde_json::to_value(provider.build_request(&context, &options))
+            .expect("serialize request");
+        assert!(value.get("thinking").is_none());
+        assert!(value.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn test_build_request_deepseek_provider_alias_detected() {
+        // The `deep-seek` provider alias canonicalizes to `deepseek`, so the
+        // thinking dialect must fire for it too (gh #114, finding 3) — matching
+        // `ModelEntry::is_deepseek_reasoning_model`'s `canonical_provider_id` use.
+        let provider = OpenAIProvider::new("deepseek-v4-pro")
+            .with_provider_name("deep-seek")
+            .with_reasoning(true);
+        let context = Context {
+            system_prompt: None,
+            messages: vec![Message::User(crate::model::UserMessage {
+                content: UserContent::Text("solve it".to_string()),
+                timestamp: 0,
+            })]
+            .into(),
+            tools: Vec::<ToolDef>::new().into(),
+        };
+        let options = StreamOptions {
+            thinking_level: Some(crate::model::ThinkingLevel::XHigh),
+            ..Default::default()
+        };
+        let value = serde_json::to_value(provider.build_request(&context, &options))
+            .expect("serialize request");
+        assert_eq!(value["thinking"]["type"], "enabled");
+        assert_eq!(value["reasoning_effort"], "max");
+    }
+
+    #[test]
+    fn test_build_request_non_deepseek_omits_reasoning_controls() {
+        let provider = OpenAIProvider::new("gpt-4o");
+        let context = Context {
+            system_prompt: None,
+            messages: vec![Message::User(crate::model::UserMessage {
+                content: UserContent::Text("hi".to_string()),
+                timestamp: 0,
+            })]
+            .into(),
+            tools: Vec::<ToolDef>::new().into(),
+        };
+        let options = StreamOptions {
+            thinking_level: Some(crate::model::ThinkingLevel::High),
+            ..Default::default()
+        };
+        let value = serde_json::to_value(provider.build_request(&context, &options))
+            .expect("serialize request");
+        // A non-DeepSeek openai-completions provider serializes exactly as before:
+        // no thinking toggle and no reasoning_effort regardless of thinking level.
+        assert!(value.get("thinking").is_none());
+        assert!(value.get("reasoning_effort").is_none());
     }
 
     #[test]
@@ -1524,6 +4506,320 @@ mod tests {
         );
     }
 
+    /// Serialized request body for one thinking level, as the wire sees it
+    /// (routing overrides applied).
+    fn openrouter_body(provider: &OpenAIProvider, level: crate::model::ThinkingLevel) -> Value {
+        let context = Context {
+            system_prompt: None,
+            messages: vec![Message::User(crate::model::UserMessage {
+                content: UserContent::Text("Solve it".to_string()),
+                timestamp: 0,
+            })]
+            .into(),
+            tools: Vec::<ToolDef>::new().into(),
+        };
+        let options = StreamOptions {
+            thinking_level: Some(level),
+            ..Default::default()
+        };
+        provider
+            .build_request_json(&context, &options)
+            .expect("serialize request")
+    }
+
+    #[test]
+    fn explicit_plain_effort_capability_preserves_maps_and_null_tiers() {
+        let make = |enabled, reasoning| {
+            OpenAIProvider::new("ovh-free/gpt-oss-120b")
+                .with_provider_name("freeflow")
+                .with_base_url("http://127.0.0.1:28180/v1/chat/completions".to_string())
+                .with_reasoning(reasoning)
+                .with_compat(Some(CompatConfig {
+                    supports_reasoning_effort: enabled,
+                    thinking_level_map: Some(HashMap::from([
+                        ("xhigh".to_string(), Some("high".to_string())),
+                        ("medium".to_string(), None),
+                    ])),
+                    ..CompatConfig::default()
+                }))
+        };
+        let enabled = make(Some(true), true);
+        let mapped = openrouter_body(&enabled, ThinkingLevel::XHigh);
+        assert_eq!(mapped["reasoning_effort"], "high");
+        assert!(mapped.get("reasoning").is_none());
+        assert!(mapped.get("thinking").is_none());
+        assert_eq!(
+            openrouter_body(&enabled, ThinkingLevel::Low)["reasoning_effort"],
+            "low"
+        );
+        for level in [ThinkingLevel::Off, ThinkingLevel::Medium] {
+            let body = openrouter_body(&enabled, level);
+            assert!(body.get("reasoning_effort").is_none());
+        }
+        for provider in [
+            make(None, true),
+            make(Some(false), true),
+            make(Some(true), false),
+        ] {
+            let body = openrouter_body(&provider, ThinkingLevel::XHigh);
+            assert!(body.get("reasoning_effort").is_none());
+        }
+    }
+
+    #[test]
+    fn explicit_null_effort_does_not_fall_back_to_a_vendor_dialect() {
+        for format in ["deepseek", "openrouter", "openai"] {
+            let provider = OpenAIProvider::new("freeflow-reasoner")
+                .with_reasoning(true)
+                .with_compat(Some(CompatConfig {
+                    supports_reasoning_effort: Some(true),
+                    thinking_format: Some(format.to_string()),
+                    thinking_level_map: Some(HashMap::from([("max".to_string(), None)])),
+                    ..CompatConfig::default()
+                }));
+            let body = openrouter_body(&provider, ThinkingLevel::Max);
+            assert!(body.get("reasoning_effort").is_none(), "{format}: {body}");
+            assert!(body.get("reasoning").is_none(), "{format}: {body}");
+            assert!(body.get("thinking").is_none(), "{format}: {body}");
+        }
+    }
+
+    /// gh #220: on the OpenRouter transport a reasoning model's thinking
+    /// level goes out as the gateway's normalized `reasoning: {effort}`
+    /// object — one fixture per level — and never as a vendor field.
+    #[test]
+    fn test_build_request_openrouter_reasoning_effort_per_level() {
+        use crate::model::ThinkingLevel;
+        let provider = OpenAIProvider::new("deepseek/deepseek-v4-pro")
+            .with_provider_name("openrouter")
+            .with_base_url("https://openrouter.ai/api/v1/chat/completions".to_string())
+            .with_reasoning(true);
+
+        let off = openrouter_body(&provider, ThinkingLevel::Off);
+        assert!(
+            off.get("reasoning").is_none(),
+            "unmapped off leaves the model default: {off}"
+        );
+
+        for (level, effort) in [
+            (ThinkingLevel::Minimal, "minimal"),
+            (ThinkingLevel::Low, "low"),
+            (ThinkingLevel::Medium, "medium"),
+            (ThinkingLevel::High, "high"),
+            (ThinkingLevel::XHigh, "xhigh"),
+            (ThinkingLevel::Max, "max"),
+        ] {
+            let body = openrouter_body(&provider, level);
+            assert_eq!(
+                body["reasoning"],
+                json!({ "effort": effort }),
+                "level {level}: {body}"
+            );
+            assert!(
+                body.get("reasoning_effort").is_none() && body.get("thinking").is_none(),
+                "vendor fields must never be sent through the gateway: {body}"
+            );
+        }
+        // The rest of the OpenRouter shape is unchanged.
+        let high = openrouter_body(&provider, ThinkingLevel::High);
+        assert_eq!(high["usage"], json!({ "include": true }));
+        assert_eq!(high["model"], "deepseek/deepseek-v4-pro");
+    }
+
+    /// gh #220: a non-reasoning OpenRouter model never carries a `reasoning`
+    /// key, whatever level was requested.
+    #[test]
+    fn test_build_request_openrouter_non_reasoning_model_has_no_reasoning_key() {
+        use crate::model::ThinkingLevel;
+        let provider = OpenAIProvider::new("openai/gpt-4o")
+            .with_provider_name("openrouter")
+            .with_base_url("https://openrouter.ai/api/v1/chat/completions".to_string())
+            .with_reasoning(false);
+        for level in [ThinkingLevel::Off, ThinkingLevel::High, ThinkingLevel::Max] {
+            let body = openrouter_body(&provider, level);
+            assert!(body.get("reasoning").is_none(), "{body}");
+            assert!(body.get("reasoning_effort").is_none(), "{body}");
+            assert!(body.get("thinking").is_none(), "{body}");
+        }
+    }
+
+    /// gh #220: `thinkingLevelMap` steers the OpenRouter object per level —
+    /// an integer becomes `max_tokens` (mutually exclusive with `effort`),
+    /// any other string is sent as `effort`, and mapping `off` lets a
+    /// model that reasons by default be switched off explicitly.
+    #[test]
+    fn test_build_request_openrouter_thinking_level_map_budget_and_overrides() {
+        use crate::model::ThinkingLevel;
+        let provider = OpenAIProvider::new("anthropic/claude-sonnet-4.6")
+            .with_provider_name("openrouter")
+            .with_base_url("https://openrouter.ai/api/v1/chat/completions".to_string())
+            .with_reasoning(true)
+            .with_compat(Some(CompatConfig {
+                thinking_level_map: Some(HashMap::from([
+                    ("high".to_string(), Some("8000".to_string())),
+                    ("max".to_string(), Some(" 32000 ".to_string())),
+                    ("low".to_string(), Some("minimal".to_string())),
+                    ("off".to_string(), Some("none".to_string())),
+                    ("medium".to_string(), Some("0".to_string())),
+                ])),
+                ..Default::default()
+            }));
+
+        let high = openrouter_body(&provider, ThinkingLevel::High);
+        assert_eq!(high["reasoning"], json!({ "max_tokens": 8000 }), "{high}");
+        let max = openrouter_body(&provider, ThinkingLevel::Max);
+        assert_eq!(max["reasoning"], json!({ "max_tokens": 32000 }), "{max}");
+        let low = openrouter_body(&provider, ThinkingLevel::Low);
+        assert_eq!(low["reasoning"], json!({ "effort": "minimal" }), "{low}");
+        let off = openrouter_body(&provider, ThinkingLevel::Off);
+        assert_eq!(off["reasoning"], json!({ "effort": "none" }), "{off}");
+        // A zero budget is not a budget; it is passed through as an effort
+        // string so the gateway rejects it loudly instead of us guessing.
+        let medium = openrouter_body(&provider, ThinkingLevel::Medium);
+        assert_eq!(medium["reasoning"], json!({ "effort": "0" }), "{medium}");
+        // Unmapped levels keep the pass-through name.
+        let xhigh = openrouter_body(&provider, ThinkingLevel::XHigh);
+        assert_eq!(xhigh["reasoning"], json!({ "effort": "xhigh" }), "{xhigh}");
+    }
+
+    /// gh #220: `compat.thinkingFormat` selects the dialect explicitly —
+    /// `"openrouter"` opts a custom proxy into the normalized object, any
+    /// other declared format on the OpenRouter transport opts out, and a
+    /// bare `openrouter.ai` base URL is enough to enable it by default.
+    #[test]
+    fn test_build_request_openrouter_thinking_format_declarations() {
+        use crate::model::ThinkingLevel;
+
+        // Custom provider that speaks the OpenRouter dialect by declaration.
+        let proxy = OpenAIProvider::new("some/model")
+            .with_provider_name("my-gateway")
+            .with_base_url("https://gateway.example.com/v1/chat/completions".to_string())
+            .with_reasoning(true)
+            .with_compat(Some(CompatConfig {
+                thinking_format: Some("OpenRouter".to_string()),
+                ..Default::default()
+            }));
+        let body = openrouter_body(&proxy, ThinkingLevel::High);
+        assert_eq!(body["reasoning"], json!({ "effort": "high" }), "{body}");
+        assert!(
+            body.get("usage").is_none(),
+            "usage accounting stays gateway-only"
+        );
+
+        // Explicit opt-out on the OpenRouter transport: no reasoning controls
+        // at all, and in particular no DeepSeek vendor dialect even when
+        // declared.
+        for format in ["openai", "deepseek", "zai"] {
+            let opted_out = OpenAIProvider::new("deepseek/deepseek-v4-pro")
+                .with_provider_name("openrouter")
+                .with_base_url("https://openrouter.ai/api/v1/chat/completions".to_string())
+                .with_reasoning(true)
+                .with_compat(Some(CompatConfig {
+                    thinking_format: Some(format.to_string()),
+                    ..Default::default()
+                }));
+            let body = openrouter_body(&opted_out, ThinkingLevel::High);
+            assert!(body.get("reasoning").is_none(), "{format}: {body}");
+            assert!(body.get("reasoning_effort").is_none(), "{format}: {body}");
+            assert!(body.get("thinking").is_none(), "{format}: {body}");
+        }
+
+        // Detected by base URL alone (custom provider pointed at OpenRouter).
+        let by_url = OpenAIProvider::new("x/y")
+            .with_provider_name("custom-or")
+            .with_base_url("https://openrouter.ai/api/v1/chat/completions".to_string())
+            .with_reasoning(true);
+        let body = openrouter_body(&by_url, ThinkingLevel::Low);
+        assert_eq!(body["reasoning"], json!({ "effort": "low" }), "{body}");
+
+        // The direct DeepSeek transport is untouched by all of this.
+        let deepseek = OpenAIProvider::new("deepseek-v4-pro")
+            .with_provider_name("deepseek")
+            .with_reasoning(true);
+        let body = openrouter_body(&deepseek, ThinkingLevel::High);
+        assert!(body.get("reasoning").is_none(), "{body}");
+        assert_eq!(body["reasoning_effort"], "high");
+        assert_eq!(body["thinking"]["type"], "enabled");
+    }
+
+    /// gh #220: `compat.openRouterRouting` keeps merging onto the top level
+    /// next to `reasoning`, and a routing object that carries its own
+    /// `reasoning` key wins over the level-derived one.
+    #[test]
+    fn test_build_request_openrouter_reasoning_coexists_with_routing_passthrough() {
+        use crate::model::ThinkingLevel;
+        let provider = OpenAIProvider::new("deepseek/deepseek-v4-pro")
+            .with_provider_name("openrouter")
+            .with_base_url("https://openrouter.ai/api/v1/chat/completions".to_string())
+            .with_reasoning(true)
+            .with_compat(Some(CompatConfig {
+                open_router_routing: Some(json!({
+                    "provider": { "only": ["deepseek"], "allow_fallbacks": false },
+                    "store": false,
+                })),
+                ..Default::default()
+            }));
+        let body = openrouter_body(&provider, ThinkingLevel::High);
+        assert_eq!(body["reasoning"], json!({ "effort": "high" }));
+        assert_eq!(
+            body["provider"],
+            json!({ "only": ["deepseek"], "allow_fallbacks": false })
+        );
+        assert_eq!(body["store"], false);
+
+        let pinned = OpenAIProvider::new("deepseek/deepseek-v4-pro")
+            .with_provider_name("openrouter")
+            .with_base_url("https://openrouter.ai/api/v1/chat/completions".to_string())
+            .with_reasoning(true)
+            .with_compat(Some(CompatConfig {
+                open_router_routing: Some(json!({ "reasoning": { "exclude": true } })),
+                ..Default::default()
+            }));
+        let body = openrouter_body(&pinned, ThinkingLevel::High);
+        assert_eq!(body["reasoning"], json!({ "exclude": true }));
+    }
+
+    /// gh #221: OpenRouter requests opt into usage accounting so the final
+    /// usage chunk carries the billed cost; other providers never see the
+    /// field.
+    #[test]
+    fn test_build_request_requests_openrouter_usage_accounting() {
+        let context = Context {
+            system_prompt: None,
+            messages: vec![Message::User(crate::model::UserMessage {
+                content: UserContent::Text("Ping".to_string()),
+                timestamp: 0,
+            })]
+            .into(),
+            tools: Vec::new().into(),
+        };
+        let options = StreamOptions::default();
+
+        let openrouter = OpenAIProvider::new("deepseek/deepseek-v4-pro")
+            .with_provider_name("openrouter")
+            .with_base_url("https://openrouter.ai/api/v1");
+        let request = openrouter
+            .build_request_json(&context, &options)
+            .expect("request json");
+        assert_eq!(request["usage"]["include"], true);
+        assert_eq!(request["stream_options"]["include_usage"], true);
+
+        // A custom provider pointed at the OpenRouter gateway counts too.
+        let custom_gateway = OpenAIProvider::new("openai/gpt-4o-mini")
+            .with_provider_name("my-router")
+            .with_base_url("https://openrouter.ai/api/v1");
+        let request = custom_gateway
+            .build_request_json(&context, &options)
+            .expect("request json");
+        assert_eq!(request["usage"]["include"], true);
+
+        let openai = OpenAIProvider::new("gpt-4o-mini");
+        let request = openai
+            .build_request_json(&context, &options)
+            .expect("request json");
+        assert!(request.get("usage").is_none(), "request: {request}");
+    }
+
     #[test]
     fn test_build_request_applies_openrouter_routing_overrides() {
         let provider = OpenAIProvider::new("openai/gpt-4o-mini")
@@ -1575,6 +4871,298 @@ mod tests {
         let body: Value = serde_json::from_str(&captured.body).expect("request body json");
         assert_eq!(body["stream"], true);
         assert_eq!(body["stream_options"]["include_usage"], true);
+    }
+
+    #[test]
+    fn auth_header_false_sends_custom_openai_request_without_authorization() {
+        let options = StreamOptions::default();
+        let captured = run_stream_and_capture_headers_with(
+            OpenAIProvider::new("custom-model")
+                .with_provider_name("custom-openai")
+                .with_auth_header(false),
+            &options,
+        )
+        .expect("captured keyless custom request");
+
+        assert!(
+            !captured.headers.contains_key("authorization"),
+            "authHeader:false must not synthesize Authorization"
+        );
+    }
+
+    #[test]
+    fn stream_error_redacts_transmitted_bearer_credential() {
+        let secret = "provider-\"secret\\with&reserved=characters";
+        let header_secret = "custom-\"header\\credential";
+        let query_secret = "query-secret-value";
+        let response_json = serde_json::json!({
+            "authorizationEcho": secret,
+            "customHeaderEcho": header_secret,
+            "queryEcho": query_secret,
+        })
+        .to_string();
+        let response_body = format!("upstream error: {response_json}");
+        let (base_url, request_rx) = spawn_test_server(401, "application/json", &response_body);
+        let provider = OpenAIProvider::new("gpt-4o")
+            .with_base_url(format!("{base_url}?api_key={query_secret}"));
+        let context = Context {
+            system_prompt: None,
+            messages: vec![Message::User(crate::model::UserMessage {
+                content: UserContent::Text("ping".to_string()),
+                timestamp: 0,
+            })]
+            .into(),
+            tools: Vec::new().into(),
+        };
+        let mut options = StreamOptions {
+            api_key: Some(secret.to_string()),
+            ..Default::default()
+        };
+        options
+            .headers
+            .insert("x-api-key".to_string(), header_secret.to_string());
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        let error = runtime.block_on(async {
+            match provider.stream(&context, &options).await {
+                Ok(_) => panic!("HTTP error must not produce a stream"),
+                Err(error) => error,
+            }
+        });
+        let message = error.to_string();
+        assert!(message.contains("HTTP 401"), "{message}");
+        assert!(message.contains("[REDACTED]"), "{message}");
+        assert!(!message.contains(secret), "credential leaked: {message}");
+        assert!(
+            !message.contains("provider-"),
+            "escaped credential leaked: {message}"
+        );
+        assert!(
+            !message.contains("custom-"),
+            "header credential leaked: {message}"
+        );
+        assert!(
+            !message.contains(query_secret),
+            "query credential leaked: {message}"
+        );
+        request_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("captured error request");
+
+        let expanding = redacted_api_error_body(&"x".repeat(MAX_API_ERROR_BODY_BYTES), &["x"]);
+        assert!(
+            expanding.len() <= MAX_API_ERROR_BODY_BYTES,
+            "redaction expansion exceeded the final API error bound"
+        );
+    }
+
+    #[test]
+    fn sap_stream_exchanges_service_key_before_sending_bearer_header() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let auth_path = temp_dir.path().join("auth.json");
+        let (token_url, token_request_rx) = spawn_test_server(
+            200,
+            "application/json",
+            r#"{"access_token":"sap-access-token"}"#,
+        );
+        let mut auth = AuthStorage::load(auth_path.clone()).expect("load auth");
+        let service_key_json = json!({
+            "clientid": "sap-client",
+            // ubs:ignore test fixture credential, not live secret.
+            "clientsecret": "sap-secret",
+            "url": token_url,
+            "serviceurls": {
+                "AI_API_URL": "https://api.ai.sap.example.com"
+            }
+        })
+        .to_string();
+        auth.set(
+            "sap-ai-core",
+            // Legacy auth files stored the complete service-key JSON in the generic ApiKey lane.
+            // It must be exchanged, never forwarded as the bearer value.
+            AuthCredential::ApiKey {
+                key: service_key_json.clone(),
+            },
+        );
+        auth.save().expect("save auth");
+
+        let (inference_url, inference_request_rx) =
+            spawn_test_server(200, "text/event-stream", &success_sse_body());
+        let provider = OpenAIProvider::new("deployment-a")
+            .with_provider_name("sap-ai-core")
+            .with_base_url(inference_url)
+            .with_auth_path(auth_path);
+        let context = Context {
+            system_prompt: None,
+            messages: vec![Message::User(crate::model::UserMessage {
+                content: UserContent::Text("ping".to_string()),
+                timestamp: 0,
+            })]
+            .into(),
+            tools: Vec::new().into(),
+        };
+        let options = StreamOptions::default();
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async {
+            let mut stream = provider.stream(&context, &options).await.expect("stream");
+            while let Some(event) = stream.next().await {
+                if matches!(event.expect("stream event"), StreamEvent::Done { .. }) {
+                    break;
+                }
+            }
+        });
+
+        let token_request = token_request_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("captured token request");
+        assert!(token_request.body.contains("grant_type=client_credentials"));
+        assert!(token_request.body.contains("client_id=sap-client"));
+
+        let inference_request = inference_request_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("captured inference request");
+        let authorization = inference_request
+            .headers
+            .get("authorization")
+            .expect("SAP inference authorization header");
+        assert_eq!(
+            authorization, "Bearer sap-access-token",
+            "legacy service-key JSON must be exchanged before inference"
+        );
+        assert!(!authorization.contains(&service_key_json));
+        assert!(!authorization.contains("sap-secret"));
+        assert!(!inference_request.body.contains(&service_key_json));
+        assert!(!inference_request.body.contains("sap-secret"));
+    }
+
+    #[test]
+    fn sap_stream_uses_stored_direct_bearer_without_requiring_service_key() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let auth_path = temp_dir.path().join("auth.json");
+        let mut auth = AuthStorage::load(auth_path.clone()).expect("load auth");
+        auth.set(
+            "sap-ai-core",
+            AuthCredential::BearerToken {
+                token: "stored-sap-bearer".to_string(),
+            },
+        );
+        auth.save().expect("save auth");
+
+        let (inference_url, inference_request_rx) =
+            spawn_test_server(200, "text/event-stream", &success_sse_body());
+        let provider = OpenAIProvider::new("deployment-a")
+            .with_provider_name("sap-ai-core")
+            .with_base_url(inference_url)
+            .with_auth_path(auth_path);
+        let context = Context {
+            system_prompt: None,
+            messages: vec![Message::User(crate::model::UserMessage {
+                content: UserContent::Text("ping".to_string()),
+                timestamp: 0,
+            })]
+            .into(),
+            tools: Vec::new().into(),
+        };
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async {
+            let mut stream = provider
+                .stream(&context, &StreamOptions::default())
+                .await
+                .expect("stream");
+            while let Some(event) = stream.next().await {
+                if matches!(event.expect("stream event"), StreamEvent::Done { .. }) {
+                    break;
+                }
+            }
+        });
+
+        let inference_request = inference_request_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("captured inference request");
+        assert_eq!(
+            inference_request
+                .headers
+                .get("authorization")
+                .map(String::as_str),
+            Some("Bearer stored-sap-bearer")
+        );
+    }
+
+    /// Drive `provider.stream()` once against `base_url` with no API key and
+    /// return the `Result`. Keeps the request path deterministic and fast by
+    /// pointing at an unroutable address so we observe the *auth decision*
+    /// (key required vs. not) without depending on a full network round-trip.
+    fn stream_result_without_key(
+        provider_name: &str,
+        base_url: &str,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>> {
+        let provider = OpenAIProvider::new("local-model")
+            .with_provider_name(provider_name)
+            .with_base_url(base_url.to_string());
+        let context = Context {
+            system_prompt: None,
+            messages: vec![Message::User(crate::model::UserMessage {
+                content: UserContent::Text("ping".to_string()),
+                timestamp: 0,
+            })]
+            .into(),
+            tools: Vec::new().into(),
+        };
+        let options = StreamOptions {
+            api_key: None,
+            ..Default::default()
+        };
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async { provider.stream(&context, &options).await })
+    }
+
+    #[test]
+    fn test_stream_keyless_local_provider_does_not_require_key() {
+        // #104: local OpenAI-compatible providers (ollama, llamacpp, mistralrs)
+        // need NO API key. With no api_key configured the request path must NOT
+        // raise the "Missing API key for provider" error. We point at an
+        // unroutable address so the call resolves quickly: it either starts the
+        // stream or fails with a *connection* error — never the missing-key
+        // error. (Skipped when OPENAI_API_KEY is ambient, which would satisfy
+        // the key check for every provider and make the assertion vacuous.)
+        if std::env::var("OPENAI_API_KEY").is_ok() {
+            return;
+        }
+        for provider in ["llamacpp", "mistralrs", "ollama"] {
+            // 127.0.0.1:1 is reserved/unroutable, so connect fails fast.
+            let result = stream_result_without_key(provider, "http://127.0.0.1:1/v1");
+            if let Err(err) = result {
+                assert!(
+                    !err.to_string().contains("Missing API key"),
+                    "{provider}: keyless local provider must not raise missing-key error, got: {err}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_stream_unknown_provider_without_key_still_errors() {
+        // Guard: the keyless bypass is scoped to known local providers. An
+        // unknown provider with no key (and no ambient OPENAI_API_KEY) must
+        // still fail with the missing-key error — and does so synchronously,
+        // before any network I/O.
+        if std::env::var("OPENAI_API_KEY").is_ok() {
+            return; // ambient key would satisfy the gate; skip in that env
+        }
+        let result =
+            stream_result_without_key("totally-unknown-cloud-provider", "http://127.0.0.1:1/v1");
+        let err = result.err().expect("missing key should error");
+        assert!(
+            err.to_string().contains("Missing API key"),
+            "expected missing-key error, got: {err}"
+        );
     }
 
     #[test]
@@ -1731,6 +5319,93 @@ mod tests {
         .join("\n")
     }
 
+    #[test]
+    fn stream_rejects_transport_eof_before_done_sentinel() {
+        let body = [
+            r#"data: {"choices":[{"delta":{"content":"partial"}}]}"#,
+            "",
+            r#"data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#,
+            "",
+        ]
+        .join("\n");
+
+        let out = collect_stream_items_from_body(&body);
+        assert!(
+            out.iter()
+                .any(|item| matches!(item, Ok(StreamEvent::TextDelta { delta, .. }) if delta == "partial")),
+            "partial content should be emitted before the terminal error"
+        );
+        assert!(
+            !out.iter()
+                .any(|item| matches!(item, Ok(StreamEvent::Done { .. }))),
+            "premature EOF must never be reported as Done"
+        );
+        let error = out
+            .last()
+            .expect("terminal stream item")
+            .as_ref()
+            .expect_err("premature EOF must be a stream error")
+            .to_string();
+        assert!(error.contains("[DONE]"), "{error}");
+        assert!(error.contains("unexpected EOF"), "{error}");
+        assert!(crate::error::is_retryable_error(&error, None, None));
+    }
+
+    #[test]
+    fn stream_emits_exactly_one_done_when_transport_ends_after_done_sentinel() {
+        let body = [
+            r#"data: {"choices":[{"delta":{"content":"whole"}}]}"#,
+            "",
+            r#"data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#,
+            "",
+            "data: [DONE]",
+            "",
+        ]
+        .join("\n");
+
+        let out = collect_stream_items_from_body(&body);
+        assert!(out.iter().all(Result::is_ok), "complete stream: {out:?}");
+        let done = out
+            .iter()
+            .filter(|item| matches!(item, Ok(StreamEvent::Done { .. })))
+            .count();
+        assert_eq!(done, 1, "a complete stream finishes exactly once: {out:?}");
+        assert!(
+            matches!(out.last(), Some(Ok(StreamEvent::Done { .. }))),
+            "Done must be the terminal item: {out:?}"
+        );
+    }
+
+    fn collect_stream_items_from_body(body: &str) -> Vec<Result<StreamEvent>> {
+        let (base_url, _rx) = spawn_test_server(200, "text/event-stream", body);
+        let provider = OpenAIProvider::new("gpt-test").with_base_url(base_url);
+        let context = Context {
+            system_prompt: None,
+            messages: vec![Message::User(crate::model::UserMessage {
+                content: UserContent::Text("ping".to_string()),
+                timestamp: 0,
+            })]
+            .into(),
+            tools: Vec::new().into(),
+        };
+        let options = StreamOptions {
+            api_key: Some("sk-test-key".to_string()),
+            ..Default::default()
+        };
+
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async {
+            let mut stream = provider.stream(&context, &options).await.expect("stream");
+            let mut items = Vec::new();
+            while let Some(item) = stream.next().await {
+                items.push(item);
+            }
+            items
+        })
+    }
+
     fn spawn_test_server(
         status_code: u16,
         content_type: &str,
@@ -1744,9 +5419,14 @@ mod tests {
 
         std::thread::spawn(move || {
             let (mut socket, _) = listener.accept().expect("accept");
+            // 250ms is the POLLING interval; the deadline below is the budget.
+            // Treating a timed-out read as end-of-request truncated the buffer
+            // and the header scan then failed as a malformed request rather
+            // than a slow one (bd-eg6ng).
             socket
-                .set_read_timeout(Some(Duration::from_secs(2)))
+                .set_read_timeout(Some(Duration::from_millis(250)))
                 .expect("set read timeout");
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
 
             let mut bytes = Vec::new();
             let mut chunk = [0_u8; 4096];
@@ -1763,7 +5443,10 @@ mod tests {
                         if err.kind() == std::io::ErrorKind::WouldBlock
                             || err.kind() == std::io::ErrorKind::TimedOut =>
                     {
-                        break;
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "fixture timed out waiting for the request"
+                        );
                     }
                     Err(err) => panic!("read error: {err}"),
                 }
@@ -1789,7 +5472,10 @@ mod tests {
                         if err.kind() == std::io::ErrorKind::WouldBlock
                             || err.kind() == std::io::ErrorKind::TimedOut =>
                     {
-                        break;
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "fixture timed out waiting for the request"
+                        );
                     }
                     Err(err) => panic!("read error: {err}"),
                 }
@@ -1951,6 +5637,8 @@ mod tests {
             StopReason::Stop => "stop",
             StopReason::Length => "length",
             StopReason::ToolUse => "tool_use",
+            StopReason::PauseTurn => "pause_turn",
+            StopReason::Refusal => "refusal",
             StopReason::Error => "error",
             StopReason::Aborted => "aborted",
         }
@@ -2254,6 +5942,51 @@ mod tests {
     }
 
     #[test]
+    fn reasoning_field_aliases_emit_thinking_and_non_strings_are_ignored() {
+        for (delta, expected) in [
+            (json!({"reasoning": "plan"}), "plan"),
+            (json!({"reasoning_text": "plan"}), "plan"),
+            // `reasoning_content` wins when a gateway sends more than one.
+            (
+                json!({"reasoning_content": "kept", "reasoning": "dropped"}),
+                "kept",
+            ),
+            // An empty `reasoning_content` does not hide the alternative.
+            (
+                json!({"reasoning_content": "", "reasoning": "plan"}),
+                "plan",
+            ),
+        ] {
+            let events = vec![
+                json!({"choices": [{"delta": delta, "finish_reason": null}]}),
+                json!({"choices": [{"delta": {}, "finish_reason": "stop"}]}),
+                Value::String("[DONE]".to_string()),
+            ];
+            let out = collect_events(&events);
+            assert_eq!(collect_thinking_text(&out), expected, "{events:?}");
+        }
+
+        // A non-string `reasoning` (some gateways echo an object) is not
+        // thinking text and must not fail the chunk that carries the answer.
+        let events = vec![
+            json!({"choices": [{
+                "delta": {"content": "answer", "reasoning": {"effort": "high"}},
+                "finish_reason": null
+            }]}),
+            json!({"choices": [{"delta": {}, "finish_reason": "stop"}]}),
+            Value::String("[DONE]".to_string()),
+        ];
+        let out = collect_events(&events);
+        assert_eq!(collect_thinking_text(&out), "");
+        assert!(
+            out.iter().any(
+                |event| matches!(event, StreamEvent::TextDelta { delta, .. } if delta == "answer")
+            ),
+            "the answer text still streams: {out:?}"
+        );
+    }
+
+    #[test]
     fn reasoning_delta_segmentation_is_lossless() {
         let single = vec![
             json!({
@@ -2317,6 +6050,90 @@ mod tests {
             let empty = stream::empty::<std::result::Result<Vec<u8>, std::io::Error>>();
             let sse = crate::sse::SseStream::new(Box::pin(empty));
             StreamState::new(sse, "gpt-test".into(), "openai".into(), "openai".into())
+        }
+
+        /// Regression for #121: cached prompt tokens must not be double-counted.
+        /// `prompt_tokens` includes cached tokens, so `usage.input` must exclude
+        /// them (`prompt_tokens - cached_tokens`) while `cache_read` keeps the
+        /// cached count, matching the Anthropic convention where
+        /// `input + cache_read` reconstructs the full prompt.
+        #[test]
+        fn cache_heavy_usage_excludes_cache_reads_from_input() {
+            let mut state = make_state();
+            let chunk = r#"{"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":172405,"completion_tokens":40,"total_tokens":172445,"prompt_tokens_details":{"cached_tokens":172288}}}"#;
+            state.process_event(chunk).expect("process usage chunk");
+
+            assert_eq!(state.partial.usage.input, 117);
+            assert_eq!(state.partial.usage.cache_read, 172_288);
+            assert_eq!(state.partial.usage.output, 40);
+            assert_eq!(state.partial.usage.total_tokens, 172_445);
+            // input + cache_read reconstructs the full prompt token count.
+            assert_eq!(
+                state.partial.usage.input + state.partial.usage.cache_read,
+                172_405
+            );
+        }
+
+        /// DeepSeek reports the cache-miss count directly; prefer it over
+        /// subtraction as the authoritative source for `usage.input`.
+        #[test]
+        fn deepseek_prompt_cache_miss_tokens_is_authoritative_for_input() {
+            let mut state = make_state();
+            let chunk = r#"{"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":1000,"completion_tokens":20,"total_tokens":1020,"prompt_cache_miss_tokens":128,"prompt_tokens_details":{"cached_tokens":872}}}"#;
+            state.process_event(chunk).expect("process usage chunk");
+
+            assert_eq!(state.partial.usage.input, 128);
+            assert_eq!(state.partial.usage.cache_read, 872);
+        }
+
+        /// Guard against underflow: if a provider ever reports more cached
+        /// tokens than prompt tokens, `input` saturates to 0 rather than
+        /// wrapping around.
+        #[test]
+        fn cached_greater_than_prompt_saturates_input_to_zero() {
+            let mut state = make_state();
+            let chunk = r#"{"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":100,"completion_tokens":5,"total_tokens":105,"prompt_tokens_details":{"cached_tokens":250}}}"#;
+            state.process_event(chunk).expect("process usage chunk");
+
+            assert_eq!(state.partial.usage.input, 0);
+            assert_eq!(state.partial.usage.cache_read, 250);
+        }
+
+        /// gh #221: OpenRouter usage accounting reports the billed `cost`
+        /// on the final usage chunk; it must land in `usage.cost.total`
+        /// (captured shape: `usage: {…, "cost": 0.0123, "is_byok": false,
+        /// "cost_details": {"upstream_inference_cost": …}}`).
+        #[test]
+        fn openrouter_usage_cost_populates_cost_total() {
+            let mut state = make_state();
+            let chunk = r#"{"id":"gen-1","choices":[{"delta":{},"finish_reason":"stop","index":0}],"usage":{"prompt_tokens":3624,"completion_tokens":1,"total_tokens":3625,"cost":0.001087,"is_byok":false,"prompt_tokens_details":{"cached_tokens":0},"cost_details":{"upstream_inference_cost":null},"completion_tokens_details":{"reasoning_tokens":0}}}"#;
+            state.process_event(chunk).expect("process usage chunk");
+
+            assert_eq!(state.partial.usage.input, 3624);
+            assert_eq!(state.partial.usage.output, 1);
+            assert!((state.partial.usage.cost.total - 0.001_087).abs() < 1e-12);
+        }
+
+        /// Providers that do not report a cost leave `usage.cost` at zero
+        /// for the agent to fill from catalog rates.
+        #[test]
+        fn usage_without_cost_leaves_cost_total_zero() {
+            let mut state = make_state();
+            let chunk = r#"{"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":500,"completion_tokens":10,"total_tokens":510}}"#;
+            state.process_event(chunk).expect("process usage chunk");
+            assert!(state.partial.usage.cost.total.abs() < f64::EPSILON);
+        }
+
+        /// No cache details: `input` equals `prompt_tokens` and `cache_read`
+        /// stays zero (no regression for the common uncached case).
+        #[test]
+        fn usage_without_cache_details_maps_input_directly() {
+            let mut state = make_state();
+            let chunk = r#"{"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":500,"completion_tokens":10,"total_tokens":510}}"#;
+            state.process_event(chunk).expect("process usage chunk");
+
+            assert_eq!(state.partial.usage.input, 500);
+            assert_eq!(state.partial.usage.cache_read, 0);
         }
 
         fn small_string() -> impl Strategy<Value = String> {

@@ -35,7 +35,9 @@ use crate::scheduler::{Clock as SchedulerClock, HostcallOutcome, Scheduler, Wall
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use rquickjs::function::{Func, Opt};
-use rquickjs::loader::{Loader as JsModuleLoader, Resolver as JsModuleResolver};
+use rquickjs::loader::{
+    ImportAttributes as JsImportAttributes, Loader as JsModuleLoader, Resolver as JsModuleResolver,
+};
 use rquickjs::module::Declared as JsModuleDeclared;
 use rquickjs::{
     AsyncContext, AsyncRuntime, Coerced, Ctx, Exception, FromJs, Function, IntoJs, Module, Object,
@@ -48,8 +50,8 @@ use std::collections::{BTreeSet, BinaryHeap, HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use std::{fs, path::Path, path::PathBuf};
 use swc_common::{FileName, GLOBALS, Globals, Mark, SourceMap, sync::Lrc};
 use swc_ecma_ast::{Module as SwcModule, Pass, Program as SwcProgram};
@@ -58,52 +60,41 @@ use swc_ecma_parser::{Parser as SwcParser, StringInput, Syntax, TsSyntax};
 use swc_ecma_transforms_base::resolver;
 use swc_ecma_transforms_typescript::strip;
 
+mod executable;
+mod intl;
+mod process_session;
+mod sqlite;
+#[path = "extensions_js_storage.rs"]
+mod storage;
+mod worktree_metadata;
+
+macro_rules! compressed_js_literal {
+    ($source:expr) => {{
+        const RAW_LEN: usize = ($source).len();
+        const COMPRESSED_LEN: usize =
+            crate::embedded_assets::lzss_compressed_len(($source).as_bytes());
+        static COMPRESSED: [u8; COMPRESSED_LEN] =
+            crate::embedded_assets::lzss_compress::<COMPRESSED_LEN>(($source).as_bytes());
+        crate::embedded_assets::lzss_decompress(&COMPRESSED, RAW_LEN)
+            .expect("compile-time compressed JavaScript literal must decode")
+    }};
+}
+
 // ============================================================================
 // Environment variable filtering (bd-1av0.9)
 // ============================================================================
 
 use crate::extensions::{
-    ExecMediationResult, ExtensionPolicy, ExtensionPolicyMode, SecretBrokerPolicy,
+    ExecMediationResult, ExtensionPolicy, SecretBrokerPolicy, SessionActionOrigin,
     evaluate_exec_mediation,
 };
 
 /// Helper to check `exec` capability for sync execution where we cannot prompt.
 fn check_exec_capability(policy: &ExtensionPolicy, extension_id: Option<&str>) -> bool {
-    let cap = "exec";
-
-    // 1. Per-extension overrides
-    if let Some(id) = extension_id {
-        if let Some(override_config) = policy.per_extension.get(id) {
-            if override_config.deny.iter().any(|c| c == cap) {
-                return false;
-            }
-            if override_config.allow.iter().any(|c| c == cap) {
-                return true;
-            }
-            if let Some(mode) = override_config.mode {
-                return match mode {
-                    ExtensionPolicyMode::Permissive => true,
-                    ExtensionPolicyMode::Strict | ExtensionPolicyMode::Prompt => false, // Prompt = deny for sync
-                };
-            }
-        }
-    }
-
-    // 2. Global deny
-    if policy.deny_caps.iter().any(|c| c == cap) {
-        return false;
-    }
-
-    // 3. Global allow (default_caps)
-    if policy.default_caps.iter().any(|c| c == cap) {
-        return true;
-    }
-
-    // 4. Mode fallback
-    match policy.mode {
-        ExtensionPolicyMode::Permissive => true,
-        ExtensionPolicyMode::Strict | ExtensionPolicyMode::Prompt => false, // Prompt = deny for sync
-    }
+    // Use the same precedence and case normalization as asynchronous exec.
+    // In particular, a per-extension allow cannot override a global deny.
+    // Synchronous calls have no prompt channel, so Prompt also fails closed.
+    policy.evaluate_for("exec", extension_id).decision == crate::extensions::PolicyDecision::Allow
 }
 
 /// Determine whether an environment variable is safe to expose to extensions.
@@ -115,6 +106,48 @@ pub fn is_env_var_allowed(key: &str) -> bool {
     // is_secret returns true if it IS a secret (should be blocked).
     // So we allow it if it is NOT a secret.
     !policy.is_secret(key)
+}
+
+fn configured_environment_value<'a>(
+    environment: &'a HashMap<String, String>,
+    key: &str,
+    windows: bool,
+) -> Option<&'a str> {
+    if windows {
+        // Synthetic host snapshots can contain aliases that the Windows OS
+        // environment would treat as one binding. Use the same winner for
+        // every spelling, independent of HashMap iteration or the query case.
+        environment
+            .iter()
+            .filter(|(name, _)| name.eq_ignore_ascii_case(key))
+            .min_by(|(left, _), (right, _)| left.cmp(right))
+            .map(|(_, value)| value.as_str())
+    } else {
+        environment.get(key).map(String::as_str)
+    }
+}
+
+fn uses_windows_environment(environment: &HashMap<String, String>) -> bool {
+    configured_environment_value(environment, "PI_PLATFORM", cfg!(windows)).map_or(
+        cfg!(windows),
+        |platform| {
+            matches!(
+                platform.to_ascii_lowercase().as_str(),
+                "win32" | "windows" | "windows_nt" | "msys" | "cygwin"
+            )
+        },
+    )
+}
+
+fn normalize_windows_environment_snapshot(environment: &mut HashMap<String, String>) {
+    let mut entries: Vec<_> = std::mem::take(environment).into_iter().collect();
+    entries.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+    let mut names = HashSet::new();
+    for (name, value) in entries {
+        if names.insert(name.to_ascii_uppercase()) {
+            environment.insert(name, value);
+        }
+    }
 }
 
 fn parse_truthy_flag(value: &str) -> bool {
@@ -130,10 +163,8 @@ fn is_global_compat_scan_mode() -> bool {
 }
 
 fn is_compat_scan_mode(env: &HashMap<String, String>) -> bool {
-    is_global_compat_scan_mode()
-        || env
-            .get("PI_EXT_COMPAT_SCAN")
-            .is_some_and(|value| parse_truthy_flag(value))
+    configured_environment_value(env, "PI_EXT_COMPAT_SCAN", uses_windows_environment(env))
+        .map_or_else(is_global_compat_scan_mode, parse_truthy_flag)
 }
 
 /// Compatibility-mode fallback values for environment-gated extension registration.
@@ -165,6 +196,8 @@ fn compat_env_fallback_value(key: &str, env: &HashMap<String, String>) -> Option
 pub enum HostcallKind {
     /// pi.tool(name, input) - invoke a tool
     Tool { name: String },
+    /// Imported tool factory delegation to an admitted native implementation.
+    BuiltinTool { name: String },
     /// pi.exec(cmd, args) - execute a shell command
     Exec { cmd: String },
     /// pi.http(request) - make an HTTP request
@@ -281,7 +314,7 @@ impl HostcallRequest {
     #[must_use]
     pub const fn method(&self) -> &'static str {
         match self.kind {
-            HostcallKind::Tool { .. } => "tool",
+            HostcallKind::Tool { .. } | HostcallKind::BuiltinTool { .. } => "tool",
             HostcallKind::Exec { .. } => "exec",
             HostcallKind::Http => "http",
             HostcallKind::Session { .. } => "session",
@@ -294,7 +327,9 @@ impl HostcallRequest {
     #[must_use]
     pub fn required_capability(&self) -> &'static str {
         match &self.kind {
-            HostcallKind::Tool { name } => builtin_tool_required_capability(name),
+            HostcallKind::Tool { name } | HostcallKind::BuiltinTool { name } => {
+                builtin_tool_required_capability(name)
+            }
             HostcallKind::Exec { .. } => "exec",
             HostcallKind::Http => "http",
             HostcallKind::Session { .. } => "session",
@@ -314,7 +349,7 @@ impl HostcallRequest {
         match &self.kind {
             HostcallKind::Http => HostcallIoHint::IoHeavy,
             HostcallKind::Exec { .. } => HostcallIoHint::CpuBound,
-            HostcallKind::Tool { name } => {
+            HostcallKind::Tool { name } | HostcallKind::BuiltinTool { name } => {
                 let name = name.trim();
                 if name.eq_ignore_ascii_case("read")
                     || name.eq_ignore_ascii_case("write")
@@ -366,6 +401,12 @@ impl HostcallRequest {
         match &self.kind {
             HostcallKind::Tool { name } => {
                 serde_json::json!({ "name": name, "input": self.payload.clone() })
+            }
+            HostcallKind::BuiltinTool { name } => {
+                let mut params = self.payload.as_object().cloned().unwrap_or_default();
+                params.insert("name".to_string(), serde_json::Value::String(name.clone()));
+                params.insert("builtin".to_string(), serde_json::Value::Bool(true));
+                serde_json::Value::Object(params)
             }
             HostcallKind::Exec { cmd } => canonical_exec_params(cmd, &self.payload),
             HostcallKind::Http | HostcallKind::Log => self.payload.clone(),
@@ -513,7 +554,7 @@ fn js_to_json_inner(value: &Value<'_>, depth: usize) -> rquickjs::Result<serde_j
         return Ok(serde_json::json!(i));
     }
     if let Some(f) = value.as_float() {
-        return Ok(serde_json::json!(f));
+        return Ok(js_float_to_json(f));
     }
     if let Some(s) = value.as_string() {
         let s = s.to_string()?;
@@ -555,6 +596,32 @@ fn js_to_json_inner(value: &Value<'_>, depth: usize) -> rquickjs::Result<serde_j
     }
     // Fallback for functions, symbols, etc.
     Ok(serde_json::Value::Null)
+}
+
+/// Largest magnitude a JS number can hold while still naming every integer
+/// exactly (`Number.MAX_SAFE_INTEGER`, 2^53 - 1).
+const JS_MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
+
+/// Map a QuickJS float64 onto the JSON number that `JSON.stringify` would
+/// produce for it.
+///
+/// QuickJS keeps integers that fit in `i32` under `JS_TAG_INT` and promotes
+/// everything else — including `Date.now()`, which passed 2^31 in 1970 — to
+/// `JS_TAG_FLOAT64`. The tag is a storage detail: a JS number has no integer
+/// vs. float distinction, and `JSON.stringify(2147483648)` is `2147483648`,
+/// not `2147483648.0`. Emitting the tag as-is made every `i64` field on the
+/// Rust side reject an integral timestamp with "invalid type: floating point,
+/// expected i64" (gh #238). Integral finite values inside the exactly
+/// representable range therefore become JSON integers; non-integral, huge,
+/// or non-finite values keep the float path (`serde_json` renders non-finite
+/// as `null`, matching `JSON.stringify`).
+fn js_float_to_json(f: f64) -> serde_json::Value {
+    if f.is_finite() && f.fract() == 0.0 && f.abs() <= JS_MAX_SAFE_INTEGER {
+        // Exact by construction: |f| <= 2^53 - 1 fits in i64 losslessly.
+        #[allow(clippy::cast_possible_truncation)]
+        return serde_json::json!(f as i64);
+    }
+    serde_json::json!(f)
 }
 
 pub type HostcallQueue = Rc<RefCell<HostcallRequestQueue<HostcallRequest>>>;
@@ -841,17 +908,17 @@ fn map_js_error(err: &rquickjs::Error) -> Error {
 }
 
 fn format_quickjs_exception<'js>(ctx: &Ctx<'js>, caught: Value<'js>) -> String {
-    if let Ok(obj) = caught.clone().try_into_object() {
-        if let Some(exception) = Exception::from_object(obj) {
-            if let Some(message) = exception.message() {
-                if let Some(stack) = exception.stack() {
-                    return format!("{message}\n{stack}");
-                }
-                return message;
-            }
+    if let Ok(obj) = caught.clone().try_into_object()
+        && let Some(exception) = Exception::from_object(obj)
+    {
+        if let Some(message) = exception.message() {
             if let Some(stack) = exception.stack() {
-                return stack;
+                return format!("{message}\n{stack}");
             }
+            return message;
+        }
+        if let Some(stack) = exception.stack() {
+            return stack;
         }
     }
 
@@ -1159,7 +1226,7 @@ impl PatchProposal {
     }
 
     /// Number of patch operations in this proposal.
-    pub fn op_count(&self) -> usize {
+    pub const fn op_count(&self) -> usize {
         self.ops.len()
     }
 }
@@ -2187,12 +2254,12 @@ impl IntentGraph {
     }
 
     /// True if the graph contains no signals at all.
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.signals.is_empty()
     }
 
     /// Total number of signals.
-    pub fn signal_count(&self) -> usize {
+    pub const fn signal_count(&self) -> usize {
         self.signals.len()
     }
 }
@@ -2537,12 +2604,11 @@ pub struct PiJsTickStats {
 pub struct PiJsRuntimeLimits {
     /// Limit runtime heap usage (QuickJS allocator). `None` means unlimited.
     pub memory_limit_bytes: Option<usize>,
-    /// Limit warm in-memory compiled/transpiled module cache bytes.
+    /// Limit in-memory compiled/transpiled module cache bytes.
     ///
-    /// This caps the bytecode/source cache preserved across warm resets so a
-    /// reused runtime cannot grow without bound. `None` disables the in-memory
-    /// cache byte cap; persistent disk cache remains controlled by
-    /// `PiJsRuntimeConfig::disk_cache_dir`.
+    /// This prevents a realm's source cache from growing without bound. `None`
+    /// disables the in-memory cache byte cap; persistent cross-realm disk cache
+    /// remains controlled by `PiJsRuntimeConfig::disk_cache_dir`.
     pub module_cache_limit_bytes: Option<usize>,
     /// Limit runtime stack usage. `None` uses QuickJS default.
     pub max_stack_bytes: Option<usize>,
@@ -3197,7 +3263,7 @@ pub type ArtifactChecksum = String;
 pub fn compute_artifact_checksum(content: &[u8]) -> ArtifactChecksum {
     use sha2::{Digest, Sha256};
     let hash = Sha256::digest(content);
-    format!("{hash:x}")
+    hex_lower(&hash)
 }
 
 /// A single artifact entry in a golden checksum manifest.
@@ -3327,7 +3393,7 @@ pub struct GoldenChecksumManifest {
 
 impl GoldenChecksumManifest {
     /// Number of artifacts in the manifest.
-    pub fn artifact_count(&self) -> usize {
+    pub const fn artifact_count(&self) -> usize {
         self.entries.len()
     }
 
@@ -3910,12 +3976,12 @@ impl AuditLedger {
     }
 
     /// Number of entries in the ledger.
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.entries.len()
     }
 
     /// True if the ledger is empty.
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
 
@@ -4051,12 +4117,12 @@ impl TelemetryCollector {
     }
 
     /// Number of recorded points.
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.points.len()
     }
 
     /// True if no points recorded.
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.points.is_empty()
     }
 }
@@ -4189,7 +4255,7 @@ pub struct ForensicBundle {
 
 impl ForensicBundle {
     /// Number of audit entries in this bundle.
-    pub fn audit_count(&self) -> usize {
+    pub const fn audit_count(&self) -> usize {
         self.audit_entries.len()
     }
 
@@ -4580,6 +4646,49 @@ impl PiJsRuntimeConfig {
     pub const fn auto_repair_enabled(&self) -> bool {
         self.repair_mode.should_apply()
     }
+
+    /// Resolve the compatibility-scan policy for this runtime.
+    ///
+    /// An explicit per-runtime value wins over the process/feature default so
+    /// strict callers cannot receive conformance-only fallbacks accidentally.
+    pub(crate) fn compat_scan_mode(&self) -> bool {
+        is_compat_scan_mode(&self.env)
+    }
+}
+
+/// Select the same working directory used by `process.cwd()` and workspace
+/// metadata. Callers apply the immutable owner's environment admission first.
+fn effective_workspace_cwd<'a>(
+    config: &'a PiJsRuntimeConfig,
+    policy: Option<&ExtensionPolicy>,
+) -> &'a str {
+    let deterministic_cwd_allowed = !config.deny_env
+        && policy.map_or_else(
+            || is_env_var_allowed("PI_DETERMINISTIC_CWD"),
+            |policy| !policy.secret_broker.is_secret("PI_DETERMINISTIC_CWD"),
+        );
+    deterministic_cwd_allowed
+        .then(|| {
+            configured_environment_value(
+                &config.env,
+                "PI_DETERMINISTIC_CWD",
+                uses_windows_environment(&config.env),
+            )
+            .filter(|value| !value.is_empty())
+        })
+        .flatten()
+        .unwrap_or(&config.cwd)
+}
+
+/// Prepare the supported context-mode worktree override before environment
+/// snapshots freeze. The loader calls this only for its verified package owner.
+pub(crate) fn prepare_context_mode_worktree_metadata(
+    config: &mut PiJsRuntimeConfig,
+    policy: &ExtensionPolicy,
+    extension_id: &str,
+    root_deadline: std::time::Instant,
+) -> std::result::Result<(), String> {
+    worktree_metadata::prepare(config, policy, extension_id, root_deadline)
 }
 
 impl Default for PiJsRuntimeConfig {
@@ -4645,12 +4754,52 @@ impl InterruptBudget {
         false
     }
 
-    fn did_trip(&self) -> bool {
+    const fn did_trip(&self) -> bool {
         self.tripped.get()
     }
 
     fn clear_trip(&self) {
         self.tripped.set(false);
+    }
+}
+
+struct JsExecutionFence {
+    cancelled: Arc<AtomicBool>,
+    deadline: Instant,
+    interrupted: Rc<std::cell::Cell<bool>>,
+}
+
+/// Bound synchronous guest execution as well as asynchronous invocation waits. The
+/// caller's drop flag is atomic because cancellation originates on another
+/// thread while QuickJS may be executing an otherwise unbounded loop.
+#[must_use = "the JS execution fence ends when the guard is dropped"]
+pub(crate) struct JsExecutionFenceGuard {
+    active: Rc<RefCell<Option<JsExecutionFence>>>,
+    previous: Option<JsExecutionFence>,
+    interrupted: Rc<std::cell::Cell<bool>>,
+}
+
+impl JsExecutionFenceGuard {
+    pub(crate) fn was_interrupted(&self) -> bool {
+        self.interrupted.get()
+    }
+}
+
+impl Drop for JsExecutionFenceGuard {
+    fn drop(&mut self) {
+        self.active.replace(self.previous.take());
+    }
+}
+
+#[must_use = "the Session-action origin scope ends when the guard is dropped"]
+pub(crate) struct SessionActionOriginGuard {
+    active_origin: Rc<RefCell<Option<SessionActionOrigin>>>,
+    previous: Option<SessionActionOrigin>,
+}
+
+impl Drop for SessionActionOriginGuard {
+    fn drop(&mut self) {
+        self.active_origin.replace(self.previous.take());
     }
 }
 
@@ -4660,6 +4809,7 @@ struct HostcallTracker {
     cancelled: HashSet<String>,
     call_to_timer: HashMap<String, u64>,
     timer_to_call: HashMap<u64, String>,
+    call_origins: HashMap<String, SessionActionOrigin>,
     enqueued_at_ms: HashMap<String, u64>,
     stream_last_seq: HashMap<String, u64>,
 }
@@ -4677,7 +4827,13 @@ struct HostcallCancellation {
 }
 
 impl HostcallTracker {
-    fn register(&mut self, call_id: String, timer_id: Option<u64>, enqueued_at_ms: u64) {
+    fn register(
+        &mut self,
+        call_id: String,
+        timer_id: Option<u64>,
+        enqueued_at_ms: u64,
+        origin: Option<SessionActionOrigin>,
+    ) {
         self.pending.insert(call_id.clone());
         self.cancelled.remove(&call_id);
         self.stream_last_seq.remove(&call_id);
@@ -4685,8 +4841,23 @@ impl HostcallTracker {
             self.call_to_timer.insert(call_id.clone(), timer_id);
             self.timer_to_call.insert(timer_id, call_id.clone());
         }
+        if let Some(origin) = origin {
+            self.call_origins.insert(call_id.clone(), origin);
+        } else {
+            self.call_origins.remove(&call_id);
+        }
         // Last insert consumes call_id, avoiding one clone.
         self.enqueued_at_ms.insert(call_id, enqueued_at_ms);
+    }
+
+    fn origin_for_call(&self, call_id: &str) -> Option<SessionActionOrigin> {
+        self.call_origins.get(call_id).cloned()
+    }
+
+    fn origin_for_timer(&self, timer_id: u64) -> Option<SessionActionOrigin> {
+        self.timer_to_call
+            .get(&timer_id)
+            .and_then(|call_id| self.origin_for_call(call_id))
     }
 
     fn pending_count(&self) -> usize {
@@ -4751,6 +4922,7 @@ impl HostcallTracker {
         }
 
         let timer_id = self.call_to_timer.remove(call_id);
+        self.call_origins.remove(call_id);
         self.enqueued_at_ms.remove(call_id);
         self.cancelled.remove(call_id);
         self.stream_last_seq.remove(call_id);
@@ -4764,6 +4936,7 @@ impl HostcallTracker {
     fn take_timed_out_call(&mut self, timer_id: u64) -> Option<String> {
         let call_id = self.timer_to_call.remove(&timer_id)?;
         self.call_to_timer.remove(&call_id);
+        self.call_origins.remove(&call_id);
         self.enqueued_at_ms.remove(&call_id);
         self.cancelled.remove(&call_id);
         self.stream_last_seq.remove(&call_id);
@@ -4776,7 +4949,7 @@ impl HostcallTracker {
 
 fn enqueue_hostcall_request_with_backpressure<C: SchedulerClock>(
     queue: &HostcallQueue,
-    tracker: &Rc<RefCell<HostcallTracker>>,
+    _tracker: &Rc<RefCell<HostcallTracker>>,
     scheduler: &Rc<RefCell<Scheduler<C>>>,
     request: HostcallRequest,
 ) {
@@ -4812,21 +4985,20 @@ fn enqueue_hostcall_request_with_backpressure<C: SchedulerClock>(
             depth,
             overflow_depth,
         } => {
-            let completion = tracker.borrow_mut().on_complete(&call_id);
-            if let HostcallCompletion::Delivered { timer_id } = completion {
-                if let Some(timer_id) = timer_id {
-                    let _ = scheduler.borrow_mut().clear_timeout(timer_id);
-                }
-                scheduler.borrow_mut().enqueue_hostcall_complete(
-                    call_id.clone(),
-                    HostcallOutcome::Error {
-                        code: "overloaded".to_string(),
-                        message: format!(
-                            "Hostcall queue overloaded (depth={depth}, overflow_depth={overflow_depth})"
-                        ),
-                    },
-                );
-            }
+            // Keep the tracker entry live until the completion macrotask is
+            // delivered. Finalizing here would make handle_macrotask observe
+            // an unknown call and discard the overload error, leaving the JS
+            // Promise unresolved. The delivery path performs the single
+            // tracker removal and timeout cleanup for every final outcome.
+            scheduler.borrow_mut().enqueue_hostcall_complete(
+                call_id.clone(),
+                HostcallOutcome::Error {
+                    code: "overloaded".to_string(),
+                    message: format!(
+                        "Hostcall queue overloaded (depth={depth}, overflow_depth={overflow_depth})"
+                    ),
+                },
+            );
             tracing::warn!(
                 event = "pijs.hostcall.queue.rejected",
                 call_id = %call_id,
@@ -4857,6 +5029,11 @@ struct PiJsModuleState {
     /// Repair mode propagated from `PiJsRuntimeConfig` so the resolver can
     /// gate fallback patterns without executing any broken code.
     repair_mode: RepairMode,
+    /// Whether conformance-only compatibility fallbacks are enabled for this
+    /// runtime. A per-runtime `PI_EXT_COMPAT_SCAN` value takes precedence over
+    /// the compile-time feature so strict tests and callers remain strict even
+    /// in an all-features build.
+    compat_scan_mode: bool,
     /// Extension root directories used to detect monorepo escape (Pattern 3).
     /// Populated as extensions are loaded via [`PiJsRuntime::add_extension_root`].
     extension_roots: Vec<PathBuf>,
@@ -4876,6 +5053,14 @@ struct PiJsModuleState {
     /// These remain available to the active extension for legacy callers that
     /// still use `add_extension_root()`.
     extension_roots_without_id: Vec<PathBuf>,
+    /// Canonical roots belonging to other extension realms. These are
+    /// ownership boundaries only: they participate in deepest-root and
+    /// workspace-boundary checks, but never grant filesystem or resolver
+    /// access to this runtime.
+    foreign_extension_root_boundaries_by_id: HashMap<String, Vec<PathBuf>>,
+    /// Host-granted persistent data directories, deliberately excluded from
+    /// executable module resolution and missing-asset repair.
+    persistent_storage: storage::PersistentStorage,
     /// Shared handle for recording repair events from the resolver.
     repair_events: Arc<std::sync::Mutex<Vec<ExtensionRepairEvent>>>,
     /// Directory for persistent transpiled-source disk cache.
@@ -4918,12 +5103,15 @@ impl PiJsModuleState {
             compiled_sources: HashMap::new(),
             module_cache_counters: ModuleCacheCounters::default(),
             repair_mode: RepairMode::default(),
+            compat_scan_mode: is_global_compat_scan_mode(),
             extension_roots: Vec::new(),
             canonical_extension_roots: Vec::new(),
             extension_root_tiers: HashMap::new(),
             extension_root_scopes: HashMap::new(),
             extension_roots_by_id: HashMap::new(),
             extension_roots_without_id: Vec::new(),
+            foreign_extension_root_boundaries_by_id: HashMap::new(),
+            persistent_storage: storage::PersistentStorage::default(),
             repair_events: Arc::new(std::sync::Mutex::new(Vec::new())),
             disk_cache_dir: None,
             compiled_sources_bytes: 0,
@@ -4934,6 +5122,11 @@ impl PiJsModuleState {
 
     const fn with_repair_mode(mut self, mode: RepairMode) -> Self {
         self.repair_mode = mode;
+        self
+    }
+
+    const fn with_compat_scan_mode(mut self, enabled: bool) -> Self {
+        self.compat_scan_mode = enabled;
         self
     }
 
@@ -4985,13 +5178,13 @@ fn insert_compiled_source(
     entry: CompiledModuleCacheEntry,
 ) {
     let entry_len = compiled_source_len(&entry);
-    if let Some(limit) = state.compiled_cache_limit_bytes {
-        if limit == 0 || entry_len > limit {
-            let _ = remove_compiled_source(state, name);
-            state.module_cache_counters.invalidations =
-                state.module_cache_counters.invalidations.saturating_add(1);
-            return;
-        }
+    if let Some(limit) = state.compiled_cache_limit_bytes
+        && (limit == 0 || entry_len > limit)
+    {
+        let _ = remove_compiled_source(state, name);
+        state.module_cache_counters.invalidations =
+            state.module_cache_counters.invalidations.saturating_add(1);
+        return;
     }
 
     let _ = remove_compiled_source(state, name);
@@ -5016,36 +5209,21 @@ fn insert_compiled_source(
 }
 
 fn current_extension_id(ctx: &Ctx<'_>) -> Option<String> {
-    ctx.globals()
-        .get::<_, Option<String>>("__pi_current_extension_id")
+    let globals = ctx.globals();
+    let fixed_owner = globals
+        .get::<_, Function<'_>>("__pi_owner_extension_id_native")
         .ok()
-        .flatten()
+        .and_then(|getter| getter.call::<_, Option<String>>(()).ok().flatten())
         .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-}
-
-fn extension_roots_for_fs_access(
-    extension_id: Option<&str>,
-    module_state: &Rc<RefCell<PiJsModuleState>>,
-    fallback_roots: &Arc<std::sync::Mutex<Vec<PathBuf>>>,
-) -> Vec<PathBuf> {
-    if let Some(extension_id) = extension_id {
-        let state = module_state.borrow();
-        let mut roots = state.extension_roots_without_id.clone();
-        if let Some(scoped_roots) = state.extension_roots_by_id.get(extension_id) {
-            for root in scoped_roots {
-                if !roots.contains(root) {
-                    roots.push(root.clone());
-                }
-            }
-        }
-        return roots;
-    }
-
-    fallback_roots
-        .lock()
-        .map(|roots| roots.clone())
-        .unwrap_or_default()
+        .filter(|value| !value.is_empty());
+    fixed_owner.or_else(|| {
+        globals
+            .get::<_, Function<'_>>("__pi_get_current_extension_id")
+            .ok()
+            .and_then(|getter| getter.call::<_, Option<String>>(()).ok().flatten())
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    })
 }
 
 fn path_is_in_allowed_extension_root(
@@ -5054,23 +5232,167 @@ fn path_is_in_allowed_extension_root(
     module_state: &Rc<RefCell<PiJsModuleState>>,
     fallback_roots: &Arc<std::sync::Mutex<Vec<PathBuf>>>,
 ) -> bool {
-    extension_roots_for_fs_access(extension_id, module_state, fallback_roots)
-        .iter()
-        .any(|root| path.starts_with(root))
+    if extension_id.is_none() {
+        return fallback_roots
+            .lock()
+            .is_ok_and(|roots| roots.iter().any(|root| path.starts_with(root)));
+    }
+    path_is_in_owned_extension_root(path, extension_id, module_state)
 }
 
-// Retained for policy diagnostics that distinguish registered roots from the
-// broader fallback root set used by filesystem hostcalls.
-#[allow(dead_code)]
+/// Emit one structured host-filesystem policy decision record (bd-xhl7u).
+///
+/// Denials log at WARN so default subscribers capture them; allows at DEBUG.
+/// Every record carries runtime identity, active extension id, requested vs
+/// normalized path, workspace root, and the full registered-root lists so
+/// full-suite interference can be reconstructed from tracing captures alone.
+#[allow(clippy::too_many_arguments)]
+fn log_host_fs_decision(
+    op: &'static str,
+    allowed: bool,
+    runtime_id: &str,
+    extension_id: Option<&str>,
+    requested: &str,
+    checked_path: &Path,
+    workspace_root: &Path,
+    allowed_read_roots: &std::sync::Mutex<Vec<PathBuf>>,
+    module_state: &Rc<RefCell<PiJsModuleState>>,
+) {
+    let read_roots = allowed_read_roots
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let state = module_state.borrow();
+    let decision = if allowed { "allow" } else { "deny" };
+    let roots_to_string = |roots: &[PathBuf]| {
+        roots
+            .iter()
+            .map(|root| root.display().to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    macro_rules! emit {
+        ($level:path) => {
+            tracing::event!(
+                $level,
+                event = "pijs.hostfs.decision",
+                op = op,
+                decision = decision,
+                runtime_id = %runtime_id,
+                extension_id = %extension_id.unwrap_or("<none>"),
+                requested = %requested,
+                normalized = %checked_path.display(),
+                workspace_root = %workspace_root.display(),
+                read_roots_count = read_roots.len(),
+                extension_roots_count = state.canonical_extension_roots.len(),
+                read_roots = %roots_to_string(&read_roots),
+                extension_roots = %roots_to_string(&state.canonical_extension_roots),
+                "host fs policy decision"
+            );
+        };
+    }
+    if allowed {
+        emit!(tracing::Level::DEBUG);
+    } else {
+        emit!(tracing::Level::WARN);
+    }
+}
+
+/// Resolve the deepest declared extension boundary for a path and allow only
+/// the active owner's roots (or legacy idless roots). This is shared by
+/// filesystem checks and module resolution so a peer root nested under a
+/// broader package/workspace root cannot be treated as inherited authority.
+fn path_is_in_owned_extension_root(
+    path: &Path,
+    extension_id: Option<&str>,
+    module_state: &Rc<RefCell<PiJsModuleState>>,
+) -> bool {
+    let state = module_state.borrow();
+    let mut deepest_depth = None;
+    let mut deepest_roots = Vec::new();
+
+    for root in state
+        .extension_roots_without_id
+        .iter()
+        .chain(state.extension_roots_by_id.values().flatten())
+        .chain(
+            state
+                .foreign_extension_root_boundaries_by_id
+                .values()
+                .flatten(),
+        )
+    {
+        if !path.starts_with(root) {
+            continue;
+        }
+        let depth = root.components().count();
+        match deepest_depth {
+            Some(current) if depth < current => {}
+            Some(current) if depth == current => {
+                if !deepest_roots.contains(root) {
+                    deepest_roots.push(root.clone());
+                }
+            }
+            _ => {
+                deepest_depth = Some(depth);
+                deepest_roots.clear();
+                deepest_roots.push(root.clone());
+            }
+        }
+    }
+
+    deepest_roots.iter().any(|root| {
+        state.extension_roots_without_id.contains(root)
+            || extension_id.is_some_and(|extension_id| {
+                state
+                    .extension_roots_by_id
+                    .get(extension_id)
+                    .is_some_and(|roots| roots.contains(root))
+            })
+    })
+}
+
 fn path_is_in_registered_extension_root(
     path: &Path,
     module_state: &Rc<RefCell<PiJsModuleState>>,
 ) -> bool {
-    module_state
-        .borrow()
+    let state = module_state.borrow();
+    state
         .canonical_extension_roots
         .iter()
         .any(|root| path.starts_with(root))
+        || state
+            .foreign_extension_root_boundaries_by_id
+            .values()
+            .flatten()
+            .any(|root| path.starts_with(root))
+}
+
+fn path_is_in_workspace_or_registered_extension_root(
+    path: &Path,
+    workspace_root: &Path,
+    module_state: &Rc<RefCell<PiJsModuleState>>,
+) -> bool {
+    if module_state.borrow().persistent_storage.is_registered(path) {
+        return true;
+    }
+    let checked_path = crate::extensions::safe_canonicalize(path);
+    checked_path.starts_with(workspace_root)
+        || path_is_in_registered_extension_root(&checked_path, module_state)
+        || module_state
+            .borrow()
+            .persistent_storage
+            .is_registered(&checked_path)
+}
+
+fn persistent_storage_path(
+    path: &Path,
+    extension_id: Option<&str>,
+    module_state: &Rc<RefCell<PiJsModuleState>>,
+) -> std::io::Result<Option<PathBuf>> {
+    module_state
+        .borrow()
+        .persistent_storage
+        .resolve(path, extension_id)
 }
 
 fn path_is_in_leaf_allowed_extension_root(
@@ -5079,14 +5401,51 @@ fn path_is_in_leaf_allowed_extension_root(
     module_state: &Rc<RefCell<PiJsModuleState>>,
     fallback_roots: &Arc<std::sync::Mutex<Vec<PathBuf>>>,
 ) -> bool {
-    let roots = extension_roots_for_fs_access(extension_id, module_state, fallback_roots);
+    if extension_id.is_some() {
+        return path_is_in_owned_extension_root(path, extension_id, module_state);
+    }
+
+    let Ok(roots) = fallback_roots.lock() else {
+        return false;
+    };
     let Some(nearest) = nearest_containing_root(path, &roots) else {
         return false;
     };
-
     !roots
         .iter()
         .any(|root| root != nearest && root.starts_with(nearest))
+}
+
+fn path_is_allowed_extension_fs_path(
+    path: &Path,
+    workspace_root: &Path,
+    extension_id: Option<&str>,
+    module_state: &Rc<RefCell<PiJsModuleState>>,
+    fallback_roots: &Arc<std::sync::Mutex<Vec<PathBuf>>>,
+) -> bool {
+    // Resolve registered data first: validation of raw Windows components must
+    // precede canonicalization, including direct calls to the native guards.
+    match persistent_storage_path(path, extension_id, module_state) {
+        Err(_) => return false,
+        Ok(Some(granted)) => {
+            let checked = crate::extensions::safe_canonicalize(&granted);
+            return (!path_is_in_registered_extension_root(&checked, module_state)
+                || path_is_in_owned_extension_root(&checked, extension_id, module_state))
+                && module_state
+                    .borrow()
+                    .persistent_storage
+                    .allows(path, extension_id, "read");
+        }
+        Ok(None) => {}
+    }
+    let checked_path = crate::extensions::safe_canonicalize(path);
+    let path = checked_path.as_path();
+    let in_owned_root =
+        path_is_in_allowed_extension_root(path, extension_id, module_state, fallback_roots);
+    if path_is_in_registered_extension_root(path, module_state) {
+        return in_owned_root;
+    }
+    path.starts_with(workspace_root) || in_owned_root
 }
 
 #[derive(Clone, Debug)]
@@ -5133,6 +5492,19 @@ fn canonical_node_builtin(spec: &str) -> Option<&'static str> {
         "worker_threads" | "node:worker_threads" => Some("node:worker_threads"),
         _ => None,
     }
+}
+
+fn canonical_virtual_module_specifier(spec: &str) -> &str {
+    canonical_node_builtin(spec).unwrap_or(match spec {
+        "@earendil-works/pi-coding-agent" => "@mariozechner/pi-coding-agent",
+        "@earendil-works/pi-tui" => "@mariozechner/pi-tui",
+        "@earendil-works/pi-ai"
+        | "@earendil-works/pi-ai/compat"
+        | "@earendil-works/pi-agent-core"
+        | "@mariozechner/pi-agent-core" => "@mariozechner/pi-ai",
+        "typebox" => "@sinclair/typebox",
+        _ => spec,
+    })
 }
 
 fn is_network_specifier(spec: &str) -> bool {
@@ -5411,7 +5783,12 @@ fn generate_proxy_stub_module(spec: &str, named_exports: &BTreeSet<String>) -> S
         r"// Auto-generated npm proxy stub (Pattern 4) for {spec_literal}
 const __pkg = {spec_literal};
 const __handler = {{
-  get(_target, prop) {{
+  get(target, prop) {{
+    const descriptor = Reflect.getOwnPropertyDescriptor(target, prop);
+    if (descriptor && !descriptor.configurable) {{
+      if ('value' in descriptor && !descriptor.writable) return descriptor.value;
+      if ('get' in descriptor && descriptor.get === undefined) return undefined;
+    }}
     if (typeof prop === 'symbol') {{
       if (prop === Symbol.toPrimitive) return () => '';
       return undefined;
@@ -5427,10 +5804,10 @@ const __handler = {{
   }},
   apply() {{ return __stub; }},
   construct() {{ return __stub; }},
-  has() {{ return false; }},
-  ownKeys() {{ return []; }},
-  getOwnPropertyDescriptor() {{
-    return {{ configurable: true, enumerable: false }};
+  has(target, prop) {{ return Reflect.has(target, prop); }},
+  ownKeys(target) {{ return Reflect.ownKeys(target); }},
+  getOwnPropertyDescriptor(target, prop) {{
+    return Reflect.getOwnPropertyDescriptor(target, prop);
   }},
 }};
 const __stub = new Proxy(function __pijs_noop() {{}}, __handler);
@@ -5522,7 +5899,7 @@ export default __pijs_builtin_default;
 fn builtin_overlay_module_key(base: &str, canonical: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(base.as_bytes());
-    let digest = format!("{:x}", hasher.finalize());
+    let digest = hex_lower(&hasher.finalize());
     let short = &digest[..16];
     format!("pijs-compat://builtin/{canonical}/{short}")
 }
@@ -5580,15 +5957,23 @@ fn maybe_register_builtin_compat_overlay(
 
 impl JsModuleResolver for PiJsResolver {
     #[allow(clippy::too_many_lines)]
-    fn resolve(&mut self, _ctx: &Ctx<'_>, base: &str, name: &str) -> rquickjs::Result<String> {
+    fn resolve<'js>(
+        &mut self,
+        ctx: &Ctx<'js>,
+        base: &str,
+        name: &str,
+        _attributes: Option<JsImportAttributes<'js>>,
+    ) -> rquickjs::Result<String> {
         let spec = name.trim();
         if spec.is_empty() {
             return Err(rquickjs::Error::new_resolving(base, name));
         }
 
-        // Alias bare Node.js builtins to their node: prefixed virtual modules.
-        let canonical = canonical_node_builtin(spec).unwrap_or(spec);
-        let compat_scan_mode = is_global_compat_scan_mode();
+        // Resolve every compatibility alias to one module identity. Besides
+        // matching package semantics, this prevents side-effectful virtual
+        // modules from being evaluated once per alias in the same realm.
+        let canonical = canonical_virtual_module_specifier(spec);
+        let compat_scan_mode = self.state.borrow().compat_scan_mode;
 
         let repair_mode = {
             let mut state = self.state.borrow_mut();
@@ -5626,19 +6011,36 @@ impl JsModuleResolver for PiJsResolver {
             let is_safe = canonical_roots
                 .iter()
                 .any(|canonical_root| canonical.starts_with(canonical_root));
+            let active_extension_id = current_extension_id(ctx);
+            let owner_allows_path = active_extension_id.as_deref().is_none_or(|extension_id| {
+                path_is_in_owned_extension_root(&canonical, Some(extension_id), &self.state)
+            });
 
-            if !is_safe {
+            if !is_safe || !owner_allows_path {
                 tracing::warn!(
-                    event = "pijs.resolve.escape",
+                    event = "pijs.resolve.ownership_denied",
                     base = %base,
                     specifier = %spec,
                     resolved = %canonical.display(),
-                    "import resolved to path outside extension roots"
+                    extension_id = %active_extension_id.as_deref().unwrap_or("<none>"),
+                    "import resolved outside the active extension root"
                 );
-                return Err(rquickjs::Error::new_resolving(base, name));
+                return Err(rquickjs::Error::new_resolving_message(
+                    base,
+                    name,
+                    format!(
+                        "Module path denied by extension root ownership: {}",
+                        canonical.display()
+                    ),
+                ));
             }
 
-            return Ok(canonical.to_string_lossy().replace('\\', "/"));
+            let name = canonical.to_string_lossy();
+            return Ok(if cfg!(windows) {
+                name.replace('\\', "/")
+            } else {
+                name.into_owned()
+            });
         }
 
         // Pattern 3 (bd-k5q5.8.4): monorepo sibling module stubs.
@@ -5799,6 +6201,7 @@ impl JsModuleLoader for PiJsLoader {
         &mut self,
         ctx: &Ctx<'js>,
         name: &str,
+        _attributes: Option<JsImportAttributes<'js>>,
     ) -> rquickjs::Result<Module<'js, JsModuleDeclared>> {
         let source = {
             let mut state = self.state.borrow_mut();
@@ -5883,6 +6286,13 @@ fn compile_module_source(
     Ok(prefix_import_meta_url(name, &compiled))
 }
 
+/// Bump whenever a transform applied by [`compile_module_source`] changes.
+///
+/// The source file metadata can remain unchanged across a Pi upgrade while the
+/// transformed output changes. Versioning the key prevents a newer binary from
+/// reusing stale compiled JavaScript emitted by an older compiler pipeline.
+const COMPILED_MODULE_CACHE_VERSION: u8 = 5;
+
 fn module_cache_key(
     static_virtual_modules: &HashMap<String, String>,
     dynamic_virtual_modules: &HashMap<String, String>,
@@ -5897,7 +6307,10 @@ fn module_cache_key(
         hasher.update(name.as_bytes());
         hasher.update(b"\0");
         hasher.update(source.as_bytes());
-        return Some(format!("v:{:x}", hasher.finalize()));
+        return Some(format!(
+            "v{COMPILED_MODULE_CACHE_VERSION}:v:{}",
+            hex_lower(&hasher.finalize())
+        ));
     }
 
     let path = Path::new(name);
@@ -5912,7 +6325,10 @@ fn module_cache_key(
         .and_then(|ts| ts.duration_since(UNIX_EPOCH).ok())
         .map_or(0, |duration| duration.as_nanos());
 
-    Some(format!("f:{name}:{}:{modified_nanos}", metadata.len()))
+    Some(format!(
+        "v{COMPILED_MODULE_CACHE_VERSION}:f:{name}:{}:{modified_nanos}",
+        metadata.len()
+    ))
 }
 
 // ============================================================================
@@ -5926,7 +6342,7 @@ fn module_cache_key(
 fn disk_cache_path(cache_dir: &Path, cache_key: &str) -> PathBuf {
     let mut hasher = Sha256::new();
     hasher.update(cache_key.as_bytes());
-    let hex = format!("{:x}", hasher.finalize());
+    let hex = hex_lower(&hasher.finalize());
     let prefix = &hex[..2];
     cache_dir.join(prefix).join(format!("{hex}.js"))
 }
@@ -5940,11 +6356,11 @@ fn try_load_from_disk_cache(cache_dir: &Path, cache_key: &str) -> Option<Vec<u8>
 /// Persist a transpiled module source to the disk cache (best-effort).
 fn store_to_disk_cache(cache_dir: &Path, cache_key: &str, source: &[u8]) {
     let path = disk_cache_path(cache_dir, cache_key);
-    if let Some(parent) = path.parent() {
-        if let Err(err) = fs::create_dir_all(parent) {
-            tracing::debug!(event = "pijs.module_cache.disk.mkdir_failed", path = %parent.display(), %err);
-            return;
-        }
+    if let Some(parent) = path.parent()
+        && let Err(err) = fs::create_dir_all(parent)
+    {
+        tracing::debug!(event = "pijs.module_cache.disk.mkdir_failed", path = %parent.display(), %err);
+        return;
     }
 
     let temp_path = path.with_extension(format!("tmp.{}", uuid::Uuid::new_v4().simple()));
@@ -5963,6 +6379,18 @@ fn load_compiled_module_source(
     state: &mut PiJsModuleState,
     name: &str,
 ) -> rquickjs::Result<Vec<u8>> {
+    if !state.static_virtual_modules.contains_key(name)
+        && !state.dynamic_virtual_modules.contains_key(name)
+        && (state.persistent_storage.is_registered(Path::new(name))
+            || state
+                .persistent_storage
+                .is_registered(&crate::extensions::safe_canonicalize(Path::new(name))))
+    {
+        return Err(rquickjs::Error::new_loading_message(
+            name,
+            "Persistent application storage is data-only and cannot be imported as executable code",
+        ));
+    }
     let cache_key = module_cache_key(
         &state.static_virtual_modules,
         &state.dynamic_virtual_modules,
@@ -6033,21 +6461,21 @@ fn load_compiled_module_source(
 // Warm Isolate Pool (bd-3ar8v.4.16)
 // ============================================================================
 
-/// Configuration holder and factory for pre-warmed JS extension runtimes.
+/// Configuration holder and factory for cold JS extension runtimes that may
+/// share immutable/transpiled cache configuration.
 ///
 /// Since `PiJsRuntime` uses `Rc` internally and cannot cross thread
 /// boundaries, the pool does not hold live runtime instances. Instead, it
-/// provides a factory that produces pre-configured `PiJsRuntimeConfig` values,
-/// and runtimes can be returned to a "warm" state via
-/// [`PiJsRuntime::reset_transient_state`].
+/// produces pre-configured `PiJsRuntimeConfig` values. Live realms are never
+/// reused after arbitrary extension code has run; only compiled/disk cache
+/// artifacts may be shared with a newly created realm.
 ///
 /// # Lifecycle
 ///
 /// 1. Create pool with desired config via [`WarmIsolatePool::new`].
-/// 2. Call [`make_config`](WarmIsolatePool::make_config) to get a pre-warmed
-///    `PiJsRuntimeConfig` for each runtime thread.
-/// 3. After use, call [`PiJsRuntime::reset_transient_state`] to return the
-///    runtime to a clean state (keeping the transpiled source cache).
+/// 2. Call [`make_config`](WarmIsolatePool::make_config) for each cold realm.
+/// 3. Before dropping a realm, optionally call
+///    [`PiJsRuntime::scrub_for_cold_drop`] for hygiene evidence.
 #[derive(Debug, Clone)]
 pub struct WarmIsolatePool {
     /// Template configuration for new runtimes.
@@ -6074,7 +6502,7 @@ impl WarmIsolatePool {
         self.template.clone()
     }
 
-    /// Record that a runtime was reset for reuse.
+    /// Record that a runtime was scrubbed cleanly before being dropped.
     pub fn record_reset(&self) {
         self.reset_count.fetch_add(1, AtomicOrdering::Relaxed);
     }
@@ -6097,21 +6525,59 @@ impl Default for WarmIsolatePool {
 }
 
 fn prefix_import_meta_url(module_name: &str, body: &str) -> Vec<u8> {
-    let url = if module_name.starts_with('/') {
-        format!("file://{module_name}")
-    } else if module_name.starts_with("file://") {
+    let url = if module_name.starts_with("file:") {
         module_name.to_string()
+    } else if let Ok(url) = url::Url::from_file_path(module_name) {
+        url.to_string()
+    } else if module_name.starts_with('/') {
+        let mut url = url::Url::parse("file:///").expect("static file URL");
+        url.set_path(module_name);
+        url.to_string()
     } else if module_name.len() > 2
         && module_name.as_bytes()[1] == b':'
+        && module_name.as_bytes()[0].is_ascii_alphabetic()
         && (module_name.as_bytes()[2] == b'/' || module_name.as_bytes()[2] == b'\\')
     {
-        // Windows absolute path: `C:/Users/...` or `C:\Users\...`
-        format!("file:///{module_name}")
+        // Also encode Windows paths correctly in host-independent diagnostics.
+        let mut url = url::Url::parse("file:///").expect("static file URL");
+        url.set_path(&format!("/{}", module_name.replace('\\', "/")));
+        url.to_string()
     } else {
         format!("pi://{module_name}")
     };
     let url_literal = serde_json::to_string(&url).unwrap_or_else(|_| "\"\"".to_string());
     format!("import.meta.url = {url_literal};\n{body}").into_bytes()
+}
+
+fn module_path_from_file_url(specifier: &str) -> Option<PathBuf> {
+    let url = url::Url::parse(specifier).ok()?;
+    if url.scheme() != "file" || url.query().is_some() || url.fragment().is_some() {
+        // Module identity is a canonical path in PiJS. Do not silently merge
+        // distinct query/fragment module instances into that cache identity.
+        return None;
+    }
+    let encoded = url.path().as_bytes();
+    let mut index = 0;
+    while index < encoded.len() {
+        if encoded[index] == b'%' {
+            let hex = encoded.get(index + 1..index + 3)?;
+            let high = char::from(hex[0]).to_digit(16)?;
+            let low = char::from(hex[1]).to_digit(16)?;
+            let decoded = high * 16 + low;
+            if decoded == 0
+                || decoded == u32::from(b'/')
+                || (cfg!(windows) && decoded == u32::from(b'\\'))
+            {
+                return None;
+            }
+            index += 3;
+        } else {
+            index += 1;
+        }
+    }
+    let path = url.to_file_path().ok()?;
+    path.to_str()?;
+    Some(path)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -6126,11 +6592,14 @@ fn resolve_module_path(
         return None;
     }
 
-    if let Some(path) = specifier.strip_prefix("file://") {
+    if specifier
+        .get(..5)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("file:"))
+    {
         if canonical_roots.is_empty() {
             return None;
         }
-        let path_buf = PathBuf::from(path);
+        let path_buf = module_path_from_file_url(specifier)?;
         let canonical = crate::extensions::safe_canonicalize(&path_buf);
         let allowed = canonical_roots
             .iter()
@@ -6758,13 +7227,84 @@ fn source_declares_binding(source: &str, name: &str) -> bool {
     false
 }
 
-/// Extract static `require("specifier")` calls from JavaScript source.
+/// Extract free static `require("specifier")` calls from JavaScript source.
 ///
-/// This scanner is intentionally lexical: it ignores matches inside comments
-/// and string/template literals so code-generation strings like
-/// `` `require("pkg/path").default` `` do not become false-positive imports.
-#[allow(clippy::too_many_lines)]
+/// A locally bound require, including createRequire inside a function, owns
+/// its own resolution and conditional execution. Hoisting those calls would
+/// load inactive platform dependencies before their guards can run.
 fn extract_static_require_specifiers(source: &str) -> Vec<String> {
+    scoped_static_require_specifiers(source)
+        .unwrap_or_else(|| lexical_static_require_specifiers(source))
+}
+
+fn scoped_static_require_specifiers(source: &str) -> Option<Vec<String>> {
+    use swc_ecma_ast::{CallExpr, Callee, Expr, Lit};
+    use swc_ecma_visit::{Visit, VisitWith as _};
+
+    struct RequireCollector {
+        unresolved: Mark,
+        seen: HashSet<String>,
+        specifiers: Vec<String>,
+    }
+
+    impl Visit for RequireCollector {
+        fn visit_call_expr(&mut self, call: &CallExpr) {
+            call.visit_children_with(self);
+            let Callee::Expr(callee) = &call.callee else {
+                return;
+            };
+            let Expr::Ident(identifier) = callee.as_ref() else {
+                return;
+            };
+            if identifier.sym.as_ref() != "require"
+                || !identifier.ctxt.has_mark(self.unresolved)
+                || call.args.len() != 1
+                || call.args[0].spread.is_some()
+            {
+                return;
+            }
+            let Expr::Lit(Lit::Str(literal)) = call.args[0].expr.as_ref() else {
+                return;
+            };
+            let specifier = literal.value.to_string_lossy().into_owned();
+            if self.seen.insert(specifier.clone()) {
+                self.specifiers.push(specifier);
+            }
+        }
+    }
+
+    GLOBALS.set(&Globals::new(), || {
+        let cm: Lrc<SourceMap> = Lrc::default();
+        let file = cm.new_source_file(
+            FileName::Custom("pijs-require-analysis.js".to_string()).into(),
+            source.to_string(),
+        );
+        let mut parser = SwcParser::new(
+            Syntax::Es(Default::default()),
+            StringInput::from(&*file),
+            None,
+        );
+        let module = parser.parse_module().ok()?;
+        if !parser.take_errors().is_empty() {
+            return None;
+        }
+        let unresolved = Mark::new();
+        let mut program = SwcProgram::Module(module);
+        resolver(unresolved, Mark::new(), false).process(&mut program);
+        let mut collector = RequireCollector {
+            unresolved,
+            seen: HashSet::new(),
+            specifiers: Vec::new(),
+        };
+        program.visit_with(&mut collector);
+        Some(collector.specifiers)
+    })
+}
+
+/// Preserve the existing lexical fallback for source accepted only after the
+/// legacy syntax repair pass. Valid JavaScript always uses scope analysis.
+#[allow(clippy::too_many_lines)]
+fn lexical_static_require_specifiers(source: &str) -> Vec<String> {
     const REQUIRE: &[u8] = b"require";
 
     let bytes = source.as_bytes();
@@ -6939,6 +7479,25 @@ fn extract_static_require_specifiers(source: &str) -> Vec<String> {
     out
 }
 
+/// Return whether a CommonJS dependency is a platform-specific native binding.
+///
+/// These imports are conventionally protected by platform checks or
+/// `try`/`catch` fallbacks. Hoisting them into unconditional ESM imports would
+/// eagerly resolve bindings for every platform before the guard can run.
+fn is_native_addon_require(specifier: &str) -> bool {
+    let path = Path::new(specifier);
+    let extension = path.extension().and_then(std::ffi::OsStr::to_str);
+    let is_node_addon = extension.is_some_and(|ext| ext.eq_ignore_ascii_case("node"));
+    let is_wasi_cjs = extension.is_some_and(|ext| ext.eq_ignore_ascii_case("cjs"))
+        && path
+            .file_stem()
+            .and_then(|stem| Path::new(stem).extension())
+            .and_then(std::ffi::OsStr::to_str)
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("wasi"));
+
+    is_node_addon || is_wasi_cjs || specifier.starts_with("@napi-rs/")
+}
+
 /// Detect if a JavaScript source uses CommonJS patterns (`require(...)` or
 /// `module.exports`) and transform it into an ESM-compatible wrapper.
 ///
@@ -6949,7 +7508,7 @@ fn extract_static_require_specifiers(source: &str) -> Vec<String> {
 ///    for require targets and a `require()` function, preserving existing ESM
 #[allow(clippy::too_many_lines)]
 fn maybe_cjs_to_esm(source: &str) -> String {
-    let has_require = source.contains("require(");
+    let has_require = source.contains("require");
     let has_module_exports = source.contains("module.exports")
         || source.contains("module[\"exports\"]")
         || source.contains("module['exports']");
@@ -6974,7 +7533,10 @@ fn maybe_cjs_to_esm(source: &str) -> String {
     let has_export_default = source.contains("export default");
 
     // Extract all require() specifiers
-    let specifiers = extract_static_require_specifiers(source);
+    let specifiers = extract_static_require_specifiers(source)
+        .into_iter()
+        .filter(|specifier| !is_native_addon_require(specifier))
+        .collect::<Vec<_>>();
 
     if specifiers.is_empty()
         && !has_module_exports
@@ -7016,8 +7578,7 @@ fn maybe_cjs_to_esm(source: &str) -> String {
             "function require(s) {\n\
              \x20 const m = __cjs_req_map[s];\n\
              \x20 if (!m) throw new Error('Cannot find module: ' + s);\n\
-             \x20 return m.default !== undefined && typeof m.default === 'object' \
-                  ? m.default : m;\n\
+             \x20 return Object.prototype.hasOwnProperty.call(m, 'default') ? m.default : m;\n\
              }\n",
         );
     }
@@ -7028,25 +7589,31 @@ fn maybe_cjs_to_esm(source: &str) -> String {
     let has_exports_binding = source_declares_binding(source, "exports");
     let needs_filename = has_filename_refs && !has_filename_binding;
     let needs_dirname = has_dirname_refs && !has_dirname_binding;
-    let needs_module = (has_module_exports || has_exports_usage) && !has_module_binding;
+    let exports_cjs_default =
+        !has_export_default && (!has_esm || has_module_exports || has_exports_usage);
+    let needs_module =
+        (has_module_exports || has_exports_usage || exports_cjs_default) && !has_module_binding;
     let needs_exports = (has_module_exports || has_exports_usage) && !has_exports_binding;
 
+    if needs_filename || needs_dirname {
+        output.push_str("import { fileURLToPath as __cjs_file_url_to_path } from 'node:url';\n");
+    }
+    if needs_dirname {
+        output.push_str("import { dirname as __cjs_path_dirname } from 'node:path';\n");
+    }
     if needs_filename || needs_dirname || needs_module || needs_exports {
         // Provide CJS compatibility globals only for bindings not declared by source.
         if needs_filename {
             output.push_str(
                 "const __filename = (() => {\n\
-                 \x20 try { return new URL(import.meta.url).pathname || ''; } catch { return ''; }\n\
+                 \x20 return __cjs_file_url_to_path(import.meta.url);\n\
                  })();\n",
             );
         }
         if needs_dirname {
             output.push_str(
                 "const __dirname = (() => {\n\
-                 \x20 try {\n\
-                 \x20\x20 const __pi_pathname = new URL(import.meta.url).pathname || '';\n\
-                 \x20\x20 return __pi_pathname ? __pi_pathname.replace(/[/\\\\][^/\\\\]*$/, '') : '.';\n\
-                 \x20 } catch { return '.'; }\n\
+                 \x20 return __cjs_path_dirname(__cjs_file_url_to_path(import.meta.url));\n\
                  })();\n",
             );
         }
@@ -7075,7 +7642,7 @@ fn maybe_cjs_to_esm(source: &str) -> String {
         }
     }
 
-    if !has_export_default && (!has_esm || has_module_exports || has_exports_usage) {
+    if exports_cjs_default {
         // Export CommonJS entrypoint for loaders that require a default init fn.
         output.push_str("export default module.exports;\n");
     }
@@ -7115,7 +7682,7 @@ fn extract_module_exports_object_names(source: &str) -> Vec<String> {
     names.into_iter().collect()
 }
 
-fn is_identifier_boundary(bytes: &[u8], start: usize, len: usize) -> bool {
+const fn is_identifier_boundary(bytes: &[u8], start: usize, len: usize) -> bool {
     let before_ok = start == 0 || !is_js_ident_continue(bytes[start - 1]);
     let end = start + len;
     let after_ok = end >= bytes.len() || !is_js_ident_continue(bytes[end]);
@@ -7495,59 +8062,64 @@ fn transpile_typescript_module(source: &str, name: &str) -> std::result::Result<
 /// per-call hostcalls are needed.
 #[allow(clippy::too_many_lines)]
 fn build_node_os_module() -> String {
+    fn js_string(value: &str) -> String {
+        serde_json::to_string(value).expect("serialize node:os string")
+    }
+
     // Map Rust target constants to Node.js conventions.
-    let node_platform = match std::env::consts::OS {
+    let node_platform = js_string(match std::env::consts::OS {
         "macos" => "darwin",
         "windows" => "win32",
         other => other, // "linux", "freebsd", etc.
-    };
-    let node_arch = match std::env::consts::ARCH {
+    });
+    let node_arch = js_string(match std::env::consts::ARCH {
         "x86_64" => "x64",
         "aarch64" => "arm64",
         "x86" => "ia32",
         "arm" => "arm",
         other => other,
-    };
-    let node_type = match std::env::consts::OS {
+    });
+    let node_type = js_string(match std::env::consts::OS {
         "linux" => "Linux",
         "macos" => "Darwin",
         "windows" => "Windows_NT",
         other => other,
-    };
-    // Escape backslashes for safe JS string interpolation (Windows paths).
-    let tmpdir = std::env::temp_dir()
-        .display()
-        .to_string()
-        .replace('\\', "\\\\");
-    let homedir = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .unwrap_or_else(|_| "/home/unknown".to_string())
-        .replace('\\', "\\\\");
+    });
+    let tmpdir = js_string(&std::env::temp_dir().display().to_string());
+    let homedir = js_string(
+        &std::env::var("HOME")
+            .or_else(|_| std::env::var("USERPROFILE"))
+            .unwrap_or_else(|_| "/home/unknown".to_string()),
+    );
     // Read hostname from /etc/hostname (Linux) or fall back to env/default.
-    let hostname = std::fs::read_to_string("/etc/hostname")
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .or_else(|| std::env::var("HOSTNAME").ok())
-        .or_else(|| std::env::var("COMPUTERNAME").ok())
-        .unwrap_or_else(|| "localhost".to_string());
+    let hostname = js_string(
+        &std::fs::read_to_string("/etc/hostname")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .or_else(|| std::env::var("HOSTNAME").ok())
+            .or_else(|| std::env::var("COMPUTERNAME").ok())
+            .unwrap_or_else(|| "localhost".to_string()),
+    );
     let num_cpus = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
-    let eol = if cfg!(windows) { "\\r\\n" } else { "\\n" };
-    let dev_null = if cfg!(windows) {
-        "\\\\\\\\.\\\\NUL"
+    let eol = js_string(if cfg!(windows) { "\r\n" } else { "\n" });
+    let dev_null = js_string(if cfg!(windows) {
+        r"\\.\NUL"
     } else {
         "/dev/null"
-    };
-    let username = std::env::var("USER")
-        .or_else(|_| std::env::var("USERNAME"))
-        .unwrap_or_else(|_| "unknown".to_string());
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| {
+    });
+    let username = js_string(
+        &std::env::var("USER")
+            .or_else(|_| std::env::var("USERNAME"))
+            .unwrap_or_else(|_| "unknown".to_string()),
+    );
+    let shell = js_string(&std::env::var("SHELL").unwrap_or_else(|_| {
         if cfg!(windows) {
             "cmd.exe".to_string()
         } else {
             "/bin/sh".to_string()
         }
-    });
+    }));
     // Read uid/gid from /proc/self/status on Linux, fall back to defaults.
     let (uid, gid) = read_proc_uid_gid().unwrap_or((1000, 1000));
 
@@ -7556,18 +8128,18 @@ fn build_node_os_module() -> String {
 
     format!(
         r#"
-const _platform = "{node_platform}";
-const _arch = "{node_arch}";
-const _type = "{node_type}";
-const _tmpdir = "{tmpdir}";
-const _homedir = "{homedir}";
-const _hostname = "{hostname}";
-const _eol = "{eol}";
-const _devNull = "{dev_null}";
+const _platform = {node_platform};
+const _arch = {node_arch};
+const _type = {node_type};
+const _tmpdir = {tmpdir};
+const _homedir = {homedir};
+const _hostname = {hostname};
+const _eol = {eol};
+const _devNull = {dev_null};
 const _uid = {uid};
 const _gid = {gid};
-const _username = "{username}";
-const _shell = "{shell}";
+const _username = {username};
+const _shell = {shell};
 const _numCpus = {num_cpus};
 const _cpus = [];
 for (let i = 0; i < _numCpus; i++) _cpus.push({{ model: "cpu", speed: 2400, times: {{ user: 0, nice: 0, sys: 0, idle: 0, irq: 0 }} }});
@@ -7575,7 +8147,7 @@ for (let i = 0; i < _numCpus; i++) _cpus.push({{ model: "cpu", speed: 2400, time
 export function homedir() {{
   const env_home =
     globalThis.pi && globalThis.pi.env && typeof globalThis.pi.env.get === "function"
-      ? globalThis.pi.env.get("HOME")
+      ? globalThis.pi.env.get("HOME") || globalThis.pi.env.get("USERPROFILE")
       : undefined;
   return env_home || _homedir;
 }}
@@ -7647,10 +8219,33 @@ fn read_proc_uid_gid() -> Option<(u32, u32)> {
 #[allow(clippy::too_many_lines)]
 fn default_virtual_modules() -> HashMap<String, String> {
     let mut modules = HashMap::new();
+    modules.insert("bun:sqlite".to_string(), sqlite::MODULE_SOURCE.to_string());
+
+    // Some extensions import Agent unconditionally but feature-detect native
+    // Undici before using it. Keep that import resolvable without advertising
+    // a socket/dispatcher implementation or loading arbitrary npm packages.
+    modules.insert(
+        "undici".to_string(),
+        compressed_js_literal!(r"
+export class Agent {
+  constructor() {
+    const error = new Error('Custom Undici dispatchers are not available in PiJS; use global fetch through the host HTTP capability');
+    error.code = 'ERR_PIJS_UNSUPPORTED_DISPATCHER';
+    throw error;
+  }
+}
+export const fetch = globalThis.fetch;
+export const Headers = globalThis.Headers;
+export const Response = globalThis.Response;
+export default { Agent, fetch, Headers, Response };
+")
+        .trim()
+        .to_string(),
+    );
 
     modules.insert(
         "@sinclair/typebox".to_string(),
-        r#"
+        compressed_js_literal!(r#"
 export const Type = {
   String: (opts = {}) => ({ type: "string", ...opts }),
   Number: (opts = {}) => ({ type: "number", ...opts }),
@@ -7683,16 +8278,223 @@ export const Type = {
   Record: (keySchema, valueSchema, opts = {}) => ({ type: "object", additionalProperties: valueSchema, ...opts }),
   Ref: (ref, opts = {}) => ({ $ref: ref, ...opts }),
   Intersect: (schemas, opts = {}) => ({ allOf: schemas, ...opts }),
+  Unsafe: (schema = {}) => schema,
 };
 export default { Type };
-"#
+"#)
+        .trim()
+        .to_string(),
+    );
+
+    modules.insert(
+        "typebox/compile".to_string(),
+        compressed_js_literal!(r##"
+function pointer(path, key) {
+  const segment = String(key).replace(/~/g, "~0").replace(/\//g, "~1");
+  return `${path}/${segment}`;
+}
+
+function pushError(errors, instancePath, message) {
+  errors.push({ instancePath, message });
+  return false;
+}
+
+function isRecord(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function matchesType(type, value) {
+  switch (type) {
+    case "null": return value === null;
+    case "boolean": return typeof value === "boolean";
+    case "string": return typeof value === "string";
+    case "number": return typeof value === "number" && Number.isFinite(value);
+    case "integer": return typeof value === "number" && Number.isFinite(value) && Number.isInteger(value);
+    case "array": return Array.isArray(value);
+    case "object": return isRecord(value);
+    default: return true;
+  }
+}
+
+function validate(schema, value, instancePath, errors, rootSchema) {
+  if (schema === true) return true;
+  if (schema === false) return pushError(errors, instancePath, "must not match this schema");
+  if (!schema || typeof schema !== "object" || Array.isArray(schema)) {
+    return pushError(errors, instancePath, "has an invalid schema");
+  }
+
+  if (Object.prototype.hasOwnProperty.call(schema, "const") && !Object.is(value, schema.const)) {
+    return pushError(errors, instancePath, `must equal ${JSON.stringify(schema.const)}`);
+  }
+  if (Array.isArray(schema.enum) && !schema.enum.some((candidate) => Object.is(candidate, value))) {
+    return pushError(errors, instancePath, "must be one of the allowed values");
+  }
+
+  if (Array.isArray(schema.anyOf)) {
+    const matched = schema.anyOf.some((branch) => {
+      const branchErrors = [];
+      return validate(branch, value, instancePath, branchErrors, rootSchema);
+    });
+    if (!matched) return pushError(errors, instancePath, "must match at least one schema");
+  }
+  if (Array.isArray(schema.oneOf)) {
+    let matches = 0;
+    for (const branch of schema.oneOf) {
+      const branchErrors = [];
+      if (validate(branch, value, instancePath, branchErrors, rootSchema)) matches += 1;
+    }
+    if (matches !== 1) return pushError(errors, instancePath, "must match exactly one schema");
+  }
+  if (Array.isArray(schema.allOf)) {
+    let valid = true;
+    for (const branch of schema.allOf) {
+      if (!validate(branch, value, instancePath, errors, rootSchema)) valid = false;
+    }
+    if (!valid) return false;
+  }
+  if (schema.not !== undefined) {
+    const branchErrors = [];
+    if (validate(schema.not, value, instancePath, branchErrors, rootSchema)) {
+      return pushError(errors, instancePath, "must not match the excluded schema");
+    }
+  }
+
+  if (typeof schema.$ref === "string" && schema.$ref.startsWith("#/$defs/")) {
+    const key = schema.$ref.slice("#/$defs/".length).replace(/~1/g, "/").replace(/~0/g, "~");
+    const referenced = rootSchema && rootSchema.$defs && rootSchema.$defs[key];
+    if (!referenced) return pushError(errors, instancePath, `references unknown schema ${schema.$ref}`);
+    return validate(referenced, value, instancePath, errors, rootSchema);
+  }
+
+  if (schema.type !== undefined) {
+    const allowedTypes = Array.isArray(schema.type) ? schema.type : [schema.type];
+    if (!allowedTypes.some((type) => matchesType(type, value))) {
+      return pushError(errors, instancePath, `must be ${allowedTypes.join(" or ")}`);
+    }
+  }
+
+  let valid = true;
+  if (typeof value === "string") {
+    if (Number.isInteger(schema.minLength) && value.length < schema.minLength) {
+      valid = pushError(errors, instancePath, `must have at least ${schema.minLength} characters`) && valid;
+    }
+    if (Number.isInteger(schema.maxLength) && value.length > schema.maxLength) {
+      valid = pushError(errors, instancePath, `must have at most ${schema.maxLength} characters`) && valid;
+    }
+    if (typeof schema.pattern === "string") {
+      try {
+        if (!(new RegExp(schema.pattern)).test(value)) {
+          valid = pushError(errors, instancePath, `must match pattern ${schema.pattern}`) && valid;
+        }
+      } catch {
+        valid = pushError(errors, instancePath, "uses an invalid regular expression") && valid;
+      }
+    }
+  }
+
+  if (typeof value === "number" && Number.isFinite(value)) {
+    if (typeof schema.minimum === "number" && value < schema.minimum) {
+      valid = pushError(errors, instancePath, `must be >= ${schema.minimum}`) && valid;
+    }
+    if (typeof schema.maximum === "number" && value > schema.maximum) {
+      valid = pushError(errors, instancePath, `must be <= ${schema.maximum}`) && valid;
+    }
+    if (typeof schema.exclusiveMinimum === "number" && value <= schema.exclusiveMinimum) {
+      valid = pushError(errors, instancePath, `must be > ${schema.exclusiveMinimum}`) && valid;
+    }
+    if (typeof schema.exclusiveMaximum === "number" && value >= schema.exclusiveMaximum) {
+      valid = pushError(errors, instancePath, `must be < ${schema.exclusiveMaximum}`) && valid;
+    }
+  }
+
+  if (Array.isArray(value)) {
+    if (Number.isInteger(schema.minItems) && value.length < schema.minItems) {
+      valid = pushError(errors, instancePath, `must contain at least ${schema.minItems} items`) && valid;
+    }
+    if (Number.isInteger(schema.maxItems) && value.length > schema.maxItems) {
+      valid = pushError(errors, instancePath, `must contain at most ${schema.maxItems} items`) && valid;
+    }
+    if (Array.isArray(schema.items)) {
+      for (let index = 0; index < schema.items.length && index < value.length; index += 1) {
+        if (!validate(schema.items[index], value[index], pointer(instancePath, index), errors, rootSchema)) valid = false;
+      }
+    } else if (schema.items && typeof schema.items === "object") {
+      for (let index = 0; index < value.length; index += 1) {
+        if (!validate(schema.items, value[index], pointer(instancePath, index), errors, rootSchema)) valid = false;
+      }
+    }
+  }
+
+  if (isRecord(value)) {
+    const properties = isRecord(schema.properties) ? schema.properties : {};
+    if (Array.isArray(schema.required)) {
+      for (const key of schema.required) {
+        if (typeof key === "string" && !Object.prototype.hasOwnProperty.call(value, key)) {
+          valid = pushError(errors, pointer(instancePath, key), "is required") && valid;
+        }
+      }
+    }
+    for (const [key, propertySchema] of Object.entries(properties)) {
+      if (Object.prototype.hasOwnProperty.call(value, key)
+          && !validate(propertySchema, value[key], pointer(instancePath, key), errors, rootSchema)) {
+        valid = false;
+      }
+    }
+    for (const [key, propertyValue] of Object.entries(value)) {
+      if (Object.prototype.hasOwnProperty.call(properties, key)) continue;
+      if (schema.additionalProperties === false) {
+        valid = pushError(errors, pointer(instancePath, key), "is not allowed") && valid;
+      } else if (schema.additionalProperties && typeof schema.additionalProperties === "object"
+          && !validate(schema.additionalProperties, propertyValue, pointer(instancePath, key), errors, rootSchema)) {
+        valid = false;
+      }
+    }
+  }
+
+  return valid;
+}
+
+export class Validator {
+  constructor(...args) {
+    this.context = args.length > 1 ? args[0] : {};
+    this.schema = args.length > 1 ? args[1] : args[0];
+    if (this.schema !== true && this.schema !== false
+        && (!this.schema || typeof this.schema !== "object" || Array.isArray(this.schema))) {
+      throw new TypeError("Compile expects a JSON Schema object or boolean schema");
+    }
+  }
+  Check(value) {
+    return validate(this.schema, value, "", [], this.schema);
+  }
+  Errors(value) {
+    const errors = [];
+    validate(this.schema, value, "", errors, this.schema);
+    return errors;
+  }
+  Context() { return this.context; }
+  Type() { return this.schema; }
+  IsAccelerated() { return false; }
+  Code() { return ""; }
+  Parse(value) {
+    if (this.Check(value)) return value;
+    const first = this.Errors(value)[0];
+    throw new TypeError(first ? `${first.instancePath || "root"}: ${first.message}` : "schema validation failed");
+  }
+}
+
+export function Compile(...args) {
+  return new Validator(...args);
+}
+
+export default Compile;
+"##)
         .trim()
         .to_string(),
     );
 
     modules.insert(
         "@mariozechner/pi-ai".to_string(),
-        r#"
+        compressed_js_literal!(r#"
 export function StringEnum(values, opts = {}) {
   const list = Array.isArray(values) ? values.map((v) => String(v)) : [];
   return { type: "string", enum: list, ...opts };
@@ -7936,8 +8738,17 @@ function completionText(result) {
     .join("");
 }
 
-function completeSimpleArgs(model, prompt, opts) {
-  if (prompt === undefined || (prompt && typeof prompt === "object" && !Array.isArray(prompt))) {
+function completeSimpleArgs(model, prompt, opts, argumentCount) {
+  const hasModelIdentity = model && typeof model === "object" && !Array.isArray(model) &&
+    ("api" in model || "id" in model || "provider" in model || "modelId" in model);
+  const hasContext = prompt && typeof prompt === "object" && !Array.isArray(prompt) &&
+    ("messages" in prompt || "systemPrompt" in prompt || "role" in prompt ||
+      "prompt" in prompt || "input" in prompt || "message" in prompt);
+  // Keep the host shorthand completeSimple(prompt, options), but a normal
+  // Model + Context call must retain its model, messages and third argument.
+  const shorthandOptions = argumentCount < 3 && !hasModelIdentity && !hasContext &&
+    prompt && typeof prompt === "object" && !Array.isArray(prompt);
+  if (prompt === undefined || shorthandOptions) {
     return {
       model: undefined,
       prompt: model,
@@ -8008,11 +8819,12 @@ function assistantMessageFor(model, text, result) {
   const usageObj = resultObj.usage && typeof resultObj.usage === "object" ? resultObj.usage : {};
   const usageCost = usageObj.cost && typeof usageObj.cost === "object" ? usageObj.cost : {};
   return {
+    ...resultObj,
     role: "assistant",
-    content: text ? [{ type: "text", text }] : [],
-    api: modelObj.api || "",
-    provider: modelObj.provider || "",
-    model: modelObj.id || modelObj.modelId || (typeof model === "string" ? model : ""),
+    content: Array.isArray(resultObj.content) ? resultObj.content : text ? [{ type: "text", text }] : [],
+    api: resultObj.api || modelObj.api || "",
+    provider: resultObj.provider || modelObj.provider || "",
+    model: resultObj.model || modelObj.id || modelObj.modelId || (typeof model === "string" ? model : ""),
     usage: {
       input: Number(usageObj.input ?? 0),
       output: Number(usageObj.output ?? 0),
@@ -8032,7 +8844,45 @@ function assistantMessageFor(model, text, result) {
   };
 }
 
-function providerBridgeStream(name, model, context, opts = {}, simple = true) {
+function publishBridgeCompletion(stream, message) {
+  if (message.stopReason === "error" || message.stopReason === "aborted") {
+    stream.push({ type: "error", reason: message.stopReason, error: message });
+    return;
+  }
+  // The completion host owns the provider request and currently returns its
+  // terminal envelope. Replay that envelope as valid assistant events; never
+  // flatten tool calls, signed reasoning or usage into a text-only reply.
+  let content = [];
+  stream.push({ type: "start", partial: { ...message, content } });
+  for (const block of message.content) {
+    const contentIndex = content.length;
+    const before = content;
+    content = before.concat([block]);
+    const partial = { ...message, content };
+    if (block.type === "text" || block.type === "thinking") {
+      const kind = block.type;
+      const value = kind === "text" ? block.text : block.thinking;
+      stream.push({
+        type: `${kind}_start`, contentIndex,
+        partial: { ...message, content: before.concat([{ ...block, [kind]: "" }]) },
+      });
+      if (value) stream.push({ type: `${kind}_delta`, contentIndex, delta: value, partial });
+      stream.push({ type: `${kind}_end`, contentIndex, content: value, partial });
+    } else if (block.type === "toolCall") {
+      stream.push({
+        type: "toolcall_start", contentIndex,
+        partial: { ...message, content: before.concat([{ ...block, arguments: {} }]) },
+      });
+      stream.push({
+        type: "toolcall_delta", contentIndex, delta: JSON.stringify(block.arguments), partial,
+      });
+      stream.push({ type: "toolcall_end", contentIndex, toolCall: block, partial });
+    }
+  }
+  stream.push({ type: "done", reason: message.stopReason, message });
+}
+
+function providerBridgeStream(name, model, context, opts = {}) {
   const stream = createAssistantMessageEventStream();
   (async () => {
     try {
@@ -8040,17 +8890,16 @@ function providerBridgeStream(name, model, context, opts = {}, simple = true) {
         model,
         context,
         options: opts || {},
-        simple,
+        // `simple` is the host's text-only response shorthand, not the public
+        // streamSimple contract. Both stream APIs need the complete message.
+        simple: false,
       });
       const text = completionText(result);
-      if (text) {
-        stream.push({ type: "text_delta", delta: text });
-      }
-      const message =
+      const envelope =
         result && typeof result === "object" && result.message && typeof result.message === "object"
           ? result.message
-          : assistantMessageFor(model, text, result);
-      stream.push({ type: "done", message });
+          : result;
+      publishBridgeCompletion(stream, assistantMessageFor(model, text, envelope));
     } catch (error) {
       const message = assistantMessageFor(model, "", {});
       message.stopReason = "error";
@@ -8067,52 +8916,201 @@ function apiProviderBridge(api) {
   return {
     api: apiId,
     stream: (model, context, opts = {}) =>
-      providerBridgeStream(`getApiProvider(${apiId}).stream`, model, context, opts, false),
+      providerBridgeStream(`getApiProvider(${apiId}).stream`, model, context, opts),
     streamSimple: (model, context, opts = {}) =>
-      providerBridgeStream(`getApiProvider(${apiId}).streamSimple`, model, context, opts, true),
+      providerBridgeStream(`getApiProvider(${apiId}).streamSimple`, model, context, opts),
   };
 }
 
-async function* streamSimple(name, model, context, opts = {}) {
-  const result = await callProviderBridge(name, "completeAi", {
-    model,
-    context,
-    options: opts || {},
-    simple: true,
-  });
-  const text = completionText(result);
-  if (text) yield text;
+// The upstream compatibility API keeps a process-wide registry of API
+// implementations.  Extensions use it to introduce a wire protocol before
+// registering models that select that protocol through `pi.registerProvider`.
+// Keep the owner alongside the source ID so the extension registry can refuse
+// to silently bind one extension's provider to another extension's handler.
+const __piApiProviderRegistry = new Map();
+
+function apiProviderOwner() {
+  return typeof globalThis.__pi_get_current_extension_id === "function"
+    ? String(globalThis.__pi_get_current_extension_id() ?? "").trim()
+    : "";
 }
 
+function wrapRegisteredApiProvider(provider) {
+  if (!provider || typeof provider !== "object" || Array.isArray(provider)) {
+    throw new Error("registerApiProvider: provider must be an object");
+  }
+  const api = String(provider.api ?? "").trim();
+  if (!api) {
+    throw new Error("registerApiProvider: provider.api is required");
+  }
+  if (typeof provider.stream !== "function") {
+    throw new Error("registerApiProvider: provider.stream must be a function");
+  }
+  if (typeof provider.streamSimple !== "function") {
+    throw new Error("registerApiProvider: provider.streamSimple must be a function");
+  }
+
+  const ensureMatchingApi = (model) => {
+    if (model && typeof model === "object" && model.api !== undefined && String(model.api) !== api) {
+      throw new Error(`Mismatched api: ${String(model.api)} expected ${api}`);
+    }
+  };
+  return {
+    api,
+    stream: (model, context, options) => {
+      ensureMatchingApi(model);
+      return provider.stream(model, context, options);
+    },
+    streamSimple: (model, context, options) => {
+      ensureMatchingApi(model);
+      return provider.streamSimple(model, context, options);
+    },
+  };
+}
+
+export function registerApiProvider(provider, sourceId = undefined) {
+  const wrapped = wrapRegisteredApiProvider(provider);
+  __piApiProviderRegistry.set(wrapped.api, {
+    provider: wrapped,
+    extensionId: apiProviderOwner(),
+    sourceId: sourceId === undefined ? undefined : String(sourceId),
+  });
+}
+
+export function unregisterApiProviders(sourceId) {
+  const source = String(sourceId ?? "");
+  const owner = apiProviderOwner();
+  for (const [api, entry] of __piApiProviderRegistry.entries()) {
+    if (entry.sourceId === source && (!entry.extensionId || entry.extensionId === owner)) {
+      __piApiProviderRegistry.delete(api);
+    }
+  }
+}
+
+export function getApiProviders() {
+  return Array.from(__piApiProviderRegistry.values(), (entry) => entry.provider);
+}
+
+// The lookup exposes only handlers already registered by the active extension.
+// The reset hook is separately bridge-secret authenticated because it is a
+// host lifecycle control, not part of the extension-facing compatibility API.
+Object.defineProperty(globalThis, "__pi_get_registered_api_provider", {
+  value: (api) => {
+    const entry = __piApiProviderRegistry.get(String(api ?? "").trim());
+    const owner = apiProviderOwner();
+    if (entry && entry.extensionId && entry.extensionId !== owner) {
+      return undefined;
+    }
+    return entry || undefined;
+  },
+  writable: false,
+  configurable: false,
+  enumerable: false,
+});
+Object.defineProperty(globalThis, "__pi_reset_api_provider_registry", {
+  value: (secret) => {
+    const matches = globalThis.__pi_bridge_secret_matches_native;
+    if (typeof matches !== "function" || !matches(secret)) {
+      throw new Error("PiJS provider registry reset denied");
+    }
+    const clear = globalThis.__pi_map_clear_primordial;
+    if (typeof clear !== "function") {
+      throw new Error("PiJS provider registry reset primordial is unavailable");
+    }
+    clear(__piApiProviderRegistry);
+  },
+  writable: false,
+  configurable: false,
+  enumerable: false,
+});
+Object.defineProperty(globalThis, "__pi_api_provider_registry_size", {
+  value: () => {
+    const size = globalThis.__pi_map_size_primordial;
+    if (typeof size !== "function") {
+      throw new Error("PiJS provider registry size primordial is unavailable");
+    }
+    return size(__piApiProviderRegistry);
+  },
+  writable: false,
+  configurable: false,
+  enumerable: false,
+});
+
 export function streamSimpleAnthropic(model, context, opts = {}) {
-  return streamSimple("streamSimpleAnthropic", model, context, opts);
+  return providerBridgeStream("streamSimpleAnthropic", model, context, opts);
 }
 
 export function streamSimpleOpenAIResponses(model, context, opts = {}) {
-  return streamSimple("streamSimpleOpenAIResponses", model, context, opts);
+  return providerBridgeStream("streamSimpleOpenAIResponses", model, context, opts);
 }
 
 export function streamSimpleOpenAICompletions(model, context, opts = {}) {
-  return streamSimple("streamSimpleOpenAICompletions", model, context, opts);
+  return providerBridgeStream("streamSimpleOpenAICompletions", model, context, opts);
+}
+
+export function stream(model, context, opts = {}) {
+  const api = model && typeof model === "object" ? model.api : undefined;
+  if (!api) {
+    return providerBridgeStream("stream", model, context, opts || {});
+  }
+  const provider = getApiProvider(api);
+  if (!provider) {
+    throw new Error(`No API provider registered for api: ${String(api ?? "")}`);
+  }
+  return provider.stream(model, context, opts || {});
+}
+
+export function streamSimple(model, context, opts = {}) {
+  const api = model && typeof model === "object" ? model.api : undefined;
+  if (!api) {
+    return providerBridgeStream("streamSimple", model, context, opts || {});
+  }
+  const provider = getApiProvider(api);
+  if (!provider) {
+    throw new Error(`No API provider registered for api: ${String(api ?? "")}`);
+  }
+  return provider.streamSimple(model, context, opts || {});
 }
 
 export async function complete(model, messages, opts = {}) {
-  return await callProviderBridge("complete", "completeAi", {
-    model,
-    context: messages,
-    options: opts || {},
-    simple: false,
-  });
+  if (!model || typeof model !== "object" || !model.api) {
+    return await callProviderBridge("complete", "completeAi", {
+      model,
+      context: messages,
+      options: opts || {},
+      simple: false,
+    });
+  }
+  const eventStream = stream(model, messages, opts);
+  if (!eventStream || typeof eventStream.result !== "function") {
+    throw new Error("complete: provider.stream must return an AssistantMessageEventStream");
+  }
+  const result = await eventStream.result();
+  if (result && result.stopReason === "error" && result.errorMessage) {
+    throw new Error(String(result.errorMessage));
+  }
+  return result;
 }
 
 export async function completeSimple(model, prompt, opts = {}) {
-  const args = completeSimpleArgs(model, prompt, opts);
-  return await callProviderBridge("completeSimple", "completeAi", {
-    model: args.model,
-    context: args.prompt,
-    options: args.opts || {},
-    simple: true,
-  });
+  const args = completeSimpleArgs(model, prompt, opts, arguments.length);
+  if (!args.model || typeof args.model !== "object" || !args.model.api) {
+    return await callProviderBridge("completeSimple", "completeAi", {
+      model: args.model,
+      context: args.prompt,
+      options: args.opts || {},
+      simple: true,
+    });
+  }
+  const eventStream = streamSimple(args.model, args.prompt, args.opts || {});
+  if (!eventStream || typeof eventStream.result !== "function") {
+    throw new Error("completeSimple: provider.streamSimple must return an AssistantMessageEventStream");
+  }
+  const result = await eventStream.result();
+  if (result && result.stopReason === "error" && result.errorMessage) {
+    throw new Error(String(result.errorMessage));
+  }
+  return result;
 }
 
 export function getProviders() {
@@ -8132,7 +9130,8 @@ export function getModel(provider, modelId) {
 
 export function getApiProvider(api) {
   if (arguments.length >= 1) {
-    return apiProviderBridge(api);
+    const registered = __piApiProviderRegistry.get(String(api ?? "").trim());
+    return registered ? registered.provider : apiProviderBridge(api);
   }
   return (async () => {
     await callProviderBridge("getApiProvider", "getModels", {});
@@ -8156,15 +9155,88 @@ export async function refreshOpenAICodexToken(_refreshToken) {
   failClosedUnsupported("refreshOpenAICodexToken");
 }
 
-export default { StringEnum, calculateCost, getEnvApiKey, getOAuthApiKey, createAssistantMessageEventStream, streamSimpleAnthropic, streamSimpleOpenAIResponses, streamSimpleOpenAICompletions, complete, completeSimple, getProviders, getModel, getApiProvider, getModels, loginOpenAICodex, refreshOpenAICodexToken };
-"#
+// Context-overflow classification. Mirrors the host classifier
+// (`crate::error::is_context_overflow`) so extensions that import
+// `isContextOverflow` from pi-ai (e.g. custom compaction/recovery hooks)
+// reach the same verdict the agent loop itself uses. Keep the two in sync;
+// `pijs_pi_ai_is_context_overflow_matches_host_classifier` pins parity.
+const __piOverflowSubstrings = [
+  "prompt is too long",
+  "input is too long for requested model",
+  "exceeds the context window",
+  "reduce the length of the messages",
+  "exceeds the available context size",
+  "greater than the context length",
+  "context window exceeds limit",
+  "exceeded model token limit",
+  "too many tokens",
+  "token limit exceeded",
+];
+const __piOverflowPatterns = [
+  /input token count.*exceeds the maximum/,
+  /maximum prompt length is \d+/,
+  /maximum context length is \d+ tokens/,
+  /exceeds the limit of \d+/,
+  /context[_ ]length[_ ]exceeded/,
+  /^4(00|13)\s*(status code)?\s*\(no body\)/,
+];
+
+function __piOverflowMessageMatches(text) {
+  const lower = String(text ?? "").toLowerCase();
+  if (!lower) return false;
+  if (__piOverflowSubstrings.some((needle) => lower.includes(needle))) return true;
+  return __piOverflowPatterns.some((pattern) => pattern.test(lower));
+}
+
+function __piFiniteNumber(value) {
+  const n = typeof value === "number" ? value : Number(value);
+  return Number.isFinite(n) ? n : undefined;
+}
+
+// isContextOverflow(message, contextWindow?)
+//   message: an AssistantMessage ({ stopReason, errorMessage, usage }) as
+//            pi-ai callers pass, or a bare error string.
+//   contextWindow: the model's context window in tokens (optional).
+// Upstream-faithful semantics (bd-5tuh8): usage-only
+// "silent" overflow classifies ONLY when stopReason === "stop", and textual
+// overflow classifies ONLY when stopReason === "error". Bare strings keep
+// direct textual classification; every other stop reason ("toolUse",
+// "length", "aborted", unknown, or absent) is never a context overflow, so
+// compaction/recovery hooks cannot fire mid-tool-call or on aborts.
+export function isContextOverflow(message, contextWindow) {
+  if (typeof message === "string") {
+    return __piOverflowMessageMatches(message);
+  }
+  if (!message || typeof message !== "object") {
+    return false;
+  }
+  const usage = message.usage && typeof message.usage === "object" ? message.usage : undefined;
+  const window = __piFiniteNumber(contextWindow);
+  switch (message.stopReason) {
+    case "stop": {
+      if (!usage || window === undefined || window <= 0) {
+        return false;
+      }
+      const input = __piFiniteNumber(usage.input ?? usage.inputTokens ?? usage.input_tokens) ?? 0;
+      const cacheRead = __piFiniteNumber(usage.cacheRead ?? usage.cache_read) ?? 0;
+      return input + cacheRead > window;
+    }
+    case "error":
+      return __piOverflowMessageMatches(message.errorMessage);
+    default:
+      return false;
+  }
+}
+
+export default { StringEnum, calculateCost, getEnvApiKey, getOAuthApiKey, createAssistantMessageEventStream, stream, streamSimple, streamSimpleAnthropic, streamSimpleOpenAIResponses, streamSimpleOpenAICompletions, complete, completeSimple, getProviders, getModel, getApiProvider, getApiProviders, registerApiProvider, unregisterApiProviders, getModels, loginOpenAICodex, refreshOpenAICodexToken, isContextOverflow };
+"#)
         .trim()
         .to_string(),
     );
 
     modules.insert(
         "@mariozechner/pi-tui".to_string(),
-        r#"
+        compressed_js_literal!(r#"
 export function matchesKey(_data, _key) {
   return false;
 }
@@ -8205,6 +9277,101 @@ export class Spacer {
 
 export function visibleWidth(str) {
   return String(str ?? "").length;
+}
+
+let _cellDimensions = { widthPx: 9, heightPx: 18 };
+let _terminalCapabilities = { images: null, trueColor: false, hyperlinks: false };
+let _nextImageId = 1;
+
+export function getCellDimensions() {
+  return { ..._cellDimensions };
+}
+
+export function setCellDimensions(dimensions) {
+  const widthPx = Number(dimensions?.widthPx);
+  const heightPx = Number(dimensions?.heightPx);
+  if (Number.isFinite(widthPx) && widthPx > 0 && Number.isFinite(heightPx) && heightPx > 0) {
+    _cellDimensions = { widthPx, heightPx };
+  }
+}
+
+export function detectCapabilities() {
+  return { ..._terminalCapabilities };
+}
+
+export function getCapabilities() {
+  return { ..._terminalCapabilities };
+}
+
+export function setCapabilities(capabilities) {
+  _terminalCapabilities = {
+    images: capabilities?.images ?? null,
+    trueColor: Boolean(capabilities?.trueColor),
+    hyperlinks: Boolean(capabilities?.hyperlinks),
+  };
+}
+
+export function resetCapabilitiesCache() {}
+
+export function allocateImageId() {
+  const imageId = _nextImageId;
+  _nextImageId += 1;
+  return imageId;
+}
+
+export function calculateImageRows(imageDimensions, targetWidthCells, cellDimensions = getCellDimensions()) {
+  const imageWidth = Number(imageDimensions?.widthPx);
+  const imageHeight = Number(imageDimensions?.heightPx);
+  const widthCells = Math.max(1, Number(targetWidthCells) || 1);
+  const cellWidth = Math.max(1, Number(cellDimensions?.widthPx) || 9);
+  const cellHeight = Math.max(1, Number(cellDimensions?.heightPx) || 18);
+  if (!Number.isFinite(imageWidth) || imageWidth <= 0 || !Number.isFinite(imageHeight) || imageHeight <= 0) return 1;
+  return Math.max(1, Math.ceil((imageHeight * widthCells * cellWidth) / (imageWidth * cellHeight)));
+}
+
+export function getPngDimensions(_base64Data) { return null; }
+export function getJpegDimensions(_base64Data) { return null; }
+export function getGifDimensions(_base64Data) { return null; }
+export function getWebpDimensions(_base64Data) { return null; }
+
+export function getImageDimensions(base64Data, mimeType) {
+  if (mimeType === "image/png") return getPngDimensions(base64Data);
+  if (mimeType === "image/jpeg") return getJpegDimensions(base64Data);
+  if (mimeType === "image/gif") return getGifDimensions(base64Data);
+  if (mimeType === "image/webp") return getWebpDimensions(base64Data);
+  return null;
+}
+
+export function encodeKitty(base64Data, _options = {}) {
+  return `\x1b_Ga=T,f=100,q=2;${String(base64Data ?? "")}\x1b\\`;
+}
+
+export function encodeITerm2(base64Data, _options = {}) {
+  return `\x1b]1337;File=inline=1:${String(base64Data ?? "")}\x07`;
+}
+
+export function deleteKittyImage(imageId) {
+  return `\x1b_Ga=d,d=I,i=${Number(imageId) || 0},q=2\x1b\\`;
+}
+
+export function deleteAllKittyImages() {
+  return "\x1b_Ga=d,d=A,q=2\x1b\\";
+}
+
+export function renderImage(_base64Data, _imageDimensions, _options = {}) {
+  return null;
+}
+
+export function hyperlink(text, url) {
+  return `\x1b]8;;${String(url ?? "")}\x1b\\${String(text ?? "")}\x1b]8;;\x1b\\`;
+}
+
+export function imageFallback(mimeType, dimensions, filename) {
+  const parts = [];
+  if (filename) parts.push(String(filename));
+  parts.push(`[${String(mimeType ?? "image")}]`);
+  if (dimensions?.widthPx && dimensions?.heightPx) parts.push(`${dimensions.widthPx}x${dimensions.heightPx}`);
+  return `[Image: ${parts.join(" ")}]`;
 }
 
 export function wrapTextWithAnsi(text, _width) {
@@ -8391,14 +9558,14 @@ export class Image {
 }
 
 export default { matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi, Text, TruncatedText, Container, Markdown, Spacer, Editor, Box, SelectList, Input, ProcessTerminal, Image, CURSOR_MARKER, isKeyRelease, parseKey, Key, DynamicBorder, SettingsList, fuzzyMatch, getEditorKeybindings, fuzzyFilter, CancellableLoader };
-"#
+"#)
         .trim()
         .to_string(),
     );
 
     modules.insert(
         "@mariozechner/pi-coding-agent".to_string(),
-        r#"
+        compressed_js_literal!(r#"
 export const VERSION = "0.0.0";
 
 export const DEFAULT_MAX_LINES = 2000;
@@ -8522,8 +9689,122 @@ export function parseSessionEntries(text) {
   return out;
 }
 
-export function convertToLlm(entries) {
-  return entries;
+// Byte-identical to upstream messages.ts and the Rust builder constants in
+// session.rs (COMPACTION_SUMMARY_PREFIX/SUFFIX, BRANCH_SUMMARY_PREFIX/SUFFIX).
+// Note the deliberate upstream asymmetry: the branch suffix has no leading
+// newline while the compaction suffix does.
+export const COMPACTION_SUMMARY_PREFIX =
+  "The conversation history before this point was compacted into the following summary:\n\n<summary>\n";
+export const COMPACTION_SUMMARY_SUFFIX = "\n</summary>";
+export const BRANCH_SUMMARY_PREFIX =
+  "The following is a summary of a branch that this conversation came back from:\n\n<summary>\n";
+export const BRANCH_SUMMARY_SUFFIX = "</summary>";
+
+// TS-faithful port of upstream messages.ts bashExecutionToText. This is
+// deliberately NOT the Rust session.rs variant: upstream always inserts a
+// newline before the closing fence (even after a trailing-newline output)
+// and only mentions truncation when fullOutputPath is present.
+export function bashExecutionToText(msg) {
+  const m = msg && typeof msg === "object" ? msg : {};
+  let text = `Ran \`${m.command}\`\n`;
+  if (m.output) {
+    text += `\`\`\`\n${m.output}\n\`\`\``;
+  } else {
+    text += "(no output)";
+  }
+  if (m.cancelled) {
+    text += "\n\n(command cancelled)";
+  } else if (m.exitCode !== null && m.exitCode !== undefined && m.exitCode !== 0) {
+    text += `\n\nCommand exited with code ${m.exitCode}`;
+  }
+  if (m.truncated && m.fullOutputPath) {
+    text += `\n\n[Output truncated. Full output: ${m.fullOutputPath}]`;
+  }
+  return text;
+}
+
+export function createCustomMessage(customType, content, display, details, timestamp) {
+  return {
+    role: "custom",
+    customType,
+    content,
+    display,
+    details,
+    timestamp: new Date(timestamp).getTime(),
+  };
+}
+
+export function createBranchSummaryMessage(summary, fromId, timestamp) {
+  return {
+    role: "branchSummary",
+    summary,
+    fromId,
+    timestamp: new Date(timestamp).getTime(),
+  };
+}
+
+export function createCompactionSummaryMessage(summary, tokensBefore, timestamp) {
+  return {
+    role: "compactionSummary",
+    summary,
+    tokensBefore,
+    timestamp: new Date(timestamp).getTime(),
+  };
+}
+
+// Port of upstream messages.ts convertToLlm (gh #167 / bd-9wkml): transform
+// AgentMessages (including custom roles) into LLM-compatible messages.
+// Role-by-role parity with upstream; non-object entries and unknown roles are
+// dropped, mirroring upstream's exhaustive switch returning undefined.
+export function convertToLlm(messages) {
+  const list = Array.isArray(messages) ? messages : [];
+  const out = [];
+  for (const m of list) {
+    if (!m || typeof m !== "object") continue;
+    switch (m.role) {
+      case "bashExecution":
+        // Skip messages excluded from context (!! prefix).
+        if (m.excludeFromContext) break;
+        out.push({
+          role: "user",
+          content: [{ type: "text", text: bashExecutionToText(m) }],
+          timestamp: m.timestamp,
+        });
+        break;
+      case "custom": {
+        const content =
+          typeof m.content === "string" ? [{ type: "text", text: m.content }] : m.content;
+        out.push({ role: "user", content, timestamp: m.timestamp });
+        break;
+      }
+      case "branchSummary":
+        out.push({
+          role: "user",
+          content: [
+            { type: "text", text: BRANCH_SUMMARY_PREFIX + m.summary + BRANCH_SUMMARY_SUFFIX },
+          ],
+          timestamp: m.timestamp,
+        });
+        break;
+      case "compactionSummary":
+        out.push({
+          role: "user",
+          content: [
+            { type: "text", text: COMPACTION_SUMMARY_PREFIX + m.summary + COMPACTION_SUMMARY_SUFFIX },
+          ],
+          timestamp: m.timestamp,
+        });
+        break;
+      case "user":
+      case "assistant":
+      case "toolResult":
+        out.push(m);
+        break;
+      default:
+        break;
+    }
+  }
+  return out;
 }
 
 export function serializeConversation(entries) {
@@ -8534,13 +9815,113 @@ export function serializeConversation(entries) {
   }
 }
 
-export function buildSessionContext(entries = [], _leafId = null, _byId = null) {
-  const list = Array.isArray(entries) ? entries.slice() : [];
-  return {
-    messages: list,
-    thinkingLevel: null,
-    model: null,
+// Port of upstream session-manager.ts buildSessionContext (gh #167 /
+// bd-9wkml): resolve the leaf->root branch, track thinkingLevel/model along
+// the path, and apply compaction kept-entry semantics. Port-side hardening
+// beyond upstream: a corrupted parentId chain (cycle/duplicate ids) must
+// terminate instead of hanging the extension runtime.
+export function buildSessionContext(entries = [], leafId = undefined, byId = undefined) {
+  const list = Array.isArray(entries) ? entries : [];
+  let index = byId && typeof byId.get === "function" ? byId : null;
+  if (!index) {
+    index = new Map();
+    for (const entry of list) {
+      if (entry && typeof entry === "object" && typeof entry.id === "string") {
+        index.set(entry.id, entry);
+      }
+    }
+  }
+
+  // Explicit null leaf: navigated to before the first entry.
+  if (leafId === null) {
+    return { messages: [], thinkingLevel: "off", model: null };
+  }
+
+  let leaf;
+  if (leafId) leaf = index.get(leafId);
+  if (!leaf) leaf = list[list.length - 1];
+  if (!leaf) {
+    return { messages: [], thinkingLevel: "off", model: null };
+  }
+
+  // Walk from leaf to root, collecting the path (cycle-guarded).
+  const path = [];
+  const visited = new Set();
+  let current = leaf;
+  while (current) {
+    const id = typeof current.id === "string" ? current.id : null;
+    if (id !== null) {
+      if (visited.has(id)) break;
+      visited.add(id);
+    }
+    path.unshift(current);
+    current = current.parentId ? index.get(current.parentId) : undefined;
+  }
+
+  // Extract settings and find the last compaction along the path.
+  let thinkingLevel = "off";
+  let model = null;
+  let compaction = null;
+  for (const entry of path) {
+    if (!entry || typeof entry !== "object") continue;
+    if (entry.type === "thinking_level_change") {
+      thinkingLevel = entry.thinkingLevel;
+    } else if (entry.type === "model_change") {
+      model = { provider: entry.provider, modelId: entry.modelId };
+    } else if (entry.type === "message" && entry.message && entry.message.role === "assistant") {
+      model = { provider: entry.message.provider, modelId: entry.message.model };
+    } else if (entry.type === "compaction") {
+      compaction = entry;
+    }
+  }
+
+  const messages = [];
+  const appendMessage = (entry) => {
+    if (!entry || typeof entry !== "object") return;
+    if (entry.type === "message") {
+      messages.push(entry.message);
+    } else if (entry.type === "custom_message") {
+      messages.push(
+        createCustomMessage(entry.customType, entry.content, entry.display, entry.details, entry.timestamp),
+      );
+    } else if (entry.type === "branch_summary" && entry.summary) {
+      messages.push(createBranchSummaryMessage(entry.summary, entry.fromId, entry.timestamp));
+    }
   };
+
+  if (compaction) {
+    // Summary first, then kept pre-compaction entries (from firstKeptEntryId
+    // up to the compaction), then everything after the compaction. When
+    // firstKeptEntryId is missing from the pre-compaction path (degenerate
+    // corrupted session), no pre-compaction entry is kept -- matching both
+    // upstream and the Rust builder's effective output.
+    messages.push(
+      createCompactionSummaryMessage(compaction.summary, compaction.tokensBefore, compaction.timestamp),
+    );
+
+    const compactionIdx = path.findIndex((e) => e && e.type === "compaction" && e.id === compaction.id);
+
+    let foundFirstKept = false;
+    for (let i = 0; i < compactionIdx; i++) {
+      const entry = path[i];
+      if (entry && entry.id === compaction.firstKeptEntryId) {
+        foundFirstKept = true;
+      }
+      if (foundFirstKept) {
+        appendMessage(entry);
+      }
+    }
+
+    for (let i = compactionIdx + 1; i < path.length; i++) {
+      appendMessage(path[i]);
+    }
+  } else {
+    for (const entry of path) {
+      appendMessage(entry);
+    }
+  }
+
+  return { messages, thinkingLevel, model };
 }
 
 export function parseFrontmatter(text) {
@@ -8595,7 +9976,43 @@ export class CustomEditor {
   }
 }
 
-export function createBashTool(_cwd, _opts = {}) {
+function builtinToolExecute(name, cwd, opts, supported = {}) {
+  if (cwd !== undefined && (typeof cwd !== "string" || !cwd || cwd.includes("\0"))) {
+    throw new TypeError(`${name} factory cwd must be a non-empty path`);
+  }
+  if (!opts || typeof opts !== "object" || Array.isArray(opts) ||
+      (Object.getPrototypeOf(opts) !== Object.prototype && Object.getPrototypeOf(opts) !== null)) {
+    throw new TypeError(`${name} factory options must be an object`);
+  }
+  const options = Object.create(null);
+  for (const key of Reflect.ownKeys(opts)) {
+    if (typeof key !== "string" || !Object.prototype.hasOwnProperty.call(supported, key)) {
+      throw new TypeError(`${name} factory option '${String(key)}' is not supported by the native host`);
+    }
+    const value = opts[key];
+    if (value === undefined) continue;
+    if (typeof value !== supported[key]) {
+      throw new TypeError(`${name} factory option '${key}' must be a ${supported[key]}`);
+    }
+    options[key] = value;
+  }
+  return async function execute(_id, params, signal, onUpdate) {
+    if (!params || typeof params !== "object" || Array.isArray(params)) {
+      throw new TypeError(`${name} tool input must be an object`);
+    }
+    if (onUpdate !== undefined && onUpdate !== null && typeof onUpdate !== "function") {
+      throw new TypeError(`${name} tool onUpdate must be a function`);
+    }
+    if (typeof __pi_builtin_tool_hostcall !== "function") {
+      throw new Error("Native tool factory delegation is unavailable in this runtime");
+    }
+    const metadata = { options, stream: typeof onUpdate === "function" };
+    if (cwd !== undefined) metadata.cwd = cwd;
+    return __pi_builtin_tool_hostcall(name, params, metadata, signal, onUpdate);
+  };
+}
+
+export function createBashTool(cwd, opts = {}) {
   return {
     name: "bash",
     label: "bash",
@@ -8604,17 +10021,15 @@ export function createBashTool(_cwd, _opts = {}) {
       type: "object",
       properties: {
         command: { type: "string", description: "The bash command to execute" },
-        timeout: { type: "number", description: "Optional timeout in seconds" },
+        timeout: { type: "integer", minimum: 0, description: "Optional timeout in seconds; 0 disables the timeout" },
       },
       required: ["command"],
     },
-    async execute(_id, params) {
-      return { content: [{ type: "text", text: String(params?.command ?? "") }], details: {} };
-    },
+    execute: builtinToolExecute("bash", cwd, opts, { commandPrefix: "string" }),
   };
 }
 
-export function createReadTool(_cwd, _opts = {}) {
+export function createReadTool(cwd, opts = {}) {
   return {
     name: "read",
     label: "read",
@@ -8623,18 +10038,16 @@ export function createReadTool(_cwd, _opts = {}) {
       type: "object",
       properties: {
         path: { type: "string", description: "The path to the file to read" },
-        offset: { type: "number", description: "Line offset to start reading from (0-indexed)" },
-        limit: { type: "number", description: "Maximum number of lines to read" },
+        offset: { type: "integer", minimum: 1, description: "Line number to start reading from (1-indexed)" },
+        limit: { type: "integer", minimum: 1, description: "Maximum number of lines to read" },
       },
       required: ["path"],
     },
-    async execute(_id, _params) {
-      return { content: [{ type: "text", text: "" }], details: {} };
-    },
+    execute: builtinToolExecute("read", cwd, opts, { autoResizeImages: "boolean" }),
   };
 }
 
-export function createLsTool(_cwd, _opts = {}) {
+export function createLsTool(cwd, opts = {}) {
   return {
     name: "ls",
     label: "ls",
@@ -8642,17 +10055,16 @@ export function createLsTool(_cwd, _opts = {}) {
     parameters: {
       type: "object",
       properties: {
-        path: { type: "string", description: "The path to list" },
+        path: { type: "string", description: "The path to list (default: factory working directory)" },
+        limit: { type: "integer", minimum: 1, description: "Maximum number of entries" },
       },
-      required: ["path"],
+      required: [],
     },
-    async execute(_id, _params) {
-      return { content: [{ type: "text", text: "" }], details: {} };
-    },
+    execute: builtinToolExecute("ls", cwd, opts),
   };
 }
 
-export function createGrepTool(_cwd, _opts = {}) {
+export function createGrepTool(cwd, opts = {}) {
   return {
     name: "grep",
     label: "grep",
@@ -8665,13 +10077,11 @@ export function createGrepTool(_cwd, _opts = {}) {
       },
       required: ["pattern"],
     },
-    async execute(_id, _params) {
-      return { content: [{ type: "text", text: "" }], details: {} };
-    },
+    execute: builtinToolExecute("grep", cwd, opts),
   };
 }
 
-export function createFindTool(_cwd, _opts = {}) {
+export function createFindTool(cwd, opts = {}) {
   return {
     name: "find",
     label: "find",
@@ -8681,25 +10091,28 @@ export function createFindTool(_cwd, _opts = {}) {
       properties: {
         pattern: { type: "string", description: "The file name or glob pattern to match" },
         path: { type: "string", description: "The path to search in" },
+        limit: { type: "integer", minimum: 1, description: "Maximum number of results" },
       },
       required: ["pattern"],
     },
-    async execute(_id, _params) {
-      return { content: [{ type: "text", text: "" }], details: {} };
-    },
+    execute: builtinToolExecute("find", cwd, opts),
   };
 }
 
 export function createReadOnlyTools(cwd, opts = {}) {
+  if (!opts || typeof opts !== "object" || Array.isArray(opts) ||
+      Reflect.ownKeys(opts).some((key) => key !== "read")) {
+    throw new TypeError("createReadOnlyTools options support only the read configuration");
+  }
   return [
-    createGrepTool(cwd, opts),
-    createFindTool(cwd, opts),
-    createReadTool(cwd, opts),
-    createLsTool(cwd, opts),
+    createReadTool(cwd, opts.read),
+    createGrepTool(cwd),
+    createFindTool(cwd),
+    createLsTool(cwd),
   ];
 }
 
-export function createWriteTool(_cwd, _opts = {}) {
+export function createWriteTool(cwd, opts = {}) {
   return {
     name: "write",
     label: "write",
@@ -8712,13 +10125,11 @@ export function createWriteTool(_cwd, _opts = {}) {
       },
       required: ["path", "content"],
     },
-    async execute(_id, _params) {
-      return { content: [{ type: "text", text: "" }], details: {} };
-    },
+    execute: builtinToolExecute("write", cwd, opts),
   };
 }
 
-export function createEditTool(_cwd, _opts = {}) {
+export function createEditTool(cwd, opts = {}) {
   return {
     name: "edit",
     label: "edit",
@@ -8732,9 +10143,7 @@ export function createEditTool(_cwd, _opts = {}) {
       },
       required: ["path", "oldText", "newText"],
     },
-    async execute(_id, _params) {
-      return { content: [{ type: "text", text: "" }], details: {} };
-    },
+    execute: builtinToolExecute("edit", cwd, opts),
   };
 }
 
@@ -8745,38 +10154,107 @@ export function copyToClipboard(_text) {
 export function getAgentDir() {
   const home =
     globalThis.pi && globalThis.pi.env && typeof globalThis.pi.env.get === "function"
-      ? globalThis.pi.env.get("HOME")
+      ? globalThis.pi.env.get("HOME") || globalThis.pi.env.get("USERPROFILE")
       : undefined;
   return home ? `${home}/.pi/agent` : "/home/unknown/.pi/agent";
 }
 
-// Stub: keyHint returns a keyboard shortcut hint string for UI display
-export function keyHint(action, fallback = "") {
-  // Map action names to default key bindings
-  const keyMap = {
-    expandTools: "Ctrl+E",
-    copy: "Ctrl+C",
-    paste: "Ctrl+V",
-    save: "Ctrl+S",
-    quit: "Ctrl+Q",
-    help: "?",
-  };
-  return keyMap[action] || fallback || action;
+// Canonical upstream action IDs used by extension-facing key hints. Keep the
+// values in upstream's display form so package UI text matches TypeScript Pi.
+const __piKeyText = {
+  "app.tools.expand": "ctrl+o",
+  expandTools: "ctrl+o",
+  copy: "ctrl+c",
+  paste: "ctrl+v",
+  save: "ctrl+s",
+  quit: "ctrl+q",
+  help: "?",
+};
+
+export function keyText(action) {
+  return __piKeyText[String(action ?? "")] || "";
 }
 
-export function rawKeyHint(action, fallback = "") {
-  return keyHint(action, fallback);
+export function keyHint(action, description = "") {
+  const key = keyText(action);
+  const label = String(description ?? "");
+  return key && label ? `${key} ${label}` : key || label;
 }
 
-// Stub: compact performs conversation compaction via LLM
-export async function compact(_preparation, _model, _apiKey, _customInstructions, _signal) {
-  // Return a minimal compaction result
-  return {
-    summary: "Conversation summary placeholder",
-    firstKeptEntryId: null,
-    tokensBefore: 0,
-    tokensAfter: 0,
-  };
+export function rawKeyHint(key, description = "") {
+  const keyLabel = String(key ?? "");
+  const label = String(description ?? "");
+  return keyLabel && label ? `${keyLabel} ${label}` : keyLabel || label;
+}
+
+// Summary compaction accepts public model identity, custom instructions and
+// thinking level. The host resolves registered models and credentials;
+// caller-supplied credentials, headers, endpoints and custom stream functions
+// never control the request. The positional form follows the current exported
+// compact(preparation, model, apiKey, headers, customInstructions, signal,
+// thinkingLevel, streamFn, env) signature. Host-owned arguments must be absent.
+// ctx.compact uses this same implementation with an options object.
+//
+// Both signal forms cancel the exact pending generation hostcall. The runtime
+// keeps native dispatches pollable while advancing JavaScript timers and abort
+// listeners. Compaction hostcalls only return candidates: cancellation never
+// rolls back a candidate already returned or interrupts its later session save.
+export async function compact(preparation, modelOrOptions, apiKey, headers, customInstructions, signal, thinkingLevel, streamFn, env) {
+  const supplied = modelOrOptions ?? {};
+  if (typeof supplied !== "object" || Array.isArray(supplied)) {
+    throw new TypeError("compact: model/options must be an object");
+  }
+  const positionalModel = "provider" in supplied || "id" in supplied;
+  const positional = positionalModel || (modelOrOptions == null && arguments.length > 2);
+  const options = positional
+    ? { model: positionalModel ? supplied : undefined, customInstructions, signal, thinkingLevel }
+    : supplied;
+  const abortSignal = options.signal ?? signal;
+  if (abortSignal && abortSignal.aborted) {
+    if (abortSignal.reason !== undefined) {
+      throw abortSignal.reason;
+    }
+    const aborted = new Error("This operation was aborted");
+    aborted.name = "AbortError";
+    throw aborted;
+  }
+  if ([apiKey, headers, streamFn, env].some((value) => value !== undefined && value !== null)) {
+    throw new TypeError("compact: credentials, headers, streamFn and env are host-owned; pass only a public model identity and summary options");
+  }
+  if (!positional && [customInstructions, thinkingLevel].some((value) => value !== undefined && value !== null)) {
+    throw new TypeError("compact: use customInstructions and thinkingLevel inside the options object");
+  }
+  const allowed = new Set(["model", "customInstructions", "thinkingLevel", "signal", "strategy", "request"]);
+  for (const key of Object.keys(options)) {
+    if (!allowed.has(key)) throw new TypeError(`compact: unsupported option ${key}`);
+  }
+  const summaryOptions = {};
+  if (options.model !== undefined && options.model !== null) {
+    const model = options.model;
+    if (typeof model !== "object" || Array.isArray(model) || typeof model.provider !== "string" || !model.provider.trim() || typeof model.id !== "string" || !model.id.trim()) {
+      throw new TypeError("compact: model provider and id must be non-empty strings");
+    }
+    summaryOptions.model = { provider: model.provider, id: model.id };
+  }
+  if (options.customInstructions !== undefined && options.customInstructions !== null) {
+    if (typeof options.customInstructions !== "string") throw new TypeError("compact: customInstructions must be a string");
+    summaryOptions.customInstructions = options.customInstructions;
+  }
+  if (options.thinkingLevel !== undefined && options.thinkingLevel !== null) {
+    if (typeof options.thinkingLevel !== "string") throw new TypeError("compact: thinkingLevel must be a string");
+    summaryOptions.thinkingLevel = options.thinkingLevel;
+  }
+  if (!globalThis.pi || typeof globalThis.pi.events !== "function") {
+    throw new Error("compact() host bridge is unavailable in this runtime");
+  }
+  const payload = { preparation: preparation ?? null, options: summaryOptions };
+  if (options.strategy !== undefined && options.strategy !== null) {
+    payload.strategy = options.strategy;
+    payload.request = options.request ?? null;
+  } else if (options.request !== undefined && options.request !== null) {
+    throw new TypeError("compact: request requires a native strategy");
+  }
+  return await globalThis.pi.events("compact", payload, { signal: abortSignal });
 }
 
 /// Stub: AssistantMessageComponent for rendering assistant messages
@@ -8827,12 +10305,35 @@ export class ModelSelectorComponent {
   }
 }
 
+// SessionManager shim mirroring upstream's read-only identity getters. A
+// default-constructed instance reflects the host session via the bridge's
+// __pi_session_identity mirror (real id/file/dir for persisted sessions;
+// null file/dir for unsaved ones). inMemory() has no host-backed session
+// behind it, so all identity getters return null.
 export class SessionManager {
-  constructor() {}
-  static inMemory() { return new SessionManager(); }
-  getSessionFile() { return ""; }
-  getSessionDir() { return ""; }
-  getSessionId() { return ""; }
+  constructor() { this._inMemory = false; }
+  static inMemory() {
+    const manager = new SessionManager();
+    manager._inMemory = true;
+    return manager;
+  }
+  _identity() {
+    if (this._inMemory) return null;
+    const identity = globalThis.__pi_session_identity;
+    return identity && typeof identity === "object" ? identity : null;
+  }
+  getSessionFile() {
+    const identity = this._identity();
+    return identity && typeof identity.file === "string" && identity.file ? identity.file : null;
+  }
+  getSessionDir() {
+    const identity = this._identity();
+    return identity && typeof identity.dir === "string" && identity.dir ? identity.dir : null;
+  }
+  getSessionId() {
+    const identity = this._identity();
+    return identity && typeof identity.id === "string" && identity.id ? identity.id : null;
+  }
   buildSessionContext() { return buildSessionContext([]); }
 }
 
@@ -8849,6 +10350,48 @@ export class DefaultResourceLoader {
     this.opts = opts;
   }
   async reload() { return; }
+}
+
+// Upstream exports DefaultPackageManager from this module, and extensions
+// import it. In this host the package manager lives in Rust and is not
+// reachable from inside QuickJS, so this is a shim like SettingsManager and
+// DefaultResourceLoader above. Without it the import is a static link error —
+// "Could not find export 'DefaultPackageManager'" — which kills the whole
+// extension at load even when it never calls the class (gh #223).
+//
+// The read-shaped methods are inert and return the upstream shapes. The three
+// mutating ones throw instead of resolving: an install() that silently
+// succeeds without installing anything is a worse answer than a named error,
+// because the caller cannot tell the difference and will act on a package that
+// is not there.
+export class DefaultPackageManager {
+  constructor(options = {}) {
+    this.cwd = String(options.cwd ?? "");
+    this.agentDir = String(options.agentDir ?? "");
+    this.settingsManager = options.settingsManager ?? null;
+    this.progressCallback = undefined;
+  }
+  setProgressCallback(callback) {
+    this.progressCallback = typeof callback === "function" ? callback : undefined;
+  }
+  getInstalledPath(_source, _scope) { return undefined; }
+  async resolve(_onMissing) {
+    return { extensions: [], skills: [], prompts: [], themes: [] };
+  }
+  async resolveExtensionSources(_sources, _options) {
+    return { extensions: [], skills: [], prompts: [], themes: [] };
+  }
+  async install(source, _options) { throw this._unsupported("install", source); }
+  async remove(source, _options) { throw this._unsupported("remove", source); }
+  async update(source) { throw this._unsupported("update", source); }
+  _unsupported(action, source) {
+    const target = source ? ` '${String(source)}'` : "";
+    return new Error(
+      `DefaultPackageManager.${action}()${target} is not available to extensions in this host: ` +
+      "package installation is owned by the pi binary. Use `pi install` from the shell, " +
+      "or declare the package in settings.json."
+    );
+  }
 }
 
 export function highlightCode(code, _lang, _theme) {
@@ -8916,6 +10459,14 @@ export default {
   truncateHead,
   truncateTail,
   parseSessionEntries,
+  COMPACTION_SUMMARY_PREFIX,
+  COMPACTION_SUMMARY_SUFFIX,
+  BRANCH_SUMMARY_PREFIX,
+  BRANCH_SUMMARY_SUFFIX,
+  bashExecutionToText,
+  createCustomMessage,
+  createBranchSummaryMessage,
+  createCompactionSummaryMessage,
   convertToLlm,
   serializeConversation,
   buildSessionContext,
@@ -8936,6 +10487,7 @@ export default {
   createEditTool,
   copyToClipboard,
   getAgentDir,
+  keyText,
   keyHint,
   rawKeyHint,
   compact,
@@ -8946,6 +10498,7 @@ export default {
   SessionManager,
   SettingsManager,
   DefaultResourceLoader,
+  DefaultPackageManager,
   highlightCode,
   getLanguageFromPath,
   isBashToolResult,
@@ -8956,7 +10509,7 @@ export default {
   AuthStorage,
   createAgentSession,
 };
-"#
+"#)
         .trim()
         .to_string(),
     );
@@ -8987,7 +10540,8 @@ export default { SandboxManager };
 
     modules.insert(
         "ms".to_string(),
-        r#"
+        compressed_js_literal!(
+            r#"
 function parseMs(text) {
   const s = String(text ?? "").trim();
   if (!s) return undefined;
@@ -9012,13 +10566,14 @@ export default function ms(value) {
 
 export const parse = parseMs;
 "#
+        )
         .trim()
         .to_string(),
     );
 
     modules.insert(
         "jsonwebtoken".to_string(),
-        r#"
+        compressed_js_literal!(r#"
 import { createHmac, timingSafeEqual } from "node:crypto";
 
 const ALG_TO_DIGEST = {
@@ -9226,7 +10781,7 @@ export function decode(token, options) {
 }
 
 export default { sign, verify, decode };
-"#
+"#)
         .trim()
         .to_string(),
     );
@@ -9234,7 +10789,8 @@ export default { sign, verify, decode };
     // ── shell-quote ──────────────────────────────────────────────────
     modules.insert(
         "shell-quote".to_string(),
-        r#"
+        compressed_js_literal!(
+            r#"
 export function parse(cmd) {
   if (typeof cmd !== 'string') return [];
   const args = [];
@@ -9266,13 +10822,14 @@ export function quote(args) {
 }
 export default { parse, quote };
 "#
+        )
         .trim()
         .to_string(),
     );
 
     // ── vscode-languageserver-protocol ──────────────────────────────
     {
-        let vls = r"
+        let vls = compressed_js_literal!(r"
 export const DiagnosticSeverity = { Error: 1, Warning: 2, Information: 3, Hint: 4 };
 export const CodeActionKind = { QuickFix: 'quickfix', Refactor: 'refactor', RefactorExtract: 'refactor.extract', RefactorInline: 'refactor.inline', RefactorRewrite: 'refactor.rewrite', Source: 'source', SourceOrganizeImports: 'source.organizeImports', SourceFixAll: 'source.fixAll' };
 export const DocumentDiagnosticReportKind = { Full: 'full', Unchanged: 'unchanged' };
@@ -9309,7 +10866,7 @@ export function createMessageConnection(_reader, _writer) {
 }
 export class StreamMessageReader { constructor(_s) {} }
 export class StreamMessageWriter { constructor(_s) {} }
-"
+")
         .trim()
         .to_string();
 
@@ -9387,11 +10944,12 @@ export class SSEClientTransport {
     // ── glob ────────────────────────────────────────────────────────
     modules.insert(
         "glob".to_string(),
-        r#"
+        compressed_js_literal!(
+            r#"
 import "node:fs";
 
 function __pi_glob_vfs() {
-  return globalThis.__pi_vfs_state || null;
+  return globalThis.__pi_vfs_api || null;
 }
 
 function __pi_is_abs(path) {
@@ -9456,7 +11014,8 @@ function __pi_make_relative(base, full) {
 
 function __pi_collect(patterns, opts) {
   const vfs = __pi_glob_vfs();
-  if (!vfs) return [];
+  if (!vfs || typeof vfs.listVisiblePaths !== "function") return [];
+  const visible = vfs.listVisiblePaths();
   const cwd = opts && typeof opts.cwd === "string" ? opts.cwd : undefined;
   const absolute = !!(opts && opts.absolute);
   const nodir = !!(opts && opts.nodir);
@@ -9474,17 +11033,15 @@ function __pi_collect(patterns, opts) {
   for (const rawPattern of patterns) {
     const normalized = __pi_normalize(rawPattern, cwd);
     const regex = __pi_glob_regex(normalized);
-    for (const file of vfs.files.keys()) {
+    for (const file of visible.files) {
       if (regex.test(file)) results.add(file);
     }
     if (!nodir) {
-      for (const dir of vfs.dirs.values()) {
+      for (const dir of visible.dirs) {
         if (regex.test(dir)) results.add(dir);
       }
-      if (vfs.symlinks && typeof vfs.symlinks.keys === "function") {
-        for (const link of vfs.symlinks.keys()) {
-          if (regex.test(link)) results.add(link);
-        }
+      for (const link of visible.symlinks) {
+        if (regex.test(link)) results.add(link);
       }
     }
   }
@@ -9533,6 +11090,7 @@ export class Glob {
 
 export default { globSync, glob, Glob };
 "#
+        )
         .trim()
         .to_string(),
     );
@@ -9540,7 +11098,7 @@ export default { globSync, glob, Glob };
     // ── uuid ────────────────────────────────────────────────────────
     modules.insert(
         "uuid".to_string(),
-        r#"
+        compressed_js_literal!(r#"
 function randomHex(n) {
   let out = "";
   for (let i = 0; i < n; i++) out += Math.floor(Math.random() * 16).toString(16);
@@ -9559,7 +11117,7 @@ export function v5() { return v4(); }
 export function validate(uuid) { return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(String(uuid ?? "")); }
 export function version(uuid) { return parseInt(String(uuid ?? "").charAt(14), 16) || 0; }
 export default { v1, v3, v4, v5, v7, validate, version };
-"#
+"#)
         .trim()
         .to_string(),
     );
@@ -9567,7 +11125,7 @@ export default { v1, v3, v4, v5, v7, validate, version };
     // ── diff ────────────────────────────────────────────────────────
     modules.insert(
         "diff".to_string(),
-        r#"
+        compressed_js_literal!(r#"
 export function createTwoFilesPatch(oldFile, newFile, oldStr, newStr, _oldHeader, _newHeader, _opts) {
   const oldLines = String(oldStr ?? "").split("\n");
   const newLines = String(newStr ?? "").split("\n");
@@ -9586,7 +11144,7 @@ export function diffChars(o, n) { return diffLines(o, n); }
 export function diffWords(o, n) { return diffLines(o, n); }
 export function applyPatch() { return false; }
 export default { createTwoFilesPatch, createPatch, diffLines, diffChars, diffWords, applyPatch };
-"#
+"#)
         .trim()
         .to_string(),
     );
@@ -9621,7 +11179,8 @@ export default { define, loadConfig };
     // ── bun ────────────────────────────────────────────────────────
     modules.insert(
         "bun".to_string(),
-        r"
+        compressed_js_literal!(
+            r"
 const bun = globalThis.Bun || {};
 export const argv = bun.argv || [];
 export const file = (...args) => bun.file(...args);
@@ -9630,6 +11189,7 @@ export const spawn = (...args) => bun.spawn(...args);
 export const which = (...args) => bun.which(...args);
 export default bun;
 "
+        )
         .trim()
         .to_string(),
     );
@@ -9658,18 +11218,19 @@ export default { config, parse };
 
     modules.insert(
         "node:path".to_string(),
-        r#"
+        compressed_js_literal!(r#"
+function buildPosixPath() {
 function __pi_is_abs(s) {
   return s.startsWith("/") || (s.length >= 3 && s[1] === ":" && s[2] === "/");
 }
 
-export function join(...parts) {
+function join(...parts) {
   const cleaned = parts.map((p) => String(p ?? "").replace(/\\/g, "/")).filter((p) => p.length > 0);
   if (cleaned.length === 0) return ".";
   return normalize(cleaned.join("/"));
 }
 
-export function dirname(p) {
+function dirname(p) {
   const s = String(p ?? "").replace(/\\/g, "/");
   const idx = s.lastIndexOf("/");
   if (idx <= 0) return s.startsWith("/") ? "/" : ".";
@@ -9679,7 +11240,7 @@ export function dirname(p) {
   return dir;
 }
 
-export function resolve(...parts) {
+function resolve(...parts) {
   const base =
     globalThis.pi && globalThis.pi.process && typeof globalThis.pi.process.cwd === "string"
       ? globalThis.pi.process.cwd
@@ -9702,7 +11263,7 @@ export function resolve(...parts) {
   return normalize(out);
 }
 
-export function basename(p, ext) {
+function basename(p, ext) {
   const s = String(p ?? "").replace(/\\/g, "/").replace(/\/+$/, "");
   const idx = s.lastIndexOf("/");
   const name = idx === -1 ? s : s.slice(idx + 1);
@@ -9712,7 +11273,7 @@ export function basename(p, ext) {
   return name;
 }
 
-export function relative(from, to) {
+function relative(from, to) {
   const fromParts = String(from ?? "").replace(/\\/g, "/").split("/").filter(Boolean);
   const toParts = String(to ?? "").replace(/\\/g, "/").split("/").filter(Boolean);
 
@@ -9727,12 +11288,12 @@ export function relative(from, to) {
   return result.join("/") || ".";
 }
 
-export function isAbsolute(p) {
+function isAbsolute(p) {
   const s = String(p ?? "").replace(/\\/g, "/");
   return __pi_is_abs(s);
 }
 
-export function extname(p) {
+function extname(p) {
   const s = String(p ?? "").replace(/\\/g, "/");
   const b = s.lastIndexOf("/");
   const name = b === -1 ? s : s.slice(b + 1);
@@ -9741,7 +11302,7 @@ export function extname(p) {
   return name.slice(dot);
 }
 
-export function normalize(p) {
+function normalize(p) {
   const s = String(p ?? "").replace(/\\/g, "/");
   const isAbs = __pi_is_abs(s);
   const parts = s.split("/").filter(Boolean);
@@ -9755,7 +11316,7 @@ export function normalize(p) {
   return isAbs ? "/" + result : result || ".";
 }
 
-export function parse(p) {
+function parse(p) {
   const s = String(p ?? "").replace(/\\/g, "/");
   const isAbs = s.startsWith("/");
   const lastSlash = s.lastIndexOf("/");
@@ -9767,22 +11328,225 @@ export function parse(p) {
   return { root, dir, base, ext, name };
 }
 
-export function format(pathObj) {
+function format(pathObj) {
   const dir = pathObj.dir || pathObj.root || "";
   const base = pathObj.base || (pathObj.name || "") + (pathObj.ext || "");
   if (!dir) return base;
   return dir === pathObj.root ? dir + base : dir + "/" + base;
 }
 
-export const sep = "/";
-export const delimiter = ":";
-export const posix = { join, dirname, resolve, basename, relative, isAbsolute, extname, normalize, parse, format, sep, delimiter };
+return { join, dirname, resolve, basename, relative, isAbsolute, extname, normalize, parse, format,
+  sep: "/", delimiter: ":", toNamespacedPath: (p) => p };
+}
 
-const win32Stub = new Proxy({}, { get(_, prop) { throw new Error("path.win32." + String(prop) + " is not supported (Pi runs on POSIX only)"); } });
-export const win32 = win32Stub;
+function buildWindowsPath() {
+  const separator = (ch) => ch === "\\" || ch === "/";
+  function stringPath(p) {
+    if (typeof p !== "string") throw new TypeError("Path must be a string");
+    return p;
+  }
+  // Keep the root separate from lexical components: '..' must never remove a
+  // drive, UNC server or share. Preserve original separators for parse/dirname.
+  function rootOf(p, lexical = false) {
+    // Device namespaces resolve components after their prefix; parse/dirname
+    // retain the original device component in the returned root instead.
+    if (lexical && separator(p[0]) && separator(p[1]) && (p[2] === "?" || p[2] === ".") && separator(p[3])) {
+      return { device: "\\\\" + p[2], absolute: true, end: 4 };
+    }
+    if (/^[A-Za-z]:/.test(p)) {
+      const absolute = separator(p[2]);
+      return { device: p.slice(0, 2), absolute, end: absolute ? 3 : 2 };
+    }
+    if (!separator(p[0])) return { device: "", absolute: false, end: 0 };
+    if (separator(p[1]) && p.length > 2 && !separator(p[2])) {
+      let end = 2;
+      while (end < p.length && !separator(p[end])) end++;
+      const server = p.slice(2, end);
+      while (end < p.length && separator(p[end])) end++;
+      const shareStart = end;
+      while (end < p.length && !separator(p[end])) end++;
+      if (end > shareStart) {
+        return {
+          device: "\\\\" + server + "\\" + p.slice(shareStart, end),
+          absolute: true,
+          end: end < p.length ? end + 1 : end,
+        };
+      }
+    }
+    return { device: "", absolute: true, end: 1 };
+  }
+  function components(tail, absolute) {
+    const result = [];
+    for (const part of tail.split(/[\\/]+/)) {
+      if (!part || part === ".") continue;
+      if (part === "..") {
+        if (result.length && result[result.length - 1] !== "..") result.pop();
+        else if (!absolute) result.push(part);
+      } else result.push(part);
+    }
+    return result.join("\\");
+  }
+  function normalize(p) {
+    stringPath(p);
+    if (!p) return ".";
+    const root = rootOf(p, true);
+    let tail = components(p.slice(root.end), root.absolute);
+    if (!tail && !root.absolute) tail = ".";
+    if (tail && separator(p[p.length - 1])) tail += "\\";
+    // Normalization may expose a drive-looking component after removing '..'.
+    // Keep a relative input relative instead of turning it into another drive.
+    if (!root.device && !root.absolute && (/^[A-Za-z]:/.test(tail) || /:(?:$|[\\/])/.test(p))) tail = ".\\" + tail;
+    return root.device + (root.absolute ? "\\" : "") + tail;
+  }
+  function cwd() {
+    // Only the runtime's configured process snapshot is consulted; path
+    // operations never inspect the host filesystem or ambient environment.
+    const process = globalThis.pi && globalThis.pi.process;
+    return process && typeof process.cwd === "string" ? process.cwd : "/";
+  }
+  function driveCwd(device) {
+    // The process env proxy reads the configured snapshot under its normal
+    // capability policy. An unavailable per-drive directory falls back safely.
+    const process = globalThis.process;
+    const saved = process && process.env && process.env["=" + device.toUpperCase()];
+    if (typeof saved === "string") {
+      const root = rootOf(saved);
+      if (root.absolute && root.device.toLowerCase() === device.toLowerCase()) return saved;
+    }
+    const current = cwd();
+    const root = rootOf(current);
+    if (root.device && root.device.toLowerCase() !== device.toLowerCase()) return device + "\\";
+    return current;
+  }
+  function resolve(...paths) {
+    // Validate even ignored left-hand segments, before interpreting any path.
+    paths.forEach(stringPath);
+    let device = "";
+    let absolute = false;
+    let tail = "";
+    for (let index = paths.length - 1; index >= -1; index--) {
+      const p = index >= 0 ? paths[index] : device ? driveCwd(device) : cwd();
+      if (!p) continue;
+      const root = rootOf(p, true);
+      if (root.device) {
+        if (device && root.device.toLowerCase() !== device.toLowerCase()) continue;
+        if (!device) device = root.device;
+      }
+      if (!absolute) {
+        tail = p.slice(root.end) + "\\" + tail;
+        absolute = root.absolute;
+      }
+      if (absolute && device) break;
+    }
+    tail = components(tail, absolute);
+    return device + (absolute ? "\\" : "") + tail || ".";
+  }
+  function join(...paths) {
+    paths.forEach(stringPath);
+    const parts = paths.filter((p) => p.length > 0);
+    if (!parts.length) return ".";
+    let joined = parts.join("\\");
+    const first = parts[0];
+    // Joining ordinary rooted segments must not accidentally invent a UNC
+    // share. A UNC prefix must already be present in the first segment.
+    if (!(separator(first[0]) && separator(first[1]) && first.length > 2 && !separator(first[2]))) {
+      joined = joined.replace(/^[\\/]{2,}/, "\\");
+    }
+    return normalize(joined);
+  }
+  function basename(p, suffix) {
+    stringPath(p);
+    if (suffix !== undefined) stringPath(suffix);
+    if (p === suffix) return "";
+    const floor = /^[A-Za-z]:/.test(p) ? 2 : 0;
+    let end = p.length;
+    while (end > floor && separator(p[end - 1])) end--;
+    let start = end;
+    while (start > floor && !separator(p[start - 1])) start--;
+    let base = p.slice(start, end);
+    if (suffix && suffix.length < base.length && base.endsWith(suffix)) base = base.slice(0, -suffix.length);
+    return base;
+  }
+  function extension(base) {
+    const dot = base.lastIndexOf(".");
+    return dot <= 0 || base === ".." ? "" : base.slice(dot);
+  }
+  function extname(p) {
+    return extension(basename(p));
+  }
+  function parse(p) {
+    stringPath(p);
+    const root = rootOf(p);
+    let end = p.length;
+    while (end > root.end && separator(p[end - 1])) end--;
+    let start = end;
+    while (start > root.end && !separator(p[start - 1])) start--;
+    const base = p.slice(start, end);
+    const ext = extension(base);
+    return {
+      root: p.slice(0, root.end),
+      dir: p.slice(0, start > root.end ? start - 1 : root.end),
+      base, ext, name: ext ? base.slice(0, -ext.length) : base,
+    };
+  }
+  function dirname(p) {
+    return parse(p).dir || ".";
+  }
+  function relative(from, to) {
+    const origin = resolve(stringPath(from));
+    const destination = resolve(stringPath(to));
+    if (origin.toLowerCase() === destination.toLowerCase()) return "";
+    const left = origin.split("\\").filter(Boolean);
+    const right = destination.split("\\").filter(Boolean);
+    let common = 0;
+    while (common < left.length && common < right.length && left[common].toLowerCase() === right[common].toLowerCase()) common++;
+    // Distinct drives or UNC hosts have no relative filesystem path.
+    if (!common || origin.startsWith("\\\\") !== destination.startsWith("\\\\")) return destination;
+    return [...Array(left.length - common).fill(".."), ...right.slice(common)].join("\\");
+  }
+  function isAbsolute(p) {
+    return rootOf(stringPath(p)).absolute;
+  }
+  function format(pathObj) {
+    if (!pathObj || typeof pathObj !== "object" || Array.isArray(pathObj)) throw new TypeError("Path object must be an object");
+    const dir = pathObj.dir || pathObj.root || "";
+    const ext = pathObj.ext || "";
+    const base = pathObj.base || (pathObj.name || "") + (ext && !ext.startsWith(".") ? "." + ext : ext);
+    if (!dir) return base;
+    return dir === pathObj.root ? dir + base : dir + "\\" + base;
+  }
+  function toNamespacedPath(p) {
+    if (typeof p !== "string" || !p) return p;
+    const full = resolve(p);
+    if (full.length <= 2) return p;
+    if (full.startsWith("\\\\") && full[2] !== "?" && full[2] !== ".") return "\\\\?\\UNC\\" + full.slice(2);
+    if (/^[A-Za-z]:\\/.test(full)) return "\\\\?\\" + full;
+    return full;
+  }
+  return { join, dirname, resolve, basename, relative, isAbsolute, extname, normalize, parse, format,
+    sep: "\\", delimiter: ";", toNamespacedPath };
+}
 
-export default { join, dirname, resolve, basename, relative, isAbsolute, extname, normalize, parse, format, sep, delimiter, posix, win32 };
-"#
+export const posix = buildPosixPath();
+export const win32 = buildWindowsPath();
+posix.posix = win32.posix = posix;
+posix.win32 = win32.win32 = win32;
+const nativePath = globalThis.process && globalThis.process.platform === "win32" ? win32 : posix;
+export const join = nativePath.join;
+export const dirname = nativePath.dirname;
+export const resolve = nativePath.resolve;
+export const basename = nativePath.basename;
+export const relative = nativePath.relative;
+export const isAbsolute = nativePath.isAbsolute;
+export const extname = nativePath.extname;
+export const normalize = nativePath.normalize;
+export const parse = nativePath.parse;
+export const format = nativePath.format;
+export const sep = nativePath.sep;
+export const delimiter = nativePath.delimiter;
+export const toNamespacedPath = nativePath.toNamespacedPath;
+export default nativePath;
+"#)
         .trim()
         .to_string(),
     );
@@ -9791,18 +11555,13 @@ export default { join, dirname, resolve, basename, relative, isAbsolute, extname
 
     modules.insert(
         "node:child_process".to_string(),
-        r#"
-const __pi_child_process_state = (() => {
-  if (globalThis.__pi_child_process_state) {
-    return globalThis.__pi_child_process_state;
-  }
-  const state = {
-    nextPid: 1000,
-    children: new Map(),
-  };
-  globalThis.__pi_child_process_state = state;
-  return state;
-})();
+        compressed_js_literal!(r#"
+const __pi_child_process_state = {
+  // Native process IDs are u32. Provisional handles must never collide with
+  // an admitted child's PID while another spawn is still awaiting admission.
+  nextPid: 0x100000000,
+  children: new Map(),
+};
 
 function __makeEmitter() {
   const listeners = new Map();
@@ -9858,7 +11617,7 @@ function __emitCloseOnce(child, code, signal = null) {
 
 function __parseSpawnOptions(raw) {
   const options = raw && typeof raw === "object" ? raw : {};
-  const allowed = new Set(["cwd", "detached", "shell", "stdio", "timeout"]);
+  const allowed = new Set(["cwd", "detached", "shell", "stdio", "timeout", "env"]);
   for (const key of Object.keys(options)) {
     if (!allowed.has(key)) {
       throw new Error(`node:child_process.spawn: unsupported option '${key}'`);
@@ -9911,11 +11670,12 @@ function __parseSpawnOptions(raw) {
     detached: Boolean(options.detached),
     stdio,
     timeoutMs,
+    env: options.env,
   };
 }
 
 function __installProcessKillBridge() {
-  globalThis.__pi_process_kill_impl = (pidValue, signal = "SIGTERM") => {
+  const killImpl = (pidValue, signal = "SIGTERM") => {
     const pidNumeric = Number(pidValue);
     if (!Number.isFinite(pidNumeric) || pidNumeric === 0) {
       const err = new Error(`kill EINVAL: invalid pid ${String(pidValue)}`);
@@ -9932,9 +11692,321 @@ function __installProcessKillBridge() {
     child.kill(signal);
     return true;
   };
+  Object.defineProperty(globalThis, "__pi_process_kill_impl", {
+    value: killImpl,
+    writable: false,
+    configurable: false,
+    enumerable: false,
+  });
+  Object.defineProperty(globalThis, "__pi_reset_child_process_registry", {
+    value: (secret) => {
+      const matches = globalThis.__pi_bridge_secret_matches_native;
+      if (typeof matches !== "function" || !matches(secret)) {
+        throw new Error("PiJS child-process registry reset denied");
+      }
+      for (const child of __pi_child_process_state.children.values()) {
+        if (child && !child.__pi_done) {
+          return false;
+        }
+      }
+      const clear = globalThis.__pi_map_clear_primordial;
+      if (typeof clear !== "function") {
+        throw new Error("PiJS child-process reset primordial is unavailable");
+      }
+      clear(__pi_child_process_state.children);
+      return true;
+    },
+    writable: false,
+    configurable: false,
+    enumerable: false,
+  });
+  Object.defineProperty(globalThis, "__pi_child_process_registry_size", {
+    value: () => {
+      const size = globalThis.__pi_map_size_primordial;
+      if (typeof size !== "function") {
+        throw new Error("PiJS child-process size primordial is unavailable");
+      }
+      return size(__pi_child_process_state.children);
+    },
+    writable: false,
+    configurable: false,
+    enumerable: false,
+  });
 }
 
 __installProcessKillBridge();
+
+function __spawnPersistent(cmd, argv, opts) {
+  if (opts.detached) {
+    throw new Error("node:child_process.spawn: persistent piped processes cannot be detached");
+  }
+  if (opts.env !== undefined && (!opts.env || typeof opts.env !== "object" || Array.isArray(opts.env))) {
+    throw new TypeError("node:child_process.spawn: env must be an object");
+  }
+  const child = __makeEmitter();
+  child.pid = __pi_child_process_state.nextPid++;
+  child.killed = false;
+  child.exitCode = null;
+  child.signalCode = null;
+  child.__pi_done = false;
+  child.stdout = opts.stdio[1] === "pipe" ? __makeEmitter() : null;
+  child.stderr = opts.stdio[2] === "pipe" ? __makeEmitter() : null;
+  child.stdin = opts.stdio[0] === "pipe" ? __makeEmitter() : null;
+  const streams = [child.stdout, child.stderr];
+  for (const stream of streams) {
+    if (!stream) continue;
+    stream.setEncoding = (encoding) => { stream.encoding = String(encoding); return stream; };
+  }
+  let handle = null;
+  let timer = null;
+  let referenced = true;
+  let spawned = false;
+  let nextWrite = 1;
+  let bufferedBytes = 0;
+  let needsDrain = false;
+  let pendingKill = null;
+  const pending = [];
+  const writes = new Map();
+  let endWrite = null;
+  const MAX_BUFFERED = 4 * 1024 * 1024;
+  const MAX_CHUNK = 256 * 1024;
+  const HIGH_WATER = 64 * 1024;
+
+  function pipeError(message) {
+    const error = message instanceof Error ? message : new Error(String(message?.message || message));
+    if (!error.code && message && typeof message === "object" && message.code) error.code = String(message.code);
+    if (!error.code) error.code = "EPIPE";
+    return error;
+  }
+  function settleWrite(id, error) {
+    const write = writes.get(id);
+    if (!write) return;
+    writes.delete(id);
+    bufferedBytes -= write.size;
+    const callbacks = write.callbacks || [write.callback];
+    for (const callback of callbacks) {
+      if (typeof callback === "function") Promise.resolve().then(() => callback(error || undefined));
+    }
+    if (write === endWrite) endWrite = null;
+    if (write.end && child.stdin && !error) {
+      child.stdin.writableFinished = true;
+      child.stdin.closed = true;
+      child.stdin.emit("finish");
+    }
+  }
+  function close(code, signal, error) {
+    if (child.__pi_done) return;
+    if (timer !== null) clearTimeout(timer);
+    timer = null;
+    if (handle) {
+      try { __pi_process_session_close_native(handle); } catch (_) {}
+    }
+    for (const id of [...writes.keys()]) settleWrite(id, pipeError(error || "Process stdin closed"));
+    pending.length = 0;
+    if (child.stdin) {
+      child.stdin.destroyed = true;
+      child.stdin.closed = true;
+    }
+    for (const stream of streams) if (stream) stream.emit("end");
+    if (error) child.emit("error", pipeError(error));
+    if (spawned) {
+      __emitCloseOnce(child, code, signal);
+    } else {
+      child.__pi_done = true;
+      child.exitCode = code;
+      child.signalCode = signal;
+      __pi_child_process_state.children.delete(child.pid);
+      child.emit("close", code, signal);
+    }
+  }
+  function flushInput() {
+    if (!handle || child.__pi_done) return;
+    while (pending.length) {
+      const next = pending[0];
+      const accepted = next.end
+        ? __pi_process_session_end_native(handle, next.id)
+        : __pi_process_session_write_native(handle, next.id, next.data);
+      if (!accepted) return;
+      pending.shift();
+    }
+  }
+  function poll() {
+    timer = null;
+    if (!handle || child.__pi_done) return;
+    try {
+      const result = JSON.parse(__pi_process_session_poll_native(handle));
+      for (const frame of result.frames || []) {
+        if (frame.stream) {
+          const stream = frame.stream === "stdout" ? child.stdout : child.stderr;
+          if (stream) {
+            const bytes = Buffer.from(frame.data, "base64");
+            stream.emit("data", stream.encoding ? bytes.toString(stream.encoding) : bytes);
+          }
+        } else if (frame.writeId !== undefined) {
+          const error = frame.error ? pipeError(frame.error) : null;
+          settleWrite(frame.writeId, error);
+          if (error && child.stdin) {
+            // The native writer closes its endpoint after an I/O failure.
+            // Settle every queued fragment and EOF callback once, including
+            // fragments already accepted by that writer's bounded channel.
+            child.stdin.destroyed = true;
+            child.stdin.closed = true;
+            for (const id of [...writes.keys()]) settleWrite(id, error);
+            pending.length = 0;
+            child.stdin.emit("error", error);
+          }
+        }
+      }
+      if (result.terminal) {
+        const terminal = result.terminal;
+        close(terminal.code ?? null, terminal.signal ?? null, terminal.error);
+        return;
+      }
+      flushInput();
+      if (needsDrain && bufferedBytes < HIGH_WATER && child.stdin) {
+        needsDrain = false;
+        child.stdin.emit("drain");
+      }
+    } catch (error) {
+      try { __pi_process_session_kill_native(handle, "SIGKILL"); } catch (_) {}
+      close(null, null, error);
+      return;
+    }
+    timer = setTimeout(poll, 10);
+    if (!referenced && timer && typeof timer.unref === "function") timer.unref();
+  }
+  if (child.stdin) {
+    child.stdin.destroyed = false;
+    child.stdin.writableEnded = false;
+    child.stdin.writableFinished = false;
+    child.stdin.closed = false;
+    child.stdin.write = (chunk, encoding, callback) => {
+      if (typeof encoding === "function") { callback = encoding; encoding = undefined; }
+      if (child.stdin.writableEnded || child.stdin.destroyed || child.__pi_done) {
+        const error = pipeError("write after process stdin closed");
+        if (typeof callback === "function") Promise.resolve().then(() => callback(error));
+        else Promise.resolve().then(() => child.stdin.emit("error", error));
+        return false;
+      }
+      const bytes = typeof chunk === "string" ? Buffer.from(chunk, encoding || "utf8") : Buffer.from(chunk);
+      const fragments = Math.max(1, Math.ceil(bytes.length / MAX_CHUNK));
+      if (bufferedBytes + bytes.length > MAX_BUFFERED || writes.size + fragments > 1024) {
+        throw new RangeError("node:child_process stdin buffer limit exceeded");
+      }
+      // A logical JSON-RPC frame can exceed one native pipe message. Validate
+      // the entire write and prepare every bounded fragment before publishing
+      // any of it, preserving byte order and one completion callback.
+      let remaining = fragments;
+      let completed = false;
+      const fragmentCallback = typeof callback === "function" ? (error) => {
+        remaining--;
+        if (!completed && (error || remaining === 0)) {
+          completed = true;
+          callback(error);
+        }
+      } : undefined;
+      const staged = [];
+      for (let index = 0; index < fragments; index++) {
+        const start = index * MAX_CHUNK;
+        const part = Buffer.from(bytes.subarray(start, Math.min(start + MAX_CHUNK, bytes.length)));
+        staged.push({ id: nextWrite++, data: part.toString("base64"), size: part.length,
+          callback: fragmentCallback, end: false });
+      }
+      for (const write of staged) {
+        writes.set(write.id, write);
+        pending.push(write);
+      }
+      bufferedBytes += bytes.length;
+      try { flushInput(); }
+      catch (error) { close(null, null, error); return false; }
+      if (bufferedBytes >= HIGH_WATER) needsDrain = true;
+      return bufferedBytes < HIGH_WATER;
+    };
+    child.stdin.end = (chunk, encoding, callback) => {
+      if (typeof chunk === "function") { callback = chunk; chunk = undefined; }
+      else if (typeof encoding === "function") { callback = encoding; encoding = undefined; }
+      const hasChunk = chunk !== undefined && chunk !== null;
+      function rejectEnd(code, message) {
+        const error = pipeError(message);
+        error.code = code;
+        if (typeof callback === "function") Promise.resolve().then(() => callback(error));
+        else if (hasChunk) Promise.resolve().then(() => child.stdin.emit("error", error));
+        return child.stdin;
+      }
+      if (child.stdin.writableEnded) {
+        if (hasChunk) return rejectEnd("ERR_STREAM_WRITE_AFTER_END", "write after process stdin ended");
+        if (endWrite && !child.stdin.destroyed && !child.__pi_done) {
+          if (typeof callback === "function") {
+            if (endWrite.callbacks.length >= 1024) throw new RangeError("node:child_process stdin callback limit exceeded");
+            endWrite.callbacks.push(callback);
+          }
+          return child.stdin;
+        }
+        return child.stdin.writableFinished
+          ? rejectEnd("ERR_STREAM_ALREADY_FINISHED", "process stdin already finished")
+          : rejectEnd("ERR_STREAM_DESTROYED", "process stdin is closed");
+      }
+      if (child.stdin.destroyed || child.__pi_done) {
+        return rejectEnd("ERR_STREAM_DESTROYED", "process stdin is closed");
+      }
+      if (hasChunk) child.stdin.write(chunk, encoding);
+      // A synchronous native-write failure may have closed the child while
+      // accepting the final chunk. Never enqueue EOF after its close drain.
+      if (child.stdin.destroyed || child.__pi_done) {
+        return rejectEnd("ERR_STREAM_DESTROYED", "process stdin is closed");
+      }
+      child.stdin.writableEnded = true;
+      const id = nextWrite++;
+      const write = { id, size: 0, callbacks: typeof callback === "function" ? [callback] : [], end: true };
+      endWrite = write;
+      writes.set(id, write);
+      pending.push(write);
+      try { flushInput(); } catch (error) { close(null, null, error); }
+      return child.stdin;
+    };
+  }
+  child.kill = (signal = "SIGTERM") => {
+    if (child.__pi_done) return false;
+    const requested = String(signal || "SIGTERM");
+    if (requested !== "SIGTERM" && requested !== "SIGKILL") throw new Error("Unsupported process signal");
+    if (!handle) {
+      pendingKill = requested;
+      child.killed = true;
+      return true;
+    }
+    const accepted = __pi_process_session_kill_native(handle, requested);
+    if (accepted) child.killed = true;
+    return accepted;
+  };
+  child.ref = () => { referenced = true; if (timer && typeof timer.ref === "function") timer.ref(); return child; };
+  child.unref = () => { referenced = false; if (timer && typeof timer.unref === "function") timer.unref(); return child; };
+  child.stdio = [child.stdin, child.stdout, child.stderr];
+  __pi_child_process_state.children.set(child.pid, child);
+  const execOptions = { persistent: true, stdio: opts.stdio, shell: false };
+  if (opts.cwd !== undefined) execOptions.cwd = opts.cwd;
+  if (opts.timeoutMs !== undefined) execOptions.timeout = opts.timeoutMs;
+  if (opts.env !== undefined) {
+    execOptions.env = Object.create(null);
+    for (const [name, value] of Object.entries(opts.env)) {
+      if (value !== undefined) execOptions.env[name] = value === null ? null : String(value);
+    }
+  }
+  globalThis.pi.exec(cmd, argv, execOptions).then((result) => {
+    if (!result || typeof result.session !== "string") throw new Error("Persistent process session was not created");
+    handle = result.session;
+    if (child.__pi_done) { __pi_process_session_close_native(handle); return; }
+    __pi_child_process_state.children.delete(child.pid);
+    child.pid = result.pid;
+    __pi_child_process_state.children.set(child.pid, child);
+    spawned = true;
+    child.emit("spawn");
+    if (pendingKill) __pi_process_session_kill_native(handle, pendingKill);
+    if (!child.stdin) pending.push({ id: 0, end: true });
+    flushInput();
+    poll();
+  }).catch((error) => close(null, null, error));
+  return child;
+}
 
 export function spawn(command, args = [], options = {}) {
   const cmd = String(command ?? "").trim();
@@ -9947,6 +12019,13 @@ export function spawn(command, args = [], options = {}) {
 
   const argv = args.map((arg) => String(arg));
   const opts = __parseSpawnOptions(options);
+
+  if (opts.stdio[0] === "pipe" || opts.env !== undefined) {
+    if (typeof __pi_process_session_poll_native !== "function") {
+      throw new Error("node:child_process.spawn: persistent process host is unavailable");
+    }
+    return __spawnPersistent(cmd, argv, opts);
+  }
 
   const child = __makeEmitter();
   child.pid = __pi_child_process_state.nextPid++;
@@ -9998,16 +12077,13 @@ export function spawn(command, args = [], options = {}) {
   };
   const onChunk = execOptions.onChunk;
   delete execOptions.onChunk;
-  const execPromise = new Promise((resolve, reject) => {
-    const callId = __pi_exec_native(cmd, argv, execOptions);
-    child.__pi_call_id = callId;
-    __pi_pending_hostcalls.set(callId, {
-      onChunk,
-      resolve,
-      reject,
-      extensionId: __pi_current_extension_id,
-    });
-  }).then(
+  const hostPromise = globalThis.pi.exec(cmd, argv, {
+    ...execOptions,
+    stream: true,
+    onChunk,
+  });
+  child.__pi_call_id = hostPromise.__pi_call_id || null;
+  const execPromise = hostPromise.then(
     (result) => ({ kind: "result", result }),
     (error) => ({ kind: "error", error })
   );
@@ -10136,8 +12212,22 @@ export function execSync(command, options) {
   const timeout = typeof opts.timeout === "number" ? opts.timeout : 0;
   const maxBuffer = typeof opts.maxBuffer === "number" ? opts.maxBuffer : 1024 * 1024;
 
-  // execSync runs through a shell, so pass via sh -c
-  const raw = __pi_exec_sync_native("sh", JSON.stringify(["-c", cmdStr]), cwd, timeout, maxBuffer);
+  // Resolve the conventional PATH probe without running a shell. All other
+  // sync execution retains its existing opt-in and capability checks.
+  const probePattern = globalThis.process && globalThis.process.platform === "win32"
+    ? /^where[ \t]+([A-Za-z0-9][A-Za-z0-9._+-]*)$/
+    : /^command[ \t]+-v[ \t]+([A-Za-z0-9][A-Za-z0-9._+-]*)$/;
+  const probe = probePattern.exec(cmdStr);
+  const discoveryOptions = Object.keys(opts).every((key) =>
+    ["cwd", "encoding", "stdio", "timeout", "maxBuffer"].includes(key));
+  let raw;
+  if (probe && discoveryOptions && typeof __pi_find_executables_native === "function") {
+    const matches = JSON.parse(__pi_find_executables_native(probe[1], cwd));
+    const hits = globalThis.process.platform === "win32" ? matches : matches.slice(0, 1);
+    raw = JSON.stringify({ stdout: hits.length ? hits.join("\n") + "\n" : "", stderr: "", status: hits.length ? 0 : 1, pid: 0 });
+  } else {
+    raw = __pi_exec_sync_native("sh", JSON.stringify(["-c", cmdStr]), cwd, timeout, maxBuffer);
+  }
   const result = __parseExecSyncResult(raw, cmdStr);
 
   if (result.error) {
@@ -10416,14 +12506,14 @@ export function fork(_modulePath, _args, _opts) {
 }
 
 export default { spawn, spawnSync, execSync, execFileSync, exec, execFile, fork };
-"#
+"#)
         .trim()
         .to_string(),
     );
 
     modules.insert(
         "node:module".to_string(),
-        r#"
+        compressed_js_literal!(r#"
 import * as fs from "node:fs";
 import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
@@ -10458,6 +12548,9 @@ import * as vm from "node:vm";
 import * as v8 from "node:v8";
 import * as workerThreads from "node:worker_threads";
 import * as testMod from "node:test";
+import * as bunSqlite from "bun:sqlite";
+import * as betterSqlite from "better-sqlite3";
+import * as axiosModule from "axios";
 
 function __normalizeBuiltin(id) {
   const spec = String(id ?? "");
@@ -10573,6 +12666,9 @@ function __normalizeBuiltin(id) {
 }
 
 const __builtinModules = {
+  "bun:sqlite": bunSqlite,
+  "better-sqlite3": betterSqlite,
+  "axios": axiosModule,
   "node:fs": fs,
   "node:fs/promises": fsPromises,
   "node:path": path,
@@ -10629,7 +12725,12 @@ function __makeMissingRequireStub(spec) {
     return __missingRequireCache[spec];
   }
   const handler = {
-    get(_target, prop) {
+    get(target, prop) {
+      const descriptor = Reflect.getOwnPropertyDescriptor(target, prop);
+      if (descriptor && !descriptor.configurable) {
+        if ('value' in descriptor && !descriptor.writable) return descriptor.value;
+        if ('get' in descriptor && descriptor.get === undefined) return undefined;
+      }
       if (typeof prop === "symbol") {
         if (prop === Symbol.toPrimitive) return () => "";
         return undefined;
@@ -10644,10 +12745,10 @@ function __makeMissingRequireStub(spec) {
     },
     apply() { return stub; },
     construct() { return stub; },
-    has() { return false; },
-    ownKeys() { return []; },
-    getOwnPropertyDescriptor() {
-      return { configurable: true, enumerable: false };
+    has(target, prop) { return Reflect.has(target, prop); },
+    ownKeys(target) { return Reflect.ownKeys(target); },
+    getOwnPropertyDescriptor(target, prop) {
+      return Reflect.getOwnPropertyDescriptor(target, prop);
     },
   };
   const stub = new Proxy(function __pijs_missing_require_stub() {}, handler);
@@ -10660,6 +12761,7 @@ export function createRequire(_path) {
     const normalized = __normalizeBuiltin(id);
     const builtIn = __builtinModules[normalized];
     if (builtIn) {
+      if (normalized === "bun:sqlite") return builtIn;
       if (builtIn && Object.prototype.hasOwnProperty.call(builtIn, "default") && builtIn.default !== undefined) {
         return builtIn.default;
       }
@@ -10683,14 +12785,14 @@ export function createRequire(_path) {
 }
 
 export default { createRequire };
-"#
+"#)
         .trim()
         .to_string(),
     );
 
     modules.insert(
         "node:fs".to_string(),
-        r#"
+        compressed_js_literal!(r#"
 import { Readable, Writable } from "node:stream";
 
 export const constants = {
@@ -10707,10 +12809,6 @@ export const constants = {
   O_APPEND: 1024,
 };
 const __pi_vfs = (() => {
-  if (globalThis.__pi_vfs_state) {
-    return globalThis.__pi_vfs_state;
-  }
-
   const state = {
     files: new Map(),
     dirs: new Set(["/"]),
@@ -10719,6 +12817,18 @@ const __pi_vfs = (() => {
     nextFd: 100,
   };
   const extensionTmpRoot = "/__pi_extension_tmp";
+  const windowsPaths = globalThis.process && globalThis.process.platform === "win32";
+
+  function childPrefix(path) {
+    return path.endsWith("/") ? path : `${path}/`;
+  }
+
+  function toHostPath(path) {
+    // Windows verbatim/device prefixes do not accept '/' separators. Keep
+    // slash-separated VFS keys, but preserve the native namespace at every
+    // authorization and host-I/O boundary.
+    return windowsPaths && /^\/\/[?.]\//.test(path) ? path.replace(/\//g, "\\") : path;
+  }
 
   function checkWriteAccess(resolved) {
     const normalized = normalizePath(resolved);
@@ -10726,8 +12836,30 @@ const __pi_vfs = (() => {
       return;
     }
     if (typeof globalThis.__pi_host_check_write_access === "function") {
-      globalThis.__pi_host_check_write_access(normalized);
+      globalThis.__pi_host_check_write_access(toHostPath(normalized));
     }
+  }
+
+  function checkReadAccess(resolved) {
+    const normalized = normalizePath(resolved);
+    if (isCurrentExtensionTempPath(normalized)) {
+      return;
+    }
+    if (typeof globalThis.__pi_host_check_read_access === "function") {
+      globalThis.__pi_host_check_read_access(toHostPath(normalized));
+    }
+  }
+
+  function isPersistentPath(path) {
+    return typeof globalThis.__pi_host_is_persistent_storage_path === "function"
+      && globalThis.__pi_host_is_persistent_storage_path(toHostPath(path));
+  }
+
+  function persistentMutation(op, path, options = {}) {
+    if (typeof globalThis.__pi_host_persistent_storage_mutate !== "function") {
+      throw new Error("PiJS persistent storage bridge is unavailable");
+    }
+    globalThis.__pi_host_persistent_storage_mutate(op, toHostPath(path), JSON.stringify(options));
   }
 
   function checkWorkspaceWriteAccess(resolved) {
@@ -10740,23 +12872,23 @@ const __pi_vfs = (() => {
         ? globalThis.process.cwd()
         : "/"
     );
-    if (normalized !== cwd && !normalized.startsWith(`${cwd}/`)) {
+    if (normalized !== cwd && !normalized.startsWith(childPrefix(cwd))) {
       throw new Error("host write denied: path outside extension root");
     }
     checkWriteAccess(normalized);
   }
 
   function currentExtensionId() {
-    if (typeof __pi_current_extension_id === "undefined") {
+    if (typeof globalThis.__pi_get_current_extension_id !== "function") {
       return "";
     }
-    return String(__pi_current_extension_id || "").trim();
+    return String(globalThis.__pi_get_current_extension_id() || "").trim();
   }
 
   function encodeExtensionTempSegment(raw) {
     let out = "";
     for (const ch of String(raw || "")) {
-      if (/^[A-Za-z0-9._-]$/.test(ch)) {
+      if (/^[A-Za-z0-9.-]$/.test(ch)) {
         out += ch;
       } else {
         out += "_" + ch.codePointAt(0).toString(16) + "_";
@@ -10765,64 +12897,127 @@ const __pi_vfs = (() => {
     return out || "anonymous";
   }
 
-  function currentExtensionTempRoot() {
+  function currentExtensionTempRoot(tempBase) {
     const id = currentExtensionId();
     if (!id) {
       return "";
     }
-    return `${extensionTmpRoot}/${encodeExtensionTempSegment(id)}`;
+    return `${extensionTmpRoot}/${encodeExtensionTempSegment(id)}/${encodeExtensionTempSegment(tempBase)}`;
   }
 
-  function isAbsoluteTmpInput(input) {
+  let configuredTempRoots = null;
+  function extensionTempRoots() {
+    if (configuredTempRoots) return configuredTempRoots;
+    let roots = ["/tmp"];
+    if (typeof globalThis.__pi_host_temp_roots_json === "function") {
+      try {
+        const parsed = JSON.parse(globalThis.__pi_host_temp_roots_json());
+        if (Array.isArray(parsed)) roots = parsed;
+      } catch (_) {}
+    }
+    configuredTempRoots = Array.from(new Set(roots.map(normalizePath)))
+      .sort((left, right) => right.length - left.length);
+    return configuredTempRoots;
+  }
+
+  function comparablePath(path) {
+    return /^[A-Za-z]:\//.test(path) ? path.toLowerCase() : path;
+  }
+
+  function pathIsWithin(path, root) {
+    const candidate = comparablePath(path);
+    const base = comparablePath(root);
+    return candidate === base || candidate.startsWith(childPrefix(base));
+  }
+
+  function isAbsolutePathInput(input) {
     const raw = String(input ?? "").replace(/\\/g, "/");
-    return raw === "/tmp" || raw.startsWith("/tmp/");
+    return raw.startsWith("/") || /^[A-Za-z]:\//.test(raw);
+  }
+
+  function matchingTempRoot(normalized) {
+    return extensionTempRoots().find((root) => pathIsWithin(normalized, root)) || "";
   }
 
   function mapExtensionTempPath(input, normalized) {
-    const root = currentExtensionTempRoot();
-    if (!root || !isAbsoluteTmpInput(input)) {
+    if (!currentExtensionId() || !isAbsolutePathInput(input)) {
       return normalized;
     }
-    if (normalized !== "/tmp" && !normalized.startsWith("/tmp/")) {
+    const tempBase = matchingTempRoot(normalized);
+    if (!tempBase) {
       return normalized;
     }
-    return `${root}${normalized.slice("/tmp".length)}`;
+    if (
+      typeof globalThis.__pi_host_is_registered_fs_path === "function" &&
+      globalThis.__pi_host_is_registered_fs_path(toHostPath(normalized))
+    ) {
+      return normalized;
+    }
+    const root = currentExtensionTempRoot(tempBase);
+    const relative = normalized.slice(tempBase.length).replace(/^\/+/, "");
+    return relative ? `${childPrefix(root)}${relative}` : root;
   }
 
   function unmapExtensionTempPath(normalized) {
-    const root = currentExtensionTempRoot();
-    if (!root) {
-      return normalized;
-    }
-    if (normalized === root) {
-      return "/tmp";
-    }
-    if (normalized.startsWith(`${root}/`)) {
-      return `/tmp${normalized.slice(root.length)}`;
+    for (const tempBase of extensionTempRoots()) {
+      const root = currentExtensionTempRoot(tempBase);
+      if (!root) {
+        continue;
+      }
+      if (normalized === root) {
+        return tempBase;
+      }
+      if (normalized.startsWith(`${root}/`)) {
+        return `${childPrefix(tempBase)}${normalized.slice(root.length + 1)}`;
+      }
     }
     return normalized;
   }
 
   function isCurrentExtensionTempPath(normalized) {
-    const root = currentExtensionTempRoot();
-    return !!root && (normalized === root || normalized.startsWith(`${root}/`));
+    return extensionTempRoots().some((tempBase) => {
+      const root = currentExtensionTempRoot(tempBase);
+      return !!root && (normalized === root || normalized.startsWith(`${root}/`));
+    });
   }
 
-  function normalizePath(input) {
-    let raw = String(input ?? "").replace(/\\/g, "/");
-    // Strip Windows UNC verbatim prefix that canonicalize() produces.
-    // \\?\C:\... becomes /?/C:/... after separator normalization.
-    if (raw.startsWith("/?/") && raw.length > 5 && /^[A-Za-z]:/.test(raw.substring(3, 5))) {
-      raw = raw.slice(3);
+  function splitRoot(path) {
+    const drive = /^[A-Za-z]:\//.exec(path);
+    if (drive) return { root: drive[0], tail: path.slice(3) };
+    if (windowsPaths) {
+      // A UNC share is one filesystem root. A verbatim UNC path additionally
+      // carries its namespace prefix; neither may be consumed by '..'.
+      const unc = /^\/\/([?.]\/UNC\/)?([^/]+)\/+([^/]+)(?=\/|$)/i.exec(path);
+      if (unc && (!/^\/\/[?.]\//.test(path) || unc[1])) {
+        return { root: `//${unc[1] || ""}${unc[2]}/${unc[3]}`, tail: path.slice(unc[0].length) };
+      }
+      const device = /^\/\/([?.])\/([^/]+)(?=\/|$)/.exec(path);
+      if (device) {
+        const root = `//${device[1]}/${device[2]}`;
+        return {
+          root: /^[A-Za-z]:$/.test(device[2]) ? `${root}/` : root,
+          tail: path.slice(device[0].length),
+        };
+      }
     }
+    return { root: path.startsWith("/") ? "/" : "", tail: path.startsWith("/") ? path.slice(1) : path };
+  }
+
+  function absoluteInputPath(raw) {
     // Detect Windows drive-letter absolute paths (e.g. "C:/Users/...")
     const hasDriveLetter = raw.length >= 3 && /^[A-Za-z]:\//.test(raw);
     const isAbsolute = raw.startsWith("/") || hasDriveLetter;
-    const base = isAbsolute
+    return isAbsolute
       ? raw
       : `${(globalThis.process && typeof globalThis.process.cwd === "function" ? globalThis.process.cwd() : "/").replace(/\\/g, "/")}/${raw}`;
+  }
+
+  function normalizePath(input) {
+    const raw = String(input ?? "").replace(/\\/g, "/");
+    const base = absoluteInputPath(raw);
+    const { root, tail } = splitRoot(base);
     const parts = [];
-    for (const part of base.split("/")) {
+    for (const part of tail.split("/")) {
       if (!part || part === ".") continue;
       if (part === "..") {
         if (parts.length > 0) parts.pop();
@@ -10830,27 +13025,28 @@ const __pi_vfs = (() => {
       }
       parts.push(part);
     }
-    // Preserve drive letter prefix on Windows (D:/...) instead of /D:/...
-    if (parts.length > 0 && /^[A-Za-z]:$/.test(parts[0])) {
-      return `${parts[0]}/${parts.slice(1).join("/")}`;
-    }
-    return `/${parts.join("/")}`;
+    return parts.length ? `${childPrefix(root || "/")}${parts.join("/")}` : root || "/";
   }
 
   function dirname(path) {
     const normalized = normalizePath(path);
-    if (normalized === "/") return "/";
+    const { root } = splitRoot(normalized);
+    if (normalized === root) return root;
     const idx = normalized.lastIndexOf("/");
-    return idx <= 0 ? "/" : normalized.slice(0, idx);
+    return idx < root.length ? root : normalized.slice(0, idx);
   }
 
   function ensureDir(path) {
     const normalized = normalizePath(path);
-    if (normalized === "/") return "/";
-    const parts = normalized.slice(1).split("/");
-    let current = "";
+    const { root, tail } = splitRoot(normalized);
+    const parts = tail.split("/").filter(Boolean);
+    let current = root;
+    state.dirs.add(root);
     for (const part of parts) {
-      current = `${current}/${part}`;
+      current = `${childPrefix(current)}${part}`;
+      if (state.files.has(current) || state.symlinks.has(current)) {
+        throw new Error(`ENOTDIR: not a directory, mkdir '${String(path ?? "")}'`);
+      }
       state.dirs.add(current);
     }
     return normalized;
@@ -10970,29 +13166,148 @@ const __pi_vfs = (() => {
     return new TextDecoder().decode(bytes);
   }
 
-  function resolveSymlinkPath(linkPath, target) {
-    const raw = String(target ?? "");
-    if (raw.startsWith("/")) {
-      return normalizePath(raw);
+  function readHostBytes(resolved) {
+    if (
+      isCurrentExtensionTempPath(resolved) ||
+      typeof globalThis.__pi_host_read_file_sync !== "function"
+    ) {
+      return { bytes: undefined, error: "" };
     }
-    return normalizePath(`${dirname(linkPath)}/${raw}`);
+    try {
+      const content = globalThis.__pi_host_read_file_sync(toHostPath(resolved));
+      return { bytes: toBytes(content, "base64"), error: "" };
+    } catch (error) {
+      const message = String((error && error.message) ? error.message : error);
+      // Protected host data never falls back to the VFS or missing-config
+      // defaults after a permission, link, or I/O failure. Only native ENOENT
+      // means that an authorized configuration file is absent.
+      if (isPersistentPath(resolved) && (!error || error.code !== "ENOENT")) {
+        throw error;
+      }
+      // A standalone realm may use an unrestricted virtual overlay, but host
+      // reads remain confined. Treat a denied host probe as an absent overlay
+      // entry so create/write operations can proceed entirely in the VFS.
+      // Identified extensions still fail closed on the same denial.
+      if (message.includes("host read denied") && currentExtensionId()) {
+        throw error;
+      }
+      return { bytes: undefined, error: message };
+    }
   }
 
-  function resolvePath(path, followSymlinks = true) {
-    let normalized = mapExtensionTempPath(path, normalizePath(path));
+  function readHostStat(resolved, followSymlinks = true) {
+    if (
+      isCurrentExtensionTempPath(resolved) ||
+      typeof globalThis.__pi_host_stat_sync !== "function"
+    ) {
+      return undefined;
+    }
+    try {
+      return JSON.parse(globalThis.__pi_host_stat_sync(toHostPath(resolved), !!followSymlinks));
+    } catch (error) {
+      const message = String((error && error.message) ? error.message : error);
+      if (isPersistentPath(resolved) && (!error || error.code !== "ENOENT")) {
+        throw error;
+      }
+      // Standalone harness realms have no extension identity. Their virtual
+      // reads and writes intentionally bypass extension policy, so a denied
+      // host metadata probe means only that no host overlay is visible. An
+      // identified extension must retain the fail-closed policy error.
+      if (message.includes("host stat denied") && currentExtensionId()) throw error;
+      return undefined;
+    }
+  }
+
+  function resolveSymlinkPath(linkPath, target, rawPaths) {
+    const raw = String(target ?? "").replace(/\\/g, "/");
+    if (isAbsolutePathInput(raw)) {
+      rawPaths.push(raw);
+      const normalized = normalizePath(raw);
+      return mapExtensionTempPath(raw, normalized);
+    }
+    const absolute = `${dirname(linkPath)}/${raw}`;
+    rawPaths.push(absolute);
+    return normalizePath(absolute);
+  }
+
+  function firstSymlinkComponent(path) {
+    const { root, tail } = splitRoot(path);
+    const parts = tail.split("/").filter(Boolean);
+    let candidate = root;
+    for (let index = 0; index < parts.length; index += 1) {
+      candidate = `${childPrefix(candidate)}${parts[index]}`;
+      if (state.symlinks.has(candidate)) {
+        return { linkPath: candidate, remaining: parts.slice(index + 1) };
+      }
+    }
+    return null;
+  }
+
+  function resolvePathDetails(path, followSymlinks = true) {
+    const raw = String(path ?? "").replace(/\\/g, "/");
+    const absolute = absoluteInputPath(raw);
+    const rawPaths = [absolute];
+    let normalized = mapExtensionTempPath(raw, normalizePath(absolute));
+    const authorizationPaths = [normalized];
     if (!followSymlinks) {
-      return normalized;
+      return { resolved: normalized, authorizationPaths, rawPaths };
     }
 
     const seen = new Set();
-    while (state.symlinks.has(normalized)) {
-      if (seen.has(normalized)) {
+    for (;;) {
+      const component = firstSymlinkComponent(normalized);
+      if (!component) break;
+      if (seen.has(component.linkPath) || seen.size >= 40) {
         throw new Error(`ELOOP: too many symbolic links encountered, stat '${String(path ?? "")}'`);
       }
-      seen.add(normalized);
-      normalized = resolveSymlinkPath(normalized, state.symlinks.get(normalized));
+      seen.add(component.linkPath);
+      authorizationPaths.push(component.linkPath);
+      const target = resolveSymlinkPath(
+        component.linkPath,
+        state.symlinks.get(component.linkPath),
+        rawPaths,
+      );
+      normalized = component.remaining.length > 0
+        ? normalizePath(`${target}/${component.remaining.join("/")}`)
+        : target;
+      authorizationPaths.push(normalized);
     }
-    return normalized;
+    return { resolved: normalized, authorizationPaths, rawPaths };
+  }
+
+  function resolvePath(path, followSymlinks = true) {
+    return resolvePathDetails(path, followSymlinks).resolved;
+  }
+
+  function authorizeResolution(details, checkAccess, capability) {
+    if (typeof globalThis.__pi_host_check_persistent_storage_input === "function") {
+      for (const raw of details.rawPaths || []) {
+        globalThis.__pi_host_check_persistent_storage_input(toHostPath(raw), capability);
+      }
+    }
+    for (const candidate of details.authorizationPaths) {
+      checkAccess(candidate);
+    }
+  }
+
+  function authorizeReadResolution(details) {
+    authorizeResolution(details, checkReadAccess, "read");
+  }
+
+  function authorizeWriteResolution(details) {
+    authorizeResolution(details, checkWriteAccess, "write");
+  }
+
+  function resolvePathForRead(path, followSymlinks = true) {
+    const details = resolvePathDetails(path, followSymlinks);
+    authorizeReadResolution(details);
+    return details.resolved;
+  }
+
+  function resolvePathForWrite(path, followSymlinks = true) {
+    const details = resolvePathDetails(path, followSymlinks);
+    authorizeWriteResolution(details);
+    return details.resolved;
   }
 
   function parseOpenFlags(rawFlags) {
@@ -11050,6 +13365,22 @@ const __pi_vfs = (() => {
     return entry;
   }
 
+  function authorizeFdRead(entry) {
+    assertFdOwner(entry, "read");
+    authorizeReadResolution({ authorizationPaths: entry.authorizationPaths, rawPaths: entry.rawPaths });
+  }
+
+  function authorizeFdWrite(entry) {
+    assertFdOwner(entry, "write");
+    authorizeWriteResolution({ authorizationPaths: entry.authorizationPaths, rawPaths: entry.rawPaths });
+  }
+
+  function assertFdOwner(entry, capability) {
+    if (entry.extensionId !== currentExtensionId()) {
+      throw new Error(`host ${capability} denied: file descriptor belongs to another extension`);
+    }
+  }
+
   function toWritableView(buffer) {
     if (buffer instanceof Uint8Array) {
       return new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength);
@@ -11074,7 +13405,7 @@ const __pi_vfs = (() => {
 
   function listChildren(path, withFileTypes) {
     const normalized = normalizePath(path);
-    const prefix = normalized === "/" ? "/" : `${normalized}/`;
+    const prefix = childPrefix(normalized);
     const children = new Map();
 
     for (const dir of state.dirs) {
@@ -11096,7 +13427,14 @@ const __pi_vfs = (() => {
       if (!children.has(rest)) children.set(rest, "symlink");
     }
 
-    const names = Array.from(children.keys()).sort();
+    const names = Array.from(children.keys()).filter((name) => {
+      try {
+        resolvePathForRead(`${normalized === "/" ? "" : normalized}/${name}`, false);
+        return true;
+      } catch (_) {
+        return false;
+      }
+    }).sort();
     if (withFileTypes) {
       return names.map((name) => makeDirent(name, children.get(name)));
     }
@@ -11104,7 +13442,7 @@ const __pi_vfs = (() => {
   }
 
   function makeStat(path, followSymlinks = true) {
-    const normalized = followSymlinks ? resolvePath(path, true) : resolvePath(path, false);
+    const normalized = resolvePathForRead(path, followSymlinks);
     const linkTarget = state.symlinks.get(normalized);
     if (linkTarget !== undefined) {
       if (!followSymlinks) {
@@ -11140,15 +13478,12 @@ const __pi_vfs = (() => {
       return makeStat(resolvePath(normalized, true), true);
     }
 
-    const isDir = state.dirs.has(normalized);
-    let bytes = state.files.get(normalized);
+    const persistent = isPersistentPath(normalized);
+    const isDir = !persistent && state.dirs.has(normalized);
+    let bytes = persistent ? undefined : state.files.get(normalized);
     let hostStat = null;
-    if (!isDir && bytes === undefined && !isCurrentExtensionTempPath(normalized) && typeof globalThis.__pi_host_stat_sync === "function") {
-      try {
-        hostStat = JSON.parse(globalThis.__pi_host_stat_sync(normalized, !!followSymlinks));
-      } catch (e) {
-        /* not on host FS */
-      }
+    if (!isDir && bytes === undefined) {
+      hostStat = readHostStat(normalized, followSymlinks) ?? null;
     }
     const hostKind = hostStat && typeof hostStat.kind === "string" ? hostStat.kind : "";
     const isHostDir = hostKind === "dir";
@@ -11157,7 +13492,11 @@ const __pi_vfs = (() => {
     const isHostOther = hostKind === "other";
     const isFile = bytes !== undefined || isHostFile;
     if (!isDir && !isHostDir && !isFile && !isHostSymlink && !isHostOther) {
-      throw new Error(`ENOENT: no such file or directory, stat '${String(path ?? "")}'`);
+      const error = new Error(`ENOENT: no such file or directory, stat '${String(path ?? "")}'`);
+      error.code = "ENOENT";
+      error.syscall = "stat";
+      error.path = String(path ?? "");
+      throw error;
     }
     const hostSize =
       hostStat && typeof hostStat.size === "number" && Number.isFinite(hostStat.size)
@@ -11193,24 +13532,134 @@ const __pi_vfs = (() => {
     };
   }
 
+  function listVisiblePaths() {
+    const visible = (paths) => {
+      const out = [];
+      for (const path of paths) {
+        try {
+          resolvePathForRead(path, false);
+          out.push(path);
+        } catch (_) {
+          // Paths outside the active extension's read scope stay private.
+        }
+      }
+      return out;
+    };
+    return {
+      files: visible(state.files.keys()),
+      dirs: visible(state.dirs.values()),
+      symlinks: visible(state.symlinks.keys()),
+    };
+  }
+
+  function authorizeTreeWrite(path) {
+    const normalized = normalizePath(path);
+    const prefix = childPrefix(normalized);
+    const descendants = [normalized];
+    for (const candidate of state.files.keys()) {
+      if (candidate.startsWith(prefix)) descendants.push(candidate);
+    }
+    for (const candidate of state.dirs) {
+      if (candidate.startsWith(prefix)) descendants.push(candidate);
+    }
+    for (const candidate of state.symlinks.keys()) {
+      if (candidate.startsWith(prefix)) descendants.push(candidate);
+    }
+    for (const candidate of new Set(descendants)) {
+      authorizeWriteResolution(resolvePathDetails(candidate, false));
+    }
+  }
+
+  function resetState() {
+    const clearMap = globalThis.__pi_map_clear_primordial;
+    const clearSet = globalThis.__pi_set_clear_primordial;
+    const addSet = globalThis.__pi_set_add_primordial;
+    if (
+      typeof clearMap !== "function" ||
+      typeof clearSet !== "function" ||
+      typeof addSet !== "function"
+    ) {
+      throw new Error("PiJS VFS reset primordials are unavailable");
+    }
+    clearMap(state.files);
+    clearSet(state.dirs);
+    addSet(state.dirs, "/");
+    clearMap(state.symlinks);
+    clearMap(state.fds);
+  }
+
   state.normalizePath = normalizePath;
+  state.toHostPath = toHostPath;
+  state.childPrefix = childPrefix;
   state.dirname = dirname;
   state.ensureDir = ensureDir;
   state.toBytes = toBytes;
   state.decodeBytes = decodeBytes;
+  state.readHostBytes = readHostBytes;
+  state.readHostStat = readHostStat;
   state.listChildren = listChildren;
   state.makeDirent = makeDirent;
   state.makeStat = makeStat;
+  state.resolvePathDetails = resolvePathDetails;
   state.resolvePath = resolvePath;
+  state.resolvePathForRead = resolvePathForRead;
+  state.resolvePathForWrite = resolvePathForWrite;
+  state.authorizeReadResolution = authorizeReadResolution;
+  state.authorizeWriteResolution = authorizeWriteResolution;
   state.mapExtensionTempPath = mapExtensionTempPath;
   state.unmapExtensionTempPath = unmapExtensionTempPath;
   state.isCurrentExtensionTempPath = isCurrentExtensionTempPath;
+  state.checkReadAccess = checkReadAccess;
   state.checkWriteAccess = checkWriteAccess;
+  state.isPersistentPath = isPersistentPath;
+  state.persistentMutation = persistentMutation;
   state.checkWorkspaceWriteAccess = checkWorkspaceWriteAccess;
   state.parseOpenFlags = parseOpenFlags;
   state.getFdEntry = getFdEntry;
+  state.currentExtensionId = currentExtensionId;
+  state.assertFdOwner = assertFdOwner;
+  state.authorizeFdRead = authorizeFdRead;
+  state.authorizeFdWrite = authorizeFdWrite;
   state.toWritableView = toWritableView;
-  globalThis.__pi_vfs_state = state;
+  state.authorizeTreeWrite = authorizeTreeWrite;
+  state.reset = resetState;
+  const safeApi = { normalizePath, listVisiblePaths };
+  Object.defineProperty(safeApi, "reset", {
+    value: (secret) => {
+      const matches = globalThis.__pi_bridge_secret_matches_native;
+      if (typeof matches !== "function" || !matches(secret)) {
+        throw new Error("PiJS VFS reset denied");
+      }
+      resetState();
+    },
+    writable: false,
+    configurable: false,
+    enumerable: false,
+  });
+  Object.defineProperty(safeApi, "counts", {
+    value: () => {
+      const mapSize = globalThis.__pi_map_size_primordial;
+      const setSize = globalThis.__pi_set_size_primordial;
+      if (typeof mapSize !== "function" || typeof setSize !== "function") {
+        throw new Error("PiJS VFS count primordials are unavailable");
+      }
+      return {
+        files: mapSize(state.files),
+        dirs: Math.max(0, setSize(state.dirs) - 1),
+        symlinks: mapSize(state.symlinks),
+        fds: mapSize(state.fds),
+      };
+    },
+    writable: false,
+    configurable: false,
+    enumerable: false,
+  });
+  Object.defineProperty(globalThis, "__pi_vfs_api", {
+    value: Object.freeze(safeApi),
+    writable: false,
+    configurable: false,
+    enumerable: false,
+  });
   return state;
 })();
 
@@ -11224,53 +13673,70 @@ export function existsSync(path) {
 }
 
 export function readFileSync(path, encoding) {
-  const resolved = __pi_vfs.resolvePath(path, true);
-  let bytes = __pi_vfs.files.get(resolved);
-  let hostError;
-  if (!bytes && !__pi_vfs.isCurrentExtensionTempPath(resolved) && typeof globalThis.__pi_host_read_file_sync === "function") {
-    try {
-      const content = globalThis.__pi_host_read_file_sync(resolved);
-      // Host read payload is base64-encoded to preserve binary file fidelity.
-      bytes = __pi_vfs.toBytes(content, "base64");
-      __pi_vfs.ensureDir(__pi_vfs.dirname(resolved));
-      __pi_vfs.files.set(resolved, bytes);
-    } catch (e) {
-      const message = String((e && e.message) ? e.message : e);
-      if (message.includes("host read denied")) {
-        throw e;
-      }
-      hostError = message;
-      /* fall through to ENOENT */
-    }
+  const resolved = __pi_vfs.resolvePathForRead(path, true);
+  let bytes = __pi_vfs.isPersistentPath(resolved) ? undefined : __pi_vfs.files.get(resolved);
+  let hostError = "";
+  if (bytes === undefined) {
+    const host = __pi_vfs.readHostBytes(resolved);
+    bytes = host.bytes;
+    hostError = host.error;
   }
-  if (!bytes) {
+  if (bytes === undefined) {
     const detail = hostError ? ` (host: ${hostError})` : "";
-    throw new Error(`ENOENT: no such file or directory, open '${String(path ?? "")}'${detail}`);
+    const error = new Error(`ENOENT: no such file or directory, open '${String(path ?? "")}'${detail}`);
+    error.code = "ENOENT";
+    error.syscall = "open";
+    error.path = String(path ?? "");
+    throw error;
   }
   return __pi_vfs.decodeBytes(bytes, encoding);
 }
 
 export function appendFileSync(path, data, opts) {
-  const resolved = __pi_vfs.resolvePath(path, true);
-  __pi_vfs.checkWriteAccess(resolved);
-  const current = __pi_vfs.files.get(resolved) || new Uint8Array();
-  const next = __pi_vfs.toBytes(data, opts);
-  const merged = new Uint8Array(current.byteLength + next.byteLength);
-  merged.set(current, 0);
-  merged.set(next, current.byteLength);
-  __pi_vfs.ensureDir(__pi_vfs.dirname(resolved));
-  __pi_vfs.files.set(resolved, merged);
+  const persistentPath = __pi_vfs.resolvePathForWrite(path, true);
+  if (__pi_vfs.isPersistentPath(persistentPath)) {
+    const bytes = __pi_vfs.toBytes(data, opts);
+    __pi_vfs.persistentMutation("append", persistentPath, {
+      data: Buffer.from(bytes).toString("base64"),
+      flag: opts && typeof opts === "object" ? opts.flag : undefined,
+    });
+    return;
+  }
+  const flags =
+    opts && typeof opts === "object" && typeof opts.flag === "string"
+      ? opts.flag
+      : "a";
+  const fd = openSync(path, flags);
+  try {
+    const next = __pi_vfs.toBytes(data, opts);
+    writeSync(fd, next, 0, next.byteLength, null);
+  } finally {
+    closeSync(fd);
+  }
 }
 
 export function writeFileSync(path, data, opts) {
-  const resolved = __pi_vfs.resolvePath(path, true);
-  __pi_vfs.checkWriteAccess(resolved);
+  const resolved = __pi_vfs.resolvePathForWrite(path, true);
+  if (__pi_vfs.isPersistentPath(resolved)) {
+    const bytes = __pi_vfs.toBytes(data, opts);
+    __pi_vfs.persistentMutation("write", resolved, {
+      data: Buffer.from(bytes).toString("base64"),
+      flag: opts && typeof opts === "object" ? opts.flag : undefined,
+    });
+    return;
+  }
+  if (
+    __pi_vfs.dirs.has(resolved) ||
+    __pi_vfs.readHostStat(resolved, true)?.kind === "dir"
+  ) {
+    throw new Error(`EISDIR: illegal operation on a directory, open '${String(path ?? "")}'`);
+  }
   __pi_vfs.ensureDir(__pi_vfs.dirname(resolved));
   __pi_vfs.files.set(resolved, __pi_vfs.toBytes(data, opts));
 }
 
 export function readdirSync(path, opts) {
-  const resolved = __pi_vfs.resolvePath(path, true);
+  const resolved = __pi_vfs.resolvePathForRead(path, true);
   const withFileTypes = !!(opts && typeof opts === "object" && opts.withFileTypes);
   const children = new Map();
   let foundDir = __pi_vfs.dirs.has(resolved);
@@ -11291,18 +13757,20 @@ export function readdirSync(path, opts) {
   let hostError;
   if (!__pi_vfs.isCurrentExtensionTempPath(resolved) && typeof globalThis.__pi_host_read_dir_sync === "function") {
     try {
-      const hostEntries = JSON.parse(globalThis.__pi_host_read_dir_sync(resolved));
+      const hostEntries = JSON.parse(globalThis.__pi_host_read_dir_sync(__pi_vfs.toHostPath(resolved)));
       foundDir = true;
-      __pi_vfs.ensureDir(resolved);
       for (const entry of hostEntries) {
         if (!entry || typeof entry.name !== "string") continue;
-        children.set(entry.name, typeof entry.kind === "string" ? entry.kind : "other");
+        const childPath = `${resolved === "/" ? "" : resolved}/${entry.name}`;
+        try {
+          __pi_vfs.resolvePathForRead(childPath, false);
+          children.set(entry.name, typeof entry.kind === "string" ? entry.kind : "other");
+        } catch (_) {
+          // Nested roots owned by another extension are invisible.
+        }
       }
     } catch (e) {
       const message = String((e && e.message) ? e.message : e);
-      if (message.includes("host readdir denied") && !foundDir) {
-        throw e;
-      }
       hostError = message;
     }
   }
@@ -11334,20 +13802,59 @@ const __fakeStat = {
 };
 export function statSync(path) { return __pi_vfs.makeStat(path, true); }
 export function lstatSync(path) { return __pi_vfs.makeStat(path, false); }
-export function mkdtempSync(prefix, _opts) {
+function pathResult(path, opts) {
+  const encoding = typeof opts === "string" ? opts : opts && opts.encoding;
+  if (encoding === "buffer") return Buffer.from(path, "utf8");
+  return encoding && encoding !== "utf8" && encoding !== "utf-8"
+    ? Buffer.from(path, "utf8").toString(encoding) : path;
+}
+export function mkdtempSync(prefix, opts) {
   const p = String(prefix ?? "/tmp/tmp-");
+  const raw = p.replace(/\\/g, "/");
+  const separator = raw.lastIndexOf("/");
+  // Only the parent is a path to resolve: the final component is a literal
+  // prefix, including a trailing '.', and must not follow an existing link.
+  const parent = __pi_vfs.resolvePathForWrite(separator < 0 ? "." : raw.slice(0, separator + 1), true);
+  const resolvedPrefix = __pi_vfs.childPrefix(parent) + raw.slice(separator + 1);
+  if (__pi_vfs.isPersistentPath(resolvedPrefix)) {
+    if (typeof globalThis.__pi_host_persistent_storage_mkdtemp !== "function") {
+      throw new Error("PiJS persistent temporary directory bridge is unavailable");
+    }
+    return pathResult(globalThis.__pi_host_persistent_storage_mkdtemp(__pi_vfs.toHostPath(resolvedPrefix)), opts);
+  }
   const out = `${p}${Date.now().toString(36)}`;
-  const resolved = __pi_vfs.resolvePath(out, true);
+  const resolved = __pi_vfs.resolvePathForWrite(out, true);
   __pi_vfs.checkWorkspaceWriteAccess(resolved);
   __pi_vfs.ensureDir(resolved);
-  return out;
+  return pathResult(out, opts);
 }
-export function realpathSync(path, _opts) {
-  return __pi_vfs.unmapExtensionTempPath(__pi_vfs.resolvePath(path, true));
+export function realpathSync(path, opts) {
+  const resolved = __pi_vfs.resolvePathForRead(path, true);
+  const virtual = __pi_vfs.files.has(resolved) || __pi_vfs.dirs.has(resolved);
+  let canonical = __pi_vfs.unmapExtensionTempPath(resolved);
+  if (!__pi_vfs.isCurrentExtensionTempPath(resolved)
+      && typeof globalThis.__pi_host_realpath_sync === "function") {
+    try {
+      canonical = globalThis.__pi_host_realpath_sync(__pi_vfs.toHostPath(resolved));
+    } catch (error) {
+      // Overlay-only entries have no host path. Never hide a denied host
+      // resolution behind a previously cached virtual directory or file.
+      const identified = typeof globalThis.__pi_get_current_extension_id === "function"
+        && !!globalThis.__pi_get_current_extension_id();
+      if (!virtual || (identified && String(error && error.message || error).includes("denied"))) throw error;
+    }
+  } else if (!virtual) {
+    throw new Error(`ENOENT: no such file or directory, realpath '${String(path ?? "")}'`);
+  }
+  return pathResult(canonical, opts);
 }
+realpathSync.native = realpathSync;
 export function unlinkSync(path) {
-  const normalized = __pi_vfs.resolvePath(path, false);
-  __pi_vfs.checkWriteAccess(normalized);
+  const normalized = __pi_vfs.resolvePathForWrite(path, false);
+  if (__pi_vfs.isPersistentPath(normalized)) {
+    __pi_vfs.persistentMutation("unlink", normalized);
+    return;
+  }
   if (__pi_vfs.symlinks.delete(normalized)) {
     return;
   }
@@ -11356,26 +13863,32 @@ export function unlinkSync(path) {
   }
 }
 export function rmdirSync(path, _opts) {
-  const normalized = __pi_vfs.resolvePath(path, false);
-  __pi_vfs.checkWriteAccess(normalized);
+  const normalized = __pi_vfs.resolvePathForWrite(path, false);
+  if (__pi_vfs.isPersistentPath(normalized)) {
+    if (_opts && _opts.recursive) throw new Error("PiJS persistent recursive directory removal is unsupported");
+    __pi_vfs.persistentMutation("rmdir", normalized);
+    return;
+  }
+  const prefix = __pi_vfs.childPrefix(normalized);
   if (normalized === "/") {
     throw new Error("EBUSY: resource busy or locked, rmdir '/'");
   }
   if (__pi_vfs.symlinks.has(normalized)) {
     throw new Error(`ENOTDIR: not a directory, rmdir '${String(path ?? "")}'`);
   }
+  __pi_vfs.authorizeTreeWrite(normalized);
   for (const filePath of __pi_vfs.files.keys()) {
-    if (filePath.startsWith(`${normalized}/`)) {
+    if (filePath.startsWith(prefix)) {
       throw new Error(`ENOTEMPTY: directory not empty, rmdir '${String(path ?? "")}'`);
     }
   }
   for (const dirPath of __pi_vfs.dirs) {
-    if (dirPath.startsWith(`${normalized}/`)) {
+    if (dirPath !== normalized && dirPath.startsWith(prefix)) {
       throw new Error(`ENOTEMPTY: directory not empty, rmdir '${String(path ?? "")}'`);
     }
   }
   for (const linkPath of __pi_vfs.symlinks.keys()) {
-    if (linkPath.startsWith(`${normalized}/`)) {
+    if (linkPath.startsWith(prefix)) {
       throw new Error(`ENOTEMPTY: directory not empty, rmdir '${String(path ?? "")}'`);
     }
   }
@@ -11384,8 +13897,15 @@ export function rmdirSync(path, _opts) {
   }
 }
 export function rmSync(path, opts) {
-  const normalized = __pi_vfs.resolvePath(path, false);
-  __pi_vfs.checkWriteAccess(normalized);
+  const normalized = __pi_vfs.resolvePathForWrite(path, false);
+  if (__pi_vfs.isPersistentPath(normalized)) {
+    if (opts && opts.recursive) throw new Error("PiJS persistent recursive directory removal is unsupported");
+    if (opts && opts.force && !existsSync(normalized)) return;
+    const op = statSync(normalized).isDirectory() ? "rmdir" : "unlink";
+    __pi_vfs.persistentMutation(op, normalized);
+    return;
+  }
+  const prefix = __pi_vfs.childPrefix(normalized);
   if (__pi_vfs.files.has(normalized)) {
     __pi_vfs.files.delete(normalized);
     return;
@@ -11400,18 +13920,19 @@ export function rmSync(path, opts) {
       rmdirSync(normalized);
       return;
     }
+    __pi_vfs.authorizeTreeWrite(normalized);
     for (const filePath of Array.from(__pi_vfs.files.keys())) {
-      if (filePath === normalized || filePath.startsWith(`${normalized}/`)) {
+      if (filePath === normalized || filePath.startsWith(prefix)) {
         __pi_vfs.files.delete(filePath);
       }
     }
     for (const dirPath of Array.from(__pi_vfs.dirs)) {
-      if (dirPath === normalized || dirPath.startsWith(`${normalized}/`)) {
+      if (dirPath === normalized || dirPath.startsWith(prefix)) {
         __pi_vfs.dirs.delete(dirPath);
       }
     }
     for (const linkPath of Array.from(__pi_vfs.symlinks.keys())) {
-      if (linkPath === normalized || linkPath.startsWith(`${normalized}/`)) {
+      if (linkPath === normalized || linkPath.startsWith(prefix)) {
         __pi_vfs.symlinks.delete(linkPath);
       }
     }
@@ -11426,10 +13947,15 @@ export function copyFileSync(src, dest, _mode) {
   writeFileSync(dest, readFileSync(src));
 }
 export function renameSync(oldPath, newPath) {
-  const src = __pi_vfs.resolvePath(oldPath, false);
-  const dst = __pi_vfs.resolvePath(newPath, false);
-  __pi_vfs.checkWriteAccess(src);
-  __pi_vfs.checkWriteAccess(dst);
+  const src = __pi_vfs.resolvePathForWrite(oldPath, false);
+  const dst = __pi_vfs.resolvePathForWrite(newPath, false);
+  if (__pi_vfs.isPersistentPath(src) || __pi_vfs.isPersistentPath(dst)) {
+    if (!__pi_vfs.isPersistentPath(src) || !__pi_vfs.isPersistentPath(dst)) {
+      throw new Error("PiJS cannot rename across persistent and virtual filesystems");
+    }
+    __pi_vfs.persistentMutation("rename", src, { target: __pi_vfs.toHostPath(dst) });
+    return;
+  }
   const linkTarget = __pi_vfs.symlinks.get(src);
   if (linkTarget !== undefined) {
     __pi_vfs.ensureDir(__pi_vfs.dirname(dst));
@@ -11447,20 +13973,39 @@ export function renameSync(oldPath, newPath) {
   throw new Error(`ENOENT: no such file or directory, rename '${String(oldPath ?? "")}'`);
 }
 export function mkdirSync(path, _opts) {
-  const resolved = __pi_vfs.resolvePath(path, true);
-  __pi_vfs.checkWriteAccess(resolved);
+  const resolved = __pi_vfs.resolvePathForWrite(path, true);
+  if (__pi_vfs.isPersistentPath(resolved)) {
+    __pi_vfs.persistentMutation("mkdir", resolved, { recursive: !!(_opts && _opts.recursive) });
+    return undefined;
+  }
+  if (__pi_vfs.files.has(resolved) || __pi_vfs.symlinks.has(resolved)) {
+    throw new Error(`EEXIST: file already exists, mkdir '${String(path ?? "")}'`);
+  }
   __pi_vfs.ensureDir(resolved);
   return __pi_vfs.normalizePath(path);
 }
-export function accessSync(path, _mode) {
+export function accessSync(path, mode = constants.F_OK) {
+  if ((Number(mode) & constants.W_OK) !== 0) {
+    __pi_vfs.resolvePathForWrite(path, true);
+  }
   if (!existsSync(path)) {
     throw new Error("ENOENT: no such file or directory");
   }
 }
-export function chmodSync(path, _mode) { accessSync(path); return; }
-export function chownSync(path, _uid, _gid) { accessSync(path); return; }
+export function chmodSync(path, _mode) {
+  const resolved = __pi_vfs.resolvePathForWrite(path, true);
+  __pi_vfs.makeStat(resolved, true);
+}
+export function chownSync(path, _uid, _gid) {
+  const resolved = __pi_vfs.resolvePathForWrite(path, true);
+  __pi_vfs.makeStat(resolved, true);
+}
+export function utimesSync(path, _atime, _mtime) {
+  const resolved = __pi_vfs.resolvePathForWrite(path, true);
+  __pi_vfs.makeStat(resolved, true);
+}
 export function readlinkSync(path, opts) {
-  const normalized = __pi_vfs.normalizePath(path);
+  const normalized = __pi_vfs.resolvePathForRead(path, false);
   if (!__pi_vfs.symlinks.has(normalized)) {
     if (__pi_vfs.files.has(normalized) || __pi_vfs.dirs.has(normalized)) {
       throw new Error(`EINVAL: invalid argument, readlink '${String(path ?? "")}'`);
@@ -11480,8 +14025,10 @@ export function readlinkSync(path, opts) {
   return target;
 }
 export function symlinkSync(target, path, _type) {
-  const normalized = __pi_vfs.resolvePath(path, false);
-  __pi_vfs.checkWriteAccess(normalized);
+  const normalized = __pi_vfs.resolvePathForWrite(path, false);
+  if (__pi_vfs.isPersistentPath(normalized)) {
+    throw new Error("PiJS persistent storage does not permit symlinks");
+  }
   const parent = __pi_vfs.dirname(normalized);
   if (!__pi_vfs.dirs.has(parent)) {
     throw new Error(`ENOENT: no such file or directory, symlink '${String(path ?? "")}'`);
@@ -11492,53 +14039,92 @@ export function symlinkSync(target, path, _type) {
   __pi_vfs.symlinks.set(normalized, String(target ?? ""));
 }
 export function openSync(path, flags = "r", _mode) {
-  const resolved = __pi_vfs.resolvePath(path, true);
   const opts = __pi_vfs.parseOpenFlags(flags);
+  const needsWriteAccess = opts.writable || opts.create || opts.append || opts.truncate;
+  const resolution = __pi_vfs.resolvePathDetails(path, true);
 
-  if (opts.writable || opts.create || opts.append || opts.truncate) {
-    __pi_vfs.checkWriteAccess(resolved);
+  if (opts.readable) {
+    __pi_vfs.authorizeReadResolution(resolution);
+  }
+  if (needsWriteAccess) {
+    __pi_vfs.authorizeWriteResolution(resolution);
+  }
+  const resolved = resolution.resolved;
+
+  if (needsWriteAccess && __pi_vfs.isPersistentPath(resolved)) {
+    throw new Error("PiJS persistent file descriptors are unsupported; use writeFileSync or appendFileSync");
   }
 
-  if (__pi_vfs.dirs.has(resolved)) {
+  const hostStat = __pi_vfs.readHostStat(resolved, true);
+  if (__pi_vfs.dirs.has(resolved) || hostStat?.kind === "dir") {
     throw new Error(`EISDIR: illegal operation on a directory, open '${String(path ?? "")}'`);
   }
 
-  const exists = __pi_vfs.files.has(resolved);
+  const existsInVfs = __pi_vfs.files.has(resolved);
+  const host = existsInVfs ? { bytes: undefined, error: "" } : __pi_vfs.readHostBytes(resolved);
+  const existsOnHost = hostStat !== undefined;
+  const exists = existsInVfs || existsOnHost;
   if (!exists && !opts.create) {
-    throw new Error(`ENOENT: no such file or directory, open '${String(path ?? "")}'`);
+    const detail = host.error ? ` (host: ${host.error})` : "";
+    throw new Error(`ENOENT: no such file or directory, open '${String(path ?? "")}'${detail}`);
   }
   if (exists && opts.create && opts.exclusive) {
     throw new Error(`EEXIST: file already exists, open '${String(path ?? "")}'`);
   }
+  if (existsOnHost && hostStat.kind !== "file") {
+    throw new Error(`EINVAL: unsupported host file type, open '${String(path ?? "")}'`);
+  }
+  if (!existsInVfs && existsOnHost && host.bytes === undefined && !opts.truncate) {
+    const detail = host.error ? `: ${host.error}` : "";
+    throw new Error(`EIO: unable to read host file '${String(path ?? "")}'${detail}`);
+  }
   if (!exists && opts.create) {
     __pi_vfs.ensureDir(__pi_vfs.dirname(resolved));
     __pi_vfs.files.set(resolved, new Uint8Array());
+  }
+  if (
+    existsOnHost &&
+    needsWriteAccess &&
+    host.bytes !== undefined &&
+    !__pi_vfs.files.has(resolved)
+  ) {
+    // Writes are isolated in the runtime overlay; seed it from a fresh host
+    // snapshot so append/update flags preserve existing bytes.
+    __pi_vfs.ensureDir(__pi_vfs.dirname(resolved));
+    __pi_vfs.files.set(resolved, host.bytes);
   }
   if (opts.truncate && opts.writable) {
     __pi_vfs.files.set(resolved, new Uint8Array());
   }
 
   const fd = __pi_vfs.nextFd++;
-  const current = __pi_vfs.files.get(resolved) || new Uint8Array();
+  const current = __pi_vfs.files.get(resolved) || host.bytes || new Uint8Array();
   __pi_vfs.fds.set(fd, {
     path: resolved,
+    extensionId: __pi_vfs.currentExtensionId(),
+    authorizationPaths: resolution.authorizationPaths.slice(),
+    rawPaths: resolution.rawPaths.slice(),
     readable: opts.readable,
     writable: opts.writable,
     append: opts.append,
     position: opts.append ? current.byteLength : 0,
+    hostBytes: needsWriteAccess ? undefined : host.bytes,
   });
   return fd;
 }
 export function closeSync(fd) {
-  if (!__pi_vfs.fds.delete(fd)) {
-    throw new Error(`EBADF: bad file descriptor, fd ${String(fd)}`);
-  }
+  const entry = __pi_vfs.getFdEntry(fd);
+  // Releasing this virtual handle performs no filesystem I/O. Its owner must
+  // be able to discard cached bytes after a path or capability is revoked.
+  __pi_vfs.assertFdOwner(entry, entry.readable ? "read" : "write");
+  __pi_vfs.fds.delete(fd);
 }
 export function readSync(fd, buffer, offset = 0, length, position = null) {
   const entry = __pi_vfs.getFdEntry(fd);
   if (!entry.readable) {
     throw new Error(`EBADF: bad file descriptor, fd ${String(fd)}`);
   }
+  __pi_vfs.authorizeFdRead(entry);
   const out = __pi_vfs.toWritableView(buffer);
   const start = Number.isInteger(offset) && offset >= 0 ? offset : 0;
   const maxLen =
@@ -11549,7 +14135,7 @@ export function readSync(fd, buffer, offset = 0, length, position = null) {
     typeof position === "number" && Number.isFinite(position) && position >= 0
       ? Math.floor(position)
       : entry.position;
-  const source = __pi_vfs.files.get(entry.path) || new Uint8Array();
+  const source = __pi_vfs.files.get(entry.path) || entry.hostBytes || new Uint8Array();
   if (cursor >= source.byteLength || maxLen <= 0 || start >= out.byteLength) {
     return 0;
   }
@@ -11565,6 +14151,7 @@ export function writeSync(fd, buffer, offset, length, position) {
   if (!entry.writable) {
     throw new Error(`EBADF: bad file descriptor, fd ${String(fd)}`);
   }
+  __pi_vfs.authorizeFdWrite(entry);
 
   let chunk;
   let explicitPosition = false;
@@ -11607,12 +14194,13 @@ export function writeSync(fd, buffer, offset, length, position) {
       : entry.position;
   }
 
-  const current = __pi_vfs.files.get(entry.path) || new Uint8Array();
+  const current = __pi_vfs.files.get(entry.path) || entry.hostBytes || new Uint8Array();
   const required = cursor + chunk.byteLength;
   const next = new Uint8Array(Math.max(current.byteLength, required));
   next.set(current, 0);
   next.set(chunk, cursor);
   __pi_vfs.files.set(entry.path, next);
+  entry.hostBytes = undefined;
 
   if (!explicitPosition) {
     entry.position = cursor + chunk.byteLength;
@@ -11621,6 +14209,7 @@ export function writeSync(fd, buffer, offset, length, position) {
 }
 export function fstatSync(fd) {
   const entry = __pi_vfs.getFdEntry(fd);
+  __pi_vfs.authorizeFdRead(entry);
   return __pi_vfs.makeStat(entry.path, true);
 }
 export function ftruncateSync(fd, len = 0) {
@@ -11628,17 +14217,33 @@ export function ftruncateSync(fd, len = 0) {
   if (!entry.writable) {
     throw new Error(`EBADF: bad file descriptor, fd ${String(fd)}`);
   }
+  __pi_vfs.authorizeFdWrite(entry);
   const targetLen =
     Number.isInteger(len) && len >= 0 ? len : 0;
-  const current = __pi_vfs.files.get(entry.path) || new Uint8Array();
+  const current = __pi_vfs.files.get(entry.path) || entry.hostBytes || new Uint8Array();
   const next = new Uint8Array(targetLen);
   next.set(current.subarray(0, Math.min(current.byteLength, targetLen)));
   __pi_vfs.files.set(entry.path, next);
+  entry.hostBytes = undefined;
   if (entry.position > targetLen) {
     entry.position = targetLen;
   }
 }
-export function futimesSync(_fd, _atime, _mtime) { return; }
+export function truncateSync(path, len = 0) {
+  const fd = openSync(path, "r+");
+  try {
+    ftruncateSync(fd, len);
+  } finally {
+    closeSync(fd);
+  }
+}
+export function futimesSync(fd, _atime, _mtime) {
+  const entry = __pi_vfs.getFdEntry(fd);
+  if (!entry.writable) {
+    throw new Error(`EBADF: bad file descriptor, fd ${String(fd)}`);
+  }
+  __pi_vfs.authorizeFdWrite(entry);
+}
 function __fakeWatcher() {
   const w = { close() {}, unref() { return w; }, ref() { return w; }, on() { return w; }, once() { return w; }, removeListener() { return w; }, removeAllListeners() { return w; } };
   return w;
@@ -11651,7 +14256,7 @@ export function watchFile(path, _optsOrListener, _listener) {
   accessSync(path);
   return __fakeWatcher();
 }
-export function unwatchFile(_path, _listener) { return; }
+export function unwatchFile(path, _listener) { accessSync(path); }
 function __queueMicrotaskPolyfill(fn) {
   if (typeof queueMicrotask === "function") {
     queueMicrotask(fn);
@@ -11708,8 +14313,28 @@ export function createWriteStream(path, opts) {
   const options = opts && typeof opts === "object" ? opts : {};
   const encoding = typeof options.encoding === "string" ? options.encoding : "utf8";
   const flags = typeof options.flags === "string" ? options.flags : "w";
-  const appendMode = flags.startsWith("a");
+  const fd = openSync(path, flags, options.mode);
+  const fdEntry = __pi_vfs.getFdEntry(fd);
   const bufferedChunks = [];
+  let closed = false;
+
+  // A stream owns the descriptor it opened. Close it at most once, and only
+  // while that exact descriptor is still registered. Lifecycle scrubs keep
+  // descriptor IDs monotonic, so a stale stream must never close a newer entry.
+  const closeOwnedFd = () => {
+    if (closed) return;
+    closed = true;
+    if (__pi_vfs.fds.get(fd) !== fdEntry) return;
+    try {
+      closeSync(fd);
+    } finally {
+      // A stream owns its exact descriptor even if cleanup runs under a
+      // different callback principal. Never release a reused numeric handle.
+      if (__pi_vfs.fds.get(fd) === fdEntry) {
+        __pi_vfs.fds.delete(fd);
+      }
+    }
+  };
 
   const stream = new Writable({
     autoDestroy: false,
@@ -11724,45 +14349,37 @@ export function createWriteStream(path, opts) {
         this.bytesWritten += bytes.byteLength;
         callback(null);
       } catch (err) {
-        callback(err instanceof Error ? err : new Error(String(err)));
+        const original = err instanceof Error ? err : new Error(String(err));
+        try { closeOwnedFd(); } catch (_) {}
+        callback(original);
       }
     },
     final(callback) {
       try {
-        if (appendMode) {
-          const resolved = __pi_vfs.resolvePath(path, true);
-          __pi_vfs.checkWriteAccess(resolved);
-          const current = __pi_vfs.files.get(resolved) || new Uint8Array();
-          const totalSize = current.byteLength + bufferedChunks.reduce((sum, bytes) => sum + bytes.byteLength, 0);
-          const merged = new Uint8Array(totalSize);
-          merged.set(current, 0);
-          let offset = current.byteLength;
-          for (const bytes of bufferedChunks) {
-            merged.set(bytes, offset);
-            offset += bytes.byteLength;
-          }
-          __pi_vfs.ensureDir(__pi_vfs.dirname(resolved));
-          __pi_vfs.files.set(resolved, merged);
-        } else {
-          const totalSize = bufferedChunks.reduce((sum, bytes) => sum + bytes.byteLength, 0);
-          const merged = new Uint8Array(totalSize);
-          let offset = 0;
-          for (const bytes of bufferedChunks) {
-            merged.set(bytes, offset);
-            offset += bytes.byteLength;
-          }
-          writeFileSync(path, merged);
+        for (const bytes of bufferedChunks) {
+          writeSync(fd, bytes, 0, bytes.byteLength, null);
         }
+        closeOwnedFd();
         callback(null);
       } catch (err) {
-        callback(err instanceof Error ? err : new Error(String(err)));
+        const original = err instanceof Error ? err : new Error(String(err));
+        try { closeOwnedFd(); } catch (_) {}
+        callback(original);
       }
     },
   });
   stream.path = __pi_vfs.normalizePath(path);
+  stream.fd = fd;
   stream.bytesWritten = 0;
   stream.cork = () => stream;
   stream.uncork = () => stream;
+  const baseDestroy = stream.destroy.bind(stream);
+  stream.destroy = (err) => {
+    // Preserve Stream.destroy's observable error/close behavior; descriptor
+    // cleanup is best-effort and must not replace an error supplied by caller.
+    try { closeOwnedFd(); } catch (_) {}
+    return baseDestroy(err);
+  };
   return stream;
 }
 export function readFile(path, optOrCb, cb) {
@@ -11882,6 +14499,14 @@ export function chown(path, uid, gid, cb) {
     catch (err) { cb(err); }
   }
 }
+export function truncate(path, lenOrCb, cb) {
+  const callback = typeof lenOrCb === "function" ? lenOrCb : cb;
+  const len = typeof lenOrCb === "function" ? 0 : lenOrCb;
+  if (typeof callback === "function") {
+    try { truncateSync(path, len); callback(null); }
+    catch (err) { callback(err); }
+  }
+}
 export function realpath(path, optOrCb, cb) {
   const callback = typeof optOrCb === 'function' ? optOrCb : cb;
   const opts = typeof optOrCb === 'function' ? undefined : optOrCb;
@@ -11890,19 +14515,54 @@ export function realpath(path, optOrCb, cb) {
     catch (err) { callback(err); }
   }
 }
+realpath.native = realpath;
 export function access(_path, modeOrCb, cb) {
   const callback = typeof modeOrCb === 'function' ? modeOrCb : cb;
+  const mode = typeof modeOrCb === 'function' ? constants.F_OK : modeOrCb;
   if (typeof callback === 'function') {
     try {
-      accessSync(_path);
+      accessSync(_path, mode);
       callback(null);
     } catch (err) {
       callback(err);
     }
   }
 }
+function makeFileHandle(fd) {
+  const fdEntry = __pi_vfs.getFdEntry(fd);
+  let closed = false;
+  const requireOpen = () => {
+    if (closed || __pi_vfs.fds.get(fd) !== fdEntry) {
+      throw new Error(`EBADF: bad file descriptor, fd ${String(fd)}`);
+    }
+    return fdEntry;
+  };
+  return {
+    fd,
+    async read(buffer, offset = 0, length, position = null) {
+      requireOpen();
+      const bytesRead = readSync(fd, buffer, offset, length, position);
+      return { bytesRead, buffer };
+    },
+    async write(buffer, offset, length, position) {
+      requireOpen();
+      const bytesWritten = writeSync(fd, buffer, offset, length, position);
+      return { bytesWritten, buffer };
+    },
+    async stat() { requireOpen(); return fstatSync(fd); },
+    async truncate(len = 0) { requireOpen(); ftruncateSync(fd, len); },
+    async sync() { __pi_vfs.authorizeFdWrite(requireOpen()); },
+    async datasync() { __pi_vfs.authorizeFdWrite(requireOpen()); },
+    async close() {
+      requireOpen();
+      closeSync(fd);
+      closed = true;
+    },
+  };
+}
+
 export const promises = {
-  access: async (path, _mode) => accessSync(path),
+  access: async (path, mode) => accessSync(path, mode),
   mkdir: async (path, opts) => mkdirSync(path, opts),
   mkdtemp: async (prefix, _opts) => {
     return mkdtempSync(prefix, _opts);
@@ -11927,19 +14587,21 @@ export const promises = {
     return copyFileSync(src, dest);
   },
   appendFile: async (path, data, opts) => appendFileSync(path, data, opts),
+  open: async (path, flags = "r", mode) => makeFileHandle(openSync(path, flags, mode)),
+  truncate: async (path, len = 0) => truncateSync(path, len),
   chmod: async (path, mode) => chmodSync(path, mode),
   chown: async (path, uid, gid) => chownSync(path, uid, gid),
-  utimes: async (path, _atime, _mtime) => accessSync(path),
+  utimes: async (path, atime, mtime) => utimesSync(path, atime, mtime),
 };
-export default { constants, existsSync, readFileSync, appendFileSync, writeFileSync, readdirSync, statSync, lstatSync, mkdtempSync, realpathSync, unlinkSync, rmdirSync, rmSync, copyFileSync, renameSync, mkdirSync, accessSync, chmodSync, chownSync, readlinkSync, symlinkSync, openSync, closeSync, readSync, writeSync, fstatSync, ftruncateSync, futimesSync, watch, watchFile, unwatchFile, createReadStream, createWriteStream, readFile, writeFile, stat, lstat, readdir, mkdir, unlink, readlink, symlink, rmdir, rm, rename, copyFile, appendFile, chmod, chown, realpath, access, promises };
-"#
+export default { constants, existsSync, readFileSync, appendFileSync, writeFileSync, readdirSync, statSync, lstatSync, mkdtempSync, realpathSync, unlinkSync, rmdirSync, rmSync, copyFileSync, renameSync, mkdirSync, accessSync, chmodSync, chownSync, utimesSync, truncateSync, readlinkSync, symlinkSync, openSync, closeSync, readSync, writeSync, fstatSync, ftruncateSync, futimesSync, watch, watchFile, unwatchFile, createReadStream, createWriteStream, readFile, writeFile, stat, lstat, readdir, mkdir, unlink, readlink, symlink, rmdir, rm, rename, copyFile, appendFile, chmod, chown, truncate, realpath, access, promises };
+"#)
         .trim()
         .to_string(),
     );
 
     modules.insert(
         "node:fs/promises".to_string(),
-        r"
+        compressed_js_literal!(r"
 import fs from 'node:fs';
 
 export async function access(path, mode) { return fs.promises.access(path, mode); }
@@ -11971,27 +14633,32 @@ export async function chmod(path, mode) { return fs.promises.chmod(path, mode); 
 export async function chown(path, uid, gid) { return fs.promises.chown(path, uid, gid); }
 export async function utimes(path, atime, mtime) { return fs.promises.utimes(path, atime, mtime); }
 export async function appendFile(path, data, opts) { return fs.promises.appendFile(path, data, opts); }
-export async function open(path, flags, mode) { return { close: async () => {} }; }
-export async function truncate(path, len) { return; }
+export async function open(path, flags, mode) { return fs.promises.open(path, flags, mode); }
+export async function truncate(path, len) { return fs.promises.truncate(path, len); }
 export default { access, mkdir, mkdtemp, readFile, writeFile, unlink, readlink, symlink, rmdir, stat, lstat, realpath, readdir, rm, copyFile, cp, rename, chmod, chown, utimes, appendFile, open, truncate };
-"
+")
         .trim()
         .to_string(),
     );
 
     modules.insert(
         "node:http".to_string(),
-        crate::http_shim::NODE_HTTP_JS.trim().to_string(),
+        compressed_js_literal!(crate::http_shim::NODE_HTTP_JS)
+            .trim()
+            .to_string(),
     );
 
     modules.insert(
         "node:https".to_string(),
-        crate::http_shim::NODE_HTTPS_JS.trim().to_string(),
+        compressed_js_literal!(crate::http_shim::NODE_HTTPS_JS)
+            .trim()
+            .to_string(),
     );
 
     modules.insert(
         "node:http2".to_string(),
-        r#"
+        compressed_js_literal!(
+            r#"
 import EventEmitter from "node:events";
 
 export const constants = {
@@ -12059,13 +14726,14 @@ export class ClientHttp2Stream extends EventEmitter {}
 
 export default { connect, constants, ClientHttp2Session, ClientHttp2Stream };
 "#
+        )
         .trim()
         .to_string(),
     );
 
     modules.insert(
         "node:util".to_string(),
-        r#"
+        compressed_js_literal!(r#"
 export function inspect(value, opts) {
   const depth = (opts && typeof opts.depth === 'number') ? opts.depth : 2;
   const seen = new Set();
@@ -12194,19 +14862,22 @@ export const TextEncoder = globalThis.TextEncoder;
 export const TextDecoder = globalThis.TextDecoder;
 
 export default { inspect, promisify, stripVTControlCharacters, deprecate, inherits, debuglog, format, callbackify, types, TextEncoder, TextDecoder };
-"#
+"#)
         .trim()
         .to_string(),
     );
 
     modules.insert(
         "node:crypto".to_string(),
-        crate::crypto_shim::NODE_CRYPTO_JS.trim().to_string(),
+        compressed_js_literal!(crate::crypto_shim::NODE_CRYPTO_JS)
+            .trim()
+            .to_string(),
     );
 
     modules.insert(
         "node:readline".to_string(),
-        r"
+        compressed_js_literal!(
+            r"
 // Readline shim backed by pi.ui('input') when UI is available.
 
 function __pi_readline_prompt(query) {
@@ -12257,6 +14928,7 @@ export const promises = {
 
 export default { createInterface, promises };
 "
+        )
         .trim()
         .to_string(),
     );
@@ -12275,19 +14947,97 @@ export default { createInterface };
 
     modules.insert(
         "node:url".to_string(),
-        r"
-export function fileURLToPath(url) {
-  const u = String(url ?? '');
-  if (u.startsWith('file://')) {
-    let p = decodeURIComponent(u.slice(7));
-    // file:///C:/... → C:/... (strip leading / before Windows drive letter)
-    if (p.length >= 3 && p[0] === '/' && p[2] === ':') { p = p.slice(1); }
-    return p;
-  }
-  return u;
+        compressed_js_literal!(r"
+import { win32 as __fileWindowsPath } from 'node:path';
+
+function __fileUrlError(code, message) {
+  const error = new TypeError(message);
+  error.code = code;
+  return error;
 }
-export function pathToFileURL(path) {
-  return new URL('file://' + encodeURI(String(path ?? '')));
+function __fileUrlWindows(options) {
+  return options?.windows === undefined
+    ? globalThis.process?.platform === 'win32'
+    : Boolean(options.windows);
+}
+
+export function fileURLToPath(value, options) {
+  let url;
+  if (typeof value === 'string') {
+    try { url = new _URL(value); }
+    catch (_) { throw __fileUrlError('ERR_INVALID_URL', 'Invalid URL'); }
+  } else if (value instanceof _URL) {
+    url = value;
+  } else {
+    throw __fileUrlError('ERR_INVALID_ARG_TYPE', 'The url argument must be a string or URL');
+  }
+  if (url.protocol !== 'file:') {
+    throw __fileUrlError('ERR_INVALID_URL_SCHEME', 'The URL must be of scheme file');
+  }
+  const windows = __fileUrlWindows(options);
+  // Reject encoded separators before decoding. Filesystem and module-loader
+  // authorization still applies to the resulting path, including dot segments.
+  if (/%2f/i.test(url.pathname) || (windows && /%5c/i.test(url.pathname))) {
+    throw __fileUrlError('ERR_INVALID_FILE_URL_PATH', 'File URL path contains an encoded separator');
+  }
+  const path = decodeURIComponent(url.pathname);
+  if (windows) {
+    const normalized = path.replace(/\//g, '\\');
+    if (url.hostname) return '\\\\' + url.hostname + normalized;
+    if (!/^\/[A-Za-z]:/.test(path)) {
+      throw __fileUrlError('ERR_INVALID_FILE_URL_PATH', 'File URL path must be absolute');
+    }
+    return normalized.slice(1);
+  }
+  if (url.hostname && url.hostname !== 'localhost') {
+    throw __fileUrlError('ERR_INVALID_FILE_URL_HOST', 'File URL host must be localhost or empty');
+  }
+  return path;
+}
+
+function __encodeFilePath(path) {
+  // encodeURI preserves URL delimiters that are literal filename characters.
+  // Encode them separately so query/hash parsing cannot change the target.
+  return encodeURI(path).replace(/[?#~]/g, (ch) => '%' + ch.charCodeAt(0).toString(16).toUpperCase());
+}
+export function pathToFileURL(path, options) {
+  if (typeof path !== 'string') {
+    throw __fileUrlError('ERR_INVALID_ARG_TYPE', 'The path argument must be a string');
+  }
+  const windows = __fileUrlWindows(options);
+  let resolved;
+  if (windows) {
+    let input = path.replace(/\\/g, '/');
+    if (/^\/\/\?\/UNC\//i.test(input)) input = '//' + input.slice(8);
+    else if (/^\/\/\?\/[A-Za-z]:\//.test(input)) input = input.slice(4);
+    if (input.startsWith('//') && input.indexOf('/', 2) < 0) {
+      throw __fileUrlError('ERR_INVALID_ARG_VALUE', 'Missing UNC resource path');
+    }
+    if (/^\/\/[^/]+\/$/.test(input)) return new _URL('file:' + input);
+    resolved = __fileWindowsPath.resolve(input).replace(/\\/g, '/');
+    if (/^\/\/[^/]+\/[^/]+$/.test(input) && resolved.endsWith('/')) {
+      resolved = resolved.slice(0, -1);
+    }
+    if (/[\\/]$/.test(path) && !resolved.endsWith('/')) resolved += '/';
+    if (resolved.startsWith('//')) {
+      const slash = resolved.indexOf('/', 2);
+      return new _URL('file://' + resolved.slice(2, slash) + __encodeFilePath(resolved.slice(slash)));
+    }
+    return new _URL('file://' + (resolved.startsWith('/') ? '' : '/') + __encodeFilePath(resolved));
+  }
+  // POSIX backslashes are filename characters. Avoid the legacy cross-platform
+  // node:path normalization that treats them as Windows separators.
+  const cwd = globalThis.process?.cwd?.() ?? '/';
+  const input = path.startsWith('/') ? path : cwd + '/' + path;
+  const parts = [];
+  for (const part of input.split('/')) {
+    if (!part || part === '.') continue;
+    if (part === '..') parts.pop();
+    else parts.push(part);
+  }
+  resolved = '/' + parts.join('/');
+  if (path.endsWith('/') && !resolved.endsWith('/')) resolved += '/';
+  return new _URL('file://' + __encodeFilePath(resolved));
 }
 
 // Use built-in URL if available (QuickJS may have it), else provide polyfill
@@ -12427,14 +15177,15 @@ export function resolve(from, to) {
   try { return new _URL(to, from).href; } catch (_) { return to; }
 }
 export default { URL: _URL, URLSearchParams: _URLSearchParams, fileURLToPath, pathToFileURL, format, parse, resolve };
-"
+")
         .trim()
         .to_string(),
     );
 
     modules.insert(
         "node:net".to_string(),
-        r"
+        compressed_js_literal!(
+            r"
 import EventEmitter from 'node:events';
 
 // Stub net module - socket operations are not available in PiJS (no network I/O)
@@ -12642,6 +15393,7 @@ export class Server {
 
 export default { createConnection, createServer, connect, isIP, isIPv4, isIPv6, Socket, Server };
 "
+        )
         .trim()
         .to_string(),
     );
@@ -12649,7 +15401,8 @@ export default { createConnection, createServer, connect, isIP, isIPv4, isIPv6, 
     // ── node:events ──────────────────────────────────────────────────
     modules.insert(
         "node:events".to_string(),
-        r"
+        compressed_js_literal!(
+            r"
 class EventEmitter {
   constructor() {
     this._events = Object.create(null);
@@ -12747,6 +15500,7 @@ EventEmitter.defaultMaxListeners = 10;
 export { EventEmitter };
 export default EventEmitter;
 "
+        )
         .trim()
         .to_string(),
     );
@@ -12754,13 +15508,16 @@ export default EventEmitter;
     // ── node:buffer ──────────────────────────────────────────────────
     modules.insert(
         "node:buffer".to_string(),
-        crate::buffer_shim::NODE_BUFFER_JS.trim().to_string(),
+        compressed_js_literal!(crate::buffer_shim::NODE_BUFFER_JS)
+            .trim()
+            .to_string(),
     );
 
     // ── node:assert ──────────────────────────────────────────────────
     modules.insert(
         "node:assert".to_string(),
-        r"
+        compressed_js_literal!(
+            r"
 function assert(value, message) {
   if (!value) throw new Error(message || 'Assertion failed');
 }
@@ -12788,6 +15545,7 @@ assert.fail = (msg) => { throw new Error(msg || 'assert.fail()'); };
 export default assert;
 export { assert };
 "
+        )
         .trim()
         .to_string(),
     );
@@ -12795,7 +15553,8 @@ export { assert };
     // ── node:assert/strict ───────────────────────────────────────────
     modules.insert(
         "node:assert/strict".to_string(),
-        r#"
+        compressed_js_literal!(
+            r#"
 import assert from "node:assert";
 
 export default assert;
@@ -12813,6 +15572,7 @@ export const doesNotThrow = assert.doesNotThrow;
 export const fail = assert.fail;
 export { assert };
 "#
+        )
         .trim()
         .to_string(),
     );
@@ -12820,7 +15580,8 @@ export { assert };
     // ── node:test ────────────────────────────────────────────────────
     modules.insert(
         "node:test".to_string(),
-        r"
+        compressed_js_literal!(
+            r"
 function __noop() {}
 
 const __state = {
@@ -12979,6 +15740,7 @@ export async function run() {
 
 export default { test, describe, it, before, after, beforeEach, afterEach, run, mock };
 "
+        )
         .trim()
         .to_string(),
     );
@@ -12986,7 +15748,7 @@ export default { test, describe, it, before, after, beforeEach, afterEach, run, 
     // ── node:stream ──────────────────────────────────────────────────
     modules.insert(
         "node:stream".to_string(),
-        r#"
+        compressed_js_literal!(r#"
 import EventEmitter from "node:events";
 
 function __streamToError(err) {
@@ -13145,50 +15907,85 @@ class Readable extends Stream {
     const stream = this;
     const queue = [];
     const waiters = [];
-    let done = false;
+    let queuedBytes = 0;
+    let done = stream.destroyed || stream._readableState.ended;
     let failure = null;
 
     const settleDone = () => {
       done = true;
+      cleanup();
       while (waiters.length > 0) {
         waiters.shift().resolve({ value: undefined, done: true });
       }
     };
     const settleError = (err) => {
       failure = __streamToError(err);
+      done = true;
+      queue.length = 0;
+      queuedBytes = 0;
+      cleanup();
       while (waiters.length > 0) {
         waiters.shift().reject(failure);
       }
     };
     const onData = (value) => {
+      if (done) return;
       if (waiters.length > 0) {
         waiters.shift().resolve({ value, done: false });
       } else {
-        queue.push(value);
+        const size = typeof value === 'string' ? value.length * 2 : (value && value.byteLength) || 1;
+        if (queue.length >= 1024 || queuedBytes + size > 1024 * 1024) {
+          settleError(new Error('Readable async iterator buffer exceeds its limit'));
+          stream.destroy();
+          return;
+        }
+        queue.push({ value, size });
+        queuedBytes += size;
       }
+      if (waiters.length === 0 && typeof stream.pause === 'function') stream.pause();
     };
     const onEnd = () => settleDone();
-    const onError = (err) => settleError(err);
+    const onError = (err) => {
+      settleError(err);
+      if (!stream.destroyed) stream.destroy();
+    };
+    const onClose = () => settleDone();
     const cleanup = () => {
       stream.removeListener("data", onData);
       stream.removeListener("end", onEnd);
       stream.removeListener("error", onError);
+      stream.removeListener("close", onClose);
     };
 
-    stream.on("data", onData);
-    stream.on("end", onEnd);
-    stream.on("error", onError);
+    if (!done) {
+      stream.on("data", onData);
+      stream.on("end", onEnd);
+      stream.on("error", onError);
+      stream.on("close", onClose);
+      if (typeof stream.pause === 'function') stream.pause();
+    }
 
     return {
       async next() {
-        if (queue.length > 0) return { value: queue.shift(), done: false };
         if (failure) throw failure;
+        if (queue.length > 0) {
+          const item = queue.shift();
+          queuedBytes -= item.size;
+          if (queue.length === 0 && !done && typeof stream.resume === 'function') stream.resume();
+          return { value: item.value, done: false };
+        }
         if (done) return { value: undefined, done: true };
-        return await new Promise((resolve, reject) => waiters.push({ resolve, reject }));
+        const pending = new Promise((resolve, reject) => waiters.push({ resolve, reject }));
+        if (typeof stream.resume === 'function') stream.resume();
+        return await pending;
       },
       async return() {
-        cleanup();
+        queue.length = 0;
+        queuedBytes = 0;
         settleDone();
+        // Node's default iterator owns the stream. A for-await break must
+        // cancel a live Web reader instead of leaving its HTTP request running.
+        if (!stream.destroyed) stream.destroy();
         return { value: undefined, done: true };
       },
       [Symbol.asyncIterator]() { return this; },
@@ -13216,16 +16013,52 @@ class Readable extends Stream {
     }
     const reader = webReadable.getReader();
     const readable = new Readable(opts);
+    let resumeRead = null;
+    const originalDestroy = readable.destroy.bind(readable);
+    readable.pause = () => {
+      readable._readableState.flowing = false;
+      return readable;
+    };
+    readable.resume = () => {
+      readable._readableState.flowing = true;
+      if (resumeRead) { const resume = resumeRead; resumeRead = null; resume(); }
+      return readable;
+    };
+    readable.destroy = (error) => {
+      if (readable.destroyed) return readable;
+      try { Promise.resolve(reader.cancel(error)).catch(() => {}); } catch (_) {}
+      if (resumeRead) { const resume = resumeRead; resumeRead = null; resume(); }
+      return originalDestroy(error);
+    };
     (async () => {
       try {
-        while (true) {
+        while (!readable.destroyed) {
+          if (readable._readableState.flowing === false) {
+            await new Promise((resolve) => { resumeRead = resolve; });
+          }
+          if (readable.destroyed) break;
           const { done, value } = await reader.read();
-          if (done) break;
-          readable.push(value);
+          if (done || readable.destroyed) break;
+          const normalized = __normalizeChunk(value, readable._readableState.encoding);
+          const chunk = !opts.objectMode && typeof normalized !== 'string' &&
+              typeof Buffer !== 'undefined' && !Buffer.isBuffer(normalized)
+            ? Buffer.from(normalized)
+            : normalized;
+          // Event consumers already receive the bytes. Retaining another copy
+          // in Readable._queue leaks an entire long-lived SSE response.
+          if (readable.listenerCount('data') > 0) {
+            readable.emit('data', chunk);
+          } else {
+            const retained = readable._queue.reduce((size, part) => size + (part.byteLength || part.length || 0), 0);
+            if (retained + (chunk.byteLength || chunk.length || 0) > 1024 * 1024) {
+              throw new Error('Readable.fromWeb buffer exceeds 1 MiB without a consumer');
+            }
+            readable._queue.push(chunk);
+          }
         }
-        readable.push(null);
+        if (!readable.destroyed) readable.push(null);
       } catch (err) {
-        readable.emit("error", __streamToError(err));
+        if (!readable.destroyed) readable.destroy(__streamToError(err));
       } finally {
         try { reader.releaseLock(); } catch (_) {}
       }
@@ -13631,7 +16464,7 @@ const promises = {
 
 export { Stream, Readable, Writable, Duplex, Transform, PassThrough, pipeline, finished, promises };
 export default { Stream, Readable, Writable, Duplex, Transform, PassThrough, pipeline, finished, promises };
-"#
+"#)
         .trim()
         .to_string(),
     );
@@ -13639,7 +16472,7 @@ export default { Stream, Readable, Writable, Duplex, Transform, PassThrough, pip
     // node:stream/promises — promise-based stream utilities
     modules.insert(
         "node:stream/promises".to_string(),
-        r"
+        compressed_js_literal!(r"
 import { Readable, Writable } from 'node:stream';
 
 function __streamToError(err) {
@@ -13762,7 +16595,7 @@ export async function finished(stream) {
   });
 }
 export default { pipeline, finished };
-"
+")
         .trim()
         .to_string(),
     );
@@ -13770,7 +16603,8 @@ export default { pipeline, finished };
     // node:stream/web — bridge to global Web Streams when available
     modules.insert(
         "node:stream/web".to_string(),
-        r"
+        compressed_js_literal!(
+            r"
 const _ReadableStream = globalThis.ReadableStream;
 const _WritableStream = globalThis.WritableStream;
 const _TransformStream = globalThis.TransformStream;
@@ -13803,6 +16637,7 @@ export default {
   CountQueuingStrategy,
 };
 "
+        )
         .trim()
         .to_string(),
     );
@@ -13811,10 +16646,48 @@ export default {
     modules.insert(
         "node:string_decoder".to_string(),
         r"
+import { Buffer } from 'node:buffer';
+
 export class StringDecoder {
-  constructor(encoding) { this.encoding = encoding || 'utf8'; }
-  write(buf) { return typeof buf === 'string' ? buf : String(buf ?? ''); }
-  end(buf) { return buf ? this.write(buf) : ''; }
+  constructor(encoding = 'utf8') {
+    const name = String(encoding).toLowerCase().replace(/[-_]/g, '');
+    this.encoding = name === 'ucs2' ? 'utf16le' : name === 'binary' ? 'latin1' : name;
+    if (!['utf8', 'utf16le', 'latin1', 'ascii', 'hex', 'base64', 'base64url'].includes(this.encoding)) {
+      throw new TypeError('Unknown encoding: ' + String(encoding));
+    }
+    this._pending = Buffer.alloc(0);
+  }
+  write(buf) {
+    if (typeof buf === 'string') return buf;
+    if (buf === undefined || buf === null) return '';
+    const input = ArrayBuffer.isView(buf)
+      ? Buffer.from(new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength))
+      : Buffer.from(buf);
+    const bytes = this._pending.length ? Buffer.concat([this._pending, input]) : input;
+    let end = bytes.length;
+    if (this.encoding === 'utf8' && end > 0) {
+      let lead = end - 1;
+      while (lead > 0 && (bytes[lead] & 0xc0) === 0x80 && end - lead < 4) lead--;
+      const first = bytes[lead];
+      const needed = first >= 0xc2 && first <= 0xdf ? 2
+        : first >= 0xe0 && first <= 0xef ? 3
+        : first >= 0xf0 && first <= 0xf4 ? 4 : 1;
+      if (end - lead < needed) end = lead;
+    } else if (this.encoding === 'utf16le') {
+      end -= end % 2;
+      if (end >= 2 && bytes[end - 1] >= 0xd8 && bytes[end - 1] <= 0xdb) end -= 2;
+    } else if (this.encoding === 'base64' || this.encoding === 'base64url') {
+      end -= end % 3;
+    }
+    this._pending = Buffer.from(bytes.subarray(end));
+    return Buffer.from(bytes.subarray(0, end)).toString(this.encoding);
+  }
+  end(buf) {
+    const head = buf === undefined ? '' : this.write(buf);
+    const tail = this._pending.toString(this.encoding);
+    this._pending = Buffer.alloc(0);
+    return head + tail;
+  }
 }
 export default { StringDecoder };
 "
@@ -13825,7 +16698,7 @@ export default { StringDecoder };
     // node:querystring — URL query string encoding/decoding
     modules.insert(
         "node:querystring".to_string(),
-        r"
+        compressed_js_literal!(r"
 export function parse(qs, sep, eq) {
   const s = String(qs ?? '');
   const sepStr = sep || '&';
@@ -13859,7 +16732,7 @@ export const encode = stringify;
 export function escape(str) { return encodeURIComponent(str); }
 export function unescape(str) { return decodeURIComponent(str); }
 export default { parse, stringify, decode, encode, escape, unescape };
-"
+")
         .trim()
         .to_string(),
     );
@@ -13867,7 +16740,8 @@ export default { parse, stringify, decode, encode, escape, unescape };
     // node:constants — compatibility map for libraries probing process constants
     modules.insert(
         "node:constants".to_string(),
-        r"
+        compressed_js_literal!(
+            r"
 const _constants = {
   EOL: '\n',
   F_OK: 0,
@@ -13891,6 +16765,7 @@ const constants = new Proxy(_constants, {
 export default constants;
 export { constants };
 "
+        )
         .trim()
         .to_string(),
     );
@@ -13898,7 +16773,8 @@ export { constants };
     // node:tty — terminal capability probes
     modules.insert(
         "node:tty".to_string(),
-        r"
+        compressed_js_literal!(
+            r"
 import EventEmitter from 'node:events';
 
 export function isatty(_fd) { return false; }
@@ -13927,6 +16803,7 @@ export class WriteStream extends EventEmitter {
 
 export default { isatty, ReadStream, WriteStream };
 "
+        )
         .trim()
         .to_string(),
     );
@@ -13934,7 +16811,8 @@ export default { isatty, ReadStream, WriteStream };
     // node:tls — secure socket APIs are intentionally unavailable in PiJS
     modules.insert(
         "node:tls".to_string(),
-        r"
+        compressed_js_literal!(
+            r"
 import EventEmitter from 'node:events';
 
 export const DEFAULT_MIN_VERSION = 'TLSv1.2';
@@ -13958,6 +16836,7 @@ export function createServer(_options, _secureConnectionListener) {
 
 export default { connect, createServer, TLSSocket, DEFAULT_MIN_VERSION, DEFAULT_MAX_VERSION };
 "
+        )
         .trim()
         .to_string(),
     );
@@ -13965,7 +16844,7 @@ export default { connect, createServer, TLSSocket, DEFAULT_MIN_VERSION, DEFAULT_
     // node:zlib - demand-driven gzip/gunzip subset; stream/Brotli APIs are unavailable.
     modules.insert(
         "node:zlib".to_string(),
-        r"
+        compressed_js_literal!(r"
 import { Buffer } from 'node:buffer';
 
 const constants = {
@@ -14069,7 +16948,7 @@ export default {
   createBrotliDecompress,
   promises,
 };
-"
+")
         .trim()
         .to_string(),
     );
@@ -14077,7 +16956,8 @@ export default {
     // node:perf_hooks — expose lightweight performance clock surface
     modules.insert(
         "node:perf_hooks".to_string(),
-        r"
+        compressed_js_literal!(
+            r"
 const perf =
   globalThis.performance ||
   {
@@ -14101,6 +16981,7 @@ export class PerformanceObserver {
 
 export default { performance, constants, PerformanceObserver };
 "
+        )
         .trim()
         .to_string(),
     );
@@ -14108,7 +16989,8 @@ export default { performance, constants, PerformanceObserver };
     // node:vm — disabled in PiJS for safety
     modules.insert(
         "node:vm".to_string(),
-        r"
+        compressed_js_literal!(
+            r"
 function unsupported(name) {
   throw new Error(`node:vm.${name} is not available in PiJS`);
 }
@@ -14124,6 +17006,7 @@ export class Script {
 
 export default { runInContext, runInNewContext, runInThisContext, createContext, Script };
 "
+        )
         .trim()
         .to_string(),
     );
@@ -14131,7 +17014,7 @@ export default { runInContext, runInNewContext, runInThisContext, createContext,
     // node:v8 — lightweight serialization fallback used by some libs
     modules.insert(
         "node:v8".to_string(),
-        r"
+        compressed_js_literal!(r"
 function __toBuffer(str) {
   if (typeof Buffer !== 'undefined' && typeof Buffer.from === 'function') {
     return Buffer.from(str, 'utf8');
@@ -14162,7 +17045,7 @@ export function deserialize(value) {
 }
 
 export default { serialize, deserialize };
-"
+")
         .trim()
         .to_string(),
     );
@@ -14191,7 +17074,7 @@ export default { isMainThread, threadId, workerData, parentPort, Worker };
     // node:process — re-exports globalThis.process
     modules.insert(
         "node:process".to_string(),
-        r"
+        compressed_js_literal!(r"
 const p = globalThis.process || {};
 export const env = p.env || {};
 export const argv = p.argv || [];
@@ -14227,7 +17110,7 @@ export const memoryUsage = p.memoryUsage || (() => ({ rss: 0, heapTotal: 0, heap
 export const cpuUsage = p.cpuUsage || (() => ({ user: 0, system: 0 }));
 export const release = p.release || { name: 'node' };
 export default p;
-"
+")
         .trim()
         .to_string(),
     );
@@ -14235,7 +17118,7 @@ export default p;
     // node:timers — expose timer helpers backed by the PiJS event loop
     modules.insert(
         "node:timers".to_string(),
-        r"
+        compressed_js_literal!(r"
 export const setTimeout = globalThis.setTimeout;
 export const clearTimeout = globalThis.clearTimeout;
 export const setInterval = globalThis.setInterval;
@@ -14253,7 +17136,7 @@ export default {
   clearImmediate,
   queueMicrotask,
 };
-"
+")
         .trim()
         .to_string(),
     );
@@ -14299,7 +17182,8 @@ export default { spawn };
 
     modules.insert(
         "chokidar".to_string(),
-        r"
+        compressed_js_literal!(
+            r"
 function makeWatcher() {
     const w = {
         on(ev, cb) { return w; },
@@ -14314,13 +17198,15 @@ function makeWatcher() {
 export function watch(paths, options) { return makeWatcher(); }
 export default { watch };
 "
+        )
         .trim()
         .to_string(),
     );
 
     modules.insert(
         "jsdom".to_string(),
-        r"
+        compressed_js_literal!(
+            r"
 class Element {
     constructor(tag, html) { this.tagName = tag; this._html = html || ''; this.childNodes = []; }
     get innerHTML() { return this._html; }
@@ -14352,6 +17238,7 @@ export class JSDOM {
     }
 }
 "
+        )
         .trim()
         .to_string(),
     );
@@ -14385,7 +17272,8 @@ export function renderMermaidAscii(source) {
 
     modules.insert(
         "@aliou/pi-utils-settings".to_string(),
-        r"
+        compressed_js_literal!(
+            r"
 export class ConfigLoader {
     constructor(name, defaultConfig, options) {
         this._name = name;
@@ -14422,13 +17310,15 @@ export function setNestedValue(obj, path, value) {
     cur[keys[keys.length - 1]] = value;
 }
 "
+        )
         .trim()
         .to_string(),
     );
 
     modules.insert(
         "@aliou/sh".to_string(),
-        r#"
+        compressed_js_literal!(
+            r#"
 export class ParseError extends Error { constructor(msg) { super(msg); this.name = 'ParseError'; } }
 export function tokenize(cmd) {
     const source = String(cmd ?? '');
@@ -14503,13 +17393,15 @@ export function parse(cmd) {
 }
 export function quote(s) { return "'" + (s || '').replace(/'/g, "'\\''") + "'"; }
 "#
+        )
         .trim()
         .to_string(),
     );
 
     modules.insert(
         "@marckrenn/pi-sub-shared".to_string(),
-        r#"
+        compressed_js_literal!(
+            r#"
 export const PROVIDERS = ["anthropic", "openai", "google", "aws", "azure"];
 export const MODEL_MULTIPLIERS = {};
 const _meta = (name) => ({
@@ -14530,6 +17422,7 @@ export function getDefaultCoreSettings() {
     return { providers: {}, behavior: { autoSwitch: false } };
 }
 "#
+        )
         .trim()
         .to_string(),
     );
@@ -14552,7 +17445,7 @@ export default TurndownService;
 
     modules.insert(
         "@xterm/headless".to_string(),
-        r"
+        compressed_js_literal!(r"
 export class Terminal {
     constructor(opts) { this._opts = opts || {}; this.cols = opts?.cols || 80; this.rows = opts?.rows || 24; this.buffer = { active: { cursorX: 0, cursorY: 0, length: 0, getLine: () => null } }; }
     write(data) {}
@@ -14563,14 +17456,15 @@ export class Terminal {
     onLineFeed(cb) { return { dispose() {} }; }
 }
 export default { Terminal };
-"
+")
         .trim()
         .to_string(),
     );
 
     modules.insert(
         "@opentelemetry/api".to_string(),
-        r"
+        compressed_js_literal!(
+            r"
 export const SpanStatusCode = { UNSET: 0, OK: 1, ERROR: 2 };
 const noopSpan = {
     setAttribute() { return this; },
@@ -14599,6 +17493,7 @@ export const context = {
     with(ctx, fn) { return fn(); },
 };
 "
+        )
         .trim()
         .to_string(),
     );
@@ -14667,7 +17562,7 @@ export function resourceFromAttributes(attrs) { return new Resource(attrs); }
 
     modules.insert(
         "@opentelemetry/sdk-trace-base".to_string(),
-        r"
+        compressed_js_literal!(r"
 const noopSpan = { setAttribute() { return this; }, end() {}, isRecording() { return false; }, spanContext() { return {}; } };
 export class BasicTracerProvider {
     constructor(opts) { this._opts = opts || {}; }
@@ -14684,14 +17579,15 @@ export class SimpleSpanProcessor {
     forceFlush() { return Promise.resolve(); }
 }
 export class BatchSpanProcessor extends SimpleSpanProcessor {}
-"
+")
         .trim()
         .to_string(),
     );
 
     modules.insert(
         "@opentelemetry/semantic-conventions".to_string(),
-        r"
+        compressed_js_literal!(
+            r"
 export const SemanticResourceAttributes = {
     SERVICE_NAME: 'service.name',
     SERVICE_VERSION: 'service.version',
@@ -14700,6 +17596,7 @@ export const SemanticResourceAttributes = {
 export const SEMRESATTRS_SERVICE_NAME = 'service.name';
 export const SEMRESATTRS_SERVICE_VERSION = 'service.version';
 "
+        )
         .trim()
         .to_string(),
     );
@@ -14707,7 +17604,8 @@ export const SEMRESATTRS_SERVICE_VERSION = 'service.version';
     // ── npm package stubs for extension conformance ──
 
     {
-        let openclaw_plugin_sdk = r#"
+        let openclaw_plugin_sdk = compressed_js_literal!(
+            r#"
 export function definePlugin(spec = {}) { return spec; }
 export function createPlugin(spec = {}) { return spec; }
 export function tool(spec = {}) { return { ...spec, type: "tool" }; }
@@ -14797,6 +17695,7 @@ export default {
   OpenClawPlugin,
 };
 "#
+        )
         .trim()
         .to_string();
 
@@ -14820,7 +17719,8 @@ export default {
 
     modules.insert(
         "zod".to_string(),
-        r"
+        compressed_js_literal!(
+            r"
 const __schema = {
   parse(value) { return value; },
   safeParse(value) { return { success: true, data: value }; },
@@ -14865,13 +17765,15 @@ export const z = {
 };
 export default z;
 "
+        )
         .trim()
         .to_string(),
     );
 
     modules.insert(
         "yaml".to_string(),
-        r##"
+        compressed_js_literal!(
+            r##"
 export function parse(input) {
     const text = String(input ?? "").trim();
     if (!text) return {};
@@ -14894,50 +17796,20 @@ export function stringify(value) {
 }
 export default { parse, stringify };
 "##
+        )
         .trim()
         .to_string(),
     );
 
     modules.insert(
         "better-sqlite3".to_string(),
-        r#"
-class Statement {
-    all() { return []; }
-    get() { return undefined; }
-    run() { return { changes: 0, lastInsertRowid: 0 }; }
-}
-
-function BetterSqlite3(filename, options = {}) {
-    if (!(this instanceof BetterSqlite3)) return new BetterSqlite3(filename, options);
-    this.filename = String(filename ?? "");
-    this.options = options;
-}
-
-BetterSqlite3.prototype.prepare = function(_sql) { return new Statement(); };
-BetterSqlite3.prototype.exec = function(_sql) { return this; };
-BetterSqlite3.prototype.pragma = function(_sql) { return []; };
-BetterSqlite3.prototype.transaction = function(fn) {
-    const wrapped = (...args) => (typeof fn === "function" ? fn(...args) : undefined);
-    wrapped.immediate = wrapped;
-    wrapped.deferred = wrapped;
-    wrapped.exclusive = wrapped;
-    return wrapped;
-};
-BetterSqlite3.prototype.close = function() {};
-
-BetterSqlite3.Statement = Statement;
-BetterSqlite3.Database = BetterSqlite3;
-
-export { Statement };
-export default BetterSqlite3;
-"#
-        .trim()
-        .to_string(),
+        include_str!("extensions_js/better_sqlite3.mjs").to_string(),
     );
 
     modules.insert(
         "ws".to_string(),
-        r#"
+        compressed_js_literal!(
+            r#"
 function __makeEmitter(target) {
   target._listeners = {};
   target.on = function(event, handler) {
@@ -15037,73 +17909,14 @@ WebSocket.WebSocketServer = WebSocketServer;
 export const Server = WebSocketServer;
 export default WebSocket;
 "#
+        )
         .trim()
         .to_string(),
     );
 
     modules.insert(
         "axios".to_string(),
-        r#"
-function __makeResponse(config, data) {
-  return {
-    data: data ?? null,
-    status: 200,
-    statusText: "OK",
-    headers: {},
-    config: config ?? {},
-    request: {},
-  };
-}
-
-async function axios(config = {}) {
-  return __makeResponse(config, config.data);
-}
-
-axios.request = (config) => axios(config);
-axios.defaults = {};
-axios.get = (url, config = {}) => axios({ ...config, url, method: "get" });
-axios.delete = (url, config = {}) => axios({ ...config, url, method: "delete" });
-axios.head = (url, config = {}) => axios({ ...config, url, method: "head" });
-axios.options = (url, config = {}) => axios({ ...config, url, method: "options" });
-axios.post = (url, data, config = {}) => axios({ ...config, url, data, method: "post" });
-axios.put = (url, data, config = {}) => axios({ ...config, url, data, method: "put" });
-axios.patch = (url, data, config = {}) => axios({ ...config, url, data, method: "patch" });
-axios.create = (defaults = {}) => {
-  const instance = (config = {}) => axios({ ...defaults, ...config });
-  instance.request = (config) => instance(config);
-  instance.get = (url, config = {}) => instance({ ...config, url, method: "get" });
-  instance.delete = (url, config = {}) => instance({ ...config, url, method: "delete" });
-  instance.head = (url, config = {}) => instance({ ...config, url, method: "head" });
-  instance.options = (url, config = {}) => instance({ ...config, url, method: "options" });
-  instance.post = (url, data, config = {}) => instance({ ...config, url, data, method: "post" });
-  instance.put = (url, data, config = {}) => instance({ ...config, url, data, method: "put" });
-  instance.patch = (url, data, config = {}) => instance({ ...config, url, data, method: "patch" });
-  instance.defaults = { ...defaults };
-  return instance;
-};
-axios.isAxiosError = (err) => !!(err && err.isAxiosError);
-axios.AxiosError = class AxiosError extends Error {
-  constructor(message) {
-    super(message || "AxiosError");
-    this.isAxiosError = true;
-  }
-};
-axios.Cancel = class Cancel extends Error {
-  constructor(message) {
-    super(message || "Cancel");
-    this.__CANCEL__ = true;
-  }
-};
-axios.CancelToken = {
-  source() { return { token: {}, cancel: () => {} }; },
-};
-axios.all = (promises) => Promise.all(promises);
-axios.spread = (cb) => (arr) => cb(...arr);
-
-export default axios;
-"#
-        .trim()
-        .to_string(),
+        include_str!("extensions_js/axios.mjs").to_string(),
     );
 
     modules.insert(
@@ -15135,7 +17948,8 @@ export default open;
 
     modules.insert(
         "commander".to_string(),
-        r#"
+        compressed_js_literal!(
+            r#"
 export class Option {
   constructor(flags, description) {
     this.flags = flags;
@@ -15187,13 +18001,15 @@ export function createCommand(name) { return new Command(name); }
 export const program = new Command();
 export default { Command, Option, Argument, program, createCommand };
 "#
+        )
         .trim()
         .to_string(),
     );
 
     modules.insert(
         "chalk".to_string(),
-        r#"
+        compressed_js_literal!(
+            r#"
 function chalk(...args) {
   return args.join("");
 }
@@ -15222,6 +18038,7 @@ export class Chalk {
 export default chalk;
 export { chalk };
 "#
+        )
         .trim()
         .to_string(),
     );
@@ -15291,7 +18108,7 @@ export default AdmZip;
 
     modules.insert(
         "linkedom".to_string(),
-        r#"
+        compressed_js_literal!(r#"
 export function parseHTML(html) {
     const doc = {
         documentElement: { outerHTML: html || "" },
@@ -15303,7 +18120,7 @@ export function parseHTML(html) {
     };
     return { document: doc, window: { document: doc } };
 }
-"#
+"#)
         .trim()
         .to_string(),
     );
@@ -15330,7 +18147,8 @@ export default { scip };
 
     modules.insert(
         "p-limit".to_string(),
-        r"
+        compressed_js_literal!(
+            r"
 export default function pLimit(concurrency) {
     const queue = [];
     let active = 0;
@@ -15358,6 +18176,7 @@ export default function pLimit(concurrency) {
     return generator;
 }
 "
+        )
         .trim()
         .to_string(),
     );
@@ -15407,6 +18226,27 @@ export default { PythonIndexer };
         .to_string(),
     );
 
+    // Current Pi packages use the @earendil-works scope, while the original
+    // compatibility modules were published under @mariozechner. Both scopes
+    // intentionally resolve to the same implementation so mixed-version
+    // extension graphs cannot drift by package name.
+    for (alias, target) in [
+        (
+            "@earendil-works/pi-coding-agent",
+            "@mariozechner/pi-coding-agent",
+        ),
+        ("@earendil-works/pi-tui", "@mariozechner/pi-tui"),
+        ("@earendil-works/pi-ai", "@mariozechner/pi-ai"),
+        ("@earendil-works/pi-ai/compat", "@mariozechner/pi-ai"),
+        ("@earendil-works/pi-agent-core", "@mariozechner/pi-ai"),
+        ("@mariozechner/pi-agent-core", "@mariozechner/pi-ai"),
+        ("typebox", "@sinclair/typebox"),
+    ] {
+        if let Some(source) = modules.get(target).cloned() {
+            modules.insert(alias.to_string(), source);
+        }
+    }
+
     modules
 }
 
@@ -15431,6 +18271,32 @@ pub fn available_virtual_module_names() -> std::collections::BTreeSet<String> {
 /// tick paths. When runtime memory is unbounded, periodic sampling preserves observability
 /// while avoiding per-tick full-heap scans.
 const UNBOUNDED_MEMORY_USAGE_SAMPLE_EVERY_TICKS: u64 = 32;
+
+type DeferredHostcallFinalizer = Box<dyn FnOnce(&HostcallOutcome)>;
+
+struct DeferredHostcall {
+    stream: futures::stream::LocalBoxStream<'static, HostcallOutcome>,
+    credit: bool,
+    deadline: Option<std::time::Instant>,
+    finalizer: Option<DeferredHostcallFinalizer>,
+}
+
+impl DeferredHostcall {
+    fn finish(&mut self, outcome: &HostcallOutcome) {
+        if let Some(finalizer) = self.finalizer.take() {
+            finalizer(outcome);
+        }
+    }
+}
+
+impl Drop for DeferredHostcall {
+    fn drop(&mut self) {
+        self.finish(&HostcallOutcome::Error {
+            code: "cancelled".to_string(),
+            message: "HTTP stream cancelled before completion".to_string(),
+        });
+    }
+}
 
 /// Integrated PiJS runtime combining QuickJS, scheduler, and Promise bridge.
 ///
@@ -15473,12 +18339,18 @@ pub struct PiJsRuntime<C: SchedulerClock = WallClock> {
     hostcall_queue: HostcallQueue,
     trace_seq: Arc<AtomicU64>,
     hostcall_tracker: Rc<RefCell<HostcallTracker>>,
+    // Poll owned network futures between JS turns. One credit permits one
+    // response frame, keeping timers, cancellation, and slow consumers live.
+    deferred_hostcalls: Rc<RefCell<HashMap<String, DeferredHostcall>>>,
+    active_session_action_origin: Rc<RefCell<Option<SessionActionOrigin>>>,
+    user_timer_origins: Rc<RefCell<HashMap<u64, SessionActionOrigin>>>,
     hostcalls_total: Arc<AtomicU64>,
     hostcalls_timed_out: Arc<AtomicU64>,
     last_memory_used_bytes: Arc<AtomicU64>,
     peak_memory_used_bytes: Arc<AtomicU64>,
     tick_counter: Arc<AtomicU64>,
     interrupt_budget: Rc<InterruptBudget>,
+    execution_fence: Rc<RefCell<Option<JsExecutionFence>>>,
     config: PiJsRuntimeConfig,
     /// Additional filesystem roots that `readFileSync` may access (e.g.
     /// extension directories).  Populated lazily as extensions are loaded.
@@ -15492,6 +18364,16 @@ pub struct PiJsRuntime<C: SchedulerClock = WallClock> {
     module_state: Rc<RefCell<PiJsModuleState>>,
     /// Extension policy for synchronous capability checks.
     policy: Option<ExtensionPolicy>,
+    /// Per-runtime capability used to authenticate Rust-only bridge entrypoints.
+    bridge_secret: String,
+    /// Stable per-runtime identity for host-fs decision diagnostics
+    /// (bd-xhl7u); deliberately NOT the authentication secret.
+    runtime_id: String,
+    /// Immutable principal for production extension isolates. Harness runtimes
+    /// leave this unset so low-level bridge tests can model multiple identities.
+    owner_extension_id: Option<Arc<str>>,
+    sqlite_state: Rc<RefCell<sqlite::SqliteRuntime>>,
+    process_sessions: process_session::ProcessSessions,
 }
 
 #[derive(Debug, Clone, Default, serde::Deserialize)]
@@ -15505,11 +18387,24 @@ struct JsRuntimeRegistrySnapshot {
     providers: u64,
     shortcuts: u64,
     message_renderers: u64,
+    mcp_servers: u64,
     pending_tasks: u64,
+    tool_invocations: u64,
     pending_hostcalls: u64,
     pending_timers: u64,
+    timer_handles: u64,
     pending_event_listener_lists: u64,
+    event_batch_contexts: u64,
     provider_streams: u64,
+    virtual_http_servers: u64,
+    virtual_http_requests: u64,
+    api_providers: u64,
+    child_processes: u64,
+    vfs_files: u64,
+    vfs_dirs: u64,
+    vfs_symlinks: u64,
+    vfs_fds: u64,
+    intrinsics_intact: bool,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -15520,13 +18415,14 @@ struct JsRuntimeResetPayload {
 }
 
 #[derive(Debug, Clone, Default)]
-pub struct PiJsWarmResetReport {
-    pub reused: bool,
+pub struct PiJsRealmScrubReport {
+    pub inventoried_state_cleared: bool,
     pub reason_code: Option<String>,
     pub rust_pending_hostcalls: u64,
     pub rust_pending_hostcall_queue: u64,
     pub rust_scheduler_pending: bool,
     pub pending_tasks_before: u64,
+    pub tool_invocations_before: u64,
     pub pending_hostcalls_before: u64,
     pub pending_timers_before: u64,
     pub residual_entries_after: u64,
@@ -15566,38 +18462,124 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
     #[allow(clippy::future_not_send, clippy::too_many_lines)]
     pub async fn with_clock_and_config_with_policy(
         clock: C,
-        mut config: PiJsRuntimeConfig,
+        config: PiJsRuntimeConfig,
         policy: Option<ExtensionPolicy>,
     ) -> Result<Self> {
-        // Inject target architecture so JS process.arch can read it
-        #[cfg(target_arch = "x86_64")]
-        config
-            .env
-            .entry("PI_TARGET_ARCH".to_string())
-            .or_insert_with(|| "x64".to_string());
-        #[cfg(target_arch = "aarch64")]
-        config
-            .env
-            .entry("PI_TARGET_ARCH".to_string())
-            .or_insert_with(|| "arm64".to_string());
-        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-        config
-            .env
-            .entry("PI_TARGET_ARCH".to_string())
-            .or_insert_with(|| "x64".to_string());
+        Self::with_clock_config_policy_and_owner(clock, config, policy, None).await
+    }
 
-        // Inject target platform so JS process.platform matches os.platform().
-        // OSTYPE env var is a shell variable and not always exported.
+    /// Create a production runtime whose host authority is permanently bound
+    /// to one extension. The owner is captured by native closures and is never
+    /// derived from mutable JavaScript state.
+    #[allow(clippy::future_not_send)]
+    pub async fn with_clock_and_config_with_policy_for_extension(
+        clock: C,
+        config: PiJsRuntimeConfig,
+        policy: Option<ExtensionPolicy>,
+        extension_id: String,
+    ) -> Result<Self> {
+        let extension_id = extension_id.trim();
+        if extension_id.is_empty() {
+            return Err(Error::extension(
+                "PiJS extension runtime owner must not be empty".to_string(),
+            ));
+        }
+        Self::with_clock_config_policy_and_owner(
+            clock,
+            config,
+            policy,
+            Some(Arc::<str>::from(extension_id)),
+        )
+        .await
+    }
+
+    #[allow(clippy::future_not_send, clippy::too_many_lines)]
+    async fn with_clock_config_policy_and_owner(
+        clock: C,
+        mut config: PiJsRuntimeConfig,
+        policy: Option<ExtensionPolicy>,
+        owner_extension_id: Option<Arc<str>>,
+    ) -> Result<Self> {
+        // The production snapshot can serve several differently authorized
+        // realms. Bind disclosure to this immutable owner before creating the
+        // JS environment snapshot or a subprocess environment. A caller's
+        // explicit deny_env remains a stronger restriction.
+        if policy.as_ref().is_some_and(|policy| {
+            policy
+                .evaluate_for("env", owner_extension_id.as_deref())
+                .decision
+                != crate::extensions::PolicyDecision::Allow
+        }) {
+            config.deny_env = true;
+        }
+
+        let windows_environment = uses_windows_environment(&config.env);
+        if windows_environment {
+            // Normalize before exposing values, enumerating the snapshot, or
+            // copying it into child processes. Retain the selected spelling
+            // so ordinary Windows `Path` snapshots still enumerate as `Path`.
+            normalize_windows_environment_snapshot(&mut config.env);
+        }
+
+        // Inject host metadata without creating a second Windows spelling of
+        // an explicitly configured binding.
+        let architecture = if cfg!(target_arch = "aarch64") {
+            "arm64"
+        } else {
+            "x64"
+        };
+        let platform = match std::env::consts::OS {
+            "macos" => "darwin",
+            "windows" => "win32",
+            other => other,
+        };
+        for (key, value) in [("PI_TARGET_ARCH", architecture), ("PI_PLATFORM", platform)] {
+            if configured_environment_value(&config.env, key, windows_environment).is_none() {
+                config.env.insert(key.to_string(), value.to_string());
+            }
+        }
+
+        // These bindings describe this runtime's workspace, not the shell
+        // that launched Pi. SDK sessions and resumed workspaces can select a
+        // different cwd without changing the host process directory. Retaining
+        // the shell's PWD or PI_WORKSPACE_DIR would make integrations persist
+        // one workspace's events in another workspace's database.
+        // Match process.cwd()'s admitted deterministic override, but never
+        // copy a broker-hidden value into a readable metadata binding.
+        let workspace_cwd = effective_workspace_cwd(&config, policy.as_ref()).to_string();
+        for key in ["PWD", "PI_WORKSPACE_DIR"] {
+            if windows_environment {
+                config.env.retain(|name, _| !name.eq_ignore_ascii_case(key));
+            }
+            config.env.insert(key.to_string(), workspace_cwd.clone());
+        }
+
+        // This is host metadata, not a filesystem grant. Child integrations
+        // identify Pi from it without probing a parent of their data root.
+        // Preserve explicit snapshots and avoid ambient HOME when supplied.
+        if configured_environment_value(&config.env, "PI_CONFIG_DIR", windows_environment).is_none()
         {
-            let platform = match std::env::consts::OS {
-                "macos" => "darwin",
-                "windows" => "win32",
-                other => other,
-            };
-            config
-                .env
-                .entry("PI_PLATFORM".to_string())
-                .or_insert_with(|| platform.to_string());
+            let config_dir = configured_environment_value(
+                &config.env,
+                "PI_CODING_AGENT_DIR",
+                windows_environment,
+            )
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| {
+                ["HOME", "USERPROFILE"]
+                    .into_iter()
+                    .find_map(|key| {
+                        configured_environment_value(&config.env, key, windows_environment)
+                            .filter(|value| !value.is_empty())
+                    })
+                    .map(|home| PathBuf::from(home).join(".pi").join("agent"))
+            })
+            .unwrap_or_else(crate::config::Config::global_dir);
+            config.env.insert(
+                "PI_CONFIG_DIR".to_string(),
+                config_dir.to_string_lossy().into_owned(),
+            );
         }
 
         let runtime = AsyncRuntime::new().map_err(|err| map_js_error(&err))?;
@@ -15609,23 +18591,40 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
         }
 
         let interrupt_budget = Rc::new(InterruptBudget::new(config.limits.interrupt_budget));
-        if config.limits.interrupt_budget.is_some() {
+        let execution_fence: Rc<RefCell<Option<JsExecutionFence>>> = Rc::new(RefCell::new(None));
+        {
             let budget = Rc::clone(&interrupt_budget);
+            let fence = Rc::clone(&execution_fence);
             runtime
-                .set_interrupt_handler(Some(Box::new(move || budget.on_interrupt())))
+                .set_interrupt_handler(Some(Box::new(move || {
+                    fence.borrow().as_ref().is_some_and(|active| {
+                        let stop = active.cancelled.load(AtomicOrdering::Acquire)
+                            || Instant::now() >= active.deadline;
+                        if stop {
+                            active.interrupted.set(true);
+                        }
+                        stop
+                    }) || budget.on_interrupt()
+                })))
                 .await;
         }
 
         let repair_events: Arc<std::sync::Mutex<Vec<ExtensionRepairEvent>>> =
             Arc::new(std::sync::Mutex::new(Vec::new()));
         let compiled_cache_limit_bytes = config.limits.module_cache_limit_bytes;
+        let compat_scan_mode = is_compat_scan_mode(&config.env);
         let module_state = Rc::new(RefCell::new(
             PiJsModuleState::new()
                 .with_repair_mode(config.repair_mode)
+                .with_compat_scan_mode(compat_scan_mode)
                 .with_repair_events(Arc::clone(&repair_events))
                 .with_disk_cache_dir(config.disk_cache_dir.clone())
                 .with_compiled_cache_limit_bytes(compiled_cache_limit_bytes),
         ));
+        module_state
+            .borrow_mut()
+            .persistent_storage
+            .set_policy(policy.clone());
         runtime
             .set_loader(
                 PiJsResolver {
@@ -15656,12 +18655,34 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
             HostcallRequestQueue::with_capacities(fast_queue_capacity, overflow_queue_capacity),
         ));
         let hostcall_tracker = Rc::new(RefCell::new(HostcallTracker::default()));
+        let active_session_action_origin = Rc::new(RefCell::new(None));
+        let user_timer_origins = Rc::new(RefCell::new(HashMap::new()));
         let hostcalls_total = Arc::new(AtomicU64::new(0));
         let hostcalls_timed_out = Arc::new(AtomicU64::new(0));
         let last_memory_used_bytes = Arc::new(AtomicU64::new(0));
         let peak_memory_used_bytes = Arc::new(AtomicU64::new(0));
         let tick_counter = Arc::new(AtomicU64::new(0));
         let trace_seq = Arc::new(AtomicU64::new(1));
+        let bridge_secret = uuid::Uuid::new_v4().simple().to_string();
+        let runtime_id = uuid::Uuid::new_v4().simple().to_string();
+        let process_sessions = process_session::ProcessSessions::new(
+            config.cwd.clone(),
+            // Inheritance must not disclose custom broker secrets through a
+            // child's stdout after process.env has correctly hidden them.
+            // ProcessSessions applies its transfer restrictions afterwards.
+            config
+                .env
+                .iter()
+                .filter(|(name, _)| {
+                    policy
+                        .as_ref()
+                        .is_none_or(|policy| !policy.secret_broker.is_secret(name))
+                })
+                .map(|(name, value)| (name.clone(), value.clone()))
+                .collect(),
+            config.deny_env,
+            owner_extension_id.clone(),
+        );
 
         let instance = Self {
             runtime,
@@ -15670,17 +18691,26 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
             hostcall_queue,
             trace_seq,
             hostcall_tracker,
+            deferred_hostcalls: Rc::new(RefCell::new(HashMap::new())),
+            active_session_action_origin,
+            user_timer_origins,
             hostcalls_total,
             hostcalls_timed_out,
             last_memory_used_bytes,
             peak_memory_used_bytes,
             tick_counter,
             interrupt_budget,
+            execution_fence,
             config,
             allowed_read_roots: Arc::new(std::sync::Mutex::new(Vec::new())),
             repair_events,
             module_state,
             policy,
+            bridge_secret,
+            runtime_id,
+            owner_extension_id,
+            sqlite_state: Rc::new(RefCell::new(sqlite::SqliteRuntime::default())),
+            process_sessions,
         };
 
         instance.install_pi_bridge().await?;
@@ -15725,7 +18755,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
         }
 
         let tick = self.tick_counter.fetch_add(1, AtomicOrdering::SeqCst) + 1;
-        tick == 1 || (tick % UNBOUNDED_MEMORY_USAGE_SAMPLE_EVERY_TICKS == 0)
+        tick == 1 || tick.is_multiple_of(UNBOUNDED_MEMORY_USAGE_SAMPLE_EVERY_TICKS)
     }
 
     fn module_cache_snapshot(&self) -> (u64, u64, u64, u64, u64, u64, Option<u64>) {
@@ -15746,19 +18776,44 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
         )
     }
 
+    /// Cancel native work retained by a permanently quarantined realm.
+    ///
+    /// Unlike a cold-drop scrub, this never runs guest cleanup or asks SQLite
+    /// to close/checkpoint a connection. The actor retains the failed realm's
+    /// diagnostic state, but process and SQLite worker permits remain with
+    /// their workers only until cancellation actually finishes.
+    pub(crate) fn cancel_native_resources_for_quarantine(&self) {
+        self.process_sessions.close_all();
+        self.sqlite_state.borrow_mut().retire();
+        let streams = std::mem::take(&mut *self.deferred_hostcalls.borrow_mut());
+        drop(streams);
+        self.hostcall_queue.borrow_mut().clear();
+    }
+
     #[allow(clippy::future_not_send, clippy::too_many_lines)]
-    pub async fn reset_for_warm_reload(&self) -> Result<PiJsWarmResetReport> {
+    /// Scrub observable realm state before the runtime is dropped.
+    ///
+    /// This report is a hygiene check, not reuse authority. Arbitrary extension
+    /// JavaScript can mutate singleton/module/global state beyond any finite
+    /// registry inventory, so callers must cold-create the next realm even
+    /// after a clean scrub.
+    pub async fn scrub_for_cold_drop(&self) -> Result<PiJsRealmScrubReport> {
+        self.process_sessions.close_all();
+        self.sqlite_state
+            .borrow_mut()
+            .reset()
+            .map_err(Error::extension)?;
         let rust_pending_hostcalls =
             u64::try_from(self.hostcall_tracker.borrow().pending_count()).unwrap_or(u64::MAX);
         let rust_pending_hostcall_queue =
             u64::try_from(self.hostcall_queue.borrow().len()).unwrap_or(u64::MAX);
         let rust_scheduler_pending = self.scheduler.borrow().has_pending();
 
-        let mut report = PiJsWarmResetReport {
+        let mut report = PiJsRealmScrubReport {
             rust_pending_hostcalls,
             rust_pending_hostcall_queue,
             rust_scheduler_pending,
-            ..PiJsWarmResetReport::default()
+            ..PiJsRealmScrubReport::default()
         };
 
         if rust_pending_hostcalls > 0 || rust_pending_hostcall_queue > 0 || rust_scheduler_pending {
@@ -15766,12 +18821,13 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
             return Ok(report);
         }
 
+        let bridge_secret = self.bridge_secret.clone();
         let reset_payload_value = match self
             .context
-            .with(|ctx| {
+            .with(move |ctx| {
                 let global = ctx.globals();
                 let reset_fn: Function<'_> = global.get("__pi_reset_extension_runtime_state")?;
-                let value: Value<'_> = reset_fn.call(())?;
+                let value: Value<'_> = reset_fn.call((bridge_secret,))?;
                 js_to_json(&value)
             })
             .await
@@ -15786,8 +18842,12 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
             })?;
 
         report.pending_tasks_before = reset_payload.before.pending_tasks;
+        report.tool_invocations_before = reset_payload.before.tool_invocations;
         report.pending_hostcalls_before = reset_payload.before.pending_hostcalls;
-        report.pending_timers_before = reset_payload.before.pending_timers;
+        report.pending_timers_before = reset_payload
+            .before
+            .pending_timers
+            .max(reset_payload.before.timer_handles);
 
         let residual_after = reset_payload.after.extensions
             + reset_payload.after.tools
@@ -15797,15 +18857,30 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
             + reset_payload.after.providers
             + reset_payload.after.shortcuts
             + reset_payload.after.message_renderers
+            + reset_payload.after.mcp_servers
             + reset_payload.after.pending_tasks
+            + reset_payload.after.tool_invocations
             + reset_payload.after.pending_hostcalls
             + reset_payload.after.pending_timers
+            + reset_payload.after.timer_handles
             + reset_payload.after.pending_event_listener_lists
-            + reset_payload.after.provider_streams;
+            + reset_payload.after.event_batch_contexts
+            + reset_payload.after.provider_streams
+            + reset_payload.after.virtual_http_servers
+            + reset_payload.after.virtual_http_requests
+            + reset_payload.after.api_providers
+            + reset_payload.after.child_processes
+            + reset_payload.after.vfs_files
+            + reset_payload.after.vfs_dirs
+            + reset_payload.after.vfs_symlinks
+            + reset_payload.after.vfs_fds;
         report.residual_entries_after = residual_after;
 
         self.hostcall_queue.borrow_mut().clear();
+        self.deferred_hostcalls.borrow_mut().clear();
         *self.hostcall_tracker.borrow_mut() = HostcallTracker::default();
+        self.active_session_action_origin.replace(None);
+        self.user_timer_origins.borrow_mut().clear();
 
         if let Ok(mut roots) = self.allowed_read_roots.lock() {
             roots.clear();
@@ -15824,6 +18899,8 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
             state.extension_root_scopes.clear();
             state.extension_roots_by_id.clear();
             state.extension_roots_without_id.clear();
+            state.foreign_extension_root_boundaries_by_id.clear();
+            state.persistent_storage.clear();
 
             for spec in dynamic_specs {
                 if remove_compiled_source(&mut state, &spec).is_some() {
@@ -15856,6 +18933,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
         report.module_cache_limit_bytes = cache_limit_bytes;
 
         if report.pending_tasks_before > 0
+            || report.tool_invocations_before > 0
             || report.pending_hostcalls_before > 0
             || report.pending_timers_before > 0
         {
@@ -15863,12 +18941,12 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
             return Ok(report);
         }
 
-        if !reset_payload.clean || residual_after > 0 {
+        if !reset_payload.clean || residual_after > 0 || !reset_payload.after.intrinsics_intact {
             report.reason_code = Some("reset_residual_state".to_string());
             return Ok(report);
         }
 
-        report.reused = true;
+        report.inventoried_state_cleared = true;
         Ok(report)
     }
 
@@ -15951,14 +19029,19 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
         self.repair_events.lock().map_or(0, |v| v.len() as u64)
     }
 
-    /// Reset transient module state for warm isolate reuse.
+    /// Clear Rust-side transient bookkeeping before this runtime is dropped.
     ///
     /// Clears extension roots, dynamic virtual modules, named export tracking,
     /// repair events, and cache counters while **preserving** the compiled
-    /// sources cache (both in-memory and disk). This lets the runtime be
-    /// reloaded with a fresh set of extensions without paying the SWC
-    /// transpilation cost again.
-    pub fn reset_transient_state(&self) {
+    /// sources cache (both in-memory and disk). This method does not reset the
+    /// JavaScript realm and must never authorize realm reuse.
+    #[cfg(test)]
+    fn reset_host_bookkeeping_before_drop(&self) {
+        self.process_sessions.close_all();
+        self.sqlite_state
+            .borrow_mut()
+            .reset()
+            .expect("reset SQLite before dropping test runtime");
         let mut state = self.module_state.borrow_mut();
         state.extension_roots.clear();
         state.canonical_extension_roots.clear();
@@ -15966,6 +19049,8 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
         state.extension_root_scopes.clear();
         state.extension_roots_by_id.clear();
         state.extension_roots_without_id.clear();
+        state.foreign_extension_root_boundaries_by_id.clear();
+        state.persistent_storage.clear();
         state.dynamic_virtual_modules.clear();
         state.dynamic_virtual_named_exports.clear();
         state.module_cache_counters = ModuleCacheCounters::default();
@@ -15977,6 +19062,8 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
         // Clear hostcall state.
         self.hostcall_queue.borrow_mut().clear();
         *self.hostcall_tracker.borrow_mut() = HostcallTracker::default();
+        self.active_session_action_origin.replace(None);
+        self.user_timer_origins.borrow_mut().clear();
         if let Ok(mut roots) = self.allowed_read_roots.lock() {
             roots.clear();
         }
@@ -16020,6 +19107,11 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
         }
     }
 
+    /// Capability passed only by trusted Rust callers to privileged JS bridge entrypoints.
+    pub(crate) fn bridge_secret(&self) -> &str {
+        &self.bridge_secret
+    }
+
     /// Read a global variable from the JS context and convert it to JSON.
     ///
     /// This is primarily intended for integration tests and diagnostics; it intentionally
@@ -16049,6 +19141,26 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
         self.hostcall_queue.borrow_mut().drain_all()
     }
 
+    /// Take one request without disturbing the queue's FIFO or reclamation state.
+    pub(crate) fn pop_hostcall_request(&self) -> Option<HostcallRequest> {
+        self.hostcall_queue.borrow_mut().pop_front()
+    }
+
+    /// Delay until actor-owned work should next be polled. In-flight hostcalls
+    /// require periodic polls even when JavaScript has no user timer scheduled.
+    pub(crate) fn idle_poll_delay_ms(&self) -> Option<u64> {
+        let scheduler = self.scheduler.borrow();
+        if scheduler.macrotask_count() > 0 || !self.hostcall_queue.borrow().is_empty() {
+            return Some(0);
+        }
+        let timer_delay = scheduler.time_until_next_timer();
+        if self.pending_hostcall_count() > 0 {
+            Some(timer_delay.unwrap_or(10).min(10))
+        } else {
+            timer_delay
+        }
+    }
+
     /// Drain pending QuickJS jobs (Promise microtasks) until fixpoint.
     pub async fn drain_microtasks(&self) -> Result<usize> {
         self.drain_jobs().await
@@ -16062,6 +19174,11 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
     /// Peek at pending hostcall requests without draining.
     pub fn pending_hostcall_count(&self) -> usize {
         self.hostcall_tracker.borrow().pending_count()
+    }
+
+    /// Snapshot outstanding native calls without draining or changing admission.
+    pub(crate) fn pending_hostcall_ids(&self) -> HashSet<String> {
+        self.hostcall_tracker.borrow().pending.clone()
     }
 
     /// Snapshot queue depth/backpressure counters for diagnostics.
@@ -16093,12 +19210,13 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
     /// Get all tools registered by loaded JS extensions.
     pub async fn get_registered_tools(&self) -> Result<Vec<ExtensionToolDef>> {
         self.interrupt_budget.reset();
+        let bridge_secret = self.bridge_secret.clone();
         let value = match self
             .context
-            .with(|ctx| {
+            .with(move |ctx| {
                 let global = ctx.globals();
                 let getter: Function<'_> = global.get("__pi_get_registered_tools")?;
-                let tools: Value<'_> = getter.call(())?;
+                let tools: Value<'_> = getter.call((bridge_secret,))?;
                 js_to_json(&tools)
             })
             .await
@@ -16160,6 +19278,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
 
     /// Cancel a pending hostcall and enqueue a final sentinel stream chunk if applicable.
     pub fn cancel_hostcall(&self, call_id: &str) -> bool {
+        self.deferred_hostcalls.borrow_mut().remove(call_id);
         let (timer_id, next_seq) = {
             let mut tracker = self.hostcall_tracker.borrow_mut();
             let Some(cancelled) = tracker.cancel(call_id) else {
@@ -16184,6 +19303,176 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
         true
     }
 
+    pub(crate) fn defer_hostcall_stream(
+        &self,
+        call_id: &str,
+        stream: futures::stream::LocalBoxStream<'static, HostcallOutcome>,
+    ) -> Result<()> {
+        let mut pending = self.deferred_hostcalls.borrow_mut();
+        if pending.len() >= 64 || pending.contains_key(call_id) {
+            return Err(Error::extension("Too many pending HTTP streams"));
+        }
+        pending.insert(
+            call_id.to_string(),
+            DeferredHostcall {
+                stream,
+                credit: true,
+                deadline: None,
+                finalizer: None,
+            },
+        );
+        Ok(())
+    }
+
+    pub(crate) fn has_deferred_hostcall(&self, call_id: &str) -> bool {
+        self.deferred_hostcalls.borrow().contains_key(call_id)
+    }
+
+    pub(crate) fn set_deferred_hostcall_finalizer(
+        &self,
+        call_id: &str,
+        finalizer: Box<dyn FnOnce(&HostcallOutcome)>,
+    ) {
+        if let Some(pending) = self.deferred_hostcalls.borrow_mut().get_mut(call_id) {
+            pending.finalizer = Some(finalizer);
+        }
+    }
+
+    fn finish_deferred_hostcall(&self, call_id: &str, outcome: &HostcallOutcome) {
+        let pending = self.deferred_hostcalls.borrow_mut().remove(call_id);
+        if let Some(mut pending) = pending {
+            pending.finish(outcome);
+        }
+    }
+
+    pub(crate) fn set_deferred_hostcall_deadline(
+        &self,
+        call_id: &str,
+        deadline: Option<std::time::Instant>,
+    ) {
+        if let Some(pending) = self.deferred_hostcalls.borrow_mut().get_mut(call_id) {
+            pending.deadline = deadline;
+        }
+    }
+
+    async fn poll_deferred_hostcalls(&self) {
+        use std::task::Poll;
+        let completions = futures::future::poll_fn(|cx| {
+            let mut completions = Vec::new();
+            self.deferred_hostcalls
+                .borrow_mut()
+                .retain(|call_id, pending| {
+                    if !self.is_hostcall_active(call_id) {
+                        return false;
+                    }
+                    if pending
+                        .deadline
+                        .is_some_and(|deadline| std::time::Instant::now() >= deadline)
+                    {
+                        let outcome = HostcallOutcome::Error {
+                            code: "timeout".to_string(),
+                            message: "Root JavaScript task deadline elapsed during HTTP stream"
+                                .to_string(),
+                        };
+                        pending.finish(&outcome);
+                        completions.push((call_id.clone(), outcome));
+                        return false;
+                    }
+                    if !pending.credit {
+                        return true;
+                    }
+                    match pending.stream.as_mut().poll_next(cx) {
+                        Poll::Pending => true,
+                        Poll::Ready(None) => {
+                            let outcome = HostcallOutcome::Error {
+                                code: "io".to_string(),
+                                message: "HTTP stream ended without a terminal response frame"
+                                    .to_string(),
+                            };
+                            pending.finish(&outcome);
+                            completions.push((call_id.clone(), outcome));
+                            false
+                        }
+                        Poll::Ready(Some(outcome)) => {
+                            let finished = !matches!(
+                                &outcome,
+                                HostcallOutcome::StreamChunk {
+                                    is_final: false,
+                                    ..
+                                }
+                            );
+                            if finished {
+                                pending.finish(&outcome);
+                            }
+                            pending.credit = false;
+                            completions.push((call_id.clone(), outcome));
+                            !finished
+                        }
+                    }
+                });
+            Poll::Ready(completions)
+        })
+        .await;
+        self.complete_hostcalls_batch(completions);
+    }
+
+    /// Enter a causal Session-action origin for synchronous JS work and all
+    /// microtasks drained before this guard is dropped.
+    pub(crate) fn enter_session_action_origin(
+        &self,
+        origin: Option<SessionActionOrigin>,
+    ) -> SessionActionOriginGuard {
+        let previous = self.active_session_action_origin.replace(origin);
+        SessionActionOriginGuard {
+            active_origin: Rc::clone(&self.active_session_action_origin),
+            previous,
+        }
+    }
+
+    pub(crate) fn enter_execution_fence(
+        &self,
+        cancelled: Arc<AtomicBool>,
+        deadline: Instant,
+    ) -> JsExecutionFenceGuard {
+        let interrupted = Rc::new(std::cell::Cell::new(false));
+        let previous = self.execution_fence.replace(Some(JsExecutionFence {
+            cancelled,
+            deadline,
+            interrupted: Rc::clone(&interrupted),
+        }));
+        JsExecutionFenceGuard {
+            active: Rc::clone(&self.execution_fence),
+            previous,
+            interrupted,
+        }
+    }
+
+    /// Return the trusted origin captured when a hostcall was created.
+    pub(crate) fn session_action_origin_for_hostcall(
+        &self,
+        call_id: &str,
+    ) -> Option<SessionActionOrigin> {
+        self.hostcall_tracker.borrow().origin_for_call(call_id)
+    }
+
+    fn take_session_action_origin_for_macrotask(
+        &self,
+        task: &crate::scheduler::Macrotask,
+    ) -> Option<SessionActionOrigin> {
+        use crate::scheduler::MacrotaskKind as SMK;
+
+        match &task.kind {
+            SMK::HostcallComplete { call_id, .. } => {
+                self.hostcall_tracker.borrow().origin_for_call(call_id)
+            }
+            SMK::TimerFired { timer_id } => {
+                let hostcall_origin = self.hostcall_tracker.borrow().origin_for_timer(*timer_id);
+                hostcall_origin.or_else(|| self.user_timer_origins.borrow_mut().remove(timer_id))
+            }
+            SMK::InboundEvent { .. } => None,
+        }
+    }
+
     /// Enqueue an inbound event to be delivered on next tick.
     pub fn enqueue_event(&self, event_id: impl Into<String>, payload: serde_json::Value) {
         self.scheduler
@@ -16195,12 +19484,22 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
     ///
     /// Returns the timer ID for cancellation.
     pub fn set_timeout(&self, delay_ms: u64) -> u64 {
-        self.scheduler.borrow_mut().set_timeout(delay_ms)
+        let timer_id = self.scheduler.borrow_mut().set_timeout(delay_ms);
+        if let Some(origin) = self.active_session_action_origin.borrow().clone() {
+            self.user_timer_origins
+                .borrow_mut()
+                .insert(timer_id, origin);
+        }
+        timer_id
     }
 
     /// Cancel a timer by ID.
     pub fn clear_timeout(&self, timer_id: u64) -> bool {
-        self.scheduler.borrow_mut().clear_timeout(timer_id)
+        let cleared = self.scheduler.borrow_mut().clear_timeout(timer_id);
+        if cleared {
+            self.user_timer_origins.borrow_mut().remove(&timer_id);
+        }
+        cleared
     }
 
     /// Get the current time from the clock.
@@ -16222,6 +19521,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
     ///
     /// Returns statistics about what was executed.
     pub async fn tick(&self) -> Result<PiJsTickStats> {
+        self.poll_deferred_hostcalls().await;
         // Get the next macrotask from scheduler
         let macrotask = self.scheduler.borrow_mut().tick();
 
@@ -16230,6 +19530,8 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
         if let Some(task) = macrotask {
             stats.ran_macrotask = true;
             self.interrupt_budget.reset();
+            let origin = self.take_session_action_origin_for_macrotask(&task);
+            let _origin_guard = self.enter_session_action_origin(origin);
 
             // Handle the macrotask inside the JS context
             let result = self
@@ -16360,6 +19662,9 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                     }
                 } else {
                     // Final chunk or non-stream outcome: complete the hostcall.
+                    // Drop a deferred request now, even if this completion was
+                    // injected externally and the actor has no later tick.
+                    self.finish_deferred_hostcall(call_id, outcome);
                     let completion = self.hostcall_tracker.borrow_mut().on_complete(call_id);
                     let timer_id = match completion {
                         HostcallCompletion::Delivered { timer_id } => timer_id,
@@ -16384,7 +19689,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                     seq = task.seq.value(),
                     "Delivering hostcall completion"
                 );
-                Self::deliver_hostcall_completion(ctx, call_id, outcome)?;
+                self.deliver_hostcall_completion(ctx, call_id, outcome)?;
             }
             SMK::TimerFired { timer_id } => {
                 if let Some(call_id) = self
@@ -16405,7 +19710,10 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                         code: "timeout".to_string(),
                         message: "Hostcall timed out".to_string(),
                     };
-                    Self::deliver_hostcall_completion(ctx, &call_id, &outcome)?;
+                    // A watchdog can be the last pending actor task. Finish
+                    // accounting and release the network future in this tick.
+                    self.finish_deferred_hostcall(&call_id, &outcome);
+                    self.deliver_hostcall_completion(ctx, &call_id, &outcome)?;
                     return Ok(());
                 }
 
@@ -16416,7 +19724,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                     "Timer fired"
                 );
                 // Timer callbacks are stored in a JS-side map
-                Self::deliver_timer_fire(ctx, *timer_id)?;
+                self.deliver_timer_fire(ctx, *timer_id)?;
             }
             SMK::InboundEvent { event_id, payload } => {
                 tracing::debug!(
@@ -16425,7 +19733,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                     seq = task.seq.value(),
                     "Delivering inbound event"
                 );
-                Self::deliver_inbound_event(ctx, event_id, payload)?;
+                self.deliver_inbound_event(ctx, event_id, payload)?;
             }
         }
         Ok(())
@@ -16433,6 +19741,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
 
     /// Deliver a hostcall completion to JS.
     fn deliver_hostcall_completion(
+        &self,
         ctx: &Ctx<'_>,
         call_id: &str,
         outcome: &HostcallOutcome,
@@ -16467,20 +19776,21 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                 obj
             }
         };
-        complete_fn.call::<_, ()>((call_id, js_outcome))?;
+        complete_fn.call::<_, ()>((self.bridge_secret.as_str(), call_id, js_outcome))?;
         Ok(())
     }
 
     /// Deliver a timer fire event to JS.
-    fn deliver_timer_fire(ctx: &Ctx<'_>, timer_id: u64) -> rquickjs::Result<()> {
+    fn deliver_timer_fire(&self, ctx: &Ctx<'_>, timer_id: u64) -> rquickjs::Result<()> {
         let global = ctx.globals();
         let fire_fn: Function<'_> = global.get("__pi_fire_timer")?;
-        fire_fn.call::<_, ()>((timer_id,))?;
+        fire_fn.call::<_, ()>((self.bridge_secret.as_str(), timer_id))?;
         Ok(())
     }
 
     /// Deliver an inbound event to JS.
     fn deliver_inbound_event(
+        &self,
         ctx: &Ctx<'_>,
         event_id: &str,
         payload: &serde_json::Value,
@@ -16488,7 +19798,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
         let global = ctx.globals();
         let dispatch_fn: Function<'_> = global.get("__pi_dispatch_event")?;
         let js_payload = json_to_js(ctx, payload)?;
-        dispatch_fn.call::<_, ()>((event_id, js_payload))?;
+        dispatch_fn.call::<_, ()>((self.bridge_secret.as_str(), event_id, js_payload))?;
         Ok(())
     }
 
@@ -16510,10 +19820,22 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
     /// bundled assets (HTML templates, markdown docs, etc.).
     pub fn add_allowed_read_root(&self, root: &std::path::Path) {
         let canonical_root = crate::extensions::safe_canonicalize(root);
-        if let Ok(mut roots) = self.allowed_read_roots.lock() {
+        if let Ok(mut roots) = self.allowed_read_roots.lock()
+            && !roots.contains(&canonical_root)
+        {
+            roots.push(canonical_root.clone());
+        }
+        let mut state = self.module_state.borrow_mut();
+        if let Some(owner) = self.owner_extension_id.as_deref() {
+            let roots = state
+                .extension_roots_by_id
+                .entry(owner.to_string())
+                .or_default();
             if !roots.contains(&canonical_root) {
                 roots.push(canonical_root);
             }
+        } else if !state.extension_roots_without_id.contains(&canonical_root) {
+            state.extension_roots_without_id.push(canonical_root);
         }
     }
 
@@ -16530,8 +19852,28 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
     /// apply stricter policy for official/first-party extensions and to allow
     /// same-scope package imports (`@scope/*`) when scope can be discovered.
     pub fn add_extension_root_with_id(&self, root: PathBuf, extension_id: Option<&str>) {
+        let extension_id = match self.owner_extension_id.as_deref() {
+            Some(owner) => {
+                if extension_id.is_some_and(|requested| requested != owner) {
+                    tracing::error!(
+                        event = "pijs.extension_root.owner_mismatch",
+                        owner_extension_id = owner,
+                        requested_extension_id = extension_id,
+                        root = %root.display(),
+                        "Rejected extension root registration for a foreign runtime owner"
+                    );
+                    return;
+                }
+                Some(owner)
+            }
+            None => extension_id,
+        };
         let canonical_root = crate::extensions::safe_canonicalize(&root);
-        self.add_allowed_read_root(&canonical_root);
+        if let Ok(mut roots) = self.allowed_read_roots.lock()
+            && !roots.contains(&canonical_root)
+        {
+            roots.push(canonical_root.clone());
+        }
         let mut state = self.module_state.borrow_mut();
         if !state.extension_roots.contains(&root) {
             state.canonical_extension_roots.push(canonical_root.clone());
@@ -16561,16 +19903,175 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
         }
     }
 
+    /// Grant one extension a persistent data directory. This is a host-only
+    /// capability: guest metadata cannot add roots, and data roots never grant
+    /// module-import authority. The path must be absolute and contain no links.
+    pub fn add_persistent_storage_root(&self, root: PathBuf, extension_id: &str) -> Result<()> {
+        if self
+            .owner_extension_id
+            .as_deref()
+            .is_some_and(|owner| owner != extension_id)
+        {
+            return Err(Error::extension(
+                "Persistent storage owner does not match runtime owner",
+            ));
+        }
+        self.module_state
+            .borrow_mut()
+            .persistent_storage
+            .register(root, extension_id, false)
+            .map_err(|error| Error::extension(format!("Invalid persistent storage grant: {error}")))
+    }
+
+    /// Grant read-only access to one host configuration file. Its parent is a
+    /// protected namespace, not a directory read grant or a module search root.
+    /// Missing files remain missing; registration never creates host paths.
+    pub fn add_configuration_read_file(&self, file: PathBuf, extension_id: &str) -> Result<()> {
+        if self
+            .owner_extension_id
+            .as_deref()
+            .is_some_and(|owner| owner != extension_id)
+        {
+            return Err(Error::extension(
+                "Configuration owner does not match runtime owner",
+            ));
+        }
+        self.module_state
+            .borrow_mut()
+            .persistent_storage
+            .register_configuration_file(file, extension_id)
+            .map_err(|error| Error::extension(format!("Invalid configuration read grant: {error}")))
+    }
+
+    pub(crate) fn register_foreign_persistent_storage_root(
+        &self,
+        root: PathBuf,
+        extension_id: &str,
+    ) -> Result<()> {
+        self.module_state
+            .borrow_mut()
+            .persistent_storage
+            .register(root, extension_id, true)
+            .map_err(|error| {
+                Error::extension(format!("Invalid persistent storage boundary: {error}"))
+            })
+    }
+
+    /// Resolve host-supplied state configuration before any guest code runs.
+    /// Mutable JavaScript process.env values cannot expand these grants.
+    pub(crate) fn application_storage_root(&self, namespace: &Path) -> Option<PathBuf> {
+        let configured_home = if self.config.deny_env {
+            None
+        } else {
+            ["HOME", "USERPROFILE"].into_iter().find_map(|key| {
+                configured_environment_value(
+                    &self.config.env,
+                    key,
+                    uses_windows_environment(&self.config.env),
+                )
+                .filter(|value| !value.trim().is_empty())
+                .map(str::to_string)
+            })
+        };
+        let home = configured_home
+            // node:os.homedir exposes this host metadata even when generic
+            // environment access is denied. Match its HOME/USERPROFILE order.
+            .or_else(|| std::env::var("HOME").ok().filter(|value| !value.is_empty()))
+            .or_else(|| {
+                std::env::var("USERPROFILE")
+                    .ok()
+                    .filter(|value| !value.is_empty())
+            })
+            .map(PathBuf::from)
+            .or_else(dirs::home_dir)?;
+        Some(
+            crate::extensions::safe_canonicalize(&home)
+                .join(".pi")
+                .join(namespace),
+        )
+    }
+
+    /// Register a peer extension root as an ownership boundary without
+    /// granting this runtime filesystem or module-resolver access to it.
+    ///
+    /// Production creates one runtime per extension. Every runtime needs
+    /// peer-root metadata so a path nested under a peer extension is never
+    /// mistaken for an ordinary workspace path. This method deliberately
+    /// does not update `allowed_read_roots`, resolver roots, source tiers, or
+    /// package scopes.
+    pub(crate) fn register_foreign_extension_root_boundary(
+        &self,
+        root: &Path,
+        owner_extension_id: &str,
+    ) {
+        let owner_extension_id = owner_extension_id.trim();
+        if owner_extension_id.is_empty() {
+            tracing::warn!(
+                event = "pijs.extension_root.foreign_boundary_empty_owner",
+                root = %root.display(),
+                "Ignored foreign extension root boundary without an owner"
+            );
+            return;
+        }
+        if self
+            .owner_extension_id
+            .as_deref()
+            .is_some_and(|owner| owner == owner_extension_id)
+        {
+            tracing::warn!(
+                event = "pijs.extension_root.foreign_boundary_self_owner",
+                owner_extension_id,
+                root = %root.display(),
+                "Ignored self-owned foreign extension root boundary"
+            );
+            return;
+        }
+
+        let canonical_root = crate::extensions::safe_canonicalize(root);
+        let mut state = self.module_state.borrow_mut();
+        let roots = state
+            .foreign_extension_root_boundaries_by_id
+            .entry(owner_extension_id.to_string())
+            .or_default();
+        if !roots.contains(&canonical_root) {
+            roots.push(canonical_root);
+        }
+    }
+
+    /// Called only after the shared exec dispatcher has admitted and mediated
+    /// this request. Native JS session callbacks cannot create new processes.
+    pub(crate) fn spawn_process_session(
+        &self,
+        extension_id: Option<&str>,
+        command: &str,
+        args: &[String],
+        options: &serde_json::Value,
+        on_exit: Box<dyn FnOnce() + Send>,
+    ) -> std::result::Result<serde_json::Value, String> {
+        self.process_sessions
+            .spawn(extension_id, command, args, options, on_exit)
+    }
+
     #[allow(clippy::too_many_lines)]
     async fn install_pi_bridge(&self) -> Result<()> {
+        let runtime_id = self.runtime_id.clone();
         let hostcall_queue = self.hostcall_queue.clone();
         let scheduler = Rc::clone(&self.scheduler);
         let hostcall_tracker = Rc::clone(&self.hostcall_tracker);
+        let deferred_hostcalls = Rc::clone(&self.deferred_hostcalls);
+        let active_session_action_origin = Rc::clone(&self.active_session_action_origin);
+        let user_timer_origins = Rc::clone(&self.user_timer_origins);
         let hostcalls_total = Arc::clone(&self.hostcalls_total);
         let trace_seq = Arc::clone(&self.trace_seq);
         let default_hostcall_timeout_ms = self.config.limits.hostcall_timeout_ms;
         let process_cwd = self.config.cwd.clone();
         let process_args = self.config.args.clone();
+        // Platform is runtime metadata, independent of permission to read env.
+        // PI_PLATFORM was supplied by the host at runtime construction above.
+        let windows_environment = uses_windows_environment(&self.config.env);
+        let process_platform =
+            configured_environment_value(&self.config.env, "PI_PLATFORM", windows_environment)
+                .map_or_else(|| std::env::consts::OS.to_string(), str::to_string);
         let env = self.config.env.clone();
         let deny_env = self.config.deny_env;
         let repair_mode = self.config.repair_mode;
@@ -16579,28 +20080,123 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
         let allowed_read_roots = Arc::clone(&self.allowed_read_roots);
         let module_state = Rc::clone(&self.module_state);
         let policy = self.policy.clone();
+        let owner_extension_id = self.owner_extension_id.clone();
+        let mut extension_temp_roots = vec![std::env::temp_dir().to_string_lossy().into_owned()];
+        for key in ["TMPDIR", "TEMP", "TMP"] {
+            if let Some(value) = configured_environment_value(&env, key, windows_environment)
+                && !value.trim().is_empty()
+                && !extension_temp_roots.iter().any(|root| root == value)
+            {
+                extension_temp_roots.push(value.to_string());
+            }
+        }
+        if !extension_temp_roots.iter().any(|root| root == "/tmp") {
+            extension_temp_roots.push("/tmp".to_string());
+        }
+        let extension_temp_roots_json = serde_json::to_string(&extension_temp_roots)
+            .unwrap_or_else(|_| "[\"/tmp\"]".to_string());
 
         self.context
             .with(|ctx| {
                 let global = ctx.globals();
 
+                storage::install(&ctx, &module_state, &process_cwd)?;
+                intl::install(&ctx)?;
+                sqlite::install(
+                    &ctx,
+                    Rc::clone(&self.sqlite_state),
+                    Rc::clone(&module_state),
+                    process_cwd.clone(),
+                    policy.clone(),
+                )?;
+                self.process_sessions.install(&ctx)?;
+                executable::install(&ctx, env.clone(), process_cwd.clone(), policy.clone())?;
+
+                global.set(
+                    "__pi_bridge_secret_matches_native",
+                    Func::from({
+                        let bridge_secret = self.bridge_secret.clone();
+                        move |candidate: String| candidate == bridge_secret
+                    }),
+                )?;
+                global.set(
+                    "__pi_owner_extension_id_native",
+                    Func::from({
+                        let owner_extension_id = owner_extension_id.clone();
+                        move || owner_extension_id.as_deref().map(str::to_owned)
+                    }),
+                )?;
+                global.set(
+                    "__pi_host_temp_roots_json",
+                    Func::from(move || extension_temp_roots_json.clone()),
+                )?;
+                global.set(
+                    "__pi_tool_result_json_native",
+                    Func::from(
+                        |input: Value<'_>, validate_patch: bool| -> rquickjs::Result<String> {
+                            // Reuse the bounded host JSON conversion for snapshots
+                            // and the host's exact response schema for rewrites.
+                            let value = js_to_json(&input)?;
+                            let value = if validate_patch {
+                                serde_json::Value::Object(
+                                    crate::extensions::normalize_tool_result_patch(value).map_err(
+                                        |err| {
+                                            rquickjs::Error::new_into_js_message(
+                                                "tool_result",
+                                                "response",
+                                                err.to_string(),
+                                            )
+                                        },
+                                    )?,
+                                )
+                            } else {
+                                value
+                            };
+                            serde_json::to_string(&value).map_err(|err| {
+                                rquickjs::Error::new_into_js_message(
+                                    "tool_result",
+                                    "json",
+                                    err.to_string(),
+                                )
+                            })
+                        },
+                    ),
+                )?;
+
                 // Install native functions that return call_ids
                 // These are wrapped by JS to create Promises
 
-                // __pi_tool_native(name, input) -> call_id
+                // __pi_tool_native(name, input, factory_options?) -> call_id
                 global.set(
                     "__pi_tool_native",
                     Func::from({
                         let queue = hostcall_queue.clone();
                         let tracker = hostcall_tracker.clone();
                         let scheduler = Rc::clone(&scheduler);
+                        let active_origin = Rc::clone(&active_session_action_origin);
                         let hostcalls_total = Arc::clone(&hostcalls_total);
                         let trace_seq = Arc::clone(&trace_seq);
                         move |ctx: Ctx<'_>,
                               name: String,
-                              input: Value<'_>|
+                              input: Value<'_>,
+                              factory: Opt<Value<'_>>|
                               -> rquickjs::Result<String> {
-                            let payload = js_to_json(&input)?;
+                            let input = js_to_json(&input)?;
+                            let (kind, payload) = match factory.0 {
+                                Some(options) if !options.is_undefined() && !options.is_null() => {
+                                    let mut options = js_to_json(&options)?;
+                                    let Some(params) = options.as_object_mut() else {
+                                        return Err(rquickjs::Error::new_into_js_message(
+                                            "factory",
+                                            "options",
+                                            "Tool factory metadata must be an object",
+                                        ));
+                                    };
+                                    params.insert("input".to_string(), input);
+                                    (HostcallKind::BuiltinTool { name }, options)
+                                }
+                                _ => (HostcallKind::Tool { name }, input),
+                            };
                             let call_id = format!("call-{}", generate_call_id());
                             hostcalls_total.fetch_add(1, AtomicOrdering::SeqCst);
                             let trace_id = trace_seq.fetch_add(1, AtomicOrdering::SeqCst);
@@ -16610,17 +20206,16 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                 timeout_ms.map(|ms| scheduler.borrow_mut().set_timeout(ms));
                             tracker
                                 .borrow_mut()
-                                .register(call_id.clone(), timer_id, enqueued_at_ms);
-                            let extension_id: Option<String> = ctx
-                                .globals()
-                                .get::<_, Option<String>>("__pi_current_extension_id")
-                                .ok()
-                                .flatten()
-                                .map(|value| value.trim().to_string())
-                                .filter(|value| !value.is_empty());
+                                .register(
+                                    call_id.clone(),
+                                    timer_id,
+                                    enqueued_at_ms,
+                                    active_origin.borrow().clone(),
+                                );
+                            let extension_id = current_extension_id(&ctx);
                             let request = HostcallRequest {
                                 call_id: call_id.clone(),
-                                kind: HostcallKind::Tool { name },
+                                kind,
                                 payload,
                                 trace_id,
                                 extension_id,
@@ -16640,6 +20235,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                         let queue = hostcall_queue.clone();
                         let tracker = hostcall_tracker.clone();
                         let scheduler = Rc::clone(&scheduler);
+                        let active_origin = Rc::clone(&active_session_action_origin);
                         let hostcalls_total = Arc::clone(&hostcalls_total);
                         let trace_seq = Arc::clone(&trace_seq);
                         move |ctx: Ctx<'_>,
@@ -16686,14 +20282,13 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                 timeout_ms.map(|ms| scheduler.borrow_mut().set_timeout(ms));
                             tracker
                                 .borrow_mut()
-                                .register(call_id.clone(), timer_id, enqueued_at_ms);
-                            let extension_id: Option<String> = ctx
-                                .globals()
-                                .get::<_, Option<String>>("__pi_current_extension_id")
-                                .ok()
-                                .flatten()
-                                .map(|value| value.trim().to_string())
-                                .filter(|value| !value.is_empty());
+                                .register(
+                                    call_id.clone(),
+                                    timer_id,
+                                    enqueued_at_ms,
+                                    active_origin.borrow().clone(),
+                                );
+                            let extension_id = current_extension_id(&ctx);
                             let request = HostcallRequest {
                                 call_id: call_id.clone(),
                                 kind: HostcallKind::Exec { cmd },
@@ -16716,6 +20311,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                         let queue = hostcall_queue.clone();
                         let tracker = hostcall_tracker.clone();
                         let scheduler = Rc::clone(&scheduler);
+                        let active_origin = Rc::clone(&active_session_action_origin);
                         let hostcalls_total = Arc::clone(&hostcalls_total);
                         let trace_seq = Arc::clone(&trace_seq);
                         move |ctx: Ctx<'_>, req: Value<'_>| -> rquickjs::Result<String> {
@@ -16729,14 +20325,13 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                 timeout_ms.map(|ms| scheduler.borrow_mut().set_timeout(ms));
                             tracker
                                 .borrow_mut()
-                                .register(call_id.clone(), timer_id, enqueued_at_ms);
-                            let extension_id: Option<String> = ctx
-                                .globals()
-                                .get::<_, Option<String>>("__pi_current_extension_id")
-                                .ok()
-                                .flatten()
-                                .map(|value| value.trim().to_string())
-                                .filter(|value| !value.is_empty());
+                                .register(
+                                    call_id.clone(),
+                                    timer_id,
+                                    enqueued_at_ms,
+                                    active_origin.borrow().clone(),
+                                );
+                            let extension_id = current_extension_id(&ctx);
                             let request = HostcallRequest {
                                 call_id: call_id.clone(),
                                 kind: HostcallKind::Http,
@@ -16759,6 +20354,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                         let queue = hostcall_queue.clone();
                         let tracker = hostcall_tracker.clone();
                         let scheduler = Rc::clone(&scheduler);
+                        let active_origin = Rc::clone(&active_session_action_origin);
                         let hostcalls_total = Arc::clone(&hostcalls_total);
                         let trace_seq = Arc::clone(&trace_seq);
                         move |ctx: Ctx<'_>,
@@ -16775,14 +20371,13 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                 timeout_ms.map(|ms| scheduler.borrow_mut().set_timeout(ms));
                             tracker
                                 .borrow_mut()
-                                .register(call_id.clone(), timer_id, enqueued_at_ms);
-                            let extension_id: Option<String> = ctx
-                                .globals()
-                                .get::<_, Option<String>>("__pi_current_extension_id")
-                                .ok()
-                                .flatten()
-                                .map(|value| value.trim().to_string())
-                                .filter(|value| !value.is_empty());
+                                .register(
+                                    call_id.clone(),
+                                    timer_id,
+                                    enqueued_at_ms,
+                                    active_origin.borrow().clone(),
+                                );
+                            let extension_id = current_extension_id(&ctx);
                             let request = HostcallRequest {
                                 call_id: call_id.clone(),
                                 kind: HostcallKind::Session { op },
@@ -16805,6 +20400,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                         let queue = hostcall_queue.clone();
                         let tracker = hostcall_tracker.clone();
                         let scheduler = Rc::clone(&scheduler);
+                        let active_origin = Rc::clone(&active_session_action_origin);
                         let hostcalls_total = Arc::clone(&hostcalls_total);
                         let trace_seq = Arc::clone(&trace_seq);
                         move |ctx: Ctx<'_>,
@@ -16821,14 +20417,13 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                 timeout_ms.map(|ms| scheduler.borrow_mut().set_timeout(ms));
                             tracker
                                 .borrow_mut()
-                                .register(call_id.clone(), timer_id, enqueued_at_ms);
-                            let extension_id: Option<String> = ctx
-                                .globals()
-                                .get::<_, Option<String>>("__pi_current_extension_id")
-                                .ok()
-                                .flatten()
-                                .map(|value| value.trim().to_string())
-                                .filter(|value| !value.is_empty());
+                                .register(
+                                    call_id.clone(),
+                                    timer_id,
+                                    enqueued_at_ms,
+                                    active_origin.borrow().clone(),
+                                );
+                            let extension_id = current_extension_id(&ctx);
                             let request = HostcallRequest {
                                 call_id: call_id.clone(),
                                 kind: HostcallKind::Ui { op },
@@ -16851,6 +20446,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                         let queue = hostcall_queue.clone();
                         let tracker = hostcall_tracker.clone();
                         let scheduler = Rc::clone(&scheduler);
+                        let active_origin = Rc::clone(&active_session_action_origin);
                         let hostcalls_total = Arc::clone(&hostcalls_total);
                         let trace_seq = Arc::clone(&trace_seq);
                         move |ctx: Ctx<'_>,
@@ -16867,14 +20463,13 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                 timeout_ms.map(|ms| scheduler.borrow_mut().set_timeout(ms));
                             tracker
                                 .borrow_mut()
-                                .register(call_id.clone(), timer_id, enqueued_at_ms);
-                            let extension_id: Option<String> = ctx
-                                .globals()
-                                .get::<_, Option<String>>("__pi_current_extension_id")
-                                .ok()
-                                .flatten()
-                                .map(|value| value.trim().to_string())
-                                .filter(|value| !value.is_empty());
+                                .register(
+                                    call_id.clone(),
+                                    timer_id,
+                                    enqueued_at_ms,
+                                    active_origin.borrow().clone(),
+                                );
+                            let extension_id = current_extension_id(&ctx);
                             let request = HostcallRequest {
                                 call_id: call_id.clone(),
                                 kind: HostcallKind::Events { op },
@@ -16897,6 +20492,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                         let queue = hostcall_queue.clone();
                         let tracker = hostcall_tracker.clone();
                         let scheduler = Rc::clone(&scheduler);
+                        let active_origin = Rc::clone(&active_session_action_origin);
                         let hostcalls_total = Arc::clone(&hostcalls_total);
                         let trace_seq = Arc::clone(&trace_seq);
                         move |ctx: Ctx<'_>, entry: Value<'_>| -> rquickjs::Result<String> {
@@ -16910,14 +20506,13 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                 timeout_ms.map(|ms| scheduler.borrow_mut().set_timeout(ms));
                             tracker
                                 .borrow_mut()
-                                .register(call_id.clone(), timer_id, enqueued_at_ms);
-                            let extension_id: Option<String> = ctx
-                                .globals()
-                                .get::<_, Option<String>>("__pi_current_extension_id")
-                                .ok()
-                                .flatten()
-                                .map(|value| value.trim().to_string())
-                                .filter(|value| !value.is_empty());
+                                .register(
+                                    call_id.clone(),
+                                    timer_id,
+                                    enqueued_at_ms,
+                                    active_origin.borrow().clone(),
+                                );
+                            let extension_id = current_extension_id(&ctx);
                             let request = HostcallRequest {
                                 call_id: call_id.clone(),
                                 kind: HostcallKind::Log,
@@ -16938,8 +20533,39 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                     "__pi_set_timeout_native",
                     Func::from({
                         let scheduler = Rc::clone(&scheduler);
+                        let active_origin = Rc::clone(&active_session_action_origin);
+                        let timer_origins = Rc::clone(&user_timer_origins);
                         move |_ctx: Ctx<'_>, delay_ms: u64| -> rquickjs::Result<u64> {
-                            Ok(scheduler.borrow_mut().set_timeout(delay_ms))
+                            let timer_id = scheduler.borrow_mut().set_timeout(delay_ms);
+                            if let Some(origin) = active_origin.borrow().clone() {
+                                timer_origins.borrow_mut().insert(timer_id, origin);
+                            }
+                            Ok(timer_id)
+                        }
+                    }),
+                )?;
+
+                // A timer handle owns this opaque scheduler closure. Keeping
+                // provenance in the Rust closure preserves the original root
+                // across refresh/repeat, including after its first firing,
+                // without retaining expired timers in a global origin map.
+                global.set(
+                    "__pi_create_timer_scheduler_native",
+                    Func::from({
+                        let scheduler = Rc::clone(&scheduler);
+                        let active_origin = Rc::clone(&active_session_action_origin);
+                        let timer_origins = Rc::clone(&user_timer_origins);
+                        move || {
+                            let origin = active_origin.borrow().clone();
+                            let scheduler = Rc::clone(&scheduler);
+                            let timer_origins = Rc::clone(&timer_origins);
+                            Func::from(move |delay_ms: u64| -> u64 {
+                                let timer_id = scheduler.borrow_mut().set_timeout(delay_ms);
+                                if let Some(origin) = origin.clone() {
+                                    timer_origins.borrow_mut().insert(timer_id, origin);
+                                }
+                                timer_id
+                            })
                         }
                     }),
                 )?;
@@ -16949,19 +20575,42 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                     "__pi_clear_timeout_native",
                     Func::from({
                         let scheduler = Rc::clone(&scheduler);
+                        let tracker = hostcall_tracker.clone();
+                        let timer_origins = Rc::clone(&user_timer_origins);
                         move |_ctx: Ctx<'_>, timer_id: u64| -> rquickjs::Result<bool> {
-                            Ok(scheduler.borrow_mut().clear_timeout(timer_id))
+                            if tracker.borrow().timer_to_call.contains_key(&timer_id) {
+                                return Ok(false);
+                            }
+                            let cleared = scheduler.borrow_mut().clear_timeout(timer_id);
+                            if cleared {
+                                timer_origins.borrow_mut().remove(&timer_id);
+                            }
+                            Ok(cleared)
                         }
                     }),
                 )?;
 
                 // __pi_cancel_hostcall_native(call_id) -> bool
                 global.set(
+                    "__pi_http_stream_pull_native",
+                    Func::from({
+                        let pending = Rc::clone(&deferred_hostcalls);
+                        move |call_id: String| {
+                            if let Some(stream) = pending.borrow_mut().get_mut(&call_id) {
+                                stream.credit = true;
+                            }
+                        }
+                    }),
+                )?;
+
+                global.set(
                     "__pi_cancel_hostcall_native",
                     Func::from({
                         let tracker = hostcall_tracker.clone();
                         let scheduler = Rc::clone(&scheduler);
+                        let pending = Rc::clone(&deferred_hostcalls);
                         move |_ctx: Ctx<'_>, call_id: String| -> rquickjs::Result<bool> {
+                            pending.borrow_mut().remove(&call_id);
                             let (timer_id, next_seq) = {
                                 let mut tracker = tracker.borrow_mut();
                                 let Some(cancelled) = tracker.cancel(&call_id) else {
@@ -17006,6 +20655,11 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                     }),
                 )?;
 
+                global.set(
+                    "__pi_process_platform_native",
+                    Func::from(move || process_platform.clone()),
+                )?;
+
                 // __pi_process_args_native() -> string[]
                 global.set(
                     "__pi_process_args_native",
@@ -17024,25 +20678,36 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                         let queue = hostcall_queue.clone();
                         let tracker = hostcall_tracker.clone();
                         let scheduler = Rc::clone(&scheduler);
-                        move |_ctx: Ctx<'_>, code: i32| -> rquickjs::Result<()> {
+                        let active_origin = Rc::clone(&active_session_action_origin);
+                        let hostcalls_total = Arc::clone(&hostcalls_total);
+                        let trace_seq = Arc::clone(&trace_seq);
+                        move |ctx: Ctx<'_>, code: i32| -> rquickjs::Result<()> {
                             tracing::info!(
                                 event = "pijs.process.exit",
                                 code,
                                 "process.exit requested"
                             );
                             let call_id = format!("call-{}", generate_call_id());
+                            hostcalls_total.fetch_add(1, AtomicOrdering::SeqCst);
+                            let trace_id = trace_seq.fetch_add(1, AtomicOrdering::SeqCst);
                             let enqueued_at_ms = scheduler.borrow().now_ms();
                             tracker
                                 .borrow_mut()
-                                .register(call_id.clone(), None, enqueued_at_ms);
+                                .register(
+                                    call_id.clone(),
+                                    None,
+                                    enqueued_at_ms,
+                                    active_origin.borrow().clone(),
+                                );
+                            let extension_id = current_extension_id(&ctx);
                             let request = HostcallRequest {
                                 call_id,
                                 kind: HostcallKind::Events {
                                     op: "exit".to_string(),
                                 },
                                 payload: serde_json::json!({ "code": code }),
-                                trace_id: 0,
-                                extension_id: None,
+                                trace_id,
+                                extension_id,
                             };
                             enqueue_hostcall_request_with_backpressure(
                                 &queue, &tracker, &scheduler, request,
@@ -17060,6 +20725,33 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                             |_| "/usr/bin/pi".to_string(),
                             |p| p.to_string_lossy().into_owned(),
                         ))
+                    }),
+                )?;
+
+                // Enumerate only permitted snapshot bindings safe to copy into
+                // child environments. Loader hooks and Windows per-drive keys
+                // remain individually readable under the same env policy, but
+                // cannot poison `{ ...process.env }` at process admission.
+                // Sorting avoids HashMap iteration nondeterminism.
+                global.set(
+                    "__pi_env_keys_native",
+                    Func::from({
+                        let env = env.clone();
+                        let policy_for_env = policy.clone();
+                        move || -> Vec<String> {
+                            if deny_env {
+                                return Vec::new();
+                            }
+                            let mut keys: Vec<String> = env.keys().filter(|key| {
+                                process_session::safe_environment_name(key)
+                                    && policy_for_env.as_ref().map_or_else(
+                                        || is_env_var_allowed(key),
+                                        |policy| !policy.secret_broker.is_secret(key),
+                                    )
+                            }).cloned().collect();
+                            keys.sort();
+                            keys
+                        }
                     }),
                 )?;
 
@@ -17102,7 +20794,8 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                             if !allowed {
                                 return Ok(None);
                             }
-                            Ok(env.get(&key).cloned())
+                            Ok(configured_environment_value(&env, &key, windows_environment)
+                                .map(str::to_string))
                         }
                     }),
                 )?;
@@ -17127,6 +20820,49 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                             );
                             random_bytes(len)
                                 .map_err(|err| map_crypto_entropy_error("randomBytes", err))
+                        },
+                    ),
+                )?;
+
+                // URL parsing is pure: it shares the host's WHATWG parser,
+                // without granting any filesystem or network capability.
+                global.set(
+                    "__pi_url_parse_native",
+                    Func::from(
+                        move |_ctx: Ctx<'_>, input: String, base: Option<String>| -> Option<String> {
+                            let parsed = match base {
+                                Some(base) => url::Url::parse(&base).ok()?.join(&input).ok()?,
+                                None => url::Url::parse(&input).ok()?,
+                            };
+                            let protocol = format!("{}:", parsed.scheme());
+                            let has_authority = parsed
+                                .as_str()
+                                .strip_prefix(&protocol)
+                                .is_some_and(|rest| rest.starts_with("//"));
+                            let hostname = parsed.host_str().unwrap_or_default();
+                            let port = parsed
+                                .port()
+                                .map_or_else(String::new, |port| port.to_string());
+                            let host = if port.is_empty() {
+                                hostname.to_string()
+                            } else {
+                                format!("{hostname}:{port}")
+                            };
+                            let parts = serde_json::json!({
+                                "href": parsed.as_str(),
+                                "protocol": protocol,
+                                "hasAuthority": has_authority,
+                                "hostname": hostname,
+                                "host": host,
+                                "port": port,
+                                "username": parsed.username(),
+                                "password": parsed.password().unwrap_or_default(),
+                                "pathname": parsed.path(),
+                                "search": parsed.query().map_or_else(String::new, |query| format!("?{query}")),
+                                "hash": parsed.fragment().map_or_else(String::new, |fragment| format!("#{fragment}")),
+                                "origin": parsed.origin().ascii_serialization(),
+                            });
+                            Some(parts.to_string())
                         },
                     ),
                 )?;
@@ -17264,19 +21000,40 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                     ),
                 )?;
 
-                // __pi_host_check_write_access(path) -> void (throws on denied path)
-                // Enforces workspace/extension-root confinement for node:fs write APIs.
-                // This guard only applies while extension code is actively executing.
+                // __pi_host_is_registered_fs_path(path) -> bool
+                // Distinguishes real workspace/extension paths from generic
+                // extension-private /tmp paths before the node:fs VFS remaps them.
                 global.set(
-                    "__pi_host_check_write_access",
+                    "__pi_host_is_registered_fs_path",
+                    Func::from({
+                        let workspace_root =
+                            crate::extensions::safe_canonicalize(Path::new(&process_cwd));
+                        let module_state = Rc::clone(&module_state);
+                        move |_ctx: Ctx<'_>, path: String| -> bool {
+                            path_is_in_workspace_or_registered_extension_root(
+                                Path::new(&path),
+                                &workspace_root,
+                                &module_state,
+                            )
+                        }
+                    }),
+                )?;
+
+                // __pi_host_check_read_access(path) -> void (throws on denied path)
+                // Applies the active extension's root policy before node:fs reads
+                // either host-backed data or runtime-cached VFS data.
+                global.set(
+                    "__pi_host_check_read_access",
                     Func::from({
                         let process_cwd = process_cwd.clone();
                         let allowed_read_roots = Arc::clone(&allowed_read_roots);
                         let module_state = Rc::clone(&module_state);
+                        let runtime_id = runtime_id.clone();
                         move |ctx: Ctx<'_>, path: String| -> rquickjs::Result<()> {
                             let extension_id = current_extension_id(&ctx);
 
-                            // Keep standalone PiJsRuntime unit harness behavior unchanged.
+                            // Standalone runtime harnesses have no active extension. Their
+                            // virtual filesystem behavior is intentionally unrestricted.
                             if extension_id.is_none() {
                                 return Ok(());
                             }
@@ -17289,18 +21046,102 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                             } else {
                                 workspace_root.join(requested)
                             };
-                            let checked_path =
-                                crate::extensions::safe_canonicalize(&requested_abs);
-
-                            let in_ext_root = path_is_in_allowed_extension_root(
-                                &checked_path,
+                            let allowed = path_is_allowed_extension_fs_path(
+                                &requested_abs,
+                                &workspace_root,
                                 extension_id.as_deref(),
                                 &module_state,
                                 &allowed_read_roots,
                             );
+                            let checked_path = if allowed {
+                                crate::extensions::safe_canonicalize(&requested_abs)
+                            } else {
+                                requested_abs
+                            };
+                            log_host_fs_decision(
+                                "read",
+                                allowed,
+                                &runtime_id,
+                                extension_id.as_deref(),
+                                &path,
+                                &checked_path,
+                                &workspace_root,
+                                &allowed_read_roots,
+                                &module_state,
+                            );
 
-                            let allowed =
-                                checked_path.starts_with(&workspace_root) || in_ext_root;
+                            if allowed {
+                                Ok(())
+                            } else {
+                                Err(storage::filesystem_error(
+                                    &ctx,
+                                    &path,
+                                    "open",
+                                    &std::io::Error::new(
+                                        std::io::ErrorKind::PermissionDenied,
+                                        "host read denied: path outside extension root",
+                                    ),
+                                ))
+                            }
+                        }
+                    }),
+                )?;
+
+                // __pi_host_check_write_access(path) -> void (throws on denied path)
+                // Enforces workspace/extension-root confinement for node:fs write APIs.
+                // This guard only applies while extension code is actively executing.
+                global.set(
+                    "__pi_host_check_write_access",
+                    Func::from({
+                        let process_cwd = process_cwd.clone();
+                        let allowed_read_roots = Arc::clone(&allowed_read_roots);
+                        let module_state = Rc::clone(&module_state);
+                        let runtime_id = runtime_id.clone();
+                        move |ctx: Ctx<'_>, path: String| -> rquickjs::Result<()> {
+                            let extension_id = current_extension_id(&ctx);
+
+                            // Standalone runtime harnesses have no active extension. Their
+                            // virtual filesystem behavior is intentionally unrestricted.
+                            if extension_id.is_none() {
+                                return Ok(());
+                            }
+
+                            let workspace_root =
+                                crate::extensions::safe_canonicalize(Path::new(&process_cwd));
+                            let requested = PathBuf::from(&path);
+                            let requested_abs = if requested.is_absolute() {
+                                requested
+                            } else {
+                                workspace_root.join(requested)
+                            };
+                            let storage = &module_state.borrow().persistent_storage;
+                            let allowed = match storage.resolve(&requested_abs, extension_id.as_deref()) {
+                                Err(_) => false,
+                                Ok(Some(_)) => storage.allows(&requested_abs, extension_id.as_deref(), "write"),
+                                Ok(None) => path_is_allowed_extension_fs_path(
+                                    &requested_abs,
+                                    &workspace_root,
+                                    extension_id.as_deref(),
+                                    &module_state,
+                                    &allowed_read_roots,
+                                ),
+                            };
+                            let checked_path = if allowed {
+                                crate::extensions::safe_canonicalize(&requested_abs)
+                            } else {
+                                requested_abs
+                            };
+                            log_host_fs_decision(
+                                "write",
+                                allowed,
+                                &runtime_id,
+                                extension_id.as_deref(),
+                                &path,
+                                &checked_path,
+                                &workspace_root,
+                                &allowed_read_roots,
+                                &module_state,
+                            );
 
                             if allowed {
                                 Ok(())
@@ -17324,6 +21165,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                         let process_cwd = process_cwd.clone();
                         let allowed_read_roots = Arc::clone(&allowed_read_roots);
                         let module_state = Rc::clone(&module_state);
+                        let runtime_id = runtime_id.clone();
                         move |ctx: Ctx<'_>,
                               path: String,
                               follow_symlinks: bool|
@@ -17338,17 +21180,29 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                             } else {
                                 workspace_root.join(requested)
                             };
-                            let checked_path =
-                                crate::extensions::safe_canonicalize(&requested_abs);
-
-                            let in_ext_root = path_is_in_allowed_extension_root(
-                                &checked_path,
+                            let allowed = path_is_allowed_extension_fs_path(
+                                &requested_abs,
+                                &workspace_root,
                                 extension_id.as_deref(),
                                 &module_state,
                                 &allowed_read_roots,
                             );
-                            let allowed =
-                                checked_path.starts_with(&workspace_root) || in_ext_root;
+                            let checked_path = if allowed {
+                                crate::extensions::safe_canonicalize(&requested_abs)
+                            } else {
+                                requested_abs.clone()
+                            };
+                            log_host_fs_decision(
+                                "stat",
+                                allowed,
+                                &runtime_id,
+                                extension_id.as_deref(),
+                                &path,
+                                &checked_path,
+                                &workspace_root,
+                                &allowed_read_roots,
+                                &module_state,
+                            );
 
                             if !allowed {
                                 return Err(rquickjs::Error::new_loading_message(
@@ -17357,16 +21211,18 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                 ));
                             }
 
-                            let metadata = if follow_symlinks {
+                            let configuration = storage::configuration_metadata(
+                                &requested_abs, extension_id.as_deref(), &module_state,
+                            ).map_err(|error| storage::filesystem_error(&ctx, &path, "stat", &error))?;
+                            let metadata = if let Some((_, metadata)) = configuration {
+                                Ok(metadata)
+                            } else if follow_symlinks {
                                 std::fs::metadata(&requested_abs)
                             } else {
                                 std::fs::symlink_metadata(&requested_abs)
                             }
                             .map_err(|err| {
-                                rquickjs::Error::new_loading_message(
-                                    &path,
-                                    format!("host stat: {err}"),
-                                )
+                                storage::filesystem_error(&ctx, &path, "stat", &err)
                             })?;
 
                             let file_type = metadata.file_type();
@@ -17385,6 +21241,42 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                 "size": metadata.len(),
                             })
                             .to_string())
+                        }
+                    }),
+                )?;
+
+                // __pi_host_realpath_sync(path) -> canonical existing host path.
+                // Project identity must follow real host aliases; data grants
+                // retain their stricter prohibition on linked path components.
+                global.set(
+                    "__pi_host_realpath_sync",
+                    Func::from({
+                        let process_cwd = process_cwd.clone();
+                        let allowed_read_roots = Arc::clone(&allowed_read_roots);
+                        let module_state = Rc::clone(&module_state);
+                        move |ctx: Ctx<'_>, path: String| -> rquickjs::Result<String> {
+                            let extension_id = current_extension_id(&ctx);
+                            let workspace_root = crate::extensions::safe_canonicalize(Path::new(&process_cwd));
+                            let requested = PathBuf::from(&path);
+                            let requested = if requested.is_absolute() { requested } else { workspace_root.join(requested) };
+                            let allowed = |path: &Path| path_is_allowed_extension_fs_path(
+                                path, &workspace_root, extension_id.as_deref(), &module_state, &allowed_read_roots,
+                            );
+                            if !allowed(&requested) {
+                                return Err(rquickjs::Error::new_loading_message(&path, "host realpath denied: path outside extension root"));
+                            }
+                            if let Some((canonical, _)) = storage::configuration_metadata(
+                                &requested, extension_id.as_deref(), &module_state,
+                            ).map_err(|error| storage::filesystem_error(&ctx, &path, "realpath", &error))? {
+                                return Ok(canonical.to_string_lossy().into_owned());
+                            }
+                            let canonical = std::fs::canonicalize(&requested)
+                                .map(crate::extensions::strip_unc_prefix)
+                                .map_err(|error| rquickjs::Error::new_loading_message(&path, format!("host realpath: {error}")))?;
+                            if !allowed(&requested) || !allowed(&canonical) {
+                                return Err(rquickjs::Error::new_loading_message(&path, "host realpath denied: path changed during resolution"));
+                            }
+                            Ok(canonical.to_string_lossy().into_owned())
                         }
                     }),
                 )?;
@@ -17410,22 +21302,28 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                             } else {
                                 workspace_root.join(requested)
                             };
-                            let checked_path =
-                                crate::extensions::safe_canonicalize(&requested_abs);
-
-                            let in_ext_root = path_is_in_allowed_extension_root(
-                                &checked_path,
+                            let allowed = path_is_allowed_extension_fs_path(
+                                &requested_abs,
+                                &workspace_root,
                                 extension_id.as_deref(),
                                 &module_state,
                                 &allowed_read_roots,
                             );
-                            let allowed =
-                                checked_path.starts_with(&workspace_root) || in_ext_root;
 
                             if !allowed {
                                 return Err(rquickjs::Error::new_loading_message(
                                     &path,
                                     "host readdir denied: path outside extension root".to_string(),
+                                ));
+                            }
+                            let checked_path = crate::extensions::safe_canonicalize(&requested_abs);
+
+                            if storage::configuration_metadata(
+                                &requested_abs, extension_id.as_deref(), &module_state,
+                            ).map_err(|error| storage::filesystem_error(&ctx, &path, "scandir", &error))?.is_some() {
+                                return Err(storage::filesystem_error(
+                                    &ctx, &path, "scandir",
+                                    &std::io::Error::new(std::io::ErrorKind::NotADirectory, "configuration is a file"),
                                 ));
                             }
 
@@ -17442,6 +21340,17 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                         format!("host readdir entry: {err}"),
                                     )
                                 })?;
+                                let child_path =
+                                    crate::extensions::safe_canonicalize(&entry.path());
+                                if !path_is_allowed_extension_fs_path(
+                                    &child_path,
+                                    &workspace_root,
+                                    extension_id.as_deref(),
+                                    &module_state,
+                                    &allowed_read_roots,
+                                ) {
+                                    continue;
+                                }
                                 let file_type = entry.file_type().map_err(|err| {
                                     rquickjs::Error::new_loading_message(
                                         &path,
@@ -17491,6 +21400,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                         let module_state = Rc::clone(&module_state);
                         let configured_repair_mode = repair_mode;
                         let repair_events = Arc::clone(&repair_events);
+                        let runtime_id = runtime_id.clone();
                         move |ctx: Ctx<'_>, path: String| -> rquickjs::Result<String> {
                             const MAX_SYNC_READ_SIZE: u64 = 64 * 1024 * 1024; // 64MB hard limit
                             let extension_id = current_extension_id(&ctx);
@@ -17504,6 +21414,14 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                             } else {
                                 workspace_root.join(requested)
                             };
+
+                            if let Some(bytes) = storage::read_file(
+                                &requested_abs,
+                                extension_id.as_deref(),
+                                &module_state,
+                            ).map_err(|error| storage::filesystem_error(&ctx, &path, "open", &error))? {
+                                return Ok(BASE64_STANDARD.encode(bytes));
+                            }
 
                             let apply_missing_asset_fallback = |checked_path: &Path, error_msg: &str| -> rquickjs::Result<String> {
                                 let in_ext_root = path_is_in_leaf_allowed_extension_root(
@@ -17563,9 +21481,34 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                 use std::io::Read;
                                 use std::os::fd::AsRawFd;
 
-                                // Open first to get a handle, then verify the handle's path.
-                                // This prevents TOCTOU attacks where the path is swapped
-                                // between check and read.
+                                let prechecked_path =
+                                    crate::extensions::safe_canonicalize(&requested_abs);
+                                if !path_is_allowed_extension_fs_path(
+                                    &requested_abs,
+                                    &workspace_root,
+                                    extension_id.as_deref(),
+                                    &module_state,
+                                    &allowed_read_roots,
+                                ) {
+                                    log_host_fs_decision(
+                                        "read",
+                                        false,
+                                        &runtime_id,
+                                        extension_id.as_deref(),
+                                        &path,
+                                        &prechecked_path,
+                                        &workspace_root,
+                                        &allowed_read_roots,
+                                        &module_state,
+                                    );
+                                    return Err(rquickjs::Error::new_loading_message(
+                                        &path,
+                                        "host read denied: path outside extension root".to_string(),
+                                    ));
+                                }
+
+                                // Authorize before probing, then verify the opened handle's
+                                // path to close the check/open TOCTOU window.
                                 let file = match std::fs::File::open(&requested_abs) {
                                     Ok(file) => file,
                                     Err(err)
@@ -17575,13 +21518,13 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                         // Pattern 2 (bd-k5q5.8.3): missing asset fallback.
                                         let checked_path = crate::extensions::safe_canonicalize(&requested_abs);
 
-                                        let in_ext_root = path_is_in_allowed_extension_root(
-                                            &checked_path,
+                                        let allowed = path_is_allowed_extension_fs_path(
+                                            &requested_abs,
+                                            &workspace_root,
                                             extension_id.as_deref(),
                                             &module_state,
                                             &allowed_read_roots,
                                         );
-                                        let allowed = checked_path.starts_with(&workspace_root) || in_ext_root;
 
                                         if !allowed {
                                             return Err(rquickjs::Error::new_loading_message(
@@ -17613,16 +21556,26 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                 let secure_path =
                                     crate::extensions::strip_unc_prefix(secure_path_buf);
 
-                                let in_ext_root = path_is_in_allowed_extension_root(
+                                let allowed = path_is_allowed_extension_fs_path(
                                     &secure_path,
+                                    &workspace_root,
                                     extension_id.as_deref(),
                                     &module_state,
                                     &allowed_read_roots,
                                 );
-                                let allowed =
-                                    secure_path.starts_with(&workspace_root) || in_ext_root;
 
                                 if !allowed {
+                                    log_host_fs_decision(
+                                        "read",
+                                        false,
+                                        &runtime_id,
+                                        extension_id.as_deref(),
+                                        &path,
+                                        &secure_path,
+                                        &workspace_root,
+                                        &allowed_read_roots,
+                                        &module_state,
+                                    );
                                     return Err(rquickjs::Error::new_loading_message(
                                         &path,
                                         "host read denied: path outside extension root".to_string(),
@@ -17652,6 +21605,8 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
 
                             #[cfg(not(target_os = "linux"))]
                             {
+                                use std::io::Read;
+
                                 let checked_path = crate::extensions::safe_canonicalize(&requested_abs);
 
                                 // Allow reads from workspace root or any registered
@@ -17662,17 +21617,32 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                     &module_state,
                                     &allowed_read_roots,
                                 );
-                                let allowed =
-                                    checked_path.starts_with(&workspace_root) || in_ext_root;
+                                let allowed = path_is_allowed_extension_fs_path(
+                                    &requested_abs,
+                                    &workspace_root,
+                                    extension_id.as_deref(),
+                                    &module_state,
+                                    &allowed_read_roots,
+                                );
 
                                 if !allowed {
+                                    log_host_fs_decision(
+                                        "read",
+                                        false,
+                                        &runtime_id,
+                                        extension_id.as_deref(),
+                                        &path,
+                                        &checked_path,
+                                        &workspace_root,
+                                        &allowed_read_roots,
+                                        &module_state,
+                                    );
                                     return Err(rquickjs::Error::new_loading_message(
                                         &path,
                                         "host read denied: path outside extension root".to_string(),
                                     ));
                                 }
 
-                                use std::io::Read;
                                 let file = match std::fs::File::open(&checked_path) {
                                     Ok(file) => file,
                                     Err(err) => {
@@ -17698,7 +21668,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                 if buffer.len() as u64 > MAX_SYNC_READ_SIZE {
                                     return Err(rquickjs::Error::new_loading_message(
                                         &path,
-                                        format!("host read failed: file exceeds {} bytes", MAX_SYNC_READ_SIZE),
+                                        format!("host read failed: file exceeds {MAX_SYNC_READ_SIZE} bytes"),
                                     ));
                                 }
 
@@ -17746,40 +21716,34 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                             };
 
                             // 2. Per-extension capability check
-                            if denied_reason.is_none() {
-                                if let Some(policy) = &policy {
-                                    let extension_id: Option<String> = ctx
-                                        .globals()
-                                        .get::<_, Option<String>>("__pi_current_extension_id")
-                                        .ok()
-                                        .flatten()
-                                        .map(|value| value.trim().to_string())
-                                        .filter(|value| !value.is_empty());
+                            if denied_reason.is_none()
+                                && let Some(policy) = &policy
+                            {
+                                let extension_id = current_extension_id(&ctx);
 
-                                    if check_exec_capability(policy, extension_id.as_deref()) {
-                                        match evaluate_exec_mediation(&policy.exec_mediation, &cmd, &args) {
-                                            ExecMediationResult::Deny { reason, .. } => {
-                                                denied_reason = Some(format!(
-                                                    "command blocked by exec mediation: {reason}"
-                                                ));
-                                            }
-                                            ExecMediationResult::AllowWithAudit {
-                                                class,
-                                                reason,
-                                            } => {
-                                                tracing::info!(
-                                                    event = "pijs.exec_sync.mediation_audit",
-                                                    cmd = %cmd,
-                                                    class = class.label(),
-                                                    reason = %reason,
-                                                    "sync child_process command allowed with exec mediation audit"
-                                                );
-                                            }
-                                            ExecMediationResult::Allow => {}
+                                if check_exec_capability(policy, extension_id.as_deref()) {
+                                    match evaluate_exec_mediation(&policy.exec_mediation, &cmd, &args) {
+                                        ExecMediationResult::Deny { reason, .. } => {
+                                            denied_reason = Some(format!(
+                                                "command blocked by exec mediation: {reason}"
+                                            ));
                                         }
-                                    } else {
-                                        denied_reason = Some("extension lacks 'exec' capability".to_string());
+                                        ExecMediationResult::AllowWithAudit {
+                                            class,
+                                            reason,
+                                        } => {
+                                            tracing::info!(
+                                                event = "pijs.exec_sync.mediation_audit",
+                                                cmd = %cmd,
+                                                class = class.label(),
+                                                reason = %reason,
+                                                "sync child_process command allowed with exec mediation audit"
+                                            );
+                                        }
+                                        ExecMediationResult::Allow => {}
                                     }
+                                } else {
+                                    denied_reason = Some("extension lacks 'exec' capability".to_string());
                                 }
                             }
 
@@ -17865,13 +21829,19 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                     .stderr(Stdio::piped());
                                 crate::tools::isolate_command_process_group(&mut command);
 
-                                let mut child = command.spawn().map_err(|e| e.to_string())?;
+                                let child =
+                                    crate::tools::spawn_command_with_job_discipline(&mut command)
+                                        .map_err(|e| e.to_string())?;
                                 let pid = child.id();
+                                let mut child = crate::tools::ProcessGuard::new(
+                                    child,
+                                    crate::tools::ProcessCleanupMode::ProcessGroupTree,
+                                );
 
                                 let stdout_pipe =
-                                    child.stdout.take().ok_or("Missing stdout pipe")?;
+                                    child.take_stdout().ok_or("Missing stdout pipe")?;
                                 let stderr_pipe =
-                                    child.stderr.take().ok_or("Missing stderr pipe")?;
+                                    child.take_stderr().ok_or("Missing stderr pipe")?;
 
                                 let (tx, rx) = std::sync::mpsc::sync_channel::<StreamChunk>(128);
                                 let tx_stdout = tx.clone();
@@ -17920,22 +21890,25 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                         ingest_chunk!(chunk.kind, chunk.bytes);
                                     }
 
-                                    if let Some(st) = child.try_wait().map_err(|e| e.to_string())? {
+                                    if let Some(st) =
+                                        child.try_wait_child().map_err(|e| e.to_string())?
+                                    {
                                         break st;
                                     }
                                     if !killed && limit_exceeded {
                                         killed = true;
-                                        crate::tools::kill_process_group_tree(Some(pid));
-                                        let _ = child.kill();
-                                        break child.wait().map_err(|e| e.to_string())?;
+                                        break child
+                                            .terminate_and_wait()
+                                            .map_err(|e| e.to_string())?;
                                     }
-                                    if let Some(t) = timeout {
-                                        if !killed && start.elapsed() >= t {
-                                            killed = true;
-                                            crate::tools::kill_process_group_tree(Some(pid));
-                                            let _ = child.kill();
-                                            break child.wait().map_err(|e| e.to_string())?;
-                                        }
+                                    if let Some(t) = timeout
+                                        && !killed
+                                        && start.elapsed() >= t
+                                    {
+                                        killed = true;
+                                        break child
+                                            .terminate_and_wait()
+                                            .map_err(|e| e.to_string())?;
                                     }
                                     if let Ok(chunk) = rx.recv_timeout(Duration::from_millis(5)) {
                                         ingest_chunk!(chunk.kind, chunk.bytes);
@@ -17997,6 +21970,40 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                     }),
                 )?;
 
+                // gh #167: canonical event-name list for unknown-event
+                // warnings in __pi_register_hook. Data-only global; the
+                // bridge freezes it (with every other __pi_* global) on eval.
+                let known_event_names: Vec<String> =
+                    crate::extensions::ExtensionEventName::ALL
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect();
+                global.set("__pi_known_event_names", known_event_names)?;
+
+                // __pi_warn_unknown_event_native(extension_id, event_name) —
+                // loud diagnostic for hooks that will never fire (gh #167).
+                // Fail-open: registration still succeeds; this only emits a
+                // tracing warning.
+                global.set(
+                    "__pi_warn_unknown_event_native",
+                    Func::from(
+                        |_ctx: Ctx<'_>,
+                         extension_id: String,
+                         event_name: String|
+                         -> rquickjs::Result<()> {
+                            tracing::warn!(
+                                extension = %extension_id,
+                                event = %event_name,
+                                "extension registered a handler for an event this host \
+                                 never fires natively; it will only run if an extension \
+                                 emits it via pi.events.emit (kept registered for \
+                                 forward-compatibility; check for typos)"
+                            );
+                            Ok(())
+                        },
+                    ),
+                )?;
+
                 // Register crypto hostcalls for node:crypto module
                 crate::crypto_shim::register_crypto_hostcalls(&global)?;
 
@@ -18010,7 +22017,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                 }
 
                 // Install the JS bridge that creates Promises and wraps the native functions
-                match ctx.eval::<(), _>(PI_BRIDGE_JS) {
+                match ctx.eval::<(), _>(pi_bridge_js()) {
                     Ok(()) => {}
                     Err(rquickjs::Error::Exception) => {
                         let detail = format_quickjs_exception(&ctx, ctx.catch());
@@ -18084,7 +22091,64 @@ fn random_bytes(len: usize) -> std::result::Result<Vec<u8>, getrandom::Error> {
 ///
 /// This code creates the `pi` global object with Promise-returning methods.
 /// Each method wraps a native Rust function (`__pi_*_native`) that returns a call_id.
-const PI_BRIDGE_JS: &str = r"
+#[expect(
+    clippy::too_many_lines,
+    reason = "this function owns one indivisible embedded JavaScript bridge source"
+)]
+fn pi_bridge_js() -> &'static str {
+    static PI_BRIDGE_JS: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    PI_BRIDGE_JS.get_or_init(|| {
+        [
+            compressed_js_literal!(r"
+(() => {
+'use strict';
+
+// Capture collection primordials before extension code can monkeypatch them.
+// Reset and proof paths use these bound functions instead of dynamic prototype
+// dispatch so a poisoned realm is detected honestly and cannot retain state.
+const __pi_original_Map = Map;
+const __pi_original_Set = Set;
+const __pi_original_map_clear = __pi_original_Map.prototype.clear;
+const __pi_original_set_clear = __pi_original_Set.prototype.clear;
+const __pi_original_set_add = __pi_original_Set.prototype.add;
+const __pi_map_clear_primordial =
+    Function.prototype.call.bind(__pi_original_map_clear);
+const __pi_set_clear_primordial =
+    Function.prototype.call.bind(__pi_original_set_clear);
+const __pi_set_add_primordial =
+    Function.prototype.call.bind(__pi_original_set_add);
+const __pi_map_size_primordial = Function.prototype.call.bind(
+    Object.getOwnPropertyDescriptor(__pi_original_Map.prototype, 'size').get
+);
+const __pi_set_size_primordial = Function.prototype.call.bind(
+    Object.getOwnPropertyDescriptor(__pi_original_Set.prototype, 'size').get
+);
+for (const [name, value] of Object.entries({
+    __pi_map_clear_primordial,
+    __pi_set_clear_primordial,
+    __pi_set_add_primordial,
+    __pi_map_size_primordial,
+    __pi_set_size_primordial,
+})) {
+    Object.defineProperty(globalThis, name, {
+        value,
+        writable: false,
+        configurable: false,
+        enumerable: false,
+    });
+}
+
+const __pi_secret_matches = globalThis.__pi_bridge_secret_matches_native;
+function __pi_require_bridge_secret(candidate) {
+    if (typeof __pi_secret_matches !== 'function' || !__pi_secret_matches(candidate)) {
+        throw new Error('PiJS privileged bridge entrypoint denied');
+    }
+}
+const __pi_fixed_extension_id =
+    typeof globalThis.__pi_owner_extension_id_native === 'function'
+        ? globalThis.__pi_owner_extension_id_native()
+        : null;
+
 // ============================================================================
 // Console global — must come first so all other bridge code can use it.
 // ============================================================================
@@ -18194,20 +22258,82 @@ if (typeof globalThis.Intl === 'undefined') {
         resolvedOptions() { return { ...this._opts, locale: this._locale }; }
     }
 
-    class Segmenter {
-        constructor(locale, opts) {
-            this._locale = locale || 'en';
-            this._opts = opts || {};
+    // Locale-independent extended grapheme boundaries come from the host's
+    // Unicode implementation. Keep the original JS string here: its indices
+    // and slices use UTF-16, including any unpaired surrogate code units.
+    const __graphemeBoundaries = globalThis.__pi_intl_grapheme_boundaries;
+    const __segmenters = new WeakSet();
+    const __segmentStates = new WeakMap();
+
+    function __segmentState(receiver) {
+        const state = __segmentStates.get(receiver);
+        if (!state) throw new TypeError('Incompatible Segments receiver');
+        return state;
+    }
+
+    function __segmentRecord(state, index) {
+        const start = state.boundaries[index];
+        return {
+            segment: state.input.slice(start, state.boundaries[index + 1]),
+            index: start,
+            input: state.input,
+        };
+    }
+
+    class Segments {
+        constructor(input, boundaries) {
+            __segmentStates.set(this, { input, boundaries });
         }
-        segment(str) {
-            const s = String(str ?? '');
-            const segments = [];
-            // Approximate grapheme segmentation: split by codepoints
-            for (const ch of s) {
-                segments.push({ segment: ch, index: segments.length, input: s });
+
+        [Symbol.iterator]() {
+            const state = __segmentState(this);
+            // Each traversal owns its cursor and creates fresh records. Do
+            // not iterate this Segments object from inside its own iterator.
+            return (function*() {
+                for (let index = 0; index + 1 < state.boundaries.length; index++) {
+                    yield __segmentRecord(state, index);
+                }
+            })();
+        }
+
+        containing(index) {
+            const state = __segmentState(this);
+            const number = +index;
+            const position = Number.isNaN(number) ? 0 : Math.trunc(number);
+            if (position < 0 || position >= state.input.length) return undefined;
+            let low = 0;
+            let high = state.boundaries.length - 1;
+            while (low + 1 < high) {
+                const middle = Math.floor((low + high) / 2);
+                if (state.boundaries[middle] <= position) low = middle;
+                else high = middle;
             }
-            segments[Symbol.iterator] = function*() { for (const seg of segments) yield seg; };
-            return segments;
+            return __segmentRecord(state, low);
+        }
+    }
+
+    class Segmenter {
+        constructor(_locale, opts) {
+            if (opts === null) throw new TypeError('Intl.Segmenter options must not be null');
+            const requested = opts === undefined ? undefined : opts.granularity;
+            const granularity = requested === undefined ? 'grapheme' : `${requested}`;
+            if (granularity !== 'grapheme') {
+                throw new RangeError('PiJS Intl.Segmenter supports only grapheme granularity');
+            }
+            __segmenters.add(this);
+        }
+
+        segment(value) {
+            if (!__segmenters.has(this)) throw new TypeError('Incompatible Intl.Segmenter receiver');
+            const input = `${value}`;
+            // Rust strings require valid Unicode. Replacement is only for
+            // classifying boundaries; each unpaired surrogate still occupies
+            // one UTF-16 unit, and returned text always slices the original.
+            const boundaryInput = input.replace(
+                /[\uD800-\uDBFF][\uDC00-\uDFFF]|[\uD800-\uDFFF]/g,
+                units => units.length === 2 ? units : '\uFFFD',
+            );
+            return new Segments(input, __graphemeBoundaries(boundaryInput));
         }
     }
 
@@ -18248,11 +22374,57 @@ const __pi_timer_callbacks = new Map();
 // Event listeners: event_id -> [callback, ...]
 const __pi_event_listeners = new Map();
 
+// Rust-driven batch id -> one stable extension context object. This preserves
+// object identity and extension-local mutations across events in a batch.
+const __pi_event_batch_contexts = new Map();
+
 // ============================================================================
 // Extension Registry (registration + hooks)
 // ============================================================================
 
-var __pi_current_extension_id = null;
+let __pi_current_extension_id = __pi_fixed_extension_id;
+let __pi_current_extension_leases = 0;
+
+function __pi_get_current_extension_id() {
+    return __pi_fixed_extension_id || __pi_current_extension_id;
+}
+
+function __pi_enter_extension(extension_id) {
+    const id = String(extension_id || '').trim();
+    if (!id) {
+        throw new Error('extension_id is required');
+    }
+    if (__pi_fixed_extension_id && id !== __pi_fixed_extension_id) {
+        throw new Error(`PiJS runtime is owned by ${__pi_fixed_extension_id}, not ${id}`);
+    }
+    if (__pi_current_extension_id && __pi_current_extension_id !== id) {
+        throw new Error(
+            `Concurrent PiJS extension scopes are denied: ${__pi_current_extension_id} is active`
+        );
+    }
+    __pi_current_extension_id = id;
+    __pi_current_extension_leases += 1;
+    return id;
+}
+
+function __pi_leave_extension(extension_id) {
+    if (__pi_current_extension_id !== extension_id || __pi_current_extension_leases <= 0) {
+        throw new Error('PiJS extension scope stack is inconsistent');
+    }
+    __pi_current_extension_leases -= 1;
+    if (__pi_current_extension_leases === 0) {
+        __pi_current_extension_id = __pi_fixed_extension_id;
+    }
+}
+
+function __pi_with_extension_sync(extension_id, fn) {
+    const id = __pi_enter_extension(extension_id);
+    try {
+        return fn();
+    } finally {
+        __pi_leave_extension(id);
+    }
+}
 
 // extension_id -> { id, name, version, apiVersion, tools: Map, commands: Map, hooks: Map, mcpServers: Map }
 const __pi_extensions = new Map();
@@ -18266,6 +22438,21 @@ const __pi_provider_index = new Map();  // provider_id -> { extensionId, spec }
 const __pi_shortcut_index = new Map();  // key_id -> { extensionId, key, description, handler }
 const __pi_message_renderer_index = new Map(); // customType -> { extensionId, customType, renderer }
 const __pi_mcp_server_index = new Map(); // server_name -> { extensionId, spec }
+
+// gh #167 extension-API parity: host session identity mirror + current system
+// prompt. `__pi_session_identity` is published on globalThis (frozen property,
+// mutable fields) so the @mariozechner/pi-coding-agent SessionManager shim can
+// surface real values; `__pi_current_system_prompt` backs ctx.getSystemPrompt()
+// and is captured from before_agent_start payloads (and, when present, from
+// a `systemPrompt` field on the host ctx payload).
+const __pi_session_identity = { id: null, file: null, dir: null };
+Object.defineProperty(globalThis, '__pi_session_identity', {
+    value: __pi_session_identity,
+    writable: false,
+    configurable: false,
+    enumerable: false,
+});
+let __pi_current_system_prompt = null;
 
 // Async task tracking for Rust-driven calls (tool exec, command exec, event dispatch).
 // task_id -> { status: 'pending'|'resolved'|'rejected', value?, error? }
@@ -18316,31 +22503,78 @@ function __pi_task_take(task_id) {
 }
 
 function __pi_runtime_registry_snapshot() {
+    const optionalCount = (getter) => {
+        if (typeof getter !== 'function') return 0;
+        try {
+            const value = Number(getter());
+            return Number.isSafeInteger(value) && value >= 0 ? value : 1;
+        } catch (_) {
+            // An installed-but-unreadable registry is residual state, not zero.
+            return 1;
+        }
+    };
+    const vfsCounts = (() => {
+        if (
+            !globalThis.__pi_vfs_api ||
+            typeof globalThis.__pi_vfs_api.counts !== 'function'
+        ) {
+            return { files: 0, dirs: 0, symlinks: 0, fds: 0 };
+        }
+        try {
+            return globalThis.__pi_vfs_api.counts();
+        } catch (_) {
+            return { files: 1, dirs: 1, symlinks: 1, fds: 1 };
+        }
+    })();
+    const intrinsicsIntact =
+        globalThis.Map === __pi_original_Map &&
+        globalThis.Set === __pi_original_Set &&
+        __pi_original_Map.prototype.clear === __pi_original_map_clear &&
+        __pi_original_Set.prototype.clear === __pi_original_set_clear &&
+        __pi_original_Set.prototype.add === __pi_original_set_add;
     return {
-        extensions: __pi_extensions.size,
-        tools: __pi_tool_index.size,
-        commands: __pi_command_index.size,
-        hooks: __pi_hook_index.size,
-        eventBusHooks: __pi_event_bus_index.size,
-        providers: __pi_provider_index.size,
-        shortcuts: __pi_shortcut_index.size,
-        messageRenderers: __pi_message_renderer_index.size,
-        mcpServers: __pi_mcp_server_index.size,
-        pendingTasks: __pi_tasks.size,
-        pendingHostcalls: __pi_pending_hostcalls.size,
-        pendingTimers: __pi_timer_callbacks.size,
-        pendingEventListenerLists: __pi_event_listeners.size,
+        extensions: __pi_map_size_primordial(__pi_extensions),
+        tools: __pi_map_size_primordial(__pi_tool_index),
+        commands: __pi_map_size_primordial(__pi_command_index),
+        hooks: __pi_map_size_primordial(__pi_hook_index),
+        eventBusHooks: __pi_map_size_primordial(__pi_event_bus_index),
+        providers: __pi_map_size_primordial(__pi_provider_index),
+        shortcuts: __pi_map_size_primordial(__pi_shortcut_index),
+        messageRenderers: __pi_map_size_primordial(__pi_message_renderer_index),
+        mcpServers: __pi_map_size_primordial(__pi_mcp_server_index),
+        pendingTasks: __pi_map_size_primordial(__pi_tasks),
+        toolInvocations: __pi_tool_invocation_runtime.count(),
+        pendingHostcalls: __pi_map_size_primordial(__pi_pending_hostcalls),
+        pendingTimers: __pi_map_size_primordial(__pi_timer_callbacks),
+        timerHandles: __pi_timer_runtime.count(),
+        pendingEventListenerLists: __pi_map_size_primordial(__pi_event_listeners),
+        eventBatchContexts: __pi_map_size_primordial(__pi_event_batch_contexts),
         providerStreams:
             typeof __pi_provider_streams !== 'undefined' &&
-            __pi_provider_streams &&
-            typeof __pi_provider_streams.size === 'number'
-                ? __pi_provider_streams.size
+            __pi_provider_streams
+                ? optionalCount(() => __pi_map_size_primordial(__pi_provider_streams))
                 : 0,
+        virtualHttpServers: __pi_map_size_primordial(__pi_virtual_http_servers),
+        virtualHttpRequests: __pi_set_size_primordial(__pi_virtual_http_requests),
+        apiProviders: optionalCount(globalThis.__pi_api_provider_registry_size),
+        childProcesses: optionalCount(globalThis.__pi_child_process_registry_size),
+        vfsFiles: Number(vfsCounts.files) || 0,
+        vfsDirs: Number(vfsCounts.dirs) || 0,
+        vfsSymlinks: Number(vfsCounts.symlinks) || 0,
+        vfsFds: Number(vfsCounts.fds) || 0,
+        intrinsicsIntact,
     };
 }
 
-function __pi_reset_extension_runtime_state() {
+function __pi_reset_extension_runtime_state(bridge_secret) {
     const before = __pi_runtime_registry_snapshot();
+
+    __pi_tool_invocation_runtime.reset();
+    for (const server of __pi_virtual_http_server_values(__pi_virtual_http_servers)) {
+        __pi_virtual_http_close(server);
+    }
+    __pi_map_clear_primordial(__pi_virtual_http_servers);
+    __pi_set_clear_primordial(__pi_virtual_http_requests);
 
     if (
         typeof __pi_provider_streams !== 'undefined' &&
@@ -18363,28 +22597,45 @@ function __pi_reset_extension_runtime_state() {
                 }
             } catch (_) {}
         }
-        if (typeof __pi_provider_streams.clear === 'function') {
-            __pi_provider_streams.clear();
-        }
+        __pi_map_clear_primordial(__pi_provider_streams);
     }
     if (typeof __pi_provider_stream_seq === 'number') {
         __pi_provider_stream_seq = 0;
     }
+    if (typeof globalThis.__pi_reset_api_provider_registry === 'function') {
+        globalThis.__pi_reset_api_provider_registry(bridge_secret);
+    }
+    if (typeof globalThis.__pi_reset_child_process_registry === 'function') {
+        globalThis.__pi_reset_child_process_registry(bridge_secret);
+    }
+    if (
+        globalThis.__pi_vfs_api &&
+        typeof globalThis.__pi_vfs_api.reset === 'function'
+    ) {
+        globalThis.__pi_vfs_api.reset(bridge_secret);
+    }
 
-    __pi_current_extension_id = null;
-    __pi_extensions.clear();
-    __pi_tool_index.clear();
-    __pi_command_index.clear();
-    __pi_hook_index.clear();
-    __pi_event_bus_index.clear();
-    __pi_provider_index.clear();
-    __pi_shortcut_index.clear();
-    __pi_message_renderer_index.clear();
-    __pi_mcp_server_index.clear();
-    __pi_tasks.clear();
-    __pi_pending_hostcalls.clear();
-    __pi_timer_callbacks.clear();
-    __pi_event_listeners.clear();
+    __pi_current_extension_id = __pi_fixed_extension_id;
+    __pi_current_extension_leases = 0;
+    __pi_map_clear_primordial(__pi_extensions);
+    __pi_map_clear_primordial(__pi_tool_index);
+    __pi_map_clear_primordial(__pi_command_index);
+    __pi_map_clear_primordial(__pi_hook_index);
+    __pi_map_clear_primordial(__pi_event_bus_index);
+    __pi_map_clear_primordial(__pi_provider_index);
+    __pi_map_clear_primordial(__pi_shortcut_index);
+    __pi_map_clear_primordial(__pi_message_renderer_index);
+    __pi_map_clear_primordial(__pi_mcp_server_index);
+    __pi_map_clear_primordial(__pi_tasks);
+    __pi_map_clear_primordial(__pi_pending_hostcalls);
+    __pi_map_clear_primordial(__pi_timer_callbacks);
+    __pi_timer_runtime.reset(bridge_secret);
+    __pi_map_clear_primordial(__pi_event_listeners);
+    __pi_map_clear_primordial(__pi_event_batch_contexts);
+    __pi_session_identity.id = null;
+    __pi_session_identity.file = null;
+    __pi_session_identity.dir = null;
+    __pi_current_system_prompt = null;
 
     const after = __pi_runtime_registry_snapshot();
     const clean =
@@ -18398,10 +22649,22 @@ function __pi_reset_extension_runtime_state() {
         after.messageRenderers === 0 &&
         after.mcpServers === 0 &&
         after.pendingTasks === 0 &&
+        after.toolInvocations === 0 &&
         after.pendingHostcalls === 0 &&
         after.pendingTimers === 0 &&
+        after.timerHandles === 0 &&
         after.pendingEventListenerLists === 0 &&
-        after.providerStreams === 0;
+        after.eventBatchContexts === 0 &&
+        after.providerStreams === 0 &&
+        after.virtualHttpServers === 0 &&
+        after.virtualHttpRequests === 0 &&
+        after.apiProviders === 0 &&
+        after.childProcesses === 0 &&
+        after.vfsFiles === 0 &&
+        after.vfsDirs === 0 &&
+        after.vfsSymlinks === 0 &&
+        after.vfsFds === 0 &&
+        after.intrinsicsIntact === true;
 
     return { before, after, clean };
 }
@@ -18410,6 +22673,9 @@ function __pi_get_or_create_extension(extension_id, meta) {
     const id = String(extension_id || '').trim();
     if (!id) {
         throw new Error('extension_id is required');
+    }
+    if (__pi_fixed_extension_id && id !== __pi_fixed_extension_id) {
+        throw new Error(`PiJS runtime is owned by ${__pi_fixed_extension_id}, not ${id}`);
     }
 
     if (!__pi_extensions.has(id)) {
@@ -18437,11 +22703,14 @@ function __pi_get_or_create_extension(extension_id, meta) {
 
 function __pi_begin_extension(extension_id, meta) {
     const ext = __pi_get_or_create_extension(extension_id, meta);
-    __pi_current_extension_id = ext.id;
+    __pi_enter_extension(ext.id);
 }
 
 function __pi_end_extension() {
-    __pi_current_extension_id = null;
+    if (!__pi_current_extension_id) {
+        return;
+    }
+    __pi_leave_extension(__pi_current_extension_id);
 }
 
 function __pi_current_extension_or_throw() {
@@ -18456,12 +22725,11 @@ function __pi_current_extension_or_throw() {
 }
 
 async function __pi_with_extension_async(extension_id, fn) {
-    const prev = __pi_current_extension_id;
-    __pi_current_extension_id = String(extension_id || '').trim();
+    const id = __pi_enter_extension(extension_id);
     try {
         return await fn();
     } finally {
-        __pi_current_extension_id = prev;
+        __pi_leave_extension(id);
     }
 }
 
@@ -18488,9 +22756,8 @@ async function __pi_load_extension(extension_id, entry_specifier, meta) {
         throw new Error('load_extension: entry_specifier is required');
     }
 
-    const prev = __pi_current_extension_id;
-    __pi_begin_extension(id, meta);
-    try {
+    const extension = __pi_get_or_create_extension(id, meta);
+    return __pi_with_extension_async(extension.id, async () => {
         const mod = await import(entry);
         let init = mod && mod.default;
 
@@ -18557,9 +22824,7 @@ async function __pi_load_extension(extension_id, entry_specifier, meta) {
         }
         await init(pi);
         return true;
-    } finally {
-        __pi_current_extension_id = prev;
-    }
+    });
 }
 
 function __pi_register_tool(spec) {
@@ -18669,6 +22934,9 @@ function __pi_register_provider(provider_id, spec) {
         if (m && m.cost) out.cost = m.cost;
         if (m && m.contextWindow !== undefined) out.contextWindow = m.contextWindow;
         if (m && m.maxTokens !== undefined) out.maxTokens = m.maxTokens;
+        if (m && m.headers && typeof m.headers === 'object') out.headers = Object.assign({}, m.headers);
+        if (m && m.compat && typeof m.compat === 'object' && !Array.isArray(m.compat)) out.compat = Object.assign({}, m.compat);
+        if (m && m.thinkingLevelMap && typeof m.thinkingLevelMap === 'object' && !Array.isArray(m.thinkingLevelMap)) out.thinkingLevelMap = Object.assign({}, m.thinkingLevelMap);
         return out;
     }) : [];
 
@@ -18677,16 +22945,69 @@ function __pi_register_provider(provider_id, spec) {
         throw new Error('registerProvider: spec.streamSimple must be a function');
     }
 
+    const api = spec.api ? String(spec.api) : '';
+    const registeredApiProvider =
+        typeof globalThis.__pi_get_registered_api_provider === 'function'
+            ? globalThis.__pi_get_registered_api_provider(api)
+            : undefined;
+    if (
+        registeredApiProvider &&
+        registeredApiProvider.extensionId &&
+        registeredApiProvider.extensionId !== ext.id &&
+        !hasStreamSimple
+    ) {
+        throw new Error(
+            `registerProvider: api '${api}' is registered by extension '${registeredApiProvider.extensionId}', not '${ext.id}'`
+        );
+    }
+    const apiStreamSimple =
+        registeredApiProvider &&
+        registeredApiProvider.provider &&
+        typeof registeredApiProvider.provider.streamSimple === 'function'
+            ? registeredApiProvider.provider.streamSimple
+            : null;
+    const streamSimple = hasStreamSimple ? spec.streamSimple : apiStreamSimple;
+    const effectiveHasStreamSimple = typeof streamSimple === 'function';
+
     const providerSpec = {
         id: id,
         baseUrl: spec.baseUrl ? String(spec.baseUrl) : '',
         apiKey: spec.apiKey ? String(spec.apiKey) : '',
-        api: spec.api ? String(spec.api) : '',
+        api: api,
         models: models,
-        hasStreamSimple: hasStreamSimple,
+        hasStreamSimple: effectiveHasStreamSimple,
     };
+    // This transport capability comes only from an owned in-memory listener.
+    // An extension-supplied virtualHttpServer field never grants authority.
+    const virtualServer = __pi_virtual_http_find(ext.id, providerSpec.baseUrl);
+    if (virtualServer) providerSpec.virtualHttpServer = virtualServer.id;
+    if (spec.headers && typeof spec.headers === 'object') {
+        providerSpec.headers = Object.assign({}, spec.headers);
+    }
+    if (spec.compat && typeof spec.compat === 'object' && !Array.isArray(spec.compat)) {
+        providerSpec.compat = Object.assign({}, spec.compat);
+    }
+    if (spec.oauth && typeof spec.oauth === 'object') {
+        const oauth = {};
+        if (spec.oauth.authUrl !== undefined && spec.oauth.authUrl !== null) {
+            oauth.authUrl = String(spec.oauth.authUrl);
+        }
+        if (spec.oauth.tokenUrl !== undefined && spec.oauth.tokenUrl !== null) {
+            oauth.tokenUrl = String(spec.oauth.tokenUrl);
+        }
+        if (spec.oauth.clientId !== undefined && spec.oauth.clientId !== null) {
+            oauth.clientId = String(spec.oauth.clientId);
+        }
+        if (Array.isArray(spec.oauth.scopes)) {
+            oauth.scopes = spec.oauth.scopes.map((scope) => String(scope));
+        }
+        if (spec.oauth.redirectUri !== undefined && spec.oauth.redirectUri !== null) {
+            oauth.redirectUri = String(spec.oauth.redirectUri);
+        }
+        providerSpec.oauth = oauth;
+    }
 
-    if (hasStreamSimple && !providerSpec.api) {
+    if (effectiveHasStreamSimple && !providerSpec.api) {
         throw new Error('registerProvider: api is required when registering streamSimple');
     }
 
@@ -18700,7 +23021,10 @@ function __pi_register_provider(provider_id, spec) {
     const record = {
         extensionId: ext.id,
         spec: providerSpec,
-        streamSimple: hasStreamSimple ? spec.streamSimple : null,
+        streamSimple: streamSimple,
+        // Preserve the granted origin across a same-owner listener restart.
+        // Providers registered without a listener gain no future authority.
+        virtualHttpOrigin: virtualServer ? virtualServer.origin : null,
     };
     ext.providers.set(id, record);
     __pi_provider_index.set(id, record);
@@ -18745,13 +23069,34 @@ function __pi_register_mcp_server(name, spec) {
         }
     }
 
+    // bd-hyik7: headers previously dropped here, silently stripping
+    // authentication from authenticated HTTP extension servers.
+    let headers = undefined;
+    if (spec.headers !== undefined && spec.headers !== null) {
+        if (typeof spec.headers !== 'object' || Array.isArray(spec.headers)) {
+            throw new Error('registerMcpServer: spec.headers must be an object');
+        }
+        headers = Object.create(null);
+        for (const [key, value] of Object.entries(spec.headers)) {
+            headers[String(key)] = String(value);
+        }
+    }
+
+    // bd-hyik7: preserve the `type` alias alongside `transport` so the
+    // unified manager's disagreement check sees both spellings.
+    const typeAlias = spec.type !== undefined && spec.type !== null
+        ? String(spec.type).trim()
+        : undefined;
+
     const mcpSpec = {
         name: serverName,
         transport: spec.transport ? String(spec.transport) : undefined,
+        type: typeAlias,
         command: command || undefined,
         url: url || undefined,
         args: args,
         env: env,
+        headers: headers,
     };
     if (spec.description !== undefined) {
         mcpSpec.description = String(spec.description);
@@ -18778,47 +23123,212 @@ function __pi_register_mcp_server_for_extension(extension_id, name, spec) {
     if (!extId) {
         throw new Error('registerMcpServer: extension_id is required');
     }
-    const prev = __pi_current_extension_id;
-    __pi_current_extension_id = extId;
-    try {
-        return __pi_register_mcp_server(name, spec);
-    } finally {
-        __pi_current_extension_id = prev;
-    }
+    return __pi_with_extension_sync(extId, () => __pi_register_mcp_server(name, spec));
 }
 
 // ============================================================================
 // Provider Streaming (streamSimple bridge)
 // ============================================================================
 
+// Virtual loopback HTTP routes live entirely inside this realm. They expose no
+// listener to the OS or other extensions. Native providers capture an owned
+// route at registration; all actual egress continues through pi.http policy.
+const __pi_virtual_http_servers = new __pi_original_Map();
+const __pi_virtual_http_requests = new __pi_original_Set();
+const __pi_virtual_http_server_set = Function.prototype.call.bind(__pi_original_Map.prototype.set);
+const __pi_virtual_http_server_delete = Function.prototype.call.bind(__pi_original_Map.prototype.delete);
+const __pi_virtual_http_server_values = Function.prototype.call.bind(__pi_original_Map.prototype.values);
+const __pi_virtual_http_request_values = Function.prototype.call.bind(__pi_original_Set.prototype.values);
+const __pi_virtual_http_request_delete = Function.prototype.call.bind(__pi_original_Set.prototype.delete);
+let __pi_virtual_http_server_seq = 0;
+const __pi_virtual_http_parse_url = __pi_url_parse_native;
+const __pi_virtual_http_parse_json = JSON.parse;
+
+function __pi_virtual_http_origin(value) {
+    try {
+        if (typeof value !== 'string') return null;
+        const parsed = __pi_virtual_http_parse_url(value, null);
+        if (typeof parsed !== 'string') return null;
+        const url = __pi_virtual_http_parse_json(parsed);
+        if (url.protocol !== 'http:' || url.username || url.password) return null;
+        const host = url.hostname;
+        if (host !== '127.0.0.1' && host !== 'localhost' && host !== '[::1]') return null;
+        // The native parser canonicalizes hosts and bounds ports to u16.
+        if (url.port === '0') return null;
+        return 'http://' + host + ':' + (url.port || '80');
+    } catch (_) { return null; }
+}
+
+function __pi_virtual_http_find(extensionId, url) {
+    const origin = __pi_virtual_http_origin(url);
+    if (!origin) return null;
+    for (const server of __pi_virtual_http_server_values(__pi_virtual_http_servers)) {
+        if (server.extensionId === extensionId && server.origin === origin) return server;
+    }
+    return null;
+}
+
+function __pi_virtual_http_close(server) {
+    if (!__pi_virtual_http_server_delete(__pi_virtual_http_servers, server.id)) return;
+    for (const request of __pi_virtual_http_request_values(__pi_virtual_http_requests)) {
+        if (request.server === server) request.cancel(new Error('Virtual HTTP server closed'));
+    }
+    try { server.closed(); } catch (_) {}
+}
+
+globalThis.__pi_virtual_http_listen = (host, port, dispatch, closed) => {
+    const owner = __pi_current_extension_or_throw().id;
+    const address = typeof host === 'string' ? host.toLowerCase() : '';
+    const number = Number(port);
+    if (!['127.0.0.1', 'localhost', '::1', '[::1]'].includes(address) ||
+        !Number.isInteger(number) || number < 1 || number > 65535) {
+        throw new Error('PiJS virtual HTTP servers require an explicit loopback host and port (1-65535)');
+    }
+    if (typeof dispatch !== 'function' || typeof closed !== 'function') {
+        throw new TypeError('Virtual HTTP server requires request and close handlers');
+    }
+    const origin = __pi_virtual_http_origin('http://' + (address === '::1' ? '[::1]' : address) + ':' + String(number));
+    if (__pi_virtual_http_find(owner, origin)) {
+        const error = new Error('Virtual HTTP address is already in use by this extension');
+        error.code = 'EADDRINUSE';
+        throw error;
+    }
+    if (__pi_map_size_primordial(__pi_virtual_http_servers) >= 16) {
+        throw new Error('PiJS virtual HTTP server limit reached');
+    }
+    const id = 'virtual-http-server-' + String(++__pi_virtual_http_server_seq);
+    const server = { id, extensionId: owner, origin, dispatch, closed };
+    __pi_virtual_http_server_set(__pi_virtual_http_servers, id, server);
+    const requireOwner = () => {
+        if (__pi_current_extension_or_throw().id !== owner) {
+            throw new Error('Virtual HTTP server belongs to another extension');
+        }
+    };
+    return {
+        host: address === '[::1]' ? '::1' : address,
+        port: number,
+        close() { requireOwner(); __pi_virtual_http_close(server); },
+        cancelRequests() {
+            requireOwner();
+            for (const request of __pi_virtual_http_request_values(__pi_virtual_http_requests)) {
+                if (request.server === server) request.cancel(new Error('Virtual HTTP connections closed'));
+            }
+        },
+    };
+};
+
+function __pi_virtual_http_open(server, request) {
+    if (__pi_set_size_primordial(__pi_virtual_http_requests) >= 64) {
+        throw new Error('PiJS virtual HTTP request limit reached');
+    }
+    if (__pi_virtual_http_origin(request && request.url) !== server.origin) {
+        throw new Error('Virtual HTTP request origin does not match the registered listener');
+    }
+    let channel = null;
+    let failure = null;
+    let cancelled = false;
+    let reading = false;
+    let readyResolve;
+    const ready = new Promise((resolve) => { readyResolve = resolve; });
+    const active = {
+        server,
+        cancel(reason) {
+            if (cancelled) return;
+            cancelled = true;
+            try { if (channel) channel.cancel(reason); } catch (_) {}
+            __pi_virtual_http_request_delete(__pi_virtual_http_requests, active);
+            readyResolve();
+        },
+    };
+    __pi_set_add_primordial(__pi_virtual_http_requests, active);
+    const task = __pi_with_extension_async(server.extensionId, async () => {
+        try {
+            channel = server.dispatch(request);
+            if (!channel || typeof channel.poll !== 'function' ||
+                typeof channel.next !== 'function' || typeof channel.cancel !== 'function') {
+                throw new Error('Invalid virtual HTTP response channel');
+            }
+            if (cancelled) channel.cancel();
+            readyResolve();
+            await channel.finished;
+        } catch (error) {
+            failure = error;
+            readyResolve();
+        } finally {
+            // Completed producers no longer need cancellation bookkeeping.
+            // A caller that discards a completed Response must not leave its
+            // body retained by the runtime's global request set.
+            __pi_virtual_http_request_delete(__pi_virtual_http_requests, active);
+        }
+    });
+    Promise.resolve(task).catch((error) => { failure = error; readyResolve(); });
+    const finish = (result) => {
+        if (result && result.done) __pi_virtual_http_request_delete(__pi_virtual_http_requests, active);
+        return result;
+    };
+    const poll = () => {
+        if (cancelled) return { done: true };
+        if (failure) { active.cancel(failure); throw failure; }
+        if (!channel) return { done: false, value: { pending: true } };
+        try { return finish(channel.poll()); }
+        catch (error) { active.cancel(error); throw error; }
+    };
+    return {
+        poll,
+        async next() {
+            if (reading) throw new Error('Concurrent virtual HTTP reads are not supported');
+            reading = true;
+            try {
+                await ready;
+                if (cancelled) return { done: true };
+                if (failure) throw failure;
+                return finish(await channel.next());
+            } catch (error) { active.cancel(error); throw error; }
+            finally { reading = false; }
+        },
+        return() { active.cancel(); return { done: true }; },
+        [Symbol.asyncIterator]() { return this; },
+    };
+}
+
+// Safe extension-facing entrypoint: there is deliberately no server-id argument.
+// An unavailable owned route is distinguishable from a failed owned request;
+// callers must never retry a failed in-memory request against a real listener.
+globalThis.__pi_virtual_http_dispatch = (request) => {
+    // Embedders can use ordinary fetch outside an extension activation. Such
+    // calls have no authority to dispatch an extension-owned in-memory route.
+    if (!__pi_current_extension_id) return null;
+    const owner = __pi_current_extension_id;
+    const server = __pi_virtual_http_find(owner, request && request.url);
+    return server ? __pi_virtual_http_open(server, request) : null;
+};
+
+function __pi_virtual_http_start(provider_id, request) {
+    const provider = __pi_provider_index.get(String(provider_id));
+    const origin = provider && provider.virtualHttpOrigin;
+    const server = origin ? __pi_virtual_http_find(provider.extensionId, origin) : null;
+    if (!server) {
+        throw new Error('Provider has no active owned virtual HTTP server');
+    }
+    const stream = __pi_virtual_http_open(server, request);
+    const controller = __pi_make_abort_controller();
+    const streamId = 'provider-stream-' + String(++__pi_provider_stream_seq);
+    // Native callers poll this iterator instead of holding the runtime actor
+    // inside an HTTP await. Cancellation can therefore run before headers too.
+    __pi_provider_streams.set(streamId, {
+        iterator: { next: stream.poll, return: stream.return },
+        controller,
+    });
+    return streamId;
+}
+
 let __pi_provider_stream_seq = 0;
 const __pi_provider_streams = new Map(); // stream_id -> { iterator, controller }
 
 function __pi_make_abort_controller() {
-    const listeners = new Set();
-    const signal = {
-        aborted: false,
-        addEventListener: (type, cb) => {
-            if (type !== 'abort') return;
-            if (typeof cb === 'function') listeners.add(cb);
-        },
-        removeEventListener: (type, cb) => {
-            if (type !== 'abort') return;
-            listeners.delete(cb);
-        },
-    };
-    return {
-        signal,
-        abort: () => {
-            if (signal.aborted) return;
-            signal.aborted = true;
-            for (const cb of listeners) {
-                try {
-                    cb();
-                } catch (_) {}
-            }
-        },
-    };
+    // Provider cancellation must compose with the same branded signals used
+    // by fetch and AbortSignal.any; a signal-shaped object cannot do so.
+    return new globalThis.AbortController();
 }
 
 async function __pi_provider_stream_simple_start(provider_id, model, context, options) {
@@ -18859,6 +23369,14 @@ async function __pi_provider_stream_simple_next(stream_id) {
     try {
         result = await record.iterator.next();
     } catch (err) {
+        try {
+            record.controller.abort();
+        } catch (_) {}
+        try {
+            if (record.iterator && typeof record.iterator.return === 'function') {
+                await record.iterator.return();
+            }
+        } catch (_) {}
         __pi_provider_streams.delete(id);
         throw err;
     }
@@ -18978,6 +23496,21 @@ function __pi_register_message_renderer(customType, renderer) {
 	    if (typeof handler !== 'function') {
 	        throw new Error('on: handler must be a function');
 	    }
+
+	    // gh #167: warn (fail-open) when the event name is not one this host
+	    // ever fires — a typo here means the handler silently never runs.
+	    // Unknown events stay registrable for forward-compatibility.
+	    try {
+	        const known = globalThis.__pi_known_event_names;
+	        if (
+	            Array.isArray(known) &&
+	            known.length > 0 &&
+	            known.indexOf(eventName) === -1 &&
+	            typeof globalThis.__pi_warn_unknown_event_native === 'function'
+	        ) {
+	            globalThis.__pi_warn_unknown_event_native(String(ext.id), eventName);
+	        }
+	    } catch (_e) {}
 
 	    if (!ext.hooks.has(eventName)) {
 	        ext.hooks.set(eventName, []);
@@ -19204,9 +23737,12 @@ function __pi_snapshot_extensions() {
             }
         }
 
-        const event_hooks = [];
+        const event_hooks = new Set();
         for (const key of ext.hooks.keys()) {
-            event_hooks.push(String(key));
+            event_hooks.add(String(key));
+        }
+        for (const key of ext.eventBusHooks.keys()) {
+            event_hooks.add(String(key));
         }
 
         const shortcuts = [];
@@ -19241,11 +23777,18 @@ function __pi_snapshot_extensions() {
             shortcuts: shortcuts,
             message_renderers: message_renderers,
             flags: flags,
-            event_hooks: event_hooks,
+            event_hooks: Array.from(event_hooks),
             active_tools: Array.isArray(ext.activeTools) ? ext.activeTools.slice() : null,
         });
     }
     return out;
+}
+
+function __pi_count_event_handlers(event_name) {
+    const name = String(event_name || '').trim();
+    if (!name) return 0;
+    return (__pi_hook_index.get(name) || []).length +
+        (__pi_event_bus_index.get(name) || []).length;
 }
 
 function __pi_make_extension_theme() {
@@ -19326,7 +23869,12 @@ function __pi_build_extension_ui_template(hasUI) {
                 text: text, // compat: some UI surfaces only consume `text`
             }).catch(() => {});
         },
+        // OMP and pi-mono pass these a component factory. The host cannot
+        // draw one, so it is ignored, as pi-mono's RPC mode ignores it.
+        // Turned into text, it put the factory's source in the status line
+        // and the terminal title.
         setFooter: (text) => {
+            if (typeof text === 'function') return;
             const value = toUiText(text);
             void pi.ui('setStatus', {
                 statusKey: 'footer',
@@ -19335,6 +23883,7 @@ function __pi_build_extension_ui_template(hasUI) {
             }).catch(() => {});
         },
         setHeader: (text) => {
+            if (typeof text === 'function') return;
             const value = toUiText(text);
             void pi.ui('setTitle', {
                 title: value,
@@ -19425,7 +23974,8 @@ function __pi_build_extension_ui_template(hasUI) {
             };
             const tui = {
                 requestRender: () => {
-                    needsRender = true;
+"),
+            compressed_js_literal!(r"                    needsRender = true;
                 },
             };
 
@@ -19626,10 +24176,94 @@ function __pi_make_extension_ctx(ctx_payload) {
         (ctx_payload && (ctx_payload.modelRegistry || ctx_payload.model_registry || ctx_payload.model_registry_values)) ||
         {};
 
+    // gh #167 parity: session identity + current model from the host payload.
+    const sessionStateRaw =
+        (ctx_payload && (ctx_payload.sessionState || ctx_payload.session_state)) || null;
+    const sessionState =
+        sessionStateRaw && typeof sessionStateRaw === 'object' && !Array.isArray(sessionStateRaw)
+            ? sessionStateRaw
+            : null;
+    let sessionId = null;
+    let sessionFile = null;
+    let sessionDir = null;
+    if (sessionState) {
+        sessionId =
+            typeof sessionState.sessionId === 'string' && sessionState.sessionId
+                ? sessionState.sessionId
+                : null;
+        sessionFile =
+            typeof sessionState.sessionFile === 'string' && sessionState.sessionFile
+                ? sessionState.sessionFile
+                : null;
+        if (sessionFile) {
+            const cut = Math.max(sessionFile.lastIndexOf('/'), sessionFile.lastIndexOf('\\'));
+            if (cut > 0) sessionDir = sessionFile.slice(0, cut);
+        }
+        __pi_session_identity.id = sessionId;
+        __pi_session_identity.file = sessionFile;
+        __pi_session_identity.dir = sessionDir;
+    } else {
+        // Session-less payloads (extension tool executions ship a minimal
+        // {cwd} ctx; shortcuts/emit may pass custom ctx objects) must not
+        // clobber the last known host session identity. Fall back to the
+        // mirror so identity getters stay correct mid-session (gh #167).
+        sessionId = __pi_session_identity.id;
+        sessionFile = __pi_session_identity.file;
+        sessionDir = __pi_session_identity.dir;
+    }
+
+    let model =
+        ctx_payload && ctx_payload.model !== undefined && ctx_payload.model !== null
+            ? ctx_payload.model
+            : undefined;
+    if (model === undefined && sessionState && sessionState.model !== undefined && sessionState.model !== null) {
+        model = sessionState.model;
+    }
+
+    // Seed-only: the host payload carries the boot-time system prompt so
+    // getSystemPrompt() is answerable before any before_agent_start. Once a
+    // fresher value is captured (before_agent_start payload or a handler's
+    // systemPrompt amendment), a cached host payload must not clobber it.
+    if (
+        ctx_payload &&
+        typeof ctx_payload.systemPrompt === 'string' &&
+        __pi_current_system_prompt === null
+    ) {
+        __pi_current_system_prompt = ctx_payload.systemPrompt;
+    }
+
+    const modelCatalog =
+        ctx_payload && Array.isArray(ctx_payload.models) ? ctx_payload.models : [];
+
+    // A native request snapshot, independent of the cached session entries.
+    // Copy only public numeric fields before handlers can mutate the payload.
+    // No previous-event fallback: missing data must not revive another model
+    // or session's usage. Each getter returns an independent value.
+    let contextUsage;
+    const usage = ctx_payload && ctx_payload.contextUsage;
+    if (usage && typeof usage === 'object' && !Array.isArray(usage)) {
+        const window = usage.contextWindow;
+        const tokens = usage.tokens;
+        if (
+            Number.isSafeInteger(window) && window > 0 &&
+            (tokens === null || (Number.isSafeInteger(tokens) && tokens >= 0))
+        ) {
+            contextUsage = {
+                tokens,
+                contextWindow: window,
+                // Percent means 0..100, not a fraction. Do not clamp overflow.
+                percent: tokens === null ? null : (tokens / window) * 100,
+            };
+        }
+    }
+
     const sessionManager = {
         getEntries: () => entries,
         getBranch: () => branch,
         getLeafEntry: () => leafEntry,
+        getSessionId: () => sessionId,
+        getSessionFile: () => sessionFile,
+        getSessionDir: () => sessionDir,
     };
 
     return {
@@ -19637,7 +24271,27 @@ function __pi_make_extension_ctx(ctx_payload) {
         cwd: cwd,
         ui: __pi_make_extension_ui(hasUI),
         sessionManager: sessionManager,
+        model: model,
+        getSystemPrompt: () => __pi_current_system_prompt,
+        getContextUsage: () => contextUsage === undefined ? undefined : { ...contextUsage },
         modelRegistry: {
+            // Synchronous catalog lookup (upstream ModelRegistry.find parity,
+            // gh #167 / bd-t9n21). Consumers call it without await (e.g.
+            // pi-better-compaction's native fallback), so it must not return
+            // a Promise. Results pass through a strict whitelist projection
+            // so credential-shaped metadata can never surface.
+            find: (provider, modelId) => {
+                const providerKey = String(provider === undefined || provider === null ? '' : provider);
+                const modelKey = String(modelId === undefined || modelId === null ? '' : modelId);
+                if (!providerKey || !modelKey) return undefined;
+                for (const raw of modelCatalog) {
+                    if (!raw || typeof raw !== 'object') continue;
+                    if (raw.provider === providerKey && raw.id === modelKey) {
+                        return __pi_project_model_entry(raw);
+                    }
+                }
+                return undefined;
+            },
             getApiKeyForProvider: async (provider) => {
                 const key = String(provider || '').trim();
                 if (!key) return undefined;
@@ -19645,15 +24299,75 @@ function __pi_make_extension_ctx(ctx_payload) {
                 if (value === undefined || value === null) return undefined;
                 return String(value);
             },
+            // getApiKeyAndHeaders() is DELIBERATELY not exposed (gh #167 /
+            // bd-j8sxn): handing live API keys or auth headers to sandboxed
+            // JS would breach pi's deny-by-default env blocklist, which
+            // exists precisely to keep *_API_KEY / *_SECRET / *_TOKEN values
+            // away from extensions. Extensions that need compaction provider
+            // access use ctx.compact() (below), which runs host-side with
+            // the session's own credentials and never exposes them.
+            // pi-better-compaction feature-detects the absence and fails
+            // open to normal compaction.
+        },
+        // Share the public summary options, credential checks and cancellation
+        // behavior with the exported API. Native strategy requests remain
+        // host-sanitized and pinned to the current session model.
+        compact: async (preparation, options) => {
+            const codingAgent = await import('@mariozechner/pi-coding-agent');
+            return codingAgent.compact(preparation, options);
         },
     };
 }
 
-	async function __pi_dispatch_event_inner(eventName, event_payload, ctx) {
-	    const handlers = [
-	        ...(__pi_hook_index.get(eventName) || []),
-	        ...(__pi_event_bus_index.get(eventName) || []),
-	    ];
+// Whitelisted fields for model objects handed to extensions. Mirrors the
+// host-side `pi_ai_model_entry_value` projection; anything outside this list
+// (api keys, headers, nested secrets in unexpected fields) is dropped.
+const __pi_model_entry_whitelist = [
+    'id',
+    'name',
+    'api',
+    'provider',
+    'baseUrl',
+    'reasoning',
+    'input',
+    'cost',
+    'contextWindow',
+    'maxTokens',
+    'authHeader',
+    'hasCredentials',
+];
+
+function __pi_project_model_entry(raw) {
+    const out = {};
+    for (const key of __pi_model_entry_whitelist) {
+        if (raw[key] !== undefined) out[key] = raw[key];
+    }
+    return out;
+}
+
+// Capture the JSON reader and native snapshotter before extension code runs.
+// The native conversion is bounded and does not invoke extension toJSON hooks.
+const __pi_tool_result_parse_json = JSON.parse;
+const __pi_tool_result_json = globalThis.__pi_tool_result_json_native;
+
+	async function __pi_dispatch_event_inner(eventName, event_payload, ctx, handlerPhase = 'all') {
+	    // gh #167: remember the host-provided system prompt (even with zero
+	    // handlers) so ctx.getSystemPrompt() works on later events too.
+	    if (
+	        eventName === 'before_agent_start' &&
+	        event_payload &&
+	        typeof event_payload === 'object' &&
+	        typeof event_payload.systemPrompt === 'string'
+	    ) {
+	        __pi_current_system_prompt = event_payload.systemPrompt;
+	    }
+	    const directHandlers = __pi_hook_index.get(eventName) || [];
+	    const eventBusHandlers = __pi_event_bus_index.get(eventName) || [];
+	    const handlers = handlerPhase === 'direct'
+	        ? directHandlers
+	        : handlerPhase === 'event_bus'
+	            ? eventBusHandlers
+	            : [...directHandlers, ...eventBusHandlers];
 	    if (handlers.length === 0) {
 	        return undefined;
 	    }
@@ -19732,6 +24446,7 @@ function __pi_make_extension_ctx(ctx_payload) {
 	                if (result.systemPrompt !== undefined) {
 	                    currentSystemPrompt = String(result.systemPrompt);
 	                    modified = true;
+	                    __pi_current_system_prompt = currentSystemPrompt;
                 }
             }
         }
@@ -19741,6 +24456,79 @@ function __pi_make_extension_ctx(ctx_payload) {
         }
         return undefined;
     }
+
+	    if (eventName === 'context') {
+	        const base = event_payload && typeof event_payload === 'object' ? event_payload : {};
+	        let currentMessages = Array.isArray(base.messages) ? base.messages : [];
+	        for (const entry of handlers) {
+	            const handler = entry && entry.handler;
+	            if (typeof handler !== 'function') continue;
+	            const event = Object.assign({ type: 'context' }, base, { messages: currentMessages });
+	            let result = undefined;
+	            try {
+	                result = await __pi_with_extension_async(entry.extensionId, () => handler(event, ctx));
+	            } catch (e) {
+	                try { globalThis.console && globalThis.console.error && globalThis.console.error('Event handler error:', eventName, entry.extensionId, e); } catch (_e) {}
+	                continue;
+	            }
+	            // A void handler keeps prior rewrites, including in-place array
+	            // changes. Each subsequent handler sees the current messages.
+	            if (Array.isArray(event.messages)) currentMessages = event.messages;
+	            if (result === undefined || result === null) continue;
+	            const next = Array.isArray(result)
+	                ? result
+	                : (typeof result === 'object' ? result.messages : undefined);
+	            if (Array.isArray(next)) currentMessages = next;
+	            else if (next === null) currentMessages = [];
+	        }
+	        // Return the messages even for in-place/void handlers so changes
+	        // survive the realm boundary and cannot be lost to a later owner.
+	        return { messages: currentMessages };
+	    }
+
+	    if (eventName === 'tool_result') {
+	        const base = event_payload && typeof event_payload === 'object' ? event_payload : {};
+	        const current = __pi_tool_result_parse_json(__pi_tool_result_json(base, false));
+	        if (current.content === undefined) current.content = [];
+	        if (current.details === undefined) current.details = null;
+	        const isError = current.isError === undefined ? false : current.isError;
+	        const response = {};
+	        let modified = false;
+	        for (const entry of handlers) {
+	            const handler = entry && entry.handler;
+	            if (typeof handler !== 'function') continue;
+	            current.result = { content: current.content, details: current.details, isError };
+	            // Handlers may inspect either shape. A fresh deep snapshot keeps
+	            // void/in-place mutations from becoming implicit returned patches.
+	            const event = __pi_tool_result_parse_json(__pi_tool_result_json(current, false));
+	            let value = undefined;
+	            try {
+	                value = await __pi_with_extension_async(entry.extensionId, () => handler(event, ctx));
+	            } catch (e) {
+	                try { globalThis.console && globalThis.console.error && globalThis.console.error('Event handler error:', eventName, entry.extensionId, e); } catch (_e) {}
+	                continue;
+	            }
+	            if (value === undefined || value === null) continue;
+	            let patch;
+	            try {
+	                patch = __pi_tool_result_parse_json(__pi_tool_result_json(value, true));
+	            } catch (e) {
+	                try { globalThis.console && globalThis.console.error && globalThis.console.error('Invalid tool_result handler response (ignored):', entry.extensionId, e); } catch (_e) {}
+	                continue;
+	            }
+	            if (patch.content !== undefined) {
+	                current.content = patch.content;
+	                response.content = patch.content;
+	                modified = true;
+	            }
+	            if (patch.details !== undefined) {
+	                current.details = patch.details;
+	                response.details = patch.details;
+	                modified = true;
+	            }
+	        }
+	        return modified ? response : undefined;
+	    }
 
 	    if (eventName === 'resources_discover') {
 	        const skillPaths = [];
@@ -19788,6 +24576,41 @@ function __pi_make_extension_ctx(ctx_payload) {
 	        return undefined;
 	    }
 
+	    if (eventName === 'before_provider_request') {
+	        // gh #219: handlers chain in load order. Each handler sees the
+	        // payload as rewritten by the handlers before it; returning
+	        // undefined/null keeps that payload, returning an object replaces
+	        // it (the payload itself or `{ payload }`, the two shapes the host
+	        // normalizer accepts). The final payload is always handed back so
+	        // in-place mutations of `event.payload` reach the wire too.
+	        const base = event_payload && typeof event_payload === 'object' ? event_payload : {};
+	        let currentPayload = base.payload;
+	        for (const entry of handlers) {
+	            const handler = entry && entry.handler;
+	            if (typeof handler !== 'function') continue;
+	            const event = Object.assign({}, base, { payload: currentPayload });
+	            let result = undefined;
+	            try {
+	                result = await __pi_with_extension_async(entry.extensionId, () => handler(event, ctx));
+	            } catch (e) {
+	                try { globalThis.console && globalThis.console.error && globalThis.console.error('Event handler error:', eventName, entry.extensionId, e); } catch (_e) {}
+	                continue;
+	            }
+	            if (result === undefined || result === null) {
+	                currentPayload = event.payload;
+	                continue;
+	            }
+	            if (typeof result !== 'object' || Array.isArray(result)) {
+	                try { globalThis.console && globalThis.console.error && globalThis.console.error('before_provider_request handler returned a non-object rewrite (ignored):', entry.extensionId); } catch (_e) {}
+	                currentPayload = event.payload;
+	                continue;
+	            }
+	            const next = Object.prototype.hasOwnProperty.call(result, 'payload') ? result.payload : result;
+	            currentPayload = (next && typeof next === 'object' && !Array.isArray(next)) ? next : event.payload;
+	        }
+	        return { payload: currentPayload };
+	    }
+
 	    let last = undefined;
 	    for (const entry of handlers) {
 	        const handler = entry && entry.handler;
@@ -19829,6 +24652,63 @@ function __pi_make_extension_ctx(ctx_payload) {
 	    }
 	    const ctx = __pi_make_extension_ctx(ctx_payload);
 	    return __pi_dispatch_event_inner(eventName, event_payload, ctx);
+	}
+
+	async function __pi_dispatch_extension_event_phase(event_name, event_payload, ctx_payload, phase) {
+	    const eventName = String(event_name || '').trim();
+	    const handlerPhase = String(phase || '').trim();
+	    if (!eventName) {
+	        throw new Error('dispatch_event: event name is required');
+	    }
+	    if (handlerPhase !== 'direct' && handlerPhase !== 'event_bus') {
+	        throw new Error('dispatch_event: invalid handler phase');
+	    }
+	    const ctx = __pi_make_extension_ctx(ctx_payload);
+	    const value = await __pi_dispatch_event_inner(
+	        eventName,
+	        event_payload,
+	        ctx,
+	        handlerPhase
+	    );
+	    return value === undefined ? { present: false } : { present: true, value };
+	}
+
+	function __pi_event_batch_context_create(batch_id, ctx_payload) {
+	    const id = String(batch_id || '').trim();
+	    if (!id) throw new Error('event batch id is required');
+	    if (__pi_event_batch_contexts.has(id)) {
+	        throw new Error(`event batch context already exists: ${id}`);
+	    }
+	    __pi_event_batch_contexts.set(id, __pi_make_extension_ctx(ctx_payload));
+	}
+
+	function __pi_event_batch_context_delete(batch_id) {
+	    const id = String(batch_id || '').trim();
+	    return id ? __pi_event_batch_contexts.delete(id) : false;
+	}
+
+	async function __pi_dispatch_extension_event_phase_in_batch(
+	    event_name,
+	    event_payload,
+	    batch_id,
+	    phase
+	) {
+	    const eventName = String(event_name || '').trim();
+	    const id = String(batch_id || '').trim();
+	    const handlerPhase = String(phase || '').trim();
+	    if (!eventName) throw new Error('dispatch_event: event name is required');
+	    if (handlerPhase !== 'direct' && handlerPhase !== 'event_bus') {
+	        throw new Error('dispatch_event: invalid handler phase');
+	    }
+	    const ctx = __pi_event_batch_contexts.get(id);
+	    if (!ctx) throw new Error(`unknown event batch context: ${id}`);
+	    const value = await __pi_dispatch_event_inner(
+	        eventName,
+	        event_payload,
+	        ctx,
+	        handlerPhase
+	    );
+	    return value === undefined ? { present: false } : { present: true, value };
 	}
 
 	async function __pi_dispatch_extension_events_batch(events_json, ctx_payload) {
@@ -19892,7 +24772,9 @@ function __pi_validate_tool_input(schema, input) {
     }
 }
 
-async function __pi_execute_tool(tool_name, tool_call_id, input, ctx_payload) {
+async function __pi_execute_tool(
+    tool_name, tool_call_id, input, ctx_payload, invocation_token, native_update
+) {
     const name = String(tool_name || '').trim();
     const record = __pi_tool_index.get(name);
     if (!record) {
@@ -19901,10 +24783,27 @@ async function __pi_execute_tool(tool_name, tool_call_id, input, ctx_payload) {
 
     __pi_validate_tool_input(record.spec && record.spec.parameters, input);
 
-    const ctx = __pi_make_extension_ctx(ctx_payload);
-    return __pi_with_extension_async(record.extensionId, () =>
-        record.execute(tool_call_id, input, undefined, undefined, ctx)
-    );
+    return __pi_with_extension_async(record.extensionId, async () => {
+        const invocation = __pi_tool_invocation_runtime.start(
+            invocation_token, record.extensionId, native_update
+        );
+        try {
+            const ctx = __pi_make_extension_ctx(ctx_payload);
+            return await record.execute(
+                tool_call_id, input, invocation.signal, invocation.onUpdate, ctx
+            );
+        } finally {
+            __pi_tool_invocation_runtime.finish(invocation_token, invocation);
+        }
+    });
+}
+
+function __pi_cancel_tool_invocation(invocation_token) {
+    return __pi_tool_invocation_runtime.cancel(invocation_token);
+}
+
+function __pi_finish_tool_invocation(invocation_token) {
+    return __pi_tool_invocation_runtime.finish(invocation_token);
 }
 
 async function __pi_execute_command(command_name, args, ctx_payload) {
@@ -20019,6 +24918,9 @@ class __pi_HostcallStream {
         }
     }
     next() {
+        if (!this.done && typeof __pi_http_stream_pull_native === 'function') {
+            __pi_http_stream_pull_native(this.callId);
+        }
         if (this.buffer.length > 0) {
             const entry = this.buffer.shift();
             if (!this.done) {
@@ -20100,6 +25002,11 @@ function __pi_complete_hostcall_impl(call_id, outcome) {
 
         if (pending.stream) {
             pending.stream.pushChunk(outcome.chunk, outcome.isFinal);
+        } else if (pending.onUpdate && !outcome.isFinal) {
+            // Tool progress is an ordered snapshot. Deliver it before a
+            // following completion can settle and retire the callback.
+            try { pending.onUpdate(outcome.chunk); }
+            catch (error) { console.error('Tool onUpdate error:', error); }
         } else if (pending.onChunk) {
             const chunk = outcome.chunk;
             const isFinal = outcome.isFinal;
@@ -20126,6 +25033,14 @@ function __pi_complete_hostcall_impl(call_id, outcome) {
         return;
     }
 
+    if (outcome.ok && pending.stream) {
+        // Embedders may complete a streamed request with one buffered result.
+        // Its iterator must receive that result and then finish normally.
+        pending.stream.pushChunk(outcome.value, true);
+        __pi_pending_hostcalls.delete(call_id);
+        return;
+    }
+
     __pi_pending_hostcalls.delete(call_id);
     if (outcome.ok) {
         pending.resolve(outcome.value);
@@ -20139,13 +25054,10 @@ function __pi_complete_hostcall_impl(call_id, outcome) {
 function __pi_complete_hostcall(call_id, outcome) {
     const pending = __pi_pending_hostcalls.get(call_id);
     if (pending && pending.extensionId) {
-        const prev = __pi_current_extension_id;
-        __pi_current_extension_id = pending.extensionId;
-        try {
-            return __pi_complete_hostcall_impl(call_id, outcome);
-        } finally {
-            Promise.resolve().then(() => { __pi_current_extension_id = prev; });
-        }
+        return __pi_with_extension_sync(
+            pending.extensionId,
+            () => __pi_complete_hostcall_impl(call_id, outcome)
+        );
     }
     return __pi_complete_hostcall_impl(call_id, outcome);
 }
@@ -20214,10 +25126,108 @@ function __pi_make_hostcall(nativeFn) {
             __pi_pending_hostcalls.set(call_id, {
                 resolve,
                 reject,
-                extensionId: __pi_current_extension_id
+                extensionId: __pi_get_current_extension_id()
             });
         });
     };
+}
+
+// Abortable generation and native tool execution share request retirement.
+// Session mutation hostcalls retain their admitted transaction lifetime.
+function __pi_abortable_hostcall(start, signal, label, onUpdate) {
+    return new Promise((resolve, reject) => {
+        const hasSignal = signal !== undefined && signal !== null;
+        if (hasSignal && (typeof signal.aborted !== 'boolean' ||
+            typeof signal.addEventListener !== 'function' ||
+            typeof signal.removeEventListener !== 'function')) {
+            throw new TypeError(`${label}: signal must be an AbortSignal`);
+        }
+        let callId = null;
+        let settled = false;
+        let listening = false;
+        const abortReason = () => {
+            const reason = signal.reason;
+            if (reason !== undefined) return reason;
+            const error = new Error('This operation was aborted');
+            error.name = 'AbortError';
+            return error;
+        };
+        const finish = (callback, value) => {
+            if (settled) return;
+            settled = true;
+            if (listening) {
+                listening = false;
+                // A foreign signal shim must not hide the original result or
+                // abort reason by throwing during listener cleanup.
+                try { signal.removeEventListener('abort', onAbort); } catch (_) {}
+            }
+            callback(value);
+        };
+        const cancelNative = () => {
+            if (callId === null) return;
+            __pi_cancel_hostcall_native(callId);
+            __pi_pending_hostcalls.delete(callId);
+        };
+        const onAbort = () => {
+            // Synthetic abort events cannot retire a live request or consume
+            // the listener needed for the controller's actual cancellation.
+            if (settled || !signal.aborted) return;
+            const reason = abortReason();
+            cancelNative();
+            finish(reject, reason);
+        };
+        try {
+            if (hasSignal && signal.aborted) {
+                finish(reject, abortReason());
+                return;
+            }
+            if (hasSignal) {
+                listening = true;
+                signal.addEventListener('abort', onAbort);
+                if (signal.aborted) onAbort();
+            }
+            if (settled) return;
+            callId = start();
+            // Payload getters can abort while the native bridge captures the
+            // request, before its call ID has been returned to this closure.
+            if (settled) {
+                cancelNative();
+                return;
+            }
+            __pi_pending_hostcalls.set(callId, {
+                resolve: (value) => finish(resolve, value),
+                reject: (error) => finish(reject, error),
+                onUpdate: typeof onUpdate === 'function'
+                    ? (chunk) => {
+                        if (!settled) onUpdate(chunk);
+                    }
+                    : undefined,
+                extensionId: __pi_get_current_extension_id()
+            });
+            if (hasSignal && signal.aborted) onAbort();
+        } catch (error) {
+            cancelNative();
+            finish(reject, error);
+        }
+    });
+}
+
+function __pi_compact_hostcall(payload, signal) {
+    return __pi_abortable_hostcall(
+        () => __pi_events_native('compact', payload), signal, 'compact'
+    );
+}
+
+function __pi_builtin_tool_hostcall(name, input, metadata, signal, onUpdate) {
+    const owner = __pi_get_current_extension_id();
+    const publish = typeof onUpdate === 'function'
+        ? (update) => owner
+            ? __pi_with_extension_sync(owner, () => onUpdate(update))
+            : onUpdate(update)
+        : undefined;
+    return __pi_abortable_hostcall(
+        () => __pi_tool_native(name, input, metadata), signal, name, publish
+    );
 }
 
 function __pi_make_streaming_hostcall(nativeFn, ...args) {
@@ -20234,7 +25244,7 @@ function __pi_make_streaming_hostcall(nativeFn, ...args) {
         stream,
         resolve: () => {},
         reject: () => {},
-        extensionId: __pi_current_extension_id
+        extensionId: __pi_get_current_extension_id()
     });
     return stream;
 }
@@ -20297,6 +25307,7 @@ function __pi_sleep(ms) {
 
 // Create the pi global object with Promise-returning methods
 const __pi_exec_hostcall = __pi_make_hostcall(__pi_exec_native);
+const __pi_events_hostcall = __pi_make_hostcall(__pi_events_native);
 	const pi = {
     // pi.tool(name, input) - invoke a tool
     tool: __pi_make_hostcall(__pi_tool_native),
@@ -20313,9 +25324,16 @@ const __pi_exec_hostcall = __pi_make_hostcall(__pi_exec_native);
                 delete opts.onChunk;
                 delete opts.on_chunk;
                 const call_id = __pi_exec_native(cmd, args, opts);
-                return new Promise((resolve, reject) => {
-                    __pi_pending_hostcalls.set(call_id, { onChunk, resolve, reject, extensionId: __pi_current_extension_id });
+                const promise = new Promise((resolve, reject) => {
+                    __pi_pending_hostcalls.set(call_id, { onChunk, resolve, reject, extensionId: __pi_get_current_extension_id() });
                 });
+                Object.defineProperty(promise, '__pi_call_id', {
+                    value: call_id,
+                    writable: false,
+                    configurable: false,
+                    enumerable: false,
+                });
+                return promise;
             }
             return __pi_make_streaming_hostcall(__pi_exec_native, cmd, args, options);
         }
@@ -20335,7 +25353,7 @@ const __pi_exec_hostcall = __pi_make_hostcall(__pi_exec_native);
                 delete req.on_chunk;
                 const call_id = __pi_http_native(req);
                 return new Promise((resolve, reject) => {
-                    __pi_pending_hostcalls.set(call_id, { onChunk, resolve, reject, extensionId: __pi_current_extension_id });
+                    __pi_pending_hostcalls.set(call_id, { onChunk, resolve, reject, extensionId: __pi_get_current_extension_id() });
                 });
             }
             return __pi_make_streaming_hostcall(__pi_http_native, request);
@@ -20349,8 +25367,13 @@ const __pi_exec_hostcall = __pi_make_hostcall(__pi_exec_native);
     // pi.ui(op, args) - UI operations
     ui: __pi_make_hostcall(__pi_ui_native),
 
-	    // pi.events(op, args) - event operations
-	    events: __pi_make_hostcall(__pi_events_native),
+    // The signal is runtime-local and never serialized into host authority.
+    events: (op, args, options = undefined) => {
+        const signal = options && options.signal;
+        if (signal === undefined || signal === null) return __pi_events_hostcall(op, args);
+        if (op !== 'compact') return Promise.reject(new TypeError('events: signal is only supported for compact'));
+        return __pi_compact_hostcall(args, signal);
+    },
 
     // pi.log(entry) - structured log emission
     log: __pi_make_hostcall(__pi_log_native),
@@ -20411,7 +25434,8 @@ if (__pi_det_cwd) {
     try { pi.process.cwd = __pi_det_cwd; } catch (_) {}
 }
 
-try { Object.freeze(pi.process.args); } catch (_) {}
+"),
+            compressed_js_literal!(r"try { Object.freeze(pi.process.args); } catch (_) {}
 try { Object.freeze(pi.process); } catch (_) {}
 
 pi.path = {
@@ -20586,17 +25610,36 @@ if (typeof globalThis.TextEncoder === 'undefined') {
 }
 
 if (typeof globalThis.TextDecoder === 'undefined') {
+    // WHATWG UTF-8 decoding: each maximal invalid subpart becomes one U+FFFD
+    // (or a TypeError when `fatal`), `{stream: true}` carries an incomplete
+    // sequence into the next call, and a leading BOM is dropped unless
+    // `ignoreBOM` is set.
+    const INVALID_UTF8 = 'The encoded data was not valid for encoding utf-8';
     class TextDecoder {
-        constructor(encoding = 'utf-8') {
+        constructor(encoding = 'utf-8', options = {}) {
             this.encoding = encoding;
+            this.fatal = Boolean(options && options.fatal);
+            this.ignoreBOM = Boolean(options && options.ignoreBOM);
+            this._reset();
         }
 
-        decode(input, _opts) {
-            if (input === undefined || input === null) return '';
+        _reset() {
+            this._needed = 0;
+            this._seen = 0;
+            this._codePoint = 0;
+            this._lower = 0x80;
+            this._upper = 0xbf;
+            this._bomChecked = false;
+        }
+
+        decode(input, options) {
+            const stream = Boolean(options && options.stream);
             if (typeof input === 'string') return input;
 
             let bytes;
-            if (input instanceof ArrayBuffer) {
+            if (input === undefined || input === null) {
+                bytes = new Uint8Array(0);
+            } else if (input instanceof ArrayBuffer) {
                 bytes = new Uint8Array(input);
             } else if (ArrayBuffer.isView && ArrayBuffer.isView(input)) {
                 bytes = new Uint8Array(input.buffer, input.byteOffset, input.byteLength);
@@ -20608,43 +25651,99 @@ if (typeof globalThis.TextDecoder === 'undefined') {
                 return '';
             }
 
-            let outChunks = [];
-            let chunk = [];
-            for (let i = 0; i < bytes.length; ) {
+            let needed = this._needed;
+            let seen = this._seen;
+            let codePoint = this._codePoint;
+            let lower = this._lower;
+            let upper = this._upper;
+            const invalid = () => {
+                if (this.fatal) {
+                    this._reset();
+                    throw new TypeError(INVALID_UTF8);
+                }
+                return 0xfffd;
+            };
+            const outChunks = [];
+            const chunk = [];
+            let i = 0;
+            while (i < bytes.length) {
                 if (chunk.length >= 4096) {
                     outChunks.push(String.fromCharCode.apply(null, chunk));
                     chunk.length = 0;
                 }
-                const b0 = bytes[i++];
-                if (b0 < 0x80) {
-                    chunk.push(b0);
+                const b = bytes[i];
+                if (needed === 0) {
+                    i++;
+                    if (b < 0x80) {
+                        chunk.push(b);
+                    } else if (b >= 0xc2 && b <= 0xdf) {
+                        needed = 1;
+                        codePoint = b & 0x1f;
+                    } else if (b >= 0xe0 && b <= 0xef) {
+                        if (b === 0xe0) lower = 0xa0;
+                        if (b === 0xed) upper = 0x9f;
+                        needed = 2;
+                        codePoint = b & 0x0f;
+                    } else if (b >= 0xf0 && b <= 0xf4) {
+                        if (b === 0xf0) lower = 0x90;
+                        if (b === 0xf4) upper = 0x8f;
+                        needed = 3;
+                        codePoint = b & 0x07;
+                    } else {
+                        chunk.push(invalid());
+                    }
                     continue;
                 }
-                if ((b0 & 0xe0) === 0xc0) {
-                    const b1 = bytes[i++] & 0x3f;
-                    chunk.push(((b0 & 0x1f) << 6) | b1);
+                if (b < lower || b > upper) {
+                    // This byte ends the invalid subpart; decode it afresh.
+                    needed = 0;
+                    seen = 0;
+                    codePoint = 0;
+                    lower = 0x80;
+                    upper = 0xbf;
+                    chunk.push(invalid());
                     continue;
                 }
-                if ((b0 & 0xf0) === 0xe0) {
-                    const b1 = bytes[i++] & 0x3f;
-                    const b2 = bytes[i++] & 0x3f;
-                    chunk.push(((b0 & 0x0f) << 12) | (b1 << 6) | b2);
-                    continue;
+                i++;
+                lower = 0x80;
+                upper = 0xbf;
+                codePoint = (codePoint << 6) | (b & 0x3f);
+                seen++;
+                if (seen === needed) {
+                    if (codePoint > 0xffff) {
+                        const offset = codePoint - 0x10000;
+                        chunk.push(0xd800 + (offset >> 10), 0xdc00 + (offset & 0x3ff));
+                    } else {
+                        chunk.push(codePoint);
+                    }
+                    needed = 0;
+                    seen = 0;
+                    codePoint = 0;
                 }
-                if ((b0 & 0xf8) === 0xf0) {
-                    const b1 = bytes[i++] & 0x3f;
-                    const b2 = bytes[i++] & 0x3f;
-                    const b3 = bytes[i++] & 0x3f;
-                    let cp = ((b0 & 0x07) << 18) | (b1 << 12) | (b2 << 6) | b3;
-                    cp -= 0x10000;
-                    chunk.push(0xd800 + (cp >> 10), 0xdc00 + (cp & 0x3ff));
-                    continue;
-                }
+            }
+            if (needed !== 0 && !stream) {
+                // A sequence cut off by the end of the input.
+                needed = 0;
+                chunk.push(invalid());
             }
             if (chunk.length > 0) {
                 outChunks.push(String.fromCharCode.apply(null, chunk));
             }
-            return outChunks.join('');
+            let text = outChunks.join('');
+            if (!this.ignoreBOM && !this._bomChecked && text.length > 0) {
+                this._bomChecked = true;
+                if (text.charCodeAt(0) === 0xfeff) text = text.slice(1);
+            }
+            if (stream) {
+                this._needed = needed;
+                this._seen = seen;
+                this._codePoint = codePoint;
+                this._lower = lower;
+                this._upper = upper;
+            } else {
+                this._reset();
+            }
+            return text;
         }
     }
 
@@ -20714,45 +25813,25 @@ if (typeof globalThis.URLSearchParams === 'undefined') {
 }
 
 if (typeof globalThis.URL === 'undefined') {
+    const parseURL = __pi_url_parse_native;
     class URL {
         constructor(input, base) {
-            const s = base ? new URL(base).href.replace(/\/[^/]*$/, '/') + String(input ?? '') : String(input ?? '');
-            const m = s.match(/^([a-zA-Z][a-zA-Z0-9+.-]*):\/\/([^/?#]*)([^?#]*)(\?[^#]*)?(#.*)?$/);
-            if (m) {
-                this.protocol = m[1] + ':';
-                const auth = m[2];
-                const atIdx = auth.lastIndexOf('@');
-                if (atIdx !== -1) {
-                    const userinfo = auth.slice(0, atIdx);
-                    const ci = userinfo.indexOf(':');
-                    this.username = ci === -1 ? userinfo : userinfo.slice(0, ci);
-                    this._pw = ci === -1 ? String() : userinfo.slice(ci + 1);
-                    this.host = auth.slice(atIdx + 1);
-                } else {
-                    this.username = '';
-                    this._pw = String();
-                    this.host = auth;
-                }
-                const hi = this.host.indexOf(':');
-                this.hostname = hi === -1 ? this.host : this.host.slice(0, hi);
-                this.port = hi === -1 ? '' : this.host.slice(hi + 1);
-                this.pathname = m[3] || '/';
-                this.search = m[4] || '';
-                this.hash = m[5] || '';
-            } else {
-                this.protocol = '';
-                this.username = '';
-                this._pw = String();
-                this.host = '';
-                this.hostname = '';
-                this.port = '';
-                this.pathname = s;
-                this.search = '';
-                this.hash = '';
-            }
+            const parsed = parseURL(String(input), base === undefined ? null : String(base));
+            if (typeof parsed !== 'string') throw new TypeError('Invalid URL');
+            const parts = JSON.parse(parsed);
+            this.protocol = parts.protocol;
+            this.username = parts.username;
+            this._pw = parts.password;
+            this.host = parts.host;
+            this.hostname = parts.hostname;
+            this.port = parts.port;
+            this.pathname = parts.pathname;
+            this.search = parts.search;
+            this.hash = parts.hash;
+            this._hasAuthority = parts.hasAuthority;
             this.searchParams = new globalThis.URLSearchParams(this.search.replace(/^\?/, ''));
-            this.origin = this.protocol ? `${this.protocol}//${this.host}` : '';
-            this.href = this.toString();
+            this.origin = parts.origin;
+            this.href = parts.href;
         }
         get password() {
             return this._pw;
@@ -20761,8 +25840,9 @@ if (typeof globalThis.URL === 'undefined') {
             this._pw = value == null ? String() : String(value);
         }
         toString() {
-            const auth = this.username ? `${this.username}${this.password ? ':' + this.password : ''}@` : '';
-            return this.protocol ? `${this.protocol}//${auth}${this.host}${this.pathname}${this.search}${this.hash}` : this.pathname;
+            const auth = this.username || this.password ? `${this.username}${this.password ? ':' + this.password : ''}@` : '';
+            const authority = this._hasAuthority ? `//${auth}${this.host}` : '';
+            return `${this.protocol}${authority}${this.pathname}${this.search}${this.hash}`;
         }
         toJSON() { return this.toString(); }
     }
@@ -21501,7 +26581,8 @@ if (typeof globalThis.crypto.getRandomValues !== 'function') {
     };
 }
 
-if (!globalThis.crypto.subtle) {
+"),
+            compressed_js_literal!(r"if (!globalThis.crypto.subtle) {
     globalThis.crypto.subtle = {};
 }
 
@@ -21544,50 +26625,69 @@ if (typeof globalThis.crypto.randomUUID !== 'function') {
 }
 
 if (typeof globalThis.process === 'undefined') {
-    const rawPlatform =
-        __pi_env_get_native('PI_PLATFORM') ||
-        __pi_env_get_native('OSTYPE') ||
-        __pi_env_get_native('OS') ||
-        'linux';
+    const rawPlatform = __pi_process_platform_native();
     // Normalize to Node.js conventions: strip version suffix from OSTYPE
     // (e.g. darwin24.0 -> darwin, linux-gnu -> linux, msys -> win32)
     const platform = (() => {
-        const s = String(rawPlatform).replace(/[0-9].*$/, '').split('-')[0].toLowerCase();
+        const raw = String(rawPlatform).toLowerCase();
+        if (raw === 'win32' || raw === 'windows' || raw === 'windows_nt' || raw === 'msys' || raw === 'cygwin') return 'win32';
+        const s = raw.replace(/[0-9].*$/, '').split('-')[0];
         if (s === 'darwin') return 'darwin';
-        if (s === 'msys' || s === 'cygwin' || s === 'windows_nt') return 'win32';
         return s || 'linux';
     })();
     const detHome = __pi_env_get_native('PI_DETERMINISTIC_HOME');
     const detCwd = __pi_env_get_native('PI_DETERMINISTIC_CWD');
 
+    // Materialize only the capability-filtered, immutable host snapshot.
+    // Libraries can spread process.env into child options without exposing
+    // credentials or receiving permission to enumerate the ambient host env.
+    const envTarget = Object.create(null);
+    for (const key of __pi_env_keys_native()) {
+        const value = __pi_env_get_native(key);
+        if (value !== null && value !== undefined) envTarget[key] = value;
+    }
+    if (detHome) envTarget.HOME = detHome;
     const envProxy = new Proxy(
-        {},
+        envTarget,
         {
-            get(_target, prop) {
+            get(target, prop, receiver) {
+                if (Reflect.getOwnPropertyDescriptor(target, prop)) {
+                    return Reflect.get(target, prop, receiver);
+                }
                 if (typeof prop !== 'string') return undefined;
-                if (prop === 'HOME' && detHome) return detHome;
                 const value = __pi_env_get_native(prop);
                 return value === null || value === undefined ? undefined : value;
             },
-            set(_target, prop, _value) {
+            set(target, prop, value) {
+                const descriptor = Reflect.getOwnPropertyDescriptor(target, prop);
+                if (descriptor && descriptor.configurable === false) {
+                    if ('value' in descriptor && descriptor.writable === false) {
+                        return Object.is(value, descriptor.value);
+                    }
+                    if ('set' in descriptor && descriptor.set === undefined) return false;
+                }
                 // Read-only in PiJS — silently ignore writes
                 return typeof prop === 'string';
             },
-            deleteProperty(_target, prop) {
+            deleteProperty(target, prop) {
+                const descriptor = Reflect.getOwnPropertyDescriptor(target, prop);
+                if (descriptor && (!descriptor.configurable || !Reflect.isExtensible(target))) return false;
                 // Read-only — silently ignore deletes
                 return typeof prop === 'string';
             },
-            has(_target, prop) {
+            has(target, prop) {
+                if (Reflect.has(target, prop)) return true;
                 if (typeof prop !== 'string') return false;
-                if (prop === 'HOME' && detHome) return true;
                 const value = __pi_env_get_native(prop);
                 return value !== null && value !== undefined;
             },
-            ownKeys() {
-                // Cannot enumerate real env — return empty
-                return [];
+            ownKeys(target) {
+                return Reflect.ownKeys(target);
             },
-            getOwnPropertyDescriptor(_target, prop) {
+            getOwnPropertyDescriptor(target, prop) {
+                const descriptor = Reflect.getOwnPropertyDescriptor(target, prop);
+                if (descriptor) return descriptor;
+                if (!Reflect.isExtensible(target)) return undefined;
                 if (typeof prop !== 'string') return undefined;
                 const value = __pi_env_get_native(prop);
                 if (value === null || value === undefined) return undefined;
@@ -22017,12 +27117,9 @@ if (typeof globalThis.Bun === 'undefined') {
             globalThis.process && typeof globalThis.process.cwd === 'function'
                 ? globalThis.process.cwd()
                 : '/';
-        const raw = __pi_exec_sync_native('which', JSON.stringify([name]), cwd, 2000, 1024 * 1024);
         try {
-            const parsed = JSON.parse(raw || '{}');
-            if (Number(parsed && parsed.code) !== 0) return null;
-            const out = String((parsed && parsed.stdout) || '').trim();
-            return out ? out.split('\n')[0] : null;
+            const matches = JSON.parse(__pi_find_executables_native(name, cwd));
+            return matches.length ? matches[0] : null;
         } catch (_) {
             return null;
         }
@@ -22169,7 +27266,7 @@ if (typeof globalThis.Bun === 'undefined') {
                     settled = true;
                     reject(error);
                 },
-                extensionId: __pi_current_extension_id,
+                extensionId: __pi_get_current_extension_id(),
             });
         });
 
@@ -22223,72 +27320,147 @@ if (typeof globalThis.Bun === 'undefined') {
     globalThis.Bun = Bun;
 }
 
-if (typeof globalThis.setTimeout !== 'function') {
-    globalThis.setTimeout = (callback, delay, ...args) => {
-        const ms = Number(delay || 0);
-        const timer_id = __pi_set_timeout_native(ms <= 0 ? 0 : Math.floor(ms));
-        const captured_id = __pi_current_extension_id;
-        __pi_register_timer(timer_id, () => {
-            const prev = __pi_current_extension_id;
-            __pi_current_extension_id = captured_id;
-            try {
-                callback(...args);
-            } catch (e) {
-                console.error('setTimeout callback error:', e);
-            } finally {
-                __pi_current_extension_id = prev;
-            }
-        });
-        return timer_id;
-    };
-}
+// Timer ownership belongs to the embedding actor. ref/unref record the Node
+// handle preference; neither can retain a realm after host shutdown or cancel
+// a callback while its host is alive. State and trusted rescheduling closures
+// stay private, so inspecting a handle cannot reveal or replace provenance.
+const __pi_timer_runtime = (() => {
+    const states = new WeakMap();
+    const active = new Map();
+    const getState = Function.call.bind(WeakMap.prototype.get);
+    const setState = Function.call.bind(WeakMap.prototype.set);
+    const hasState = Function.call.bind(WeakMap.prototype.has);
+    const getActive = Function.call.bind(Map.prototype.get);
+    const setActive = Function.call.bind(Map.prototype.set);
+    const deleteActive = Function.call.bind(Map.prototype.delete);
+    const forEachActive = Function.call.bind(Map.prototype.forEach);
+    const clearActive = __pi_map_clear_primordial;
+    const activeCount = __pi_map_size_primordial;
+    const createScheduler = __pi_create_timer_scheduler_native;
+    Object.defineProperty(globalThis, '__pi_create_timer_scheduler_native', {
+        value: undefined, writable: false, configurable: false, enumerable: false,
+    });
+    let epoch = 0;
 
-if (typeof globalThis.clearTimeout !== 'function') {
-    globalThis.clearTimeout = (timer_id) => {
-        __pi_unregister_timer(timer_id);
-        try {
-            __pi_clear_timeout_native(timer_id);
-        } catch (_) {}
-    };
-}
-
-// setInterval polyfill using setTimeout
-const __pi_intervals = new Map();
-let __pi_interval_id = 0;
-
-if (typeof globalThis.setInterval !== 'function') {
-    globalThis.setInterval = (callback, delay, ...args) => {
-        const ms = Math.max(0, Number(delay || 0));
-        const id = ++__pi_interval_id;
-        const captured_id = __pi_current_extension_id;
-        const run = () => {
-            if (!__pi_intervals.has(id)) return;
-            const prev = __pi_current_extension_id;
-            __pi_current_extension_id = captured_id;
-            try {
-                callback(...args);
-            } catch (e) {
-                console.error('setInterval callback error:', e);
-            } finally {
-                __pi_current_extension_id = prev;
-            }
-            if (__pi_intervals.has(id)) {
-                __pi_intervals.set(id, globalThis.setTimeout(run, ms));
-            }
-        };
-        __pi_intervals.set(id, globalThis.setTimeout(run, ms));
-        return id;
-    };
-}
-
-if (typeof globalThis.clearInterval !== 'function') {
-    globalThis.clearInterval = (id) => {
-        const timerId = __pi_intervals.get(id);
-        if (timerId !== undefined) {
-            globalThis.clearTimeout(timerId);
-            __pi_intervals.delete(id);
+    function stateOf(handle) {
+        const state = getState(states, handle);
+        if (!state) throw new TypeError('Invalid Timeout receiver');
+        return state;
+    }
+    function disarm(state) {
+        if (state.nativeId !== null) {
+            __pi_unregister_timer(state.nativeId);
+            __pi_clear_timeout_native(state.nativeId);
+            state.nativeId = null;
         }
-    };
+    }
+    function cancel(handle) {
+        const state = stateOf(handle);
+        if (state.epoch !== epoch || state.cancelled) return;
+        disarm(state);
+        deleteActive(active, state.id);
+        state.active = false;
+        state.cancelled = true;
+        state.callback = null;
+        state.args = null;
+        state.schedule = null;
+    }
+    function arm(handle, state) {
+        disarm(state);
+        const version = ++state.version;
+        const nativeId = state.schedule(state.delay);
+        state.nativeId = nativeId;
+        // The initial native id is unique across both kinds of timer. Later
+        // re-arms get fresh native ids without changing the handle's identity.
+        if (state.id === null) state.id = nativeId;
+        state.active = true;
+        setActive(active, state.id, handle);
+        __pi_register_timer(nativeId, () => {
+            if (state.epoch !== epoch || !state.active || state.version !== version) return;
+            state.nativeId = null;
+            if (!state.repeat) {
+                state.active = false;
+                deleteActive(active, state.id);
+            }
+            const callback = state.callback;
+            const args = state.args;
+            const invoke = () => callback.apply(handle, args);
+            const result = state.owner
+                ? __pi_with_extension_async(state.owner, invoke)
+                : Promise.resolve().then(invoke);
+            result.catch((error) => console.error('Timer callback error:', error)).then(() => {
+                // Keep the existing serialized interval callback behavior.
+                // A refresh or clear during that callback wins over re-arming.
+                if (state.repeat && state.active && !state.cancelled &&
+                    state.epoch === epoch && state.version === version) {
+                    arm(handle, state);
+                }
+            });
+        });
+    }
+    class Timeout {
+        ref() { stateOf(this).referenced = true; return this; }
+        unref() { stateOf(this).referenced = false; return this; }
+        hasRef() { return stateOf(this).referenced; }
+        refresh() {
+            const state = stateOf(this);
+            if (state.epoch === epoch && !state.cancelled) arm(this, state);
+            return this;
+        }
+        close() { cancel(this); return this; }
+        [Symbol.toPrimitive]() { return stateOf(this).id; }
+    }
+    if (typeof Symbol.dispose === 'symbol') {
+        Object.defineProperty(Timeout.prototype, Symbol.dispose, {
+            value() { cancel(this); }, configurable: true, writable: true,
+        });
+    }
+    function create(callback, delay, repeat, args) {
+        if (typeof callback !== 'function') throw new TypeError('Timer callback must be a function');
+        let ms = Number(delay || 0);
+        if (!Number.isFinite(ms) || ms < 0 || ms > 2147483647) ms = 1;
+        const handle = new Timeout();
+        const state = {
+            id: null, nativeId: null, delay: Math.floor(ms), repeat, callback, args,
+            owner: __pi_get_current_extension_id(),
+            schedule: createScheduler(),
+            referenced: true, active: false, cancelled: false, epoch, version: 0,
+        };
+        setState(states, handle, state);
+        arm(handle, state);
+        return handle;
+    }
+    function clear(handle) {
+        if (typeof handle === 'number' || typeof handle === 'string') {
+            handle = getActive(active, Number(handle));
+        }
+        if (handle && hasState(states, handle)) cancel(handle);
+    }
+    return Object.freeze({
+        setTimeout: (callback, delay, ...args) => create(callback, delay, false, args),
+        setInterval: (callback, delay, ...args) => create(callback, delay, true, args),
+        clear,
+        count: () => activeCount(active),
+        reset(secret) {
+            if (!__pi_bridge_secret_matches_native(secret)) throw new Error('Timer reset denied');
+            forEachActive(active, (handle) => cancel(handle));
+            epoch++;
+            clearActive(active);
+        },
+    });
+})();
+
+if (typeof globalThis.setTimeout !== 'function') {
+    globalThis.setTimeout = __pi_timer_runtime.setTimeout;
+}
+if (typeof globalThis.clearTimeout !== 'function') {
+    globalThis.clearTimeout = __pi_timer_runtime.clear;
+}
+if (typeof globalThis.setInterval !== 'function') {
+    globalThis.setInterval = __pi_timer_runtime.setInterval;
+}
+if (typeof globalThis.clearInterval !== 'function') {
+    globalThis.clearInterval = __pi_timer_runtime.clear;
 }
 
 if (typeof globalThis.fetch !== 'function') {
@@ -22322,7 +27494,7 @@ if (typeof globalThis.fetch !== 'function') {
 
     class Headers {
         constructor(init) {
-            this._map = {};
+            this._map = Object.create(null);
             if (init && typeof init === 'object') {
                 if (Array.isArray(init)) {
                     for (const pair of init) {
@@ -22348,48 +27520,240 @@ if (typeof globalThis.fetch !== 'function') {
             this._map[key] = String(value === undefined || value === null ? '' : value);
         }
 
-        entries() {
-            return Object.entries(this._map);
+        append(name, value) {
+            const previous = this.get(name);
+            this.set(name, previous === null ? value : previous + ', ' + value);
         }
+
+        has(name) { return this.get(name) !== null; }
+        delete(name) { delete this._map[String(name || '').toLowerCase()]; }
+        forEach(callback, thisArg) {
+            for (const [key, value] of this.entries()) callback.call(thisArg, value, key, this);
+        }
+        keys() { return Object.keys(this._map)[Symbol.iterator](); }
+        values() { return Object.values(this._map)[Symbol.iterator](); }
+        entries() {
+            return Object.entries(this._map)[Symbol.iterator]();
+        }
+        [Symbol.iterator]() { return this.entries(); }
     }
 
+    // A pull-driven byte stream for fetch and Node's Readable.fromWeb bridge.
+    // It never owns a socket: cancellation is delegated to the hostcall source.
+    if (typeof globalThis.ReadableStream !== 'function') {
+        class ReadableStream {
+            constructor(source = {}) {
+                this._queue = [];
+                this._pending = [];
+                this._closed = false;
+                this._errored = false;
+                this._error = undefined;
+                this._locked = false;
+                this._disturbed = false;
+                this._pulling = false;
+                this._pullAgain = false;
+                this._started = false;
+                this._source = source;
+                this._controller = {
+                    enqueue: (value) => {
+                        if (this._closed || this._errored) throw new TypeError('ReadableStream is closed');
+                        const pending = this._pending.shift();
+                        if (pending) pending.resolve({ value, done: false });
+                        else this._queue.push(value);
+                        this._pull();
+                    },
+                    close: () => {
+                        if (this._closed || this._errored) return;
+                        this._closed = true;
+                        for (const pending of this._pending.splice(0)) pending.resolve({ value: undefined, done: true });
+                    },
+                    error: (error) => {
+                        if (this._closed || this._errored) return;
+                        this._errored = true;
+                        this._error = error;
+                        this._queue = [];
+                        for (const pending of this._pending.splice(0)) pending.reject(error);
+                    },
+                };
+                Object.defineProperty(this._controller, 'desiredSize', {
+                    get: () => this._errored ? null : (this._closed ? 0 : 1 - this._queue.length),
+                });
+                Promise.resolve(typeof source.start === 'function' ? source.start(this._controller) : undefined)
+                    .then(() => { this._started = true; this._pull(); }, (error) => this._controller.error(error));
+            }
+            get locked() { return this._locked; }
+            _pull() {
+                if (!this._started || this._closed || this._errored || this._pending.length === 0) return;
+                if (this._pulling) { this._pullAgain = true; return; }
+                if (typeof this._source.pull !== 'function') return;
+                this._pulling = true;
+                this._pullAgain = false;
+                const count = this._pending.length;
+                Promise.resolve().then(() => this._source.pull(this._controller)).then(() => {
+                    this._pulling = false;
+                    if (this._pullAgain || this._pending.length < count) this._pull();
+                }, (error) => { this._pulling = false; this._controller.error(error); });
+            }
+            _read() {
+                this._disturbed = true;
+                if (this._errored) return Promise.reject(this._error);
+                if (this._queue.length > 0) return Promise.resolve({ value: this._queue.shift(), done: false });
+                if (this._closed) return Promise.resolve({ value: undefined, done: true });
+                return new Promise((resolve, reject) => { this._pending.push({ resolve, reject }); this._pull(); });
+            }
+            _cancel(reason) {
+                this._disturbed = true;
+                if (this._errored) return Promise.reject(this._error);
+                this._queue = [];
+                if (this._closed) return Promise.resolve();
+                this._controller.close();
+                return Promise.resolve().then(() => {
+                    if (typeof this._source.cancel === 'function') return this._source.cancel(reason);
+                });
+            }
+            cancel(reason) {
+                return this._locked ? Promise.reject(new TypeError('ReadableStream is locked')) : this._cancel(reason);
+            }
+            getReader() {
+                if (this._locked) throw new TypeError('ReadableStream is locked');
+                this._locked = true;
+                let released = false;
+                return {
+                    read: () => released ? Promise.reject(new TypeError('Reader lock was released')) : this._read(),
+                    cancel: (reason) => released ? Promise.reject(new TypeError('Reader lock was released')) : this._cancel(reason),
+                    releaseLock: () => {
+                        if (released) return;
+                        if (this._pending.length > 0) throw new TypeError('Reader has pending reads');
+                        released = true;
+                        this._locked = false;
+                    },
+                };
+            }
+            tee() {
+                const reader = this.getReader();
+                const controllers = [];
+                const cancelled = [false, false];
+                const reasons = [];
+                let pending = null;
+                let ended = false;
+                const pull = () => {
+                    if (ended) return;
+                    if (!pending) {
+                        pending = reader.read().then((result) => {
+                            pending = null;
+                            if (result.done) {
+                                ended = true;
+                                for (let i = 0; i < 2; i++) if (!cancelled[i]) controllers[i].close();
+                                reader.releaseLock();
+                            } else {
+                                for (let i = 0; i < 2; i++) {
+                                    if (!cancelled[i]) controllers[i].enqueue(result.value instanceof Uint8Array ? result.value.slice() : result.value);
+                                }
+                            }
+                        }, (error) => {
+                            ended = true;
+                            for (let i = 0; i < 2; i++) if (!cancelled[i]) controllers[i].error(error);
+                            reader.releaseLock();
+                        });
+                    }
+                    return pending;
+                };
+                return [0, 1].map((index) => new ReadableStream({
+                    start(controller) { controllers[index] = controller; },
+                    pull,
+                    cancel(reason) {
+                        cancelled[index] = true;
+                        reasons[index] = reason;
+                        if (cancelled[0] && cancelled[1] && !ended) {
+                            ended = true;
+                            return reader.cancel(reasons).finally(() => reader.releaseLock());
+                        }
+                    },
+                }));
+            }
+            values(options = {}) {
+                const reader = this.getReader();
+                let ended = false;
+                return {
+                    async next() {
+                        if (ended) return { value: undefined, done: true };
+                        try {
+                            const result = await reader.read();
+                            if (result.done) { ended = true; reader.releaseLock(); }
+                            return result;
+                        } catch (error) { ended = true; reader.releaseLock(); throw error; }
+                    },
+                    async return() {
+                        if (!ended) {
+                            ended = true;
+                            try { if (!options.preventCancel) await reader.cancel(); }
+                            finally { reader.releaseLock(); }
+                        }
+                        return { value: undefined, done: true };
+                    },
+                    [Symbol.asyncIterator]() { return this; },
+                };
+            }
+            [Symbol.asyncIterator]() { return this.values(); }
+        }
+        globalThis.ReadableStream = ReadableStream;
+    }
+
+    const __pi_fetch_bytes = (value) => {
+        if (value instanceof Uint8Array) return value;
+        if (value instanceof ArrayBuffer) return new Uint8Array(value);
+        if (ArrayBuffer.isView && ArrayBuffer.isView(value)) return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+        return new TextEncoder().encode(String(value));
+    };
+
     class Response {
-        constructor(bodyBytes, init) {
+        constructor(body, init) {
             const options = init && typeof init === 'object' ? init : {};
-            this.status = Number(options.status || 0);
+            this.status = Number(options.status === undefined ? 200 : options.status);
+            this.statusText = String(options.statusText || '');
             this.ok = this.status >= 200 && this.status < 300;
             this.headers = new Headers(options.headers || {});
-            this._bytes = bodyBytes || new Uint8Array();
-            this.body = {
-                getReader: () => {
-                    let done = false;
-                    return {
-                        read: async () => {
-                            if (done) return { done: true, value: undefined };
-                            done = true;
-                            return { done: false, value: this._bytes };
-                        },
-                        cancel: async () => {
-                            done = true;
-                        },
-                        releaseLock: () => {},
-                    };
-                },
-            };
+            this.url = String(options.url || '');
+            this.redirected = !!options.redirected;
+            this._bodyUsed = false;
+            this.body = body === undefined || body === null ? null
+                : typeof body.getReader === 'function' ? body
+                : new globalThis.ReadableStream({ start(controller) { controller.enqueue(__pi_fetch_bytes(body)); controller.close(); } });
         }
-
-        async text() {
-            return new TextDecoder().decode(this._bytes);
+        get bodyUsed() { return this._bodyUsed || !!(this.body && this.body._disturbed); }
+        async _consume() {
+            if (this.bodyUsed || (this.body && this.body.locked)) throw new TypeError('Response body is already used');
+            if (!this.body) return new Uint8Array();
+            this._bodyUsed = true;
+            const reader = this.body.getReader();
+            const chunks = [];
+            let size = 0;
+            try {
+                while (true) {
+                    const result = await reader.read();
+                    if (result.done) break;
+                    const bytes = __pi_fetch_bytes(result.value);
+                    chunks.push(bytes);
+                    size += bytes.byteLength;
+                }
+            } finally { reader.releaseLock(); }
+            const bytes = new Uint8Array(size);
+            let offset = 0;
+            for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
+            return bytes;
         }
-
-        async json() {
-            return JSON.parse(await this.text());
-        }
-
-        async arrayBuffer() {
-            const copy = new Uint8Array(this._bytes.length);
-            copy.set(this._bytes);
-            return copy.buffer;
+        async text() { return new TextDecoder().decode(await this._consume()); }
+        async json() { return JSON.parse(await this.text()); }
+        async arrayBuffer() { return (await this._consume()).buffer; }
+        clone() {
+            if (this.bodyUsed || (this.body && this.body.locked)) throw new TypeError('Response body is already used');
+            let body = null;
+            if (this.body) {
+                const branches = this.body.tee();
+                this.body = branches[0];
+                body = branches[1];
+            }
+            return new Response(body, { status: this.status, statusText: this.statusText, headers: this.headers, url: this.url, redirected: this.redirected });
         }
     }
 
@@ -22508,87 +27872,741 @@ if (typeof globalThis.fetch !== 'function') {
         globalThis.TransformStream = TransformStream;
     }
 
-    // AbortController / AbortSignal polyfill — many npm packages check for these
+    const __pi_fetch_abort_error = () => {
+        const error = new Error('This operation was aborted');
+        error.name = 'AbortError';
+        return error;
+    };
+
+    // Abort state is private, immutable after the first abort, and shared by
+    // any() without letting a cancelled hedge abort its siblings.
     if (typeof globalThis.AbortController === 'undefined') {
-        class AbortSignal {
-            constructor() { this.aborted = false; this._listeners = []; }
-            get reason() { return this.aborted ? (this._reason !== undefined ? this._reason : new Error('This operation was aborted')) : undefined; }
-            addEventListener(type, fn) { if (type === 'abort') this._listeners.push(fn); }
-            removeEventListener(type, fn) { if (type === 'abort') this._listeners = this._listeners.filter(f => f !== fn); }
+        const states = new WeakMap();
+        const token = {};
+        const abort = (signal, reason) => {
+            const state = states.get(signal);
+            if (state.aborted) return;
+            state.aborted = true;
+            state.reason = reason === undefined ? __pi_fetch_abort_error() : reason;
+            if (state.cleanup) { state.cleanup(); state.cleanup = null; }
+            for (const dependent of Array.from(state.dependents)) dependent(state.reason);
+            state.dependents.clear();
+            signal.dispatchEvent(new Event('abort'));
+        };
+        class AbortSignal extends globalThis.EventTarget {
+            constructor(key) {
+                super();
+                if (key !== token) throw new TypeError('Illegal AbortSignal constructor');
+                states.set(this, { aborted: false, reason: undefined, listeners: [], dependents: new Set(), cleanup: null });
+                this.onabort = null;
+            }
+            get aborted() { return states.get(this).aborted; }
+            get reason() { return states.get(this).reason; }
+            addEventListener(type, listener, options) {
+                if (type !== 'abort' || !listener) return;
+                const capture = typeof options === 'boolean' ? options : !!(options && options.capture);
+                const state = states.get(this);
+                if (state.listeners.some((entry) => entry.listener === listener && entry.capture === capture)) return;
+                state.listeners.push({ listener, capture, once: !!(options && options.once) });
+            }
+            removeEventListener(type, listener, options) {
+                if (type !== 'abort') return;
+                const capture = typeof options === 'boolean' ? options : !!(options && options.capture);
+                const state = states.get(this);
+                state.listeners = state.listeners.filter((entry) => entry.listener !== listener || entry.capture !== capture);
+            }
+            dispatchEvent(event) {
+                if (!event || event.type !== 'abort') return true;
+                const state = states.get(this);
+                try { event.target = this; event.currentTarget = this; } catch (_) {}
+                for (const entry of state.listeners.slice()) {
+                    if (!state.listeners.includes(entry)) continue;
+                    if (entry.once) this.removeEventListener('abort', entry.listener, entry.capture);
+                    try {
+                        if (typeof entry.listener === 'function') entry.listener.call(this, event);
+                        else if (typeof entry.listener.handleEvent === 'function') entry.listener.handleEvent(event);
+                    } catch (_) {}
+                }
+                if (typeof this.onabort === 'function') { try { this.onabort.call(this, event); } catch (_) {} }
+                return !event.defaultPrevented;
+            }
             throwIfAborted() { if (this.aborted) throw this.reason; }
-            static abort(reason) { const s = new AbortSignal(); s.aborted = true; s._reason = reason !== undefined ? reason : new Error('This operation was aborted'); return s; }
-            static timeout(ms) { const s = new AbortSignal(); setTimeout(() => { s.aborted = true; s._reason = new Error('The operation was aborted due to timeout'); s._listeners.forEach(fn => fn()); }, ms); return s; }
+            static abort(reason) {
+                const signal = new AbortSignal(token);
+                abort(signal, reason);
+                return signal;
+            }
+            static timeout(ms) {
+                const delay = Number(ms);
+                if (!Number.isSafeInteger(delay) || delay < 0) throw new RangeError('AbortSignal.timeout requires a non-negative safe integer');
+                const signal = new AbortSignal(token);
+                const timer = setTimeout(() => {
+                    const error = new Error('The operation was aborted due to timeout');
+                    error.name = 'TimeoutError';
+                    abort(signal, error);
+                }, delay);
+                states.get(signal).cleanup = () => clearTimeout(timer);
+                return signal;
+            }
+            static any(signals) {
+                if (signals === null || signals === undefined || typeof signals[Symbol.iterator] !== 'function') throw new TypeError('AbortSignal.any requires an iterable');
+                const sources = Array.from(signals);
+                for (const source of sources) if (!states.has(source)) throw new TypeError('AbortSignal.any requires AbortSignals');
+                const signal = new AbortSignal(token);
+                for (const source of sources) {
+                    const state = states.get(source);
+                    if (state.aborted) { abort(signal, state.reason); return signal; }
+                }
+                const links = [];
+                states.get(signal).cleanup = () => {
+                    for (const [source, listener] of links) states.get(source).dependents.delete(listener);
+                    links.length = 0;
+                };
+                for (const source of new Set(sources)) {
+                    const listener = (reason) => abort(signal, reason);
+                    links.push([source, listener]);
+                    // Internal abort algorithms cannot be triggered by a
+                    // synthetic dispatchEvent or hidden by a user listener.
+                    states.get(source).dependents.add(listener);
+                }
+                return signal;
+            }
         }
         class AbortController {
-            constructor() { this.signal = new AbortSignal(); }
-            abort(reason) { this.signal.aborted = true; this.signal._reason = reason; this.signal._listeners.forEach(fn => fn()); }
+            constructor() { Object.defineProperty(this, 'signal', { value: new AbortSignal(token), enumerable: true }); }
+            abort(reason) { abort(this.signal, reason); }
         }
         globalThis.AbortController = AbortController;
         globalThis.AbortSignal = AbortSignal;
     }
 
-    globalThis.fetch = async (input, init) => {
+    const __pi_fetch = async (input, init, nodeResponse = false) => {
         const url = typeof input === 'string' ? input : String(input && input.url ? input.url : input);
         const options = init && typeof init === 'object' ? init : {};
-        const method = options.method ? String(options.method) : 'GET';
-
-        const headers = {};
-        if (options.headers && typeof options.headers === 'object') {
-            if (options.headers instanceof Headers) {
-                for (const [k, v] of options.headers.entries()) headers[k] = v;
-            } else if (Array.isArray(options.headers)) {
-                for (const pair of options.headers) {
-                    if (pair && pair.length >= 2) headers[String(pair[0])] = String(pair[1]);
-                }
-            } else {
-                for (const k of Object.keys(options.headers)) {
-                    headers[k] = String(options.headers[k]);
-                }
-            }
+        const inputRequest = input && typeof input === 'object' && typeof input.url === 'string' ? input : null;
+        const option = (name) => options[name] === undefined && inputRequest ? inputRequest[name] : options[name];
+        const method = option('method') === undefined ? 'GET' : String(option('method'));
+        const signal = option('signal');
+        const abortReason = () => signal.reason === undefined ? __pi_fetch_abort_error() : signal.reason;
+        if (signal !== undefined && signal !== null) {
+            if (typeof signal.aborted !== 'boolean' || typeof signal.addEventListener !== 'function' || typeof signal.removeEventListener !== 'function') throw new TypeError('fetch signal must be an AbortSignal');
+            if (signal.aborted) throw abortReason();
         }
+        if (option('dispatcher') !== undefined && option('dispatcher') !== null) throw new TypeError('Custom fetch dispatchers are not available in PiJS; use the capability-gated fetch transport');
+        if (inputRequest && inputRequest.bodyUsed) throw new TypeError('Request body is already used');
+        const headers = Object.create(null);
+        for (const [key, value] of new Headers(option('headers'))) headers[key] = value;
 
         let body = undefined;
         let body_bytes = undefined;
-        if (options.body !== undefined && options.body !== null) {
-            const encoded = __pi_fetch_body_bytes_to_base64(options.body);
+        const requestBody = option('body');
+        if (requestBody !== undefined && requestBody !== null) {
+            if (typeof requestBody.getReader === 'function') throw new TypeError('Streaming request bodies are not available in PiJS');
+            const encoded = __pi_fetch_body_bytes_to_base64(requestBody);
             if (encoded !== null) {
                 body_bytes = encoded;
             } else {
-                body = typeof options.body === 'string' ? options.body : String(options.body);
+                body = typeof requestBody === 'string' ? requestBody : String(requestBody);
             }
         }
 
-        const request = { url, method, headers };
+        const request = { url, method, headers, stream: true };
         if (body !== undefined) request.body = body;
         if (body_bytes !== undefined) request.body_bytes = body_bytes;
-
-        const resp = await pi.http(request);
-        const status = resp && resp.status !== undefined ? Number(resp.status) : 0;
-        const respHeaders = resp && resp.headers && typeof resp.headers === 'object' ? resp.headers : {};
-
-        let bytes = new Uint8Array();
-        if (resp && resp.body_bytes) {
-            const bin = __pi_base64_decode_native(String(resp.body_bytes));
-            const out = new Uint8Array(bin.length);
-            for (let i = 0; i < bin.length; i++) {
-                out[i] = bin.charCodeAt(i) & 0xff;
+        // node:http already supports a host-enforced timeout. Keep that
+        // option on the same capability-gated transport and native deadline.
+        if (nodeResponse && options.timeout !== undefined) request.timeout = options.timeout;
+        const chunkBytes = (chunk) => {
+            if (chunk && chunk.body_bytes !== undefined) {
+                const binary = __pi_base64_decode_native(String(chunk.body_bytes));
+                const bytes = new Uint8Array(binary.length);
+                for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i) & 0xff;
+                return bytes;
             }
-            bytes = out;
-        } else if (resp && resp.body !== undefined && resp.body !== null) {
-            bytes = new TextEncoder().encode(String(resp.body));
-        }
+            return chunk && chunk.body !== undefined && chunk.body !== null ? new TextEncoder().encode(String(chunk.body)) : null;
+        };
 
-        return new Response(bytes, { status, headers: respHeaders });
+        let iterator = null;
+        let controller = null;
+        let stopped = false;
+        let ended = false;
+        let cancellation = null;
+        let stopReason;
+        let rejectStopped;
+        const interrupted = new Promise((_, reject) => { rejectStopped = reject; });
+        // Abort can occur after headers but before the consumer asks for a byte.
+        interrupted.catch(() => {});
+        const cleanup = () => { if (signal) signal.removeEventListener('abort', onAbort); };
+        const cancelHost = () => {
+            if (cancellation) return cancellation;
+            if (!iterator) return Promise.resolve();
+            try { cancellation = Promise.resolve(typeof iterator.return === 'function' ? iterator.return() : undefined).catch(() => {}); }
+            catch (_) { cancellation = Promise.resolve(); }
+            return cancellation;
+        };
+        const stop = (reason) => {
+            if (stopped || ended) return;
+            stopped = true;
+            stopReason = reason;
+            cleanup();
+            rejectStopped(reason);
+            if (controller) controller.error(reason);
+            void cancelHost();
+        };
+        const onAbort = () => { if (signal.aborted) stop(abortReason()); };
+        const next = async () => {
+            if (stopped) throw stopReason;
+            const result = await Promise.race([iterator.next(), interrupted]);
+            if (stopped) throw stopReason;
+            return result;
+        };
+
+        try {
+            // A synthetic abort event must neither cancel a request nor remove
+            // the listener that will observe the controller's genuine abort.
+            if (signal) signal.addEventListener('abort', onAbort);
+            // Input/header getters can themselves abort during normalization.
+            if (signal && signal.aborted) onAbort();
+            if (stopped) throw stopReason;
+            const virtual = typeof globalThis.__pi_virtual_http_dispatch === 'function' ? globalThis.__pi_virtual_http_dispatch(request) : null;
+            const stream = virtual === null ? pi.http(request) : virtual;
+            if (stream && typeof stream.next === 'function') iterator = stream;
+            else {
+                // Keep embedding/test hosts that return one buffered response
+                // usable. The production bridge always returns a host iterator.
+                let delivered = false;
+                iterator = {
+                    async next() {
+                        if (delivered) return { value: undefined, done: true };
+                        delivered = true;
+                        return { value: await stream, done: false };
+                    },
+                    async return() { delivered = true; return { value: undefined, done: true }; },
+                };
+            }
+            if (stopped) { await cancelHost(); throw stopReason; }
+            const first = await next();
+            let head = first.value;
+            if (nodeResponse) {
+                if (first.done || !head || typeof head !== 'object') throw new TypeError('Invalid HTTP response from hostcall');
+                // Buffered embedding hosts historically accept statusCode,
+                // a missing status (200), and data as the text-body alias.
+                head = { ...head, status: head.status || head.statusCode || 200 };
+                if (head.body === undefined && head.data !== undefined) head.body = head.data;
+            }
+            if (first.done || !head || !Number.isFinite(Number(head.status))) throw new TypeError('HTTP stream ended before response headers');
+            let initialBytes = chunkBytes(head);
+            const responseBody = new globalThis.ReadableStream({
+                start(value) { controller = value; },
+                async pull(value) {
+                    try {
+                        if (initialBytes !== null) {
+                            const bytes = initialBytes;
+                            initialBytes = null;
+                            if (bytes.byteLength > 0) { value.enqueue(bytes); return; }
+                        }
+                        while (true) {
+                            const result = await next();
+                            if (result.done) { ended = true; cleanup(); value.close(); return; }
+                            const bytes = chunkBytes(result.value);
+                            if (bytes !== null && bytes.byteLength > 0) { value.enqueue(bytes); return; }
+                        }
+                    } catch (error) { stop(error); value.error(error); }
+                },
+                cancel(reason) {
+                    stop(reason === undefined ? __pi_fetch_abort_error() : reason);
+                    return cancelHost();
+                },
+            });
+            return new Response(responseBody, { status: Number(head.status), headers: head.headers || {}, url });
+        } catch (error) {
+            stop(error);
+            throw error;
+        }
     };
+    globalThis.fetch = (input, init) => __pi_fetch(input, init);
+    globalThis.__pi_fetch_for_node_http = (input, init) => __pi_fetch(input, init, true);
 }
-";
+
+// Tool invocation lifetime is separate from extension ownership. In particular,
+// a timer or persistent subprocess owned by the same extension is not implicitly
+// cancelled with a tool. Consumers use the supplied signal to stop their work.
+// Capture controller and collection intrinsics only after the fetch/abort
+// polyfills exist, before any extension can replace their public methods.
+const __pi_tool_invocation_runtime = (() => {
+    const active = new Map();
+    const getActive = Function.call.bind(Map.prototype.get);
+    const setActive = Function.call.bind(Map.prototype.set);
+    const deleteActive = Function.call.bind(Map.prototype.delete);
+    const forEachActive = Function.call.bind(Map.prototype.forEach);
+    const Controller = globalThis.AbortController;
+    const abort = Function.call.bind(Controller.prototype.abort);
+    const stringify = JSON.stringify;
+    const isArray = Array.isArray;
+    const createObject = Object.create;
+    const maxUpdateUnits = 1024 * 1024;
+
+    function ownsActive(token, state) {
+        return state.active && getActive(active, token) === state &&
+            __pi_get_current_extension_id() === state.owner;
+    }
+
+    function start(token, owner, sink) {
+        if (typeof token !== 'string' || token.length === 0 || token.length > 200) {
+            throw new TypeError('Tool invocation requires a host-assigned token');
+        }
+        if (getActive(active, token)) {
+            throw new Error('Tool invocation token is already active');
+        }
+        if (sink !== undefined && sink !== null && typeof sink !== 'function') {
+            throw new TypeError('Invalid native tool update callback');
+        }
+        const controller = new Controller();
+        const state = {
+            owner, controller, signal: controller.signal,
+            active: true, sink: typeof sink === 'function' ? sink : null,
+            onUpdate: undefined,
+        };
+        if (state.sink) {
+            state.onUpdate = (update) => {
+                if (!ownsActive(token, state) || !state.sink) return;
+                try {
+                    if (!update || typeof update !== 'object' || isArray(update)) return;
+                    const content = update.content;
+                    if (!isArray(content)) return;
+                    const details = update.details;
+                    const snapshot = createObject(null);
+                    snapshot.content = content;
+                    snapshot.details = details === undefined ? null : details;
+                    const encoded = stringify(snapshot);
+                    if (typeof encoded !== 'string' || encoded.length > maxUpdateUnits) return;
+                    // Getters/toJSON may run guest code during serialization.
+                    // Recheck lifetime and owner before crossing the boundary.
+                    if (ownsActive(token, state) && state.sink) state.sink(encoded);
+                } catch (_) {
+                    // Invalid or oversized progress is advisory. The native
+                    // sink independently validates bytes, shape and lifetime.
+                }
+            };
+        }
+        setActive(active, token, state);
+        return state;
+    }
+
+    function cancel(token) {
+        const state = getActive(active, token);
+        if (!state || !state.active) return false;
+        // Abort listeners must not be able to publish another progress update,
+        // and a retained callback must not retain the native mailbox after close.
+        state.active = false;
+        state.sink = null;
+        __pi_with_extension_sync(state.owner, () => abort(state.controller));
+        return true;
+    }
+
+    function finish(token, expected) {
+        const state = getActive(active, token);
+        if (!state || (expected !== undefined && state !== expected)) return false;
+        state.active = false;
+        state.sink = null;
+        deleteActive(active, token);
+        return true;
+    }
+
+    return Object.freeze({
+        start, cancel, finish,
+        count: () => __pi_map_size_primordial(active),
+        reset() {
+            forEachActive(active, (_state, token) => {
+                try { cancel(token); } catch (_) {}
+                finally { finish(token); }
+            });
+            __pi_map_clear_primordial(active);
+        },
+    });
+})();
+
+const __pi_export_privileged = (name, fn, forwardSecret = false) => {
+    Object.defineProperty(globalThis, name, {
+        value: (secret, ...args) => {
+            __pi_require_bridge_secret(secret);
+            return forwardSecret ? fn(secret, ...args) : fn(...args);
+        },
+        writable: false,
+        configurable: false,
+        enumerable: false,
+    });
+};
+
+__pi_export_privileged(
+    '__pi_reset_extension_runtime_state',
+    __pi_reset_extension_runtime_state,
+    true,
+);
+
+for (const [name, fn] of Object.entries({
+    __pi_runtime_registry_snapshot,
+    __pi_get_registered_tools,
+    __pi_complete_hostcall,
+    __pi_fire_timer,
+    __pi_dispatch_event,
+    __pi_snapshot_extensions,
+    __pi_count_event_handlers,
+    __pi_dispatch_extension_event,
+    __pi_dispatch_extension_event_phase,
+    __pi_event_batch_context_create,
+    __pi_event_batch_context_delete,
+    __pi_dispatch_extension_event_phase_in_batch,
+    __pi_dispatch_extension_events_batch,
+    __pi_task_start,
+    __pi_task_poll,
+    __pi_task_take,
+    __pi_set_flag_value,
+    __pi_register_mcp_server_for_extension,
+    __pi_load_extension,
+    __pi_execute_tool,
+    __pi_cancel_tool_invocation,
+    __pi_finish_tool_invocation,
+    __pi_execute_command,
+    __pi_execute_shortcut,
+    __pi_provider_stream_simple_start,
+    __pi_virtual_http_start,
+    __pi_provider_stream_simple_next,
+    __pi_provider_stream_simple_cancel,
+    // These controls are exclusively for host-side lifecycle orchestration and
+    // runtime self-tests. They remain secret-authenticated like every other
+    // bridge export; extension code never receives the bridge secret.
+    __pi_begin_extension,
+    __pi_end_extension,
+    __pi_with_extension_async,
+    __pi_validate_tool_input,
+    __pi_make_extension_ui,
+    __pi_register_timer,
+    __pi_add_event_listener,
+})) {
+    __pi_export_privileged(name, fn);
+}
+
+Object.defineProperty(globalThis, '__pi_get_current_extension_id', {
+    value: __pi_get_current_extension_id,
+    writable: false,
+    configurable: false,
+    enumerable: false,
+});
+
+// Public module adapter: every call still crosses the native capability and
+// enabled-tool gates. No privileged lifecycle operation is exposed here.
+Object.defineProperty(globalThis, '__pi_builtin_tool_hostcall', {
+    value: __pi_builtin_tool_hostcall,
+    writable: false,
+    configurable: false,
+    enumerable: false,
+});
+
+for (const name of Object.getOwnPropertyNames(globalThis)) {
+    if (!name.startsWith('__pi_')) continue;
+    const descriptor = Object.getOwnPropertyDescriptor(globalThis, name);
+    if (!descriptor || !Object.prototype.hasOwnProperty.call(descriptor, 'value')) continue;
+    try {
+        Object.defineProperty(globalThis, name, {
+            value: descriptor.value,
+            writable: false,
+            configurable: false,
+            enumerable: descriptor.enumerable,
+        });
+    } catch (_) {}
+}
+})();
+")
+        ]
+        .concat()
+    })
+}
 
 #[cfg(test)]
 #[allow(clippy::future_not_send)]
 mod tests {
     use super::*;
+    use crate::extensions::SessionActionOriginSource;
     use crate::scheduler::DeterministicClock;
     use serde_json::json;
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        hex_lower(&Sha256::digest(bytes))
+    }
+
+    /// gh #238: QuickJS stores integers above `i32` as float64. `js_to_json`
+    /// used to surface the storage tag, so a `Date.now()` timestamp became
+    /// `2147483648.0` and every `i64` field on the Rust side rejected it.
+    #[test]
+    fn js_to_json_renders_integral_floats_as_json_integers() {
+        /// The field shape that failed in the wild: an `i64` timestamp.
+        #[derive(serde::Deserialize)]
+        struct Stamped {
+            timestamp: i64,
+        }
+
+        let runtime = rquickjs::Runtime::new().expect("quickjs runtime");
+        let context = rquickjs::Context::full(&runtime).expect("quickjs context");
+        let converted = context.with(|ctx| {
+            let value: Value<'_> = ctx
+                .eval(
+                    r"({
+                        i32Max: 2147483647,
+                        i32MaxPlusOne: 2147483648,
+                        negative: -2147483649,
+                        epochMs: 1758556800123,
+                        maxSafe: 9007199254740991,
+                        beyondSafe: 9007199254740992,
+                        fraction: 1.5,
+                        negZero: -0,
+                        inf: Infinity,
+                        nan: NaN,
+                        nested: [4294967296, { ts: 3000000000 }],
+                    })",
+                )
+                .expect("eval literal");
+            js_to_json(&value).expect("convert")
+        });
+
+        assert_eq!(converted["i32Max"], json!(2_147_483_647_i64));
+        assert!(converted["i32MaxPlusOne"].is_i64(), "{converted}");
+        assert_eq!(converted["i32MaxPlusOne"], json!(2_147_483_648_i64));
+        assert_eq!(converted["negative"], json!(-2_147_483_649_i64));
+        assert!(converted["epochMs"].is_i64(), "{converted}");
+        assert_eq!(converted["epochMs"], json!(1_758_556_800_123_i64));
+        assert_eq!(converted["maxSafe"], json!(9_007_199_254_740_991_i64));
+        // Past 2^53 integers are no longer exact; keep the float rendering.
+        assert!(converted["beyondSafe"].is_f64(), "{converted}");
+        assert_eq!(converted["fraction"], json!(1.5));
+        assert_eq!(converted["negZero"], json!(0_i64));
+        assert!(converted["inf"].is_null(), "{converted}");
+        assert!(converted["nan"].is_null(), "{converted}");
+        assert_eq!(converted["nested"][0], json!(4_294_967_296_i64));
+        assert_eq!(converted["nested"][1]["ts"], json!(3_000_000_000_i64));
+
+        let stamped: Stamped = serde_json::from_value(json!({ "timestamp": converted["epochMs"] }))
+            .expect("integral float deserializes as i64");
+        assert_eq!(stamped.timestamp, 1_758_556_800_123);
+    }
+
+    /// Receipt name for `pi_bridge_js()`, which is not a virtual module.
+    const BRIDGE_RECEIPT: &str = "<bridge>";
+
+    /// Golden receipts for the compile-time-compressed JavaScript sources:
+    /// `(name, byte length, SHA-256 of the decompressed source)`.
+    ///
+    /// `compressed_js_literal!` LZSS-compresses each source literal at compile
+    /// time and `lzss_decompress` restores it on first use. Decompression
+    /// already enforces the *length* — `RAW_LEN` is derived from the same
+    /// literal, and a mismatch is a hard error — so the byte counts here
+    /// cannot catch a codec bug on their own. The SHA-256 is the assertion
+    /// that can: it is the only thing standing between a codec that decodes
+    /// the right number of wrong bytes and a silently corrupted bridge. The
+    /// lengths ride along because they turn "hash drift" into a readable
+    /// delta.
+    ///
+    /// The receipts are therefore change detectors: any deliberate edit to the
+    /// bridge or to a virtual module moves them and has to re-pin them in the
+    /// same commit. On drift the test prints the complete regenerated table,
+    /// so re-pinning is one copy-paste instead of one test run per receipt.
+    ///
+    /// Re-pinned 2026-09-09 (bridge): only `<bridge>` moved, 202_987 ->
+    /// 205_065 (+2_078 bytes, sha `fdfa107d…` -> `992b7def…`). `e0ce03b0d`
+    /// ("fix(extensions): chain `before_provider_request` handlers in load
+    /// order", gh #219) added a 35-line chaining branch to the bridge source
+    /// and changed nothing else: `git show e0ce03b0d -- src/extensions_js.rs`
+    /// adds exactly 2_078 bytes and removes none, which accounts for the whole
+    /// delta. Every virtual-module receipt is unchanged. The pin before this
+    /// one rotted the same way, so this drift is bridge edits landing without
+    /// the receipt update, not bundle corruption.
+    ///
+    /// Re-pinned 2026-09-09 (pi-coding-agent): only
+    /// `@mariozechner/pi-coding-agent` moved, 25_208 -> 27_280 (+2_072 bytes,
+    /// sha `f74b473e…` -> `61463384…`), from adding the `DefaultPackageManager`
+    /// shim export that gh #223 hits. Re-pinned in the same commit as the edit,
+    /// which is what this table exists to force.
+    ///
+    /// Re-pinned 2026-10-12 (bridge): only `<bridge>` moved, 204_644 ->
+    /// 204_796 (+152 bytes, sha `604f528a…` -> `68c0c0e6…`). The
+    /// `AbortSignal` polyfill now gives a reasonless abort an `AbortError`
+    /// (Web semantics), which `ctx.compact()` pre-abort rejection relies on.
+    ///
+    /// Re-pinned 2026-10-20 for gh #270: the bridge adds cancellation-aware
+    /// streaming fetch and owned virtual HTTP routes (+30_379 bytes), and
+    /// node:stream adds bounded Web-reader backpressure and iterator cleanup
+    /// (+3_271 bytes). These are deliberate source edits, covered by the
+    /// fetch, deferred HTTP, and virtual_http_server regression cases.
+    /// Follow-up for gh #270: only `<bridge>` moved, 235_175 -> 235_066
+    /// (-109 bytes). URL construction now delegates to the pure host parser,
+    /// provider routes retain their owned origin across listener restarts,
+    /// and provider/model compatibility and thinking metadata are preserved.
+    /// URL resolution, route ownership, and native provider regressions cover
+    /// these changes; every virtual-module receipt remains unchanged.
+    ///
+    /// Re-pinned 2026-11-01 for gh #279: the tool-result transform branch
+    /// adds 2_602 bytes. Existing drift since the 237_923-byte receipt is
+    /// accounted for by d9999a5f (+363, footer/header factories), 27e9d778
+    /// (+1_177, environment/executable facade), and 70110103 (+5_689,
+    /// context transforms and timer lifecycle): 245_152 -> 247_754 bytes.
+    ///
+    /// Grapheme rendering for gh #279 adds 2_688 bridge bytes: 247_754 ->
+    /// 250_442. The native boundary callback replaces recursive iteration
+    /// and code-point splitting; published-renderer regressions cover the
+    /// deliberate source change. The filesystem module is trimmed before
+    /// this receipt: pre-config main already contained 64_141 bytes, and
+    /// 7684b1a adds 470 for typed configuration errors, yielding 64_611.
+    /// Other pre-existing module receipt drift is not re-pinned here.
+    ///
+    /// Request-scoped context usage for gh #279 adds 1_070 bytes to the
+    /// second bridge literal: 250_442 -> 251_512. It projects host usage
+    /// into a synchronous getter without caching it across dispatches.
+    /// Published compression and native snapshot regressions cover this edit.
+    ///
+    /// Invocation-scoped tool progress and cancellation add 5_172 bytes:
+    /// 251_512 -> 256_684 (+144 inventory/reset, +635 tool dispatch,
+    /// +4_393 private lifetime controls). The pinned real-subagent source
+    /// diagnostic and native lifecycle regressions cover these edits.
+    ///
+    /// Native tool factory delegation adds 1_640 bridge bytes (259_969 ->
+    /// 261_609) and 1_832 trimmed coding-agent module bytes (29_584 -> 31_416).
+    /// These baselines include earlier source drift from the prior receipts;
+    /// only the two sources changed by this feature are re-pinned here.
+    const JS_SOURCE_RECEIPTS: &[(&str, usize, &str)] = &[
+        (
+            BRIDGE_RECEIPT,
+            261_609,
+            "fc46d7ab3f31ba0d1fdacebb34dcbdf2e52c32a3220b53150c7ff52b5b72ce2d",
+        ),
+        (
+            "node:fs",
+            64_611,
+            "00009b3d960524a1c9d37f6fd8e2a014d29520a06fa3b1283f607db8dc068151",
+        ),
+        (
+            "@mariozechner/pi-ai",
+            24_612,
+            "33423d306e358a879c8b9e763dfc7e9fddf628ea275855aa2a89d1e52411547a",
+        ),
+        (
+            "node:child_process",
+            20_034,
+            "4c32a5b1b6fbf1754d7b3f6baf6a6bb67532ad42c20c7a942ea8c73a6f4a3908",
+        ),
+        (
+            "node:stream",
+            21_108,
+            "b35c1978b8bb6c50571e4b4c31f12582380a1b024d3dfe0ac918681ee65e882a",
+        ),
+        // Re-pinned with native tool factory execution.
+        (
+            "@mariozechner/pi-coding-agent",
+            31_416,
+            "7b445ed9b02ea58abd24b614b5f3a0a1d48fb2f10929975bd07eefc2d81b2550",
+        ),
+        (
+            "@mariozechner/pi-tui",
+            8_395,
+            "e51cefc340ec148e6202c7cf8f57b429a34357559c504130e962a5c947f36a84",
+        ),
+        (
+            "typebox/compile",
+            8_189,
+            "a4b25b282d3a8d4dea5b22a12cb790975691a3202390827385680c2d9000652e",
+        ),
+        (
+            "node:module",
+            7_418,
+            "0f16b8ba098a98bf96d6ef19ff1222a7e29a820211ed7703a925157066144fd7",
+        ),
+        (
+            "jsonwebtoken",
+            6_806,
+            "ff82b2f65aace15593451d8dfa3e25e06131d7016bbf02b6bba5a8fa593fd80b",
+        ),
+        (
+            "node:net",
+            5_894,
+            "9fb7d79bf0118d8c57bbc8ac41fa1b99ce6bf6fcea05f71c20e068fe2eae49cd",
+        ),
+        (
+            "node:url",
+            5_637,
+            "c4b419ff37056fa9abdb446d0497e70841ba4df7572e8bbe80ada580cebf650c",
+        ),
+    ];
+
+    /// Render a byte length the way `JS_SOURCE_RECEIPTS` spells it, so the
+    /// table the test prints on drift is a literal copy-paste.
+    fn grouped_digits(value: usize) -> String {
+        let digits = value.to_string();
+        let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+        for (index, digit) in digits.char_indices() {
+            if index > 0 && (digits.len() - index).is_multiple_of(3) {
+                out.push('_');
+            }
+            out.push(digit);
+        }
+        out
+    }
+
+    /// Every embedded JavaScript source must decompress to exactly the bytes
+    /// pinned in [`JS_SOURCE_RECEIPTS`]; see that constant for what the
+    /// receipts do and do not prove, and how to re-pin them.
+    #[test]
+    fn compressed_javascript_sources_preserve_exact_bytes() {
+        let bridge = pi_bridge_js();
+        let modules = default_virtual_modules();
+
+        let mut regenerated = Vec::with_capacity(JS_SOURCE_RECEIPTS.len());
+        let mut drift = Vec::new();
+        for &(name, expected_len, expected_sha256) in JS_SOURCE_RECEIPTS {
+            let source: &str = if name == BRIDGE_RECEIPT {
+                bridge
+            } else {
+                modules
+                    .get(name)
+                    .unwrap_or_else(|| panic!("receipt module {name} must exist"))
+                    .as_str()
+            };
+            let len = source.len();
+            let sha256 = sha256_hex(source.as_bytes());
+            let name_literal = if name == BRIDGE_RECEIPT {
+                "BRIDGE_RECEIPT".to_string()
+            } else {
+                format!("{name:?}")
+            };
+            regenerated.push(format!(
+                "        (\n            {name_literal},\n            {},\n            {sha256:?},\n        ),",
+                grouped_digits(len)
+            ));
+            if len != expected_len || sha256 != expected_sha256 {
+                drift.push(format!(
+                    "  {name}: len {expected_len} -> {len}, sha256 {expected_sha256} -> {sha256}"
+                ));
+            }
+        }
+
+        let regenerated = regenerated.join("\n");
+        eprintln!("PiJS source receipts:\n{regenerated}");
+        assert!(
+            drift.is_empty(),
+            "compressed JavaScript source receipts drifted:\n{}\n\n\
+             If the JavaScript really did change, review that diff and re-pin \
+             JS_SOURCE_RECEIPTS to:\n{regenerated}",
+            drift.join("\n")
+        );
+    }
+
+    #[test]
+    fn per_runtime_compat_scan_flag_overrides_global_default() {
+        let disabled = HashMap::from([("PI_EXT_COMPAT_SCAN".to_string(), "0".to_string())]);
+        assert!(!is_compat_scan_mode(&disabled));
+
+        let enabled = HashMap::from([("PI_EXT_COMPAT_SCAN".to_string(), "1".to_string())]);
+        assert!(is_compat_scan_mode(&enabled));
+    }
 
     #[allow(clippy::future_not_send)]
     async fn get_global_json<C: SchedulerClock + 'static>(
@@ -22611,16 +28629,29 @@ mod tests {
         runtime: &PiJsRuntime<C>,
         name: &str,
     ) -> serde_json::Value {
+        let bridge_secret = runtime.bridge_secret().to_string();
         runtime
             .context
             .with(|ctx| {
                 let global = ctx.globals();
                 let function: Function<'_> = global.get(name)?;
-                let value: Value<'_> = function.call(())?;
+                let value: Value<'_> = function.call((bridge_secret.as_str(),))?;
                 js_to_json(&value)
             })
             .await
             .expect("js context")
+    }
+
+    fn privileged_test_script<C: SchedulerClock + 'static>(
+        runtime: &PiJsRuntime<C>,
+        source: &str,
+    ) -> String {
+        let bridge_secret = serde_json::to_string(runtime.bridge_secret())
+            .expect("serialize bridge secret for test script");
+        // Keep the capability token lexical to this host-authored eval. A
+        // test may register callbacks or promises that retain it, but later
+        // extension evals cannot discover it on the QuickJS global object.
+        format!("(() => {{ const __pi_test_secret = {bridge_secret};\n{source}\n}})();")
     }
 
     #[allow(clippy::future_not_send)]
@@ -22670,6 +28701,1434 @@ mod tests {
         }
     }
 
+    #[test]
+    fn extension_context_usage_is_a_fresh_request_snapshot() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+            runtime
+                .eval(&privileged_test_script(
+                    &runtime,
+                    r#"
+                    __pi_begin_extension(__pi_test_secret, "ext.usage", {name: "ext.usage"});
+                    globalThis.usageProbe = { captures: [] };
+                    pi.on("context", (_event, ctx) => {
+                        const value = ctx.getContextUsage();
+                        globalThis.usageProbe.captures.push(value === undefined ? "unknown" : value);
+                        if (value !== undefined) {
+                            value.tokens = -1;
+                            value.contextWindow = 1;
+                            globalThis.usageProbe.captures.push(ctx.getContextUsage());
+                        }
+                    });
+                    __pi_end_extension(__pi_test_secret);
+                    const dispatch = (payload) => __pi_dispatch_extension_event(
+                        __pi_test_secret, "context", {messages: [], contextUsage: {tokens: 99}}, payload
+                    );
+                    dispatch({contextUsage: {tokens: 60000, contextWindow: 200000, percent: 999, secret: "hidden"}})
+                        .then(() => dispatch({contextUsage: {tokens: null, contextWindow: 100000}}))
+                        .then(() => dispatch({contextUsage: {tokens: 150, contextWindow: 100}}))
+                        .then(() => dispatch({contextUsage: {tokens: 1, contextWindow: 0}}))
+                        .then(() => dispatch({contextUsage: {tokens: -1, contextWindow: 100}}))
+                        .then(() => dispatch({contextUsage: {tokens: "1", contextWindow: 100}}))
+                        .then(() => dispatch({sessionState: {sessionId: "other-session"}}))
+                        .then(() => dispatch({}))
+                        .catch((error) => { globalThis.usageProbe.error = String(error); })
+                        .finally(() => { globalThis.usageProbe.done = true; });
+                    "#,
+                ))
+                .await
+                .expect("dispatch context usage snapshots");
+            drain_until_idle(&runtime, &clock).await;
+            let probe = get_global_json(&runtime, "usageProbe").await;
+            assert_eq!(probe["done"], json!(true), "{probe}");
+            assert_eq!(probe["error"], serde_json::Value::Null, "{probe}");
+            let captures = probe["captures"].as_array().expect("usage captures");
+            assert_eq!(captures.len(), 11);
+            assert_eq!(
+                captures[1],
+                json!({"tokens": 60000, "contextWindow": 200000, "percent": 30})
+            );
+            assert_eq!(
+                captures[3],
+                json!({"tokens": null, "contextWindow": 100000, "percent": null})
+            );
+            assert_eq!(
+                captures[5],
+                json!({"tokens": 150, "contextWindow": 100, "percent": 150})
+            );
+            for value in &captures[6..] {
+                assert_eq!(value, "unknown");
+            }
+        });
+    }
+
+    // ── gh #167 extension-API parity: ctx.model / getSystemPrompt /
+    //    sessionManager identity / compact() refusal ─────────────────────
+
+    const CTX_PARITY_EXTENSION_REGISTRATION: &str = r#"
+        __pi_begin_extension(__pi_test_secret, "ext.ctx-parity", { name: "ext.ctx-parity" });
+        globalThis.ctxParity = { captures: [] };
+        pi.on("agent_start", async (_ev, ctx) => {
+            globalThis.ctxParity.captures.push({
+                model: ctx.model === undefined ? "undefined" : ctx.model,
+                systemPrompt: ctx.getSystemPrompt(),
+                sessionId: ctx.sessionManager.getSessionId(),
+                sessionFile: ctx.sessionManager.getSessionFile(),
+                sessionDir: ctx.sessionManager.getSessionDir(),
+            });
+        });
+        pi.on("before_agent_start", async (ev, ctx) => {
+            globalThis.ctxParity.promptDuringHandler = ctx.getSystemPrompt();
+            return { systemPrompt: ev.systemPrompt + " [amended]" };
+        });
+        __pi_end_extension(__pi_test_secret);
+    "#;
+
+    const CTX_PARITY_DISPATCH_SEQUENCE: &str = r"
+        const persistedPayload = {
+            hasUI: false,
+            cwd: '/workspace',
+            sessionState: {
+                model: {
+                    provider: 'anthropic',
+                    id: 'claude-4',
+                    name: 'Claude 4',
+                    api: 'anthropic-messages',
+                    reasoning: true,
+                    contextWindow: 200000,
+                    maxTokens: 64000,
+                },
+                sessionId: 'sess-persisted',
+                sessionFile: '/tmp/pi/sessions/2026_sess-persisted.jsonl',
+            },
+        };
+        const inMemoryPayload = {
+            hasUI: false,
+            cwd: '/workspace',
+            sessionState: {
+                model: { provider: 'openai', id: 'gpt-5' },
+                sessionId: 'sess-memory',
+                sessionFile: null,
+            },
+        };
+        globalThis.ctxParity.done = false;
+        __pi_dispatch_extension_event(__pi_test_secret, 'agent_start', {}, persistedPayload)
+            .then(() => __pi_dispatch_extension_event(
+                __pi_test_secret,
+                'before_agent_start',
+                { prompt: 'hello', systemPrompt: 'You are Pi.' },
+                persistedPayload,
+            ))
+            .then((outcome) => { globalThis.ctxParity.beforeAgentStartOutcome = outcome; })
+            .then(() => __pi_dispatch_extension_event(__pi_test_secret, 'agent_start', {}, inMemoryPayload))
+            .then(() => import('@mariozechner/pi-coding-agent'))
+            .then((mod) => {
+                const live = new mod.SessionManager();
+                globalThis.ctxParity.shimAfterInMemory = {
+                    id: live.getSessionId(),
+                    file: live.getSessionFile(),
+                    dir: live.getSessionDir(),
+                };
+                const detached = mod.SessionManager.inMemory();
+                globalThis.ctxParity.shimDetached = {
+                    id: detached.getSessionId(),
+                    file: detached.getSessionFile(),
+                    dir: detached.getSessionDir(),
+                };
+            })
+            .then(() => __pi_dispatch_extension_event(__pi_test_secret, 'agent_start', {}, persistedPayload))
+            .then(() => import('@mariozechner/pi-coding-agent'))
+            .then((mod) => {
+                const live = new mod.SessionManager();
+                globalThis.ctxParity.shimAfterPersisted = {
+                    id: live.getSessionId(),
+                    file: live.getSessionFile(),
+                    dir: live.getSessionDir(),
+                };
+            })
+            .catch((error) => { globalThis.ctxParity.error = String((error && error.stack) || error); })
+            .finally(() => { globalThis.ctxParity.done = true; });
+    ";
+
+    #[test]
+    fn extension_ctx_exposes_model_system_prompt_and_session_identity() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+
+            runtime
+                .eval(&privileged_test_script(
+                    &runtime,
+                    CTX_PARITY_EXTENSION_REGISTRATION,
+                ))
+                .await
+                .expect("register ctx parity extension");
+            runtime
+                .eval(&privileged_test_script(
+                    &runtime,
+                    CTX_PARITY_DISPATCH_SEQUENCE,
+                ))
+                .await
+                .expect("dispatch ctx parity events");
+            drain_until_idle(&runtime, &clock).await;
+
+            let probe = get_global_json(&runtime, "ctxParity").await;
+            assert_eq!(probe["done"], json!(true), "probe incomplete: {probe}");
+            assert_eq!(probe["error"], serde_json::Value::Null, "probe: {probe}");
+
+            // First agent_start: no system prompt is known yet; model comes
+            // from sessionState; sessionManager mirrors the persisted session.
+            let first = &probe["captures"][0];
+            assert_eq!(first["model"]["id"], json!("claude-4"));
+            assert_eq!(first["model"]["provider"], json!("anthropic"));
+            assert_eq!(first["model"]["api"], json!("anthropic-messages"));
+            assert_eq!(first["model"]["name"], json!("Claude 4"));
+            assert_eq!(first["model"]["contextWindow"], json!(200_000));
+            assert_eq!(first["model"]["maxTokens"], json!(64_000));
+            assert_eq!(first["model"]["reasoning"], json!(true));
+            assert_eq!(first["systemPrompt"], serde_json::Value::Null);
+            assert_eq!(first["sessionId"], json!("sess-persisted"));
+            assert_eq!(
+                first["sessionFile"],
+                json!("/tmp/pi/sessions/2026_sess-persisted.jsonl")
+            );
+            assert_eq!(first["sessionDir"], json!("/tmp/pi/sessions"));
+
+            // Inside the before_agent_start handler the host-provided prompt
+            // is already visible via ctx.getSystemPrompt().
+            assert_eq!(probe["promptDuringHandler"], json!("You are Pi."));
+            assert_eq!(
+                probe["beforeAgentStartOutcome"]["systemPrompt"],
+                json!("You are Pi. [amended]")
+            );
+
+            // Second agent_start (in-memory session): the amended prompt is
+            // remembered; file/dir are null while the id stays real.
+            let second = &probe["captures"][1];
+            assert_eq!(second["model"]["id"], json!("gpt-5"));
+            assert_eq!(second["systemPrompt"], json!("You are Pi. [amended]"));
+            assert_eq!(second["sessionId"], json!("sess-memory"));
+            assert_eq!(second["sessionFile"], serde_json::Value::Null);
+            assert_eq!(second["sessionDir"], serde_json::Value::Null);
+
+            // SessionManager shim reflects the most recent host session
+            // identity; inMemory() instances always report null.
+            assert_eq!(probe["shimAfterInMemory"]["id"], json!("sess-memory"));
+            assert_eq!(probe["shimAfterInMemory"]["file"], serde_json::Value::Null);
+            assert_eq!(probe["shimAfterInMemory"]["dir"], serde_json::Value::Null);
+            assert_eq!(probe["shimDetached"]["id"], serde_json::Value::Null);
+            assert_eq!(probe["shimDetached"]["file"], serde_json::Value::Null);
+            assert_eq!(probe["shimDetached"]["dir"], serde_json::Value::Null);
+            assert_eq!(probe["shimAfterPersisted"]["id"], json!("sess-persisted"));
+            assert_eq!(
+                probe["shimAfterPersisted"]["file"],
+                json!("/tmp/pi/sessions/2026_sess-persisted.jsonl")
+            );
+            assert_eq!(
+                probe["shimAfterPersisted"]["dir"],
+                json!("/tmp/pi/sessions")
+            );
+        });
+    }
+
+    #[test]
+    fn extension_ctx_prefers_top_level_model_over_session_state() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+
+            runtime
+                .eval(&privileged_test_script(
+                    &runtime,
+                    r#"
+                    __pi_begin_extension(__pi_test_secret, "ext.model-pref", { name: "ext.model-pref" });
+                    globalThis.modelPref = { done: false };
+                    pi.on("agent_start", async (_ev, ctx) => {
+                        globalThis.modelPref.model = ctx.model === undefined ? "undefined" : ctx.model;
+                    });
+                    __pi_end_extension(__pi_test_secret);
+                    "#,
+                ))
+                .await
+                .expect("register model preference extension");
+            runtime
+                .eval(&privileged_test_script(
+                    &runtime,
+                    r"
+                    __pi_dispatch_extension_event(__pi_test_secret, 'agent_start', {}, {
+                        hasUI: false,
+                        cwd: '/workspace',
+                        model: { provider: 'anthropic', id: 'from-payload' },
+                        sessionState: { model: { provider: 'anthropic', id: 'from-state' } },
+                    })
+                        .then(() => __pi_dispatch_extension_event(__pi_test_secret, 'agent_start', {}, {
+                            hasUI: false,
+                            cwd: '/workspace',
+                        }))
+                        .then(() => { globalThis.modelPref.modelAbsent = globalThis.modelPref.model; })
+                        .catch((error) => { globalThis.modelPref.error = String(error); })
+                        .finally(() => { globalThis.modelPref.done = true; });
+                    ",
+                ))
+                .await
+                .expect("dispatch model preference events");
+            drain_until_idle(&runtime, &clock).await;
+
+            let probe = get_global_json(&runtime, "modelPref").await;
+            assert_eq!(probe["done"], json!(true), "probe incomplete: {probe}");
+            assert_eq!(probe["error"], serde_json::Value::Null, "probe: {probe}");
+            // The explicit host payload model wins over sessionState.model;
+            // with neither present, ctx.model is undefined (upstream parity).
+            assert_eq!(probe["modelAbsent"], json!("undefined"));
+        });
+    }
+
+    #[test]
+    fn pi_coding_agent_tool_factories_delegate_all_tools_and_preserve_results() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock)).await.unwrap();
+            runtime.eval(r"
+                globalThis.factoryProbe = { done: false, updates: [] };
+                import('@mariozechner/pi-coding-agent').then(async (mod) => {
+                    const tools = [
+                        ...mod.createReadOnlyTools('/workspace/sub', { read: { autoResizeImages: false } }),
+                        mod.createWriteTool('/workspace/sub'), mod.createEditTool('/workspace/sub'),
+                        mod.createBashTool('/workspace/sub', { commandPrefix: 'export FOO=bar' }),
+                    ];
+                    factoryProbe.names = tools.map((tool) => tool.name);
+                    factoryProbe.values = await Promise.all(tools.map((tool) => tool.execute(
+                        'extension-id', { path: 'file.txt', command: 'printf real', pattern: 'text',
+                            content: 'body', oldText: 'before', newText: 'after' },
+                        undefined, (update) => factoryProbe.updates.push({ name: tool.name, update })
+                    )));
+                }).catch((error) => { factoryProbe.error = String(error); })
+                  .finally(() => { factoryProbe.done = true; });
+            ").await.unwrap();
+            drain_until_idle(&runtime, &clock).await;
+            let requests = runtime.drain_hostcall_requests();
+            assert_eq!(requests.len(), 7);
+            let mut ids = std::collections::HashSet::new();
+            for request in requests {
+                let HostcallKind::BuiltinTool { name } = &request.kind else {
+                    panic!(
+                        "factory used the ordinary override lookup: {:?}",
+                        request.kind
+                    );
+                };
+                assert!(ids.insert(request.call_id.clone()));
+                assert_eq!(request.payload["cwd"], json!("/workspace/sub"));
+                assert_eq!(request.payload["stream"], json!(true));
+                assert_eq!(request.params_for_hash()["builtin"], json!(true));
+                assert_eq!(
+                    request.params_for_hash()["input"]["path"],
+                    json!("file.txt")
+                );
+                match name.as_str() {
+                    "read" => assert_eq!(
+                        request.payload["options"],
+                        json!({"autoResizeImages":false})
+                    ),
+                    "bash" => assert_eq!(
+                        request.payload["options"],
+                        json!({"commandPrefix":"export FOO=bar"})
+                    ),
+                    _ => assert_eq!(request.payload["options"], json!({})),
+                }
+                runtime.complete_hostcall(&request.call_id, HostcallOutcome::StreamChunk {
+                    sequence: 0,
+                    chunk: json!({"content":[{"type":"text", "text":"progress"}], "details":{"partial":true}}),
+                    is_final: false,
+                });
+                runtime.complete_hostcall(
+                    request.call_id,
+                    HostcallOutcome::Success(json!({
+                        "content":[{"type":"text", "text":format!("executed {name}")}],
+                        "details":{"native":true}, "isError":name == "bash",
+                    })),
+                );
+            }
+            drain_until_idle(&runtime, &clock).await;
+            let probe = get_global_json(&runtime, "factoryProbe").await;
+            assert_eq!(probe["done"], json!(true), "{probe}");
+            assert_eq!(probe["error"], serde_json::Value::Null, "{probe}");
+            assert_eq!(
+                probe["names"],
+                json!(["read", "grep", "find", "ls", "write", "edit", "bash"])
+            );
+            assert_eq!(probe["updates"].as_array().unwrap().len(), 7, "{probe}");
+            assert_eq!(
+                probe["values"][0]["content"][0]["text"],
+                json!("executed read")
+            );
+            assert_eq!(probe["values"][6]["isError"], json!(true));
+            assert_eq!(probe["values"][6]["details"]["native"], json!(true));
+        });
+    }
+
+    #[test]
+    fn pi_coding_agent_tool_factories_reject_unsupported_options_and_pre_abort() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock)).await.unwrap();
+            runtime.eval(r"
+                globalThis.factoryProbe = { done: false, errors: [] };
+                import('@mariozechner/pi-coding-agent').then(async (mod) => {
+                    for (const create of [
+                        () => mod.createReadTool('/workspace', { operations: {} }),
+                        () => mod.createWriteTool('/workspace', { operations: {} }),
+                        () => mod.createEditTool('/workspace', { operations: {} }),
+                        () => mod.createBashTool('/workspace', { spawnHook() {} }),
+                        () => mod.createReadTool('/workspace', { autoResizeImages: 'false' }),
+                    ]) {
+                        try { create(); factoryProbe.errors.push('accepted'); }
+                        catch (error) { factoryProbe.errors.push(String(error)); }
+                    }
+                    try {
+                        await mod.createWriteTool('/workspace').execute('pre-abort',
+                            { path: 'must-not-exist', content: 'no' }, AbortSignal.abort('stopped'));
+                    } catch (error) { factoryProbe.aborted = error; }
+                }).catch((error) => { factoryProbe.error = String(error); })
+                  .finally(() => { factoryProbe.done = true; });
+            ").await.unwrap();
+            drain_until_idle(&runtime, &clock).await;
+            assert!(runtime.drain_hostcall_requests().is_empty());
+            let probe = get_global_json(&runtime, "factoryProbe").await;
+            assert_eq!(probe["done"], json!(true), "{probe}");
+            assert_eq!(probe["aborted"], json!("stopped"), "{probe}");
+            assert_eq!(probe["error"], serde_json::Value::Null, "{probe}");
+            assert_eq!(probe["errors"].as_array().unwrap().len(), 5);
+            assert!(
+                probe["errors"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|error| { error.as_str().unwrap().starts_with("TypeError:") }),
+                "{probe}"
+            );
+        });
+    }
+
+    #[test]
+    fn pi_coding_agent_tool_factory_abort_retires_host_work_and_progress() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock)).await.unwrap();
+            runtime
+                .eval(
+                    r"
+                globalThis.factoryProbe = { done: false, updates: [] };
+                globalThis.factoryAbort = new AbortController();
+                import('@mariozechner/pi-coding-agent').then((mod) =>
+                    mod.createBashTool('/workspace').execute('cancelled', { command: 'slow' },
+                        factoryAbort.signal, (update) => factoryProbe.updates.push(update)))
+                  .then(() => { factoryProbe.resolved = true; })
+                  .catch((error) => { factoryProbe.error = String(error); })
+                  .finally(() => { factoryProbe.done = true; });
+            ",
+                )
+                .await
+                .unwrap();
+            drain_until_idle(&runtime, &clock).await;
+            let request = runtime.drain_hostcall_requests().pop_front().unwrap();
+            runtime.complete_hostcall(
+                &request.call_id,
+                HostcallOutcome::StreamChunk {
+                    sequence: 0,
+                    chunk: json!({"content":[], "details":{"before":true}}),
+                    is_final: false,
+                },
+            );
+            drain_until_idle(&runtime, &clock).await;
+            runtime
+                .eval("factoryAbort.abort('caller stopped');")
+                .await
+                .unwrap();
+            drain_until_idle(&runtime, &clock).await;
+            assert!(!runtime.is_hostcall_active(&request.call_id));
+            runtime.complete_hostcall(
+                &request.call_id,
+                HostcallOutcome::StreamChunk {
+                    sequence: 1,
+                    chunk: json!({"content":[], "details":{"late":true}}),
+                    is_final: false,
+                },
+            );
+            runtime.complete_hostcall(
+                request.call_id,
+                HostcallOutcome::Success(json!({"content":[]})),
+            );
+            drain_until_idle(&runtime, &clock).await;
+            let probe = get_global_json(&runtime, "factoryProbe").await;
+            assert_eq!(probe["done"], json!(true), "{probe}");
+            assert_eq!(probe["error"], json!("caller stopped"), "{probe}");
+            assert_eq!(probe["resolved"], serde_json::Value::Null);
+            assert_eq!(probe["updates"].as_array().unwrap().len(), 1, "{probe}");
+        });
+    }
+
+    /// gh #178: a signal that has already aborted, in either the options form
+    /// or the current sixth argument, rejects `compact()` with the abort reason
+    /// before any host compaction is requested.
+    #[test]
+    fn pi_coding_agent_compact_rejects_a_pre_aborted_signal_without_host_work() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+
+            runtime
+                .eval(
+                    r"
+                    globalThis.abortProbe = { done: 0, errors: [] };
+                    const record = (promise) => promise
+                        .then(() => { globalThis.abortProbe.errors.push('resolved'); })
+                        .catch((error) => {
+                            globalThis.abortProbe.errors.push(String((error && error.message) || error));
+                        })
+                        .finally(() => { globalThis.abortProbe.done += 1; });
+                    import('@mariozechner/pi-coding-agent').then((mod) => {
+                        const controller = new AbortController();
+                        controller.abort(new Error('stopped by caller'));
+                        record(mod.compact(
+                            { firstKeptEntryId: 'entry-1', tokensBefore: 10 },
+                            { strategy: 'openai-responses-native', request: {}, signal: controller.signal }));
+                        record(mod.compact(
+                            { firstKeptEntryId: 'entry-1', tokensBefore: 10 },
+                            undefined, undefined, undefined, undefined, AbortSignal.abort()));
+                    });
+                    ",
+                )
+                .await
+                .expect("invoke compact with aborted signals");
+
+            for _ in 0..32 {
+                drain_until_idle(&runtime, &clock).await;
+                assert!(
+                    runtime.drain_hostcall_requests().is_empty(),
+                    "an aborted compact() must not reach the host"
+                );
+                let probe = get_global_json(&runtime, "abortProbe").await;
+                if probe["done"] == json!(2) {
+                    break;
+                }
+            }
+            let probe = get_global_json(&runtime, "abortProbe").await;
+            assert_eq!(probe["done"], json!(2), "probe incomplete: {probe}");
+            assert_eq!(
+                probe["errors"],
+                json!(["stopped by caller", "This operation was aborted"]),
+                "probe: {probe}"
+            );
+        });
+    }
+
+    /// The current positional API forwards public model identity, guidance
+    /// and thinking level without trusting model endpoint/header metadata.
+    #[test]
+    fn pi_coding_agent_compact_bridges_to_host_compaction_op() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+
+            runtime
+                .eval(
+                    r"
+                    globalThis.compactProbe = { done: false };
+                    import('@mariozechner/pi-coding-agent')
+                        .then((mod) => mod.compact(
+                            { firstKeptEntryId: 'entry-9', tokensBefore: 4200 },
+                            { provider: 'summary-provider', id: 'summary-model', baseUrl: 'https://untrusted.invalid', headers: { authorization: 'untrusted' } },
+                            undefined,
+                            undefined,
+                            'Preserve decisions',
+                            undefined,
+                            'low',
+                            undefined,
+                            undefined))
+                        .then((value) => { globalThis.compactProbe.value = value; })
+                        .catch((error) => {
+                            globalThis.compactProbe.error = String((error && error.message) || error);
+                        })
+                        .finally(() => { globalThis.compactProbe.done = true; });
+                    ",
+                )
+                .await
+                .expect("invoke compact bridge");
+
+            let mut completed = false;
+            for _ in 0..32 {
+                drain_until_idle(&runtime, &clock).await;
+                let state = get_global_json(&runtime, "compactProbe").await;
+                if state.get("done").and_then(serde_json::Value::as_bool) == Some(true) {
+                    break;
+                }
+                for request in runtime.drain_hostcall_requests() {
+                    let HostcallKind::Events { op } = &request.kind else {
+                        panic!("expected events hostcall, got {:?}", request.kind);
+                    };
+                    assert_eq!(op.as_str(), "compact", "unexpected events op");
+                    assert_eq!(
+                        request.payload["preparation"]["firstKeptEntryId"],
+                        json!("entry-9")
+                    );
+                    assert_eq!(request.payload["preparation"]["tokensBefore"], json!(4200));
+                    assert_eq!(request.payload.get("model"), None);
+                    assert_eq!(request.payload.get("apiKey"), None);
+                    assert_eq!(
+                        request.payload["options"],
+                        json!({
+                            "model": { "provider": "summary-provider", "id": "summary-model" },
+                            "customInstructions": "Preserve decisions",
+                            "thinkingLevel": "low"
+                        })
+                    );
+                    runtime.complete_hostcall(
+                        request.call_id,
+                        HostcallOutcome::Success(json!({
+                            "summary": "bridged summary",
+                            "firstKeptEntryId": "entry-9",
+                            "tokensBefore": 4200,
+                            "details": { "readFiles": [], "modifiedFiles": [] },
+                        })),
+                    );
+                    completed = true;
+                }
+            }
+            assert!(completed, "compact() never issued the compact hostcall");
+
+            drain_until_idle(&runtime, &clock).await;
+            let probe = get_global_json(&runtime, "compactProbe").await;
+            assert_eq!(probe["done"], json!(true), "probe incomplete: {probe}");
+            assert_eq!(probe["error"], serde_json::Value::Null, "probe: {probe}");
+            assert_eq!(probe["value"]["summary"], json!("bridged summary"));
+            assert_eq!(probe["value"]["firstKeptEntryId"], json!("entry-9"));
+            assert_eq!(probe["value"]["tokensBefore"], json!(4200));
+        });
+    }
+
+    #[test]
+    fn pi_coding_agent_compact_rejects_credentials_and_invalid_options_before_host_work() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("runtime");
+            runtime
+                .eval(
+                    r"
+                globalThis.compactInvalid = { done: false, errors: [] };
+                import('@mariozechner/pi-coding-agent').then(async (mod) => {
+                    const preparation = { firstKeptEntryId: 'keep' };
+                    const model = { provider: 'p', id: 'm' };
+                    const calls = [
+                        () => mod.compact(preparation, model, 'caller-key'),
+                        () => mod.compact(preparation, model, undefined, { authorization: 'caller-header' }),
+                        () => mod.compact(preparation, model, undefined, undefined, undefined, undefined, undefined, () => {}),
+                        () => mod.compact(preparation, model, undefined, undefined, undefined, undefined, undefined, undefined, { TOKEN: 'caller-env' }),
+                        () => mod.compact(preparation, { model, headers: {} }),
+                        () => mod.compact(preparation, { model: { id: 'missing-provider' } }),
+                    ];
+                    for (const call of calls) {
+                        try { await call(); compactInvalid.errors.push('resolved'); }
+                        catch (error) { compactInvalid.errors.push(error.name); }
+                    }
+                    compactInvalid.done = true;
+                });
+                    ",
+                )
+                .await
+                .expect("invoke invalid compactions");
+            for _ in 0..32 {
+                drain_until_idle(&runtime, &clock).await;
+                assert!(runtime.drain_hostcall_requests().is_empty());
+                if get_global_json(&runtime, "compactInvalid").await["done"] == json!(true) {
+                    break;
+                }
+            }
+            let probe = get_global_json(&runtime, "compactInvalid").await;
+            assert_eq!(probe["done"], json!(true), "probe: {probe}");
+            assert_eq!(
+                probe["errors"],
+                json!([
+                    "TypeError",
+                    "TypeError",
+                    "TypeError",
+                    "TypeError",
+                    "TypeError",
+                    "TypeError"
+                ])
+            );
+        });
+    }
+
+    #[test]
+    fn extension_context_compact_forwards_options_and_checks_pre_abort() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("runtime");
+            runtime
+                .eval(&privileged_test_script(
+                    &runtime,
+                    r"
+                __pi_begin_extension(__pi_test_secret, 'ext.compact-options', { name: 'ext.compact-options' });
+                globalThis.ctxCompactProbe = { done: false };
+                pi.on('session_before_compact', async (event, ctx) => {
+                    try { await ctx.compact(event.preparation, { signal: AbortSignal.abort() }); }
+                    catch (error) { ctxCompactProbe.aborted = error.name; }
+                    ctxCompactProbe.result = await ctx.compact(event.preparation, {
+                        model: { provider: 'p', id: 'm' },
+                        customInstructions: 'Keep open blockers',
+                        thinkingLevel: 'medium',
+                    });
+                });
+                __pi_end_extension(__pi_test_secret);
+                __pi_dispatch_extension_event(__pi_test_secret, 'session_before_compact', {
+                    preparation: { firstKeptEntryId: 'keep', tokensBefore: 1234 },
+                }, { hasUI: false, cwd: '/workspace' })
+                    .catch((error) => { ctxCompactProbe.error = String(error); })
+                    .finally(() => { ctxCompactProbe.done = true; });
+                    ",
+                ))
+                .await
+                .expect("dispatch compaction extension");
+            let mut calls = 0;
+            for _ in 0..32 {
+                drain_until_idle(&runtime, &clock).await;
+                for request in runtime.drain_hostcall_requests() {
+                    assert!(
+                        matches!(&request.kind, HostcallKind::Events { op } if op == "compact")
+                    );
+                    calls += 1;
+                    assert_eq!(
+                        request.payload["options"],
+                        json!({
+                            "model": { "provider": "p", "id": "m" },
+                            "customInstructions": "Keep open blockers",
+                            "thinkingLevel": "medium"
+                        })
+                    );
+                    runtime.complete_hostcall(
+                        request.call_id,
+                        HostcallOutcome::Success(json!({ "summary": "ctx summary" })),
+                    );
+                }
+                if get_global_json(&runtime, "ctxCompactProbe").await["done"] == json!(true) {
+                    break;
+                }
+            }
+            let probe = get_global_json(&runtime, "ctxCompactProbe").await;
+            assert_eq!(calls, 1, "pre-aborted context call must not reach the host");
+            assert_eq!(probe["done"], json!(true), "probe: {probe}");
+            assert_eq!(probe["aborted"], json!("AbortError"));
+            assert_eq!(probe["result"]["summary"], json!("ctx summary"));
+            assert_eq!(probe["error"], serde_json::Value::Null);
+        });
+    }
+
+    /// gh #167: `compact(preparation, { strategy: "openai-responses-native",
+    /// request })` bridges strategy + extension-composed request to the host
+    /// compact op (still never a model/apiKey) and resolves with the bridged
+    /// native result shape.
+    #[test]
+    fn pi_coding_agent_compact_native_strategy_bridges_request() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+
+            runtime
+                .eval(
+                    r"
+                    globalThis.compactProbe = { done: false };
+                    import('@mariozechner/pi-coding-agent')
+                        .then((mod) => mod.compact(
+                            { firstKeptEntryId: 'entry-3', tokensBefore: 9000 },
+                            {
+                                strategy: 'openai-responses-native',
+                                request: {
+                                    model: 'gpt-5.2-codex',
+                                    instructions: 'compact this',
+                                    input: [{ type: 'message', role: 'user', content: [] }],
+                                },
+                            }))
+                        .then((value) => { globalThis.compactProbe.value = value; })
+                        .catch((error) => {
+                            globalThis.compactProbe.error = String((error && error.message) || error);
+                        })
+                        .finally(() => { globalThis.compactProbe.done = true; });
+                    ",
+                )
+                .await
+                .expect("invoke compact bridge");
+
+            let mut completed = false;
+            for _ in 0..32 {
+                drain_until_idle(&runtime, &clock).await;
+                let state = get_global_json(&runtime, "compactProbe").await;
+                if state.get("done").and_then(serde_json::Value::as_bool) == Some(true) {
+                    break;
+                }
+                for request in runtime.drain_hostcall_requests() {
+                    let HostcallKind::Events { op } = &request.kind else {
+                        panic!("expected events hostcall, got {:?}", request.kind);
+                    };
+                    assert_eq!(op.as_str(), "compact", "unexpected events op");
+                    assert_eq!(
+                        request.payload["strategy"],
+                        json!("openai-responses-native")
+                    );
+                    assert_eq!(request.payload["request"]["model"], json!("gpt-5.2-codex"));
+                    assert_eq!(
+                        request.payload["request"]["input"][0]["type"],
+                        json!("message")
+                    );
+                    assert_eq!(
+                        request.payload["preparation"]["firstKeptEntryId"],
+                        json!("entry-3")
+                    );
+                    // Never a credential across the bridge.
+                    assert_eq!(request.payload.get("apiKey"), None);
+                    runtime.complete_hostcall(
+                        request.call_id,
+                        HostcallOutcome::Success(json!({
+                            "summary": "[OpenAI native compaction checkpoint]",
+                            "firstKeptEntryId": "entry-3",
+                            "tokensBefore": 9000,
+                            "details": {
+                                "strategy": "openai-responses-native",
+                                "compactedWindow": [{ "type": "message", "role": "user", "content": [] }],
+                                "compactResponseId": "resp_42",
+                            },
+                        })),
+                    );
+                    completed = true;
+                }
+            }
+            assert!(completed, "compact() never issued the compact hostcall");
+
+            drain_until_idle(&runtime, &clock).await;
+            let probe = get_global_json(&runtime, "compactProbe").await;
+            assert_eq!(probe["done"], json!(true), "probe incomplete: {probe}");
+            assert_eq!(probe["error"], serde_json::Value::Null, "probe: {probe}");
+            assert_eq!(
+                probe["value"]["details"]["compactResponseId"],
+                json!("resp_42")
+            );
+            assert_eq!(
+                probe["value"]["details"]["compactedWindow"][0]["type"],
+                json!("message")
+            );
+        });
+    }
+
+    /// gh #167 / bd-i28yz: when the host rejects (malformed preparation, no
+    /// bridge, provider failure) the compact() Promise rejects cleanly and
+    /// never resolves with placeholder data.
+    #[test]
+    fn pi_coding_agent_compact_rejects_cleanly_on_host_error() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+
+            runtime
+                .eval(
+                    r"
+                    globalThis.compactProbe = { done: false };
+                    import('@mariozechner/pi-coding-agent')
+                        .then((mod) => mod.compact({}, {}))
+                        .then((value) => { globalThis.compactProbe.value = value; })
+                        .catch((error) => {
+                            globalThis.compactProbe.error = String((error && error.message) || error);
+                        })
+                        .finally(() => { globalThis.compactProbe.done = true; });
+                    ",
+                )
+                .await
+                .expect("invoke compact bridge");
+
+            let mut dispatched = 0;
+            for _ in 0..32 {
+                drain_until_idle(&runtime, &clock).await;
+                let state = get_global_json(&runtime, "compactProbe").await;
+                if state.get("done").and_then(serde_json::Value::as_bool) == Some(true) {
+                    break;
+                }
+                for request in runtime.drain_hostcall_requests() {
+                    let HostcallKind::Events { op } = &request.kind else {
+                        panic!("expected events hostcall, got {:?}", request.kind);
+                    };
+                    assert_eq!(op.as_str(), "compact", "unexpected events op");
+                    dispatched += 1;
+                    runtime.complete_hostcall(
+                        request.call_id,
+                        HostcallOutcome::Error {
+                            code: "provider".to_string(),
+                            message:
+                                "compaction preparation: `firstKeptEntryId` must be a non-empty string"
+                                    .to_string(),
+                        },
+                    );
+                }
+            }
+
+            assert_eq!(dispatched, 1, "rejection must come from the host bridge");
+            drain_until_idle(&runtime, &clock).await;
+            let probe = get_global_json(&runtime, "compactProbe").await;
+            assert_eq!(probe["done"], json!(true), "probe incomplete: {probe}");
+            assert_eq!(
+                probe.get("value").filter(|value| !value.is_null()),
+                None,
+                "compact() must not resolve with placeholder data: {probe}"
+            );
+            let error = probe["error"].as_str().unwrap_or_default();
+            assert!(
+                error.contains("`firstKeptEntryId` must be a non-empty string"),
+                "unexpected compact() rejection: {error}"
+            );
+        });
+    }
+
+    // ── gh #167 wave 2: session-less payloads must not clobber identity;
+    //    modelRegistry.find is sync + whitelisted; systemPrompt seeds from
+    //    the host payload without clobbering fresher captures ─────────────
+
+    #[test]
+    fn extension_ctx_sessionless_payload_keeps_last_known_identity() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+
+            runtime
+                .eval(&privileged_test_script(
+                    &runtime,
+                    r#"
+                    __pi_begin_extension(__pi_test_secret, "ext.identity-keep", { name: "ext.identity-keep" });
+                    globalThis.identityKeep = { captures: [] };
+                    pi.on("agent_start", async (_ev, ctx) => {
+                        globalThis.identityKeep.captures.push({
+                            id: ctx.sessionManager.getSessionId(),
+                            file: ctx.sessionManager.getSessionFile(),
+                            dir: ctx.sessionManager.getSessionDir(),
+                        });
+                    });
+                    __pi_end_extension(__pi_test_secret);
+                    "#,
+                ))
+                .await
+                .expect("register identity extension");
+            runtime
+                .eval(&privileged_test_script(
+                    &runtime,
+                    r"
+                    const sessionPayload = {
+                        hasUI: false,
+                        cwd: '/workspace',
+                        sessionState: {
+                            sessionId: 'sess-live',
+                            sessionFile: '/tmp/pi/sessions/live.jsonl',
+                        },
+                    };
+                    // Mimics the minimal ctx payload extension tool executions
+                    // receive: no sessionState at all.
+                    const toolStylePayload = { hasUI: false, cwd: '/workspace' };
+                    globalThis.identityKeep.done = false;
+                    __pi_dispatch_extension_event(__pi_test_secret, 'agent_start', {}, sessionPayload)
+                        .then(() => __pi_dispatch_extension_event(__pi_test_secret, 'agent_start', {}, toolStylePayload))
+                        .then(() => import('@mariozechner/pi-coding-agent'))
+                        .then((mod) => {
+                            const live = new mod.SessionManager();
+                            globalThis.identityKeep.shim = {
+                                id: live.getSessionId(),
+                                file: live.getSessionFile(),
+                                dir: live.getSessionDir(),
+                            };
+                        })
+                        .catch((error) => { globalThis.identityKeep.error = String(error); })
+                        .finally(() => { globalThis.identityKeep.done = true; });
+                    ",
+                ))
+                .await
+                .expect("dispatch identity events");
+            drain_until_idle(&runtime, &clock).await;
+
+            let probe = get_global_json(&runtime, "identityKeep").await;
+            assert_eq!(probe["done"], json!(true), "probe incomplete: {probe}");
+            assert_eq!(probe["error"], serde_json::Value::Null, "probe: {probe}");
+
+            // The session-full dispatch establishes identity ...
+            assert_eq!(probe["captures"][0]["id"], json!("sess-live"));
+            assert_eq!(
+                probe["captures"][0]["file"],
+                json!("/tmp/pi/sessions/live.jsonl")
+            );
+            // ... and a later session-less (tool-style) payload must not
+            // clobber it: the ctx getters fall back to the mirror.
+            assert_eq!(probe["captures"][1]["id"], json!("sess-live"));
+            assert_eq!(
+                probe["captures"][1]["file"],
+                json!("/tmp/pi/sessions/live.jsonl")
+            );
+            assert_eq!(probe["captures"][1]["dir"], json!("/tmp/pi/sessions"));
+            // The SessionManager shim also still reflects the live session.
+            assert_eq!(probe["shim"]["id"], json!("sess-live"));
+            assert_eq!(probe["shim"]["file"], json!("/tmp/pi/sessions/live.jsonl"));
+        });
+    }
+
+    #[test]
+    fn extension_ctx_model_registry_find_is_sync_and_whitelisted() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+
+            runtime
+                .eval(&privileged_test_script(
+                    &runtime,
+                    r#"
+                    __pi_begin_extension(__pi_test_secret, "ext.model-find", { name: "ext.model-find" });
+                    globalThis.modelFind = { done: false };
+                    pi.on("agent_start", async (_ev, ctx) => {
+                        const found = ctx.modelRegistry.find('anthropic', 'claude-4');
+                        globalThis.modelFind.found = found === undefined ? "undefined" : found;
+                        globalThis.modelFind.foundIsPromise =
+                            !!(found && typeof found.then === 'function');
+                        globalThis.modelFind.missing =
+                            ctx.modelRegistry.find('anthropic', 'no-such-model') === undefined
+                                ? "undefined"
+                                : "present";
+                        globalThis.modelFind.blankProvider =
+                            ctx.modelRegistry.find('', 'claude-4') === undefined
+                                ? "undefined"
+                                : "present";
+                    });
+                    __pi_end_extension(__pi_test_secret);
+                    "#,
+                ))
+                .await
+                .expect("register model-find extension");
+            runtime
+                .eval(&privileged_test_script(
+                    &runtime,
+                    r"
+                    __pi_dispatch_extension_event(__pi_test_secret, 'agent_start', {}, {
+                        hasUI: false,
+                        cwd: '/workspace',
+                        models: [
+                            {
+                                id: 'claude-4',
+                                provider: 'anthropic',
+                                api: 'anthropic-messages',
+                                name: 'Claude 4',
+                                baseUrl: 'https://api.anthropic.com',
+                                reasoning: true,
+                                contextWindow: 200000,
+                                maxTokens: 64000,
+                                authHeader: 'x-api-key',
+                                hasCredentials: true,
+                                // Hostile metadata that must never surface.
+                                apiKey: 'sk-secret-' + 'never-leak',
+                                headers: { Authorization: 'Bearer leak' },
+                                oauthToken: 'leaky-token',
+                            },
+                        ],
+                    })
+                        .catch((error) => { globalThis.modelFind.error = String(error); })
+                        .finally(() => { globalThis.modelFind.done = true; });
+                    ",
+                ))
+                .await
+                .expect("dispatch model-find event");
+            drain_until_idle(&runtime, &clock).await;
+
+            let probe = get_global_json(&runtime, "modelFind").await;
+            assert_eq!(probe["done"], json!(true), "probe incomplete: {probe}");
+            assert_eq!(probe["error"], serde_json::Value::Null, "probe: {probe}");
+            // Sync (upstream parity): consumers call find() without await.
+            assert_eq!(probe["foundIsPromise"], json!(false));
+            assert_eq!(probe["missing"], json!("undefined"));
+            assert_eq!(probe["blankProvider"], json!("undefined"));
+
+            let found = &probe["found"];
+            assert_eq!(found["id"], json!("claude-4"));
+            assert_eq!(found["provider"], json!("anthropic"));
+            assert_eq!(found["api"], json!("anthropic-messages"));
+            assert_eq!(found["contextWindow"], json!(200_000));
+            assert_eq!(found["maxTokens"], json!(64_000));
+            assert_eq!(found["authHeader"], json!("x-api-key"));
+            assert_eq!(found["hasCredentials"], json!(true));
+            // The whitelist projection must drop credential-shaped fields.
+            assert_eq!(found.get("apiKey"), None, "apiKey leaked: {found}");
+            assert_eq!(found.get("headers"), None, "headers leaked: {found}");
+            assert_eq!(found.get("oauthToken"), None, "oauthToken leaked: {found}");
+        });
+    }
+
+    #[test]
+    fn extension_ctx_system_prompt_seeds_from_payload_without_clobbering() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+
+            runtime
+                .eval(&privileged_test_script(
+                    &runtime,
+                    r#"
+                    __pi_begin_extension(__pi_test_secret, "ext.prompt-seed", { name: "ext.prompt-seed" });
+                    globalThis.promptSeed = { captures: [] };
+                    pi.on("agent_start", async (_ev, ctx) => {
+                        globalThis.promptSeed.captures.push(ctx.getSystemPrompt());
+                    });
+                    pi.on("before_agent_start", async (ev, _ctx) => {
+                        return { systemPrompt: ev.systemPrompt + " [amended]" };
+                    });
+                    __pi_end_extension(__pi_test_secret);
+                    "#,
+                ))
+                .await
+                .expect("register prompt-seed extension");
+            runtime
+                .eval(&privileged_test_script(
+                    &runtime,
+                    r"
+                    // Host payloads carry the boot-time prompt (gh #167).
+                    const payload = { hasUI: false, cwd: '/workspace', systemPrompt: 'Base prompt.' };
+                    globalThis.promptSeed.done = false;
+                    __pi_dispatch_extension_event(__pi_test_secret, 'agent_start', {}, payload)
+                        .then(() => __pi_dispatch_extension_event(
+                            __pi_test_secret,
+                            'before_agent_start',
+                            { prompt: 'hi', systemPrompt: 'Base prompt.' },
+                            payload,
+                        ))
+                        .then(() => __pi_dispatch_extension_event(__pi_test_secret, 'agent_start', {}, payload))
+                        .catch((error) => { globalThis.promptSeed.error = String(error); })
+                        .finally(() => { globalThis.promptSeed.done = true; });
+                    ",
+                ))
+                .await
+                .expect("dispatch prompt-seed events");
+            drain_until_idle(&runtime, &clock).await;
+
+            let probe = get_global_json(&runtime, "promptSeed").await;
+            assert_eq!(probe["done"], json!(true), "probe incomplete: {probe}");
+            assert_eq!(probe["error"], serde_json::Value::Null, "probe: {probe}");
+            // Before any before_agent_start, the payload seed answers.
+            assert_eq!(probe["captures"][0], json!("Base prompt."));
+            // After an amendment, a cached payload must NOT clobber it.
+            assert_eq!(probe["captures"][1], json!("Base prompt. [amended]"));
+        });
+    }
+
+    // ── gh #167 / bd-9wkml: convertToLlm + buildSessionContext ports ─────
+
+    #[test]
+    fn pi_coding_agent_convert_to_llm_ports_upstream_role_transforms() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+
+            runtime
+                .eval(
+                    r#"
+                    globalThis.convertProbe = { done: false };
+                    import('@mariozechner/pi-coding-agent')
+                        .then((mod) => {
+                            const messages = [
+                                { role: "user", content: "hello", timestamp: 1 },
+                                { role: "assistant", content: [], provider: "anthropic", model: "claude-4", timestamp: 2 },
+                                { role: "toolResult", toolCallId: "t1", content: [], timestamp: 3 },
+                                { role: "bashExecution", command: "ls", output: "a.txt", exitCode: 0, timestamp: 4 },
+                                { role: "bashExecution", command: "rm x", output: "", exitCode: 1, excludeFromContext: true, timestamp: 5 },
+                                { role: "custom", customType: "note", content: "remember", timestamp: 6 },
+                                { role: "custom", customType: "rich", content: [{ type: "text", text: "kept-as-is" }], timestamp: 7 },
+                                { role: "branchSummary", summary: "branch things", timestamp: 8 },
+                                { role: "compactionSummary", summary: "old history", timestamp: 9 },
+                                { role: "definitely_unknown", timestamp: 10 },
+                            ];
+                            globalThis.convertProbe.result = mod.convertToLlm(messages);
+                            globalThis.convertProbe.prefixes = {
+                                compactionPrefix: mod.COMPACTION_SUMMARY_PREFIX,
+                                compactionSuffix: mod.COMPACTION_SUMMARY_SUFFIX,
+                                branchPrefix: mod.BRANCH_SUMMARY_PREFIX,
+                                branchSuffix: mod.BRANCH_SUMMARY_SUFFIX,
+                            };
+                        })
+                        .catch((error) => { globalThis.convertProbe.error = String(error); })
+                        .finally(() => { globalThis.convertProbe.done = true; });
+                    "#,
+                )
+                .await
+                .expect("invoke convertToLlm");
+            drain_until_idle(&runtime, &clock).await;
+
+            let probe = get_global_json(&runtime, "convertProbe").await;
+            assert_eq!(probe["done"], json!(true), "probe incomplete: {probe}");
+            assert_eq!(probe["error"], serde_json::Value::Null, "probe: {probe}");
+
+            // Exact upstream constants (byte parity with session.rs).
+            assert_eq!(
+                probe["prefixes"]["compactionPrefix"],
+                json!(
+                    "The conversation history before this point was compacted into the following summary:\n\n<summary>\n"
+                )
+            );
+            assert_eq!(probe["prefixes"]["compactionSuffix"], json!("\n</summary>"));
+            assert_eq!(
+                probe["prefixes"]["branchPrefix"],
+                json!(
+                    "The following is a summary of a branch that this conversation came back from:\n\n<summary>\n"
+                )
+            );
+            assert_eq!(probe["prefixes"]["branchSuffix"], json!("</summary>"));
+
+            let result = probe["result"].as_array().expect("array result");
+            // 10 inputs, minus the excluded bashExecution and the unknown
+            // role, gives 8 messages.
+            assert_eq!(
+                result.len(),
+                8,
+                "unexpected convertToLlm output: {result:?}"
+            );
+
+            // Passthrough roles survive unchanged.
+            assert_eq!(result[0]["role"], json!("user"));
+            assert_eq!(result[1]["role"], json!("assistant"));
+            assert_eq!(result[2]["role"], json!("toolResult"));
+
+            // bashExecution becomes a user message with the rendered text.
+            assert_eq!(result[3]["role"], json!("user"));
+            assert_eq!(
+                result[3]["content"][0]["text"],
+                json!("Ran `ls`\n```\na.txt\n```")
+            );
+            assert_eq!(result[3]["timestamp"], json!(4));
+
+            // custom string content is wrapped; custom block content kept.
+            assert_eq!(result[4]["role"], json!("user"));
+            assert_eq!(result[4]["content"][0]["text"], json!("remember"));
+            assert_eq!(result[5]["content"][0]["text"], json!("kept-as-is"));
+
+            // branch/compaction summaries get the exact prefix/suffix bytes.
+            assert_eq!(
+                result[6]["content"][0]["text"],
+                json!(
+                    "The following is a summary of a branch that this conversation came back from:\n\n<summary>\nbranch things</summary>"
+                )
+            );
+            assert_eq!(
+                result[7]["content"][0]["text"],
+                json!(
+                    "The conversation history before this point was compacted into the following summary:\n\n<summary>\nold history\n</summary>"
+                )
+            );
+        });
+    }
+
+    #[test]
+    fn pi_coding_agent_build_session_context_ports_upstream_walk() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+
+            runtime
+                .eval(
+                    r#"
+                    globalThis.buildProbe = { done: false };
+                    import('@mariozechner/pi-coding-agent')
+                        .then((mod) => {
+                            const entries = [
+                                { type: "message", id: "e1", timestamp: "2026-01-01T00:00:00Z", message: { role: "user", content: "one" } },
+                                { type: "model_change", id: "e2", parentId: "e1", timestamp: "2026-01-01T00:00:01Z", provider: "openai", modelId: "gpt-5" },
+                                { type: "message", id: "e3", parentId: "e2", timestamp: "2026-01-01T00:00:02Z", message: { role: "assistant", content: [], provider: "anthropic", model: "claude-4" } },
+                                { type: "thinking_level_change", id: "e4", parentId: "e3", timestamp: "2026-01-01T00:00:03Z", thinkingLevel: "high" },
+                                { type: "compaction", id: "e5", parentId: "e4", timestamp: "2026-01-01T00:00:04Z", summary: "squashed", firstKeptEntryId: "e3", tokensBefore: 999 },
+                                { type: "message", id: "e6", parentId: "e5", timestamp: "2026-01-01T00:00:05Z", message: { role: "user", content: "after" } },
+                                // Dead branch that must not appear in the walk.
+                                { type: "message", id: "dead", parentId: "e1", timestamp: "2026-01-01T00:00:06Z", message: { role: "user", content: "dead branch" } },
+                            ];
+                            const full = mod.buildSessionContext(entries, "e6");
+                            const nullLeaf = mod.buildSessionContext(entries, null);
+                            const implicitLeaf = mod.buildSessionContext(entries.slice(0, 4));
+                            const cycle = mod.buildSessionContext([
+                                { type: "message", id: "a", parentId: "b", timestamp: "2026-01-01T00:00:00Z", message: { role: "user", content: "a" } },
+                                { type: "message", id: "b", parentId: "a", timestamp: "2026-01-01T00:00:01Z", message: { role: "user", content: "b" } },
+                            ], "a");
+                            globalThis.buildProbe.full = full;
+                            globalThis.buildProbe.nullLeaf = nullLeaf;
+                            globalThis.buildProbe.implicitLeaf = implicitLeaf;
+                            globalThis.buildProbe.cycleLen = cycle.messages.length;
+                        })
+                        .catch((error) => { globalThis.buildProbe.error = String((error && error.stack) || error); })
+                        .finally(() => { globalThis.buildProbe.done = true; });
+                    "#,
+                )
+                .await
+                .expect("invoke buildSessionContext");
+            drain_until_idle(&runtime, &clock).await;
+
+            let probe = get_global_json(&runtime, "buildProbe").await;
+            assert_eq!(probe["done"], json!(true), "probe incomplete: {probe}");
+            assert_eq!(probe["error"], serde_json::Value::Null, "probe: {probe}");
+
+            // Compaction path: summary first, then kept e3 (firstKeptEntryId),
+            // then post-compaction e6. e1 (pre-kept) and the dead branch are
+            // dropped; the model comes from the assistant message, thinking
+            // level from the change entry.
+            let full = &probe["full"];
+            assert_eq!(full["thinkingLevel"], json!("high"));
+            assert_eq!(full["model"]["provider"], json!("anthropic"));
+            assert_eq!(full["model"]["modelId"], json!("claude-4"));
+            let messages = full["messages"].as_array().expect("messages");
+            assert_eq!(messages.len(), 3, "unexpected messages: {messages:?}");
+            assert_eq!(messages[0]["role"], json!("compactionSummary"));
+            assert_eq!(messages[0]["summary"], json!("squashed"));
+            assert_eq!(messages[0]["tokensBefore"], json!(999));
+            assert_eq!(messages[1]["role"], json!("assistant"));
+            assert_eq!(messages[2]["content"], json!("after"));
+
+            // Explicit null leaf: empty context (navigated before the root).
+            assert_eq!(probe["nullLeaf"]["messages"], json!([]));
+            assert_eq!(probe["nullLeaf"]["thinkingLevel"], json!("off"));
+            assert_eq!(probe["nullLeaf"]["model"], serde_json::Value::Null);
+
+            // Implicit leaf (undefined): last entry of the list wins; no
+            // compaction on that path, so all message entries appear and the
+            // model still tracks the assistant message.
+            let implicit = &probe["implicitLeaf"];
+            assert_eq!(implicit["thinkingLevel"], json!("high"));
+            assert_eq!(
+                implicit["messages"].as_array().map(Vec::len),
+                Some(2),
+                "implicit leaf should keep e1+e3: {implicit}"
+            );
+
+            // Corrupted parent chains terminate instead of hanging.
+            assert_eq!(probe["cycleLen"], json!(2));
+        });
+    }
+
+    /// gh #223 / bd-fpaso: pin that an extension importing `DefaultPackageManager`
+    /// from `@mariozechner/pi-coding-agent` loads without export errors, read methods
+    /// are inert, and mutating methods (install/remove/update) throw named errors.
+    #[test]
+    fn default_package_manager_shim_exports_and_behavior() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+
+            runtime
+                .eval(
+                    r"
+                    globalThis.pmProbe = { done: false };
+                    (async () => {
+                        const mod = await import('@mariozechner/pi-coding-agent');
+                        if (typeof mod.DefaultPackageManager !== 'function') {
+                            throw new Error('DefaultPackageManager is not exported');
+                        }
+                        const pm = new mod.DefaultPackageManager({ cwd: '/test/cwd', agentDir: '/test/agent' });
+                        if (pm.cwd !== '/test/cwd' || pm.agentDir !== '/test/agent') {
+                            throw new Error('Constructor options not retained');
+                        }
+                        if (pm.getInstalledPath('foo', 'user') !== undefined) {
+                            throw new Error('getInstalledPath should return undefined');
+                        }
+                        const resolved = await pm.resolve();
+                        if (!Array.isArray(resolved.extensions) || !Array.isArray(resolved.skills)) {
+                            throw new Error('resolve should return empty arrays');
+                        }
+                        const resolvedExt = await pm.resolveExtensionSources(['foo']);
+                        if (!Array.isArray(resolvedExt.extensions) || !Array.isArray(resolvedExt.skills)) {
+                            throw new Error('resolveExtensionSources should return empty arrays');
+                        }
+                        let installThrew = false;
+                        try {
+                            await pm.install('test-pkg');
+                        } catch (err) {
+                            installThrew = true;
+                            if (!err.message.includes('DefaultPackageManager.install()')) {
+                                throw new Error('Unexpected install error message: ' + err.message);
+                            }
+                        }
+                        if (!installThrew) {
+                            throw new Error('install did not throw');
+                        }
+                        let removeThrew = false;
+                        try {
+                            await pm.remove('test-pkg');
+                        } catch (err) {
+                            removeThrew = true;
+                            if (!err.message.includes('DefaultPackageManager.remove()')) {
+                                throw new Error('Unexpected remove error message: ' + err.message);
+                            }
+                        }
+                        if (!removeThrew) {
+                            throw new Error('remove did not throw');
+                        }
+                        let updateThrew = false;
+                        try {
+                            await pm.update('test-pkg');
+                        } catch (err) {
+                            updateThrew = true;
+                            if (!err.message.includes('DefaultPackageManager.update()')) {
+                                throw new Error('Unexpected update error message: ' + err.message);
+                            }
+                        }
+                        if (!updateThrew) {
+                            throw new Error('update did not throw');
+                        }
+                        globalThis.pmProbe.ok = true;
+                    })()
+                    .catch((error) => {
+                        globalThis.pmProbe.error = String((error && error.stack) || error);
+                    })
+                    .finally(() => {
+                        globalThis.pmProbe.done = true;
+                    });
+                    ",
+                )
+                .await
+                .expect("eval DefaultPackageManager probe");
+
+            drain_until_idle(&runtime, &clock).await;
+            let probe = get_global_json(&runtime, "pmProbe").await;
+            assert_eq!(probe["done"], json!(true), "probe incomplete: {probe}");
+            assert_eq!(
+                probe["error"],
+                serde_json::Value::Null,
+                "probe error: {probe}"
+            );
+            assert_eq!(probe["ok"], json!(true));
+        });
+    }
+
     #[allow(clippy::future_not_send)]
     async fn reject_pi_ai_hostcalls_until_done(
         runtime: &PiJsRuntime<Arc<DeterministicClock>>,
@@ -22716,6 +30175,55 @@ const path = require('path');
     }
 
     #[test]
+    fn extract_static_require_specifiers_respects_nested_lexical_bindings() {
+        let source = r"
+import { createRequire } from 'node:module';
+export function loadDatabase() {
+    const require = createRequire(import.meta.url);
+    if (globalThis.Bun) return require(['bun', 'sqlite'].join(':')).Database;
+    return require('better-sqlite3');
+}
+function parameter(require) { return require('parameter-local'); }
+function destructured({ require }) { return require('destructured-local'); }
+const arrow = (require) => require('arrow-local');
+{
+    const require = () => {};
+    require('block-local');
+}
+const fs = require /* whitespace must not hide a free call */ ('node:fs');
+function freeCall() { return require('node:path'); }
+const escaped = require('node:\u006f\u0073');
+";
+        assert_eq!(
+            extract_static_require_specifiers(source),
+            vec!["node:fs", "node:path", "node:os"]
+        );
+    }
+
+    #[test]
+    fn maybe_cjs_to_esm_preserves_lazy_create_require_driver_selection() {
+        let source = r"
+import { createRequire } from 'node:module';
+export function loadDatabase() {
+    const require = createRequire(import.meta.url);
+    if (globalThis.Bun) return require(['bun', 'sqlite'].join(':')).Database;
+    return require('better-sqlite3');
+}
+";
+        assert_eq!(maybe_cjs_to_esm(source), source);
+    }
+
+    #[test]
+    fn maybe_cjs_to_esm_provides_empty_exports_for_side_effect_modules() {
+        let rewritten = maybe_cjs_to_esm(
+            "const path = require ('node:path'); globalThis.loadedName = path.basename('/fixture/value');",
+        );
+        assert!(rewritten.contains("const module = { exports: {} };"));
+        assert!(rewritten.contains("export default module.exports;"));
+        assert!(rewritten.contains("from \"node:path\";"));
+    }
+
+    #[test]
     fn maybe_cjs_to_esm_ignores_codegen_string_requires() {
         let source = r#"
 const fs = require("fs");
@@ -22726,6 +30234,28 @@ module.exports = { fs, generated };
         let rewritten = maybe_cjs_to_esm(source);
         assert!(rewritten.contains(r#"from "fs";"#));
         assert!(!rewritten.contains(r#"from "ajv/dist/runtime/validation_error";"#));
+    }
+
+    #[test]
+    fn maybe_cjs_to_esm_keeps_platform_native_addon_requires_lazy() {
+        let source = r#"
+try {
+  module.exports = require("./image.android-arm64.node");
+} catch (_) {}
+try {
+  module.exports = require("@napi-rs/image-android-arm64");
+} catch (_) {}
+try {
+  module.exports = require("./image.wasi.cjs");
+} catch (_) {}
+module.exports = require("path");
+"#;
+
+        let rewritten = maybe_cjs_to_esm(source);
+        assert!(rewritten.contains(r#"from "path";"#));
+        assert!(!rewritten.contains(r#"from "./image.android-arm64.node";"#));
+        assert!(!rewritten.contains(r#"from "@napi-rs/image-android-arm64";"#));
+        assert!(!rewritten.contains(r#"from "./image.wasi.cjs";"#));
     }
 
     #[test]
@@ -22974,6 +30504,300 @@ import { isIPv4 as netIsIpv4 } from "node:net";
                 call_id: "call-1".to_string()
             }]
         );
+    }
+
+    #[test]
+    fn timer_callback_hostcalls_retain_the_timer_origin() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+            let source = SessionActionOriginSource::default();
+
+            {
+                let _origin_guard = runtime.enter_session_action_origin(Some(source.capture()));
+                runtime
+                    .eval("setTimeout(() => pi.log({ from: 'timer' }), 10);")
+                    .await
+                    .expect("schedule timer");
+            }
+
+            source.advance();
+            clock.set(10);
+            let stats = runtime.tick().await.expect("fire timer");
+            assert!(stats.ran_macrotask);
+            assert!(runtime.user_timer_origins.borrow().is_empty());
+
+            let requests = runtime.drain_hostcall_requests();
+            assert_eq!(requests.len(), 1);
+            let call_id = requests[0].call_id.clone();
+            let stale_origin = runtime
+                .session_action_origin_for_hostcall(&call_id)
+                .expect("timer callback hostcall should retain an origin");
+            assert!(!source.accepts(&stale_origin));
+
+            runtime.complete_hostcall(
+                call_id.clone(),
+                HostcallOutcome::Success(serde_json::json!(null)),
+            );
+            runtime.tick().await.expect("deliver completion");
+            assert!(
+                runtime
+                    .session_action_origin_for_hostcall(&call_id)
+                    .is_none(),
+                "final completion must erase hostcall provenance"
+            );
+        });
+    }
+
+    #[test]
+    fn timer_handles_share_cancellation_and_keep_private_state() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+            runtime
+                .eval(
+                    r"
+                    globalThis.timerResults = [];
+                    globalThis.keptTimer = setTimeout(function(value) {
+                        timerResults.push([value, this === keptTimer]);
+                    }, 10, 'kept');
+                    const interval = setInterval(() => timerResults.push('wrong interval'), 10);
+                    const cancelled = setTimeout(() => timerResults.push('wrong timeout'), 10);
+                    clearTimeout(Number(interval));
+                    clearInterval(String(Number(cancelled)));
+                    if (typeof Symbol.dispose === 'symbol') {
+                        const disposed = setTimeout(() => timerResults.push('wrong disposal'), 10);
+                        disposed[Symbol.dispose]();
+                        disposed.refresh();
+                    }
+                    globalThis.timerFeatures = {
+                        object: typeof keptTimer === 'object',
+                        private: Reflect.ownKeys(keptTimer).length === 0,
+                        unique: Number(keptTimer) !== Number(interval),
+                        referenced: keptTimer.hasRef(),
+                        same: keptTimer.unref() === keptTimer,
+                        unreferenced: !keptTimer.hasRef(),
+                        nativeFactoryHidden: typeof __pi_create_timer_scheduler_native === 'undefined',
+                    };
+                    const saved = [WeakMap.prototype.get, WeakMap.prototype.set, WeakMap.prototype.has];
+                    globalThis.timerStateIntercepts = 0;
+                    try {
+                        WeakMap.prototype.get = function(...args) { timerStateIntercepts++; return saved[0].apply(this, args); };
+                        WeakMap.prototype.set = function(...args) { timerStateIntercepts++; return saved[1].apply(this, args); };
+                        WeakMap.prototype.has = function(...args) { timerStateIntercepts++; return saved[2].apply(this, args); };
+                        const protectedTimer = setTimeout(() => {}, 100);
+                        protectedTimer.unref().ref();
+                        protectedTimer.hasRef();
+                        clearTimeout(protectedTimer);
+                    } finally {
+                        [WeakMap.prototype.get, WeakMap.prototype.set, WeakMap.prototype.has] = saved;
+                    }
+                    ",
+                )
+                .await
+                .expect("create and clear timer handles");
+            let features = runtime.read_global_json("timerFeatures").await.unwrap();
+            assert!(
+                features
+                    .as_object()
+                    .unwrap()
+                    .values()
+                    .all(|value| value.as_bool() == Some(true))
+            );
+            assert_eq!(
+                runtime
+                    .read_global_json("timerStateIntercepts")
+                    .await
+                    .unwrap(),
+                0
+            );
+            clock.set(10);
+            runtime
+                .tick()
+                .await
+                .expect("fire retained unreferenced timer");
+            assert_eq!(
+                runtime.read_global_json("timerResults").await.unwrap(),
+                serde_json::json!([["kept", true]])
+            );
+            assert!(!runtime.has_pending());
+            runtime.eval("keptTimer.refresh();").await.unwrap();
+            clock.set(20);
+            runtime.tick().await.expect("refresh fired timer");
+            assert_eq!(
+                runtime.read_global_json("timerResults").await.unwrap(),
+                serde_json::json!([["kept", true], ["kept", true]])
+            );
+            runtime.eval("keptTimer.close().refresh();").await.unwrap();
+            assert!(!runtime.has_pending(), "closed handles must not re-arm");
+            let snapshot = call_global_fn_json(&runtime, "__pi_runtime_registry_snapshot").await;
+            assert_eq!(snapshot["timerHandles"], 0);
+        });
+    }
+
+    #[test]
+    fn refreshed_and_repeated_timers_preserve_original_hostcall_provenance() {
+        futures::executor::block_on(async {
+            for timer_function in ["setTimeout", "setInterval"] {
+                let clock = Arc::new(DeterministicClock::new(0));
+                let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                    .await
+                    .expect("create runtime");
+                let source = SessionActionOriginSource::default();
+                {
+                    let _origin_guard = runtime.enter_session_action_origin(Some(source.capture()));
+                    runtime
+                        .eval(&format!(
+                            "globalThis.refreshedTimer = {timer_function}(() => pi.log({{ from: 'refresh' }}), 10);"
+                        ))
+                        .await
+                        .unwrap();
+                }
+                source.advance();
+                clock.set(5);
+                {
+                    let _later_origin = runtime.enter_session_action_origin(Some(source.capture()));
+                    runtime.eval("refreshedTimer.refresh();").await.unwrap();
+                }
+                clock.set(10);
+                assert!(!runtime.tick().await.unwrap().ran_macrotask);
+                for deadline in [15, 25] {
+                    clock.set(deadline);
+                    runtime.tick().await.unwrap();
+                    let requests = runtime.drain_hostcall_requests();
+                    assert_eq!(requests.len(), 1, "{timer_function} at {deadline}");
+                    let call_id = &requests[0].call_id;
+                    let origin = runtime.session_action_origin_for_hostcall(call_id).unwrap();
+                    assert!(
+                        !source.accepts(&origin),
+                        "refresh must not replace a stale timer origin with its caller's fresh origin"
+                    );
+                    runtime.complete_hostcall(
+                        call_id,
+                        HostcallOutcome::Success(serde_json::Value::Null),
+                    );
+                    runtime.tick().await.unwrap();
+                    if deadline == 15 && timer_function == "setTimeout" {
+                        let _later_origin =
+                            runtime.enter_session_action_origin(Some(source.capture()));
+                        runtime.eval("refreshedTimer.refresh();").await.unwrap();
+                    }
+                }
+                runtime.eval("clearTimeout(refreshedTimer);").await.unwrap();
+                assert!(!runtime.has_pending());
+                assert!(runtime.user_timer_origins.borrow().is_empty());
+            }
+        });
+    }
+
+    #[test]
+    fn timer_reset_invalidates_held_handles_and_pending_interval_callbacks() {
+        futures::executor::block_on(async {
+            let runtime = PiJsRuntime::with_clock(DeterministicClock::new(0))
+                .await
+                .expect("create runtime");
+            runtime
+                .eval("globalThis.expiredTimer = setTimeout(() => {}, 0);")
+                .await
+                .unwrap();
+            runtime.tick().await.unwrap();
+            assert!(
+                runtime
+                    .scrub_for_cold_drop()
+                    .await
+                    .unwrap()
+                    .inventoried_state_cleared
+            );
+            runtime.eval("expiredTimer.refresh();").await.unwrap();
+            assert!(
+                !runtime.has_pending(),
+                "a held pre-scrub timer cannot reactivate"
+            );
+
+            runtime.eval(
+                "globalThis.pendingInterval = setInterval(() => new Promise(resolve => { globalThis.releaseInterval = resolve; }), 0);"
+            ).await.unwrap();
+            runtime.tick().await.unwrap();
+            let snapshot = call_global_fn_json(&runtime, "__pi_runtime_registry_snapshot").await;
+            assert_eq!(snapshot["pendingTimers"], 0);
+            assert_eq!(snapshot["timerHandles"], 1);
+            let report = runtime.scrub_for_cold_drop().await.unwrap();
+            assert!(
+                !report.inventoried_state_cleared,
+                "pending callback remains hygiene evidence"
+            );
+            assert_eq!(report.reason_code.as_deref(), Some("pending_js_work"));
+            assert_eq!(report.pending_timers_before, 1);
+            assert_eq!(report.residual_entries_after, 0);
+            runtime
+                .eval("releaseInterval(); pendingInterval.refresh();")
+                .await
+                .unwrap();
+            assert!(
+                !runtime.has_pending(),
+                "settling a pre-scrub callback must not re-arm"
+            );
+            let snapshot = call_global_fn_json(&runtime, "__pi_runtime_registry_snapshot").await;
+            assert_eq!(snapshot["timerHandles"], 0);
+        });
+    }
+
+    #[test]
+    fn promise_continuation_hostcalls_retain_the_completed_call_origin() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+            let source = SessionActionOriginSource::default();
+
+            {
+                let _origin_guard = runtime.enter_session_action_origin(Some(source.capture()));
+                runtime
+                    .eval("pi.log({ step: 1 }).then(() => pi.log({ step: 2 }));")
+                    .await
+                    .expect("start hostcall chain");
+            }
+
+            let first_requests = runtime.drain_hostcall_requests();
+            assert_eq!(first_requests.len(), 1);
+            let first_call_id = first_requests[0].call_id.clone();
+            assert!(
+                source.accepts(
+                    &runtime
+                        .session_action_origin_for_hostcall(&first_call_id)
+                        .expect("first hostcall origin")
+                )
+            );
+
+            source.advance();
+            runtime.complete_hostcall(
+                first_call_id.clone(),
+                HostcallOutcome::Success(serde_json::json!(null)),
+            );
+            runtime
+                .tick()
+                .await
+                .expect("complete first hostcall and drain continuation");
+            assert!(
+                runtime
+                    .session_action_origin_for_hostcall(&first_call_id)
+                    .is_none(),
+                "completed call provenance must be erased"
+            );
+
+            let second_requests = runtime.drain_hostcall_requests();
+            assert_eq!(second_requests.len(), 1);
+            let second_call_id = &second_requests[0].call_id;
+            let stale_origin = runtime
+                .session_action_origin_for_hostcall(second_call_id)
+                .expect("Promise continuation hostcall should retain an origin");
+            assert!(!source.accepts(&stale_origin));
+        });
     }
 
     #[test]
@@ -23235,6 +31059,25 @@ import { isIPv4 as netIsIpv4 } from "node:net";
     }
 
     #[test]
+    fn module_cache_key_includes_compiler_schema_version() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let module_path = temp_dir.path().join("module.js");
+        std::fs::write(&module_path, "export const x = 1;\n").expect("write module");
+
+        let key = module_cache_key(
+            &HashMap::new(),
+            &HashMap::new(),
+            module_path.to_string_lossy().as_ref(),
+        )
+        .expect("file cache key");
+
+        assert!(
+            key.starts_with(&format!("v{COMPILED_MODULE_CACHE_VERSION}:f:")),
+            "cache key must change when the compiler schema changes: {key}"
+        );
+    }
+
+    #[test]
     fn module_cache_key_changes_when_file_size_changes() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let module_path = temp_dir.path().join("module.js");
@@ -23380,30 +31223,252 @@ import { isIPv4 as netIsIpv4 } from "node:net";
         assert_eq!(state.module_cache_counters.invalidations, 1);
     }
 
+    const WARM_RESET_EXTENSION_REGISTRATION: &str = r#"
+        __pi_begin_extension(__pi_test_secret, "ext.reset", { name: "ext.reset" });
+        pi.registerTool({
+            name: "warm_reset_tool",
+            execute: async (_callId, _input) => ({ ok: true }),
+        });
+        pi.registerCommand("warm_reset_cmd", {
+            handler: async (_args, _ctx) => ({ ok: true }),
+        });
+        pi.on("startup", async () => {});
+        __pi_end_extension(__pi_test_secret);
+    "#;
+
+    const WARM_RESET_PROTECTED_STATE: &str = r"
+        globalThis.warmResetSecurity = {};
+        Promise.all([
+            import('node:fs'),
+            import('@mariozechner/pi-ai'),
+            import('node:child_process'),
+        ])
+            .then(([fs, ai]) => __pi_with_extension_async(
+                __pi_test_secret,
+                'ext.reset',
+                async () => {
+                fs.writeFileSync('/tmp/warm-reset-vfs.txt', 'transient');
+                ai.registerApiProvider({
+                    api: 'warm-reset-api',
+                    stream: async function* () {},
+                    streamSimple: async function* () {},
+                });
+
+                const vfsReset = globalThis.__pi_vfs_api.reset;
+                const providerReset = globalThis.__pi_reset_api_provider_registry;
+                const childReset = globalThis.__pi_reset_child_process_registry;
+                const processKill = globalThis.__pi_process_kill_impl;
+                try { globalThis.__pi_vfs_api.reset('wrong-secret'); }
+                catch (_) { globalThis.warmResetSecurity.vfsResetDenied = true; }
+                try { globalThis.__pi_reset_api_provider_registry('wrong-secret'); }
+                catch (_) { globalThis.warmResetSecurity.providerResetDenied = true; }
+                try { globalThis.__pi_reset_child_process_registry('wrong-secret'); }
+                catch (_) { globalThis.warmResetSecurity.childResetDenied = true; }
+                try { globalThis.__pi_reset_api_provider_registry = () => {}; }
+                catch (_) {}
+                try {
+                    Object.defineProperty(
+                        globalThis,
+                        '__pi_reset_api_provider_registry',
+                        { value: () => {} },
+                    );
+                } catch (_) {}
+                try { globalThis.__pi_process_kill_impl = () => true; }
+                catch (_) {}
+                try { globalThis.__pi_reset_child_process_registry = () => true; }
+                catch (_) {}
+
+                globalThis.warmResetSecurity.safeApiKeys =
+                    Object.keys(globalThis.__pi_vfs_api).sort().join(',');
+                globalThis.warmResetSecurity.vfsResetIntact =
+                    globalThis.__pi_vfs_api.reset === vfsReset;
+                globalThis.warmResetSecurity.providerResetIntact =
+                    globalThis.__pi_reset_api_provider_registry === providerReset;
+                globalThis.warmResetSecurity.childResetIntact =
+                    globalThis.__pi_reset_child_process_registry === childReset;
+                globalThis.warmResetSecurity.processKillIntact =
+                    globalThis.__pi_process_kill_impl === processKill;
+                globalThis.warmResetSecurity.providerCountBefore =
+                    ai.getApiProviders().length;
+                globalThis.warmResetSecurity.rawProviderStoreHidden =
+                    typeof globalThis.__pi_api_provider_registry_store === 'undefined';
+                globalThis.warmResetSecurity.rawChildStoreHidden =
+                    typeof globalThis.__pi_child_process_state === 'undefined';
+                globalThis.warmResetSecurity.childCountBefore =
+                    globalThis.__pi_child_process_registry_size();
+                globalThis.warmResetSecurity.vfsExistsBefore =
+                    fs.existsSync('/tmp/warm-reset-vfs.txt');
+                },
+            ))
+            .catch((error) => {
+                globalThis.warmResetSecurity.error =
+                    String((error && error.stack) || error || '');
+            })
+            .finally(() => { globalThis.warmResetSecurity.done = true; });
+    ";
+
+    const WARM_RESET_POST_SCRUB_INSPECTION: &str = r"
+        globalThis.warmResetSecurity.afterDone = false;
+        Promise.all([import('node:fs'), import('@mariozechner/pi-ai')])
+            .then(([fs, ai]) => __pi_with_extension_async(
+                __pi_test_secret,
+                'ext.reset',
+                async () => {
+                globalThis.warmResetSecurity.providerCountAfter =
+                    ai.getApiProviders().length;
+                globalThis.warmResetSecurity.vfsExistsAfter =
+                    fs.existsSync('/tmp/warm-reset-vfs.txt');
+                },
+            ))
+            .catch((error) => {
+                globalThis.warmResetSecurity.postError =
+                    String((error && error.stack) || error || '');
+            })
+            .finally(() => { globalThis.warmResetSecurity.afterDone = true; });
+    ";
+
+    const WARM_FD_BEFORE_RESET: &str = r"
+        globalThis.warmFdReset = {};
+        import('node:fs')
+            .then((fs) => __pi_with_extension_async(
+                __pi_test_secret,
+                'ext.reset',
+                async () => {
+                    fs.writeFileSync('/tmp/stale-raw.txt', 'stale-raw');
+                    fs.writeFileSync('/tmp/stale-handle.txt', 'stale-handle');
+                    globalThis.__staleRawFd = fs.openSync('/tmp/stale-raw.txt', 'r');
+                    globalThis.__staleFileHandle =
+                        await fs.promises.open('/tmp/stale-handle.txt', 'r');
+                    globalThis.warmFdReset.oldRawFd = globalThis.__staleRawFd;
+                    globalThis.warmFdReset.oldHandleFd = globalThis.__staleFileHandle.fd;
+                    globalThis.warmFdReset.beforeDone = true;
+                },
+            ))
+            .catch((error) => {
+                globalThis.warmFdReset.beforeError =
+                    String((error && error.stack) || error || '');
+            });
+    ";
+
+    const WARM_FD_AFTER_RESET: &str = r"
+        import('node:fs')
+            .then((fs) => __pi_with_extension_async(
+                __pi_test_secret,
+                'ext.reset',
+                async () => {
+                    fs.writeFileSync('/tmp/fresh-after-reset.txt', 'fresh-value');
+                    const freshFd = fs.openSync('/tmp/fresh-after-reset.txt', 'r+');
+                    globalThis.warmFdReset.freshFd = freshFd;
+                    try {
+                        fs.readSync(globalThis.__staleRawFd, Buffer.alloc(1), 0, 1, 0);
+                        globalThis.warmFdReset.staleRawDenied = false;
+                    } catch (_) {
+                        globalThis.warmFdReset.staleRawDenied = true;
+                    }
+                    try {
+                        await globalThis.__staleFileHandle.read(Buffer.alloc(1), 0, 1, 0);
+                        globalThis.warmFdReset.staleHandleReadDenied = false;
+                    } catch (_) {
+                        globalThis.warmFdReset.staleHandleReadDenied = true;
+                    }
+                    try {
+                        await globalThis.__staleFileHandle.close();
+                        globalThis.warmFdReset.staleHandleCloseDenied = false;
+                    } catch (_) {
+                        globalThis.warmFdReset.staleHandleCloseDenied = true;
+                    }
+                    const freshBytes = Buffer.alloc(11);
+                    const count = fs.readSync(freshFd, freshBytes, 0, 11, 0);
+                    globalThis.warmFdReset.freshValue =
+                        freshBytes.subarray(0, count).toString('utf8');
+                    fs.closeSync(freshFd);
+                    globalThis.warmFdReset.afterDone = true;
+                },
+            ))
+            .catch((error) => {
+                globalThis.warmFdReset.afterError =
+                    String((error && error.stack) || error || '');
+            });
+    ";
+
+    const POISONED_WARM_RESET_SETUP: &str = r"
+        globalThis.poisonedWarmReset = { done: false };
+        Promise.all([import('node:fs'), import('@mariozechner/pi-ai')])
+            .then(([fs, ai]) => __pi_with_extension_async(
+                __pi_test_secret,
+                'ext.reset',
+                async () => {
+                    fs.writeFileSync('/tmp/poisoned-warm-reset.txt', 'transient');
+                    ai.registerApiProvider({
+                        api: 'poisoned-warm-reset-api',
+                        stream: async function* () {},
+                        streamSimple: async function* () {},
+                    });
+                    Map.prototype.clear = () => {};
+                    Set.prototype.clear = () => {};
+                    globalThis.poisonedWarmReset.done = true;
+                },
+            ))
+            .catch((error) => {
+                globalThis.poisonedWarmReset.error =
+                    String((error && error.stack) || error || '');
+            });
+    ";
+
+    fn assert_warm_reset_protected_state_before_scrub(value: &serde_json::Value) {
+        assert_eq!(value["done"], serde_json::json!(true));
+        assert_eq!(
+            value["error"],
+            serde_json::Value::Null,
+            "protected-state setup failed: {value}"
+        );
+        assert_eq!(
+            value["safeApiKeys"],
+            serde_json::json!("listVisiblePaths,normalizePath")
+        );
+        assert_eq!(value["vfsResetDenied"], serde_json::json!(true));
+        assert_eq!(value["providerResetDenied"], serde_json::json!(true));
+        assert_eq!(value["childResetDenied"], serde_json::json!(true));
+        assert_eq!(value["vfsResetIntact"], serde_json::json!(true));
+        assert_eq!(value["providerResetIntact"], serde_json::json!(true));
+        assert_eq!(value["childResetIntact"], serde_json::json!(true));
+        assert_eq!(value["processKillIntact"], serde_json::json!(true));
+        assert_eq!(value["providerCountBefore"], serde_json::json!(1));
+        assert_eq!(value["rawProviderStoreHidden"], serde_json::json!(true));
+        assert_eq!(value["rawChildStoreHidden"], serde_json::json!(true));
+        assert_eq!(value["childCountBefore"], serde_json::json!(0));
+        assert_eq!(value["vfsExistsBefore"], serde_json::json!(true));
+    }
+
     #[test]
     fn warm_reset_clears_extension_registry_state() {
         futures::executor::block_on(async {
             let runtime = PiJsRuntime::with_clock(DeterministicClock::new(0))
                 .await
                 .expect("create runtime");
+            runtime.register_foreign_extension_root_boundary(
+                Path::new("/tmp/ext-foreign"),
+                "ext.foreign",
+            );
 
             runtime
-                .eval(
-                    r#"
-                    __pi_begin_extension("ext.reset", { name: "ext.reset" });
-                    pi.registerTool({
-                        name: "warm_reset_tool",
-                        execute: async (_callId, _input) => ({ ok: true }),
-                    });
-                    pi.registerCommand("warm_reset_cmd", {
-                        handler: async (_args, _ctx) => ({ ok: true }),
-                    });
-                    pi.on("startup", async () => {});
-                    __pi_end_extension();
-                    "#,
-                )
+                .eval(&privileged_test_script(
+                    &runtime,
+                    WARM_RESET_EXTENSION_REGISTRATION,
+                ))
                 .await
                 .expect("register extension state");
+
+            runtime
+                .eval(&privileged_test_script(
+                    &runtime,
+                    WARM_RESET_PROTECTED_STATE,
+                ))
+                .await
+                .expect("register protected warm-reset state");
+
+            let reset_security_before = get_global_json(&runtime, "warmResetSecurity").await;
+            assert_warm_reset_protected_state_before_scrub(&reset_security_before);
 
             let before = call_global_fn_json(&runtime, "__pi_runtime_registry_snapshot").await;
             assert_eq!(before["extensions"], serde_json::json!(1));
@@ -23411,10 +31476,13 @@ import { isIPv4 as netIsIpv4 } from "node:net";
             assert_eq!(before["commands"], serde_json::json!(1));
 
             let report = runtime
-                .reset_for_warm_reload()
+                .scrub_for_cold_drop()
                 .await
                 .expect("warm reset should run");
-            assert!(report.reused, "expected warm reuse, got report: {report:?}");
+            assert!(
+                report.inventoried_state_cleared,
+                "expected inventoried state to clear, got report: {report:?}"
+            );
             assert!(
                 report.reason_code.is_none(),
                 "unexpected warm-reset reason: {:?}",
@@ -23428,6 +31496,121 @@ import { isIPv4 as netIsIpv4 } from "node:net";
             assert_eq!(after["hooks"], serde_json::json!(0));
             assert_eq!(after["pendingTasks"], serde_json::json!(0));
             assert_eq!(after["pendingHostcalls"], serde_json::json!(0));
+
+            runtime
+                .eval(&privileged_test_script(
+                    &runtime,
+                    WARM_RESET_POST_SCRUB_INSPECTION,
+                ))
+                .await
+                .expect("inspect protected state after warm reset");
+            let reset_security_after = get_global_json(&runtime, "warmResetSecurity").await;
+            assert_eq!(reset_security_after["afterDone"], serde_json::json!(true));
+            assert_eq!(
+                reset_security_after["postError"],
+                serde_json::Value::Null,
+                "post-reset inspection failed: {reset_security_after}"
+            );
+            assert_eq!(
+                reset_security_after["providerCountAfter"],
+                serde_json::json!(0)
+            );
+            assert_eq!(
+                reset_security_after["vfsExistsAfter"],
+                serde_json::json!(false)
+            );
+            assert!(
+                runtime
+                    .module_state
+                    .borrow()
+                    .foreign_extension_root_boundaries_by_id
+                    .is_empty()
+            );
+        });
+    }
+
+    #[test]
+    fn warm_reset_never_reuses_stale_vfs_file_descriptors() {
+        futures::executor::block_on(async {
+            let runtime = PiJsRuntime::with_clock(DeterministicClock::new(0))
+                .await
+                .expect("create runtime");
+
+            runtime
+                .eval(&privileged_test_script(&runtime, WARM_FD_BEFORE_RESET))
+                .await
+                .expect("create descriptors before reset");
+            let before = get_global_json(&runtime, "warmFdReset").await;
+            assert_eq!(
+                before["beforeError"],
+                serde_json::Value::Null,
+                "pre-reset descriptor setup failed: {before}"
+            );
+            assert_eq!(before["beforeDone"], serde_json::json!(true));
+
+            let report = runtime
+                .scrub_for_cold_drop()
+                .await
+                .expect("warm reset should run");
+            assert!(
+                report.inventoried_state_cleared,
+                "expected inventoried state to clear, got report: {report:?}"
+            );
+
+            runtime
+                .eval(&privileged_test_script(&runtime, WARM_FD_AFTER_RESET))
+                .await
+                .expect("exercise stale descriptors after reset");
+
+            let after = get_global_json(&runtime, "warmFdReset").await;
+            assert_eq!(
+                after["afterError"],
+                serde_json::Value::Null,
+                "post-reset descriptor exercise failed: {after}"
+            );
+            assert_eq!(after["afterDone"], serde_json::json!(true), "{after}");
+            assert_ne!(after["freshFd"], after["oldRawFd"]);
+            assert_ne!(after["freshFd"], after["oldHandleFd"]);
+            assert_eq!(after["staleRawDenied"], serde_json::json!(true));
+            assert_eq!(after["staleHandleReadDenied"], serde_json::json!(true));
+            assert_eq!(after["staleHandleCloseDenied"], serde_json::json!(true));
+            assert_eq!(after["freshValue"], serde_json::json!("fresh-value"));
+        });
+    }
+
+    #[test]
+    fn warm_reset_rejects_runtime_with_poisoned_collection_intrinsics() {
+        futures::executor::block_on(async {
+            let runtime = PiJsRuntime::with_clock(DeterministicClock::new(0))
+                .await
+                .expect("create runtime");
+
+            runtime
+                .eval(&privileged_test_script(&runtime, POISONED_WARM_RESET_SETUP))
+                .await
+                .expect("poison collection intrinsics after creating transient state");
+
+            let before = get_global_json(&runtime, "poisonedWarmReset").await;
+            assert_eq!(
+                before["error"],
+                serde_json::Value::Null,
+                "poisoned warm-reset setup failed: {before}"
+            );
+            assert_eq!(before["done"], serde_json::json!(true));
+
+            let report = runtime
+                .scrub_for_cold_drop()
+                .await
+                .expect("warm reset should use captured primordial methods");
+            assert!(
+                !report.inventoried_state_cleared,
+                "poisoned runtime must fail the realm scrub: {report:?}"
+            );
+            assert_eq!(report.reason_code.as_deref(), Some("reset_residual_state"));
+            assert_eq!(
+                report.residual_entries_after, 0,
+                "captured primordial methods should still clear all transient registries"
+            );
         });
     }
 
@@ -23440,10 +31623,10 @@ import { isIPv4 as netIsIpv4 } from "node:net";
             let _timer = runtime.set_timeout(10);
 
             let report = runtime
-                .reset_for_warm_reload()
+                .scrub_for_cold_drop()
                 .await
                 .expect("warm reset should return report");
-            assert!(!report.reused);
+            assert!(!report.inventoried_state_cleared);
             assert_eq!(report.reason_code.as_deref(), Some("pending_rust_work"));
         });
     }
@@ -23456,19 +31639,20 @@ import { isIPv4 as netIsIpv4 } from "node:net";
                 .expect("create runtime");
 
             runtime
-                .eval(
+                .eval(&privileged_test_script(
+                    &runtime,
                     r#"
-                    __pi_tasks.set("pending-task", { status: "pending" });
+                    __pi_task_start(__pi_test_secret, "pending-task", new Promise(() => {}));
                     "#,
-                )
+                ))
                 .await
                 .expect("inject pending JS task");
 
             let report = runtime
-                .reset_for_warm_reload()
+                .scrub_for_cold_drop()
                 .await
                 .expect("warm reset should return report");
-            assert!(!report.reused);
+            assert!(!report.inventoried_state_cleared);
             assert_eq!(report.reason_code.as_deref(), Some("pending_js_work"));
 
             let after = call_global_fn_json(&runtime, "__pi_runtime_registry_snapshot").await;
@@ -23485,17 +31669,20 @@ import { isIPv4 as netIsIpv4 } from "node:net";
                 .expect("create runtime");
 
             let cache_key = "pijs://virtual".to_string();
+            let extension_root = PathBuf::from("/tmp/ext-root");
             {
                 let mut state = runtime.module_state.borrow_mut();
-                let extension_root = PathBuf::from("/tmp/ext-root");
-                runtime.add_allowed_read_root(&extension_root);
                 state.extension_roots.push(extension_root.clone());
                 state
                     .extension_root_tiers
                     .insert(extension_root.clone(), ProxyStubSourceTier::Community);
                 state
                     .extension_root_scopes
-                    .insert(extension_root, "@scope".to_string());
+                    .insert(extension_root.clone(), "@scope".to_string());
+                state.foreign_extension_root_boundaries_by_id.insert(
+                    "ext.foreign".to_string(),
+                    vec![PathBuf::from("/tmp/ext-foreign")],
+                );
                 state
                     .dynamic_virtual_modules
                     .insert(cache_key.clone(), "export const v = 1;".to_string());
@@ -23519,6 +31706,7 @@ import { isIPv4 as netIsIpv4 } from "node:net";
                     disk_hits: 6,
                 };
             }
+            runtime.add_allowed_read_root(&extension_root);
 
             runtime
                 .hostcall_queue
@@ -23535,7 +31723,7 @@ import { isIPv4 as netIsIpv4 } from "node:net";
             runtime
                 .hostcall_tracker
                 .borrow_mut()
-                .register("call-1".to_string(), Some(42), 0);
+                .register("call-1".to_string(), Some(42), 0, None);
             runtime
                 .hostcalls_total
                 .store(11, std::sync::atomic::Ordering::SeqCst);
@@ -23546,7 +31734,7 @@ import { isIPv4 as netIsIpv4 } from "node:net";
                 .tick_counter
                 .store(7, std::sync::atomic::Ordering::SeqCst);
 
-            runtime.reset_transient_state();
+            runtime.reset_host_bookkeeping_before_drop();
 
             let roots_empty = runtime
                 .allowed_read_roots
@@ -23562,6 +31750,7 @@ import { isIPv4 as netIsIpv4 } from "node:net";
                 assert!(state.extension_root_scopes.is_empty());
                 assert!(state.extension_roots_by_id.is_empty());
                 assert!(state.extension_roots_without_id.is_empty());
+                assert!(state.foreign_extension_root_boundaries_by_id.is_empty());
                 assert!(state.dynamic_virtual_modules.is_empty());
                 assert!(state.dynamic_virtual_named_exports.is_empty());
 
@@ -23646,10 +31835,13 @@ import { isIPv4 as netIsIpv4 } from "node:net";
             runtime.add_extension_root_with_id(root.clone(), Some("ext.reset.roots"));
 
             let report = runtime
-                .reset_for_warm_reload()
+                .scrub_for_cold_drop()
                 .await
                 .expect("warm reset should run");
-            assert!(report.reused, "expected warm reuse, got report: {report:?}");
+            assert!(
+                report.inventoried_state_cleared,
+                "expected inventoried state to clear, got report: {report:?}"
+            );
 
             let state = runtime.module_state.borrow();
             assert!(state.extension_roots.is_empty());
@@ -23801,6 +31993,77 @@ import { isIPv4 as netIsIpv4 } from "node:net";
             &canonical_roots,
         );
         assert_eq!(resolved, Some(inside));
+    }
+
+    #[test]
+    fn resolve_module_path_decodes_file_urls_and_preserves_scope() {
+        let temp = tempfile::tempdir().expect("file URL fixture");
+        let root = temp.path().join("extension # % λ");
+        std::fs::create_dir_all(&root).expect("create encoded-name root");
+        let base = root.join("index.mjs");
+        let module = root.join("helper #%.mjs");
+        let outside = temp.path().join("outside.mjs");
+        std::fs::write(&base, "export {};\n").unwrap();
+        std::fs::write(&module, "export const answer = 42;\n").unwrap();
+        std::fs::write(&outside, "throw new Error('outside executed');\n").unwrap();
+        let roots = [crate::extensions::safe_canonicalize(&root)];
+        let module_url = url::Url::from_file_path(&module).unwrap();
+        assert!(module_url.as_str().contains("%23"));
+        assert!(module_url.as_str().contains("%25"));
+        assert_eq!(
+            resolve_module_path(
+                base.to_str().unwrap(),
+                module_url.as_str(),
+                RepairMode::Off,
+                &roots
+            ),
+            Some(module)
+        );
+        let outside_url = url::Url::from_file_path(&outside).unwrap();
+        assert!(
+            resolve_module_path(
+                base.to_str().unwrap(),
+                outside_url.as_str(),
+                RepairMode::Off,
+                &roots
+            )
+            .is_none()
+        );
+        for suffix in ["#fragment", "?variant=2", "%2fsecret.mjs", "%00", "%zz"] {
+            let invalid = format!("{}{suffix}", module_url.as_str());
+            assert!(module_path_from_file_url(&invalid).is_none(), "{invalid}");
+        }
+        let traversal = format!(
+            "{}/%2e%2e/outside.mjs",
+            url::Url::from_directory_path(&root)
+                .unwrap()
+                .as_str()
+                .trim_end_matches('/')
+        );
+        assert!(
+            resolve_module_path(base.to_str().unwrap(), &traversal, RepairMode::Off, &roots)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn import_meta_url_encodes_paths_for_native_and_windows_modules() {
+        for (path, expected) in [
+            (
+                "/tmp/extension # % λ/entry.mjs",
+                "file:///tmp/extension%20%23%20%25%20%CE%BB/entry.mjs",
+            ),
+            (
+                r"C:\Users\reporter # % λ\entry.mjs",
+                "file:///C:/Users/reporter%20%23%20%25%20%CE%BB/entry.mjs",
+            ),
+        ] {
+            let compiled = String::from_utf8(prefix_import_meta_url(path, "export {};")).unwrap();
+            assert!(
+                compiled.starts_with(&format!("import.meta.url = {expected:?};\n")),
+                "{compiled}"
+            );
+        }
     }
 
     #[test]
@@ -23965,7 +32228,20 @@ globalThis.__proxyProbe = {
   kind: typeof dep,
   chain: typeof dep.foo.bar(),
   primitive: String(dep),
+  values: Object.values(dep),
+  hasPrototype: 'prototype' in dep,
+  prototypeConfigurable: Object.getOwnPropertyDescriptor(dep, 'prototype').configurable,
 };
+Object.defineProperty(dep, 'fixed', { value: 7, enumerable: true });
+Object.defineProperty(dep, 'getterless', { get: undefined });
+const fixedSymbol = Symbol('fixed');
+Object.defineProperty(dep, fixedSymbol, { value: 9 });
+Object.freeze(dep);
+globalThis.__proxyProbe.fixed = dep.fixed;
+globalThis.__proxyProbe.symbol = dep[fixedSymbol];
+globalThis.__proxyProbe.getterless = dep.getterless === undefined;
+globalThis.__proxyProbe.frozen = Object.isFrozen(dep);
+globalThis.__proxyProbe.frozenValues = Object.values(dep);
 export default dep;
 "#,
             )
@@ -24009,6 +32285,14 @@ export default dep;
             assert_eq!(probe["kind"], serde_json::json!("function"));
             assert_eq!(probe["chain"], serde_json::json!("function"));
             assert_eq!(probe["primitive"], serde_json::json!(""));
+            assert_eq!(probe["values"], serde_json::json!([]));
+            assert_eq!(probe["hasPrototype"], serde_json::json!(true));
+            assert_eq!(probe["prototypeConfigurable"], serde_json::json!(false));
+            assert_eq!(probe["fixed"], serde_json::json!(7));
+            assert_eq!(probe["symbol"], serde_json::json!(9));
+            assert_eq!(probe["getterless"], serde_json::json!(true));
+            assert_eq!(probe["frozen"], serde_json::json!(true));
+            assert_eq!(probe["frozenValues"], serde_json::json!([7]));
 
             let events = runtime.drain_repair_events();
             assert!(events.iter().any(|event| {
@@ -24277,7 +32561,7 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
             let script = format!(
                 r#"
                 globalThis.realDoomEntryLoad = {{}};
-                __pi_load_extension("community/doom-overlay", {entry_spec:?}, {{ name: "doom-overlay" }})
+                __pi_load_extension({bridge_secret:?}, "community/doom-overlay", {entry_spec:?}, {{ name: "doom-overlay" }})
                   .then(() => {{
                     globalThis.realDoomEntryLoad.done = true;
                     globalThis.realDoomEntryLoad.error = "";
@@ -24286,7 +32570,8 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
                     globalThis.realDoomEntryLoad.done = true;
                     globalThis.realDoomEntryLoad.error = String((err && err.message) || err || "");
                   }});
-                "#
+                "#,
+                bridge_secret = runtime.bridge_secret()
             );
             runtime.eval(&script).await.expect("eval load_extension");
 
@@ -24370,13 +32655,14 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
                 .expect("create runtime");
 
             runtime
-                .eval(
+                .eval(&privileged_test_script(
+                    &runtime,
                     r#"
-                __pi_begin_extension("ext.test", { name: "Test" });
+                __pi_begin_extension(__pi_test_secret, "ext.test", { name: "Test" });
                 pi.tool("read", { path: "test.txt" });
-                __pi_end_extension();
+                __pi_end_extension(__pi_test_secret);
             "#,
-                )
+                ))
                 .await
                 .expect("eval");
 
@@ -24394,7 +32680,8 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
                 .expect("create runtime");
 
             runtime
-                .eval(
+                .eval(&privileged_test_script(
+                    &runtime,
                     r#"
                 pi.log({
                     level: "info",
@@ -24403,7 +32690,7 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
                     correlation: { scenario_id: "scn-1" }
                 });
             "#,
-                )
+                ))
                 .await
                 .expect("eval");
 
@@ -24437,9 +32724,10 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
                 .expect("create runtime");
 
             runtime
-                .eval(
+                .eval(&privileged_test_script(
+                    &runtime,
                     r"
-                __pi_begin_extension('ext.test', { name: 'Test' });
+                __pi_begin_extension(__pi_test_secret, 'ext.test', { name: 'Test' });
                 pi.registerTool({
                     name: 'my_tool',
                     label: 'My Tool',
@@ -24447,9 +32735,9 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
                     parameters: { type: 'object', properties: { path: { type: 'string' } } },
                     execute: async (_callId, _input) => { return { ok: true }; },
                 });
-                __pi_end_extension();
+                __pi_end_extension(__pi_test_secret);
             ",
-                )
+                ))
                 .await
                 .expect("eval");
 
@@ -24480,14 +32768,15 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
                 .expect("create runtime");
 
             runtime
-                .eval(
+                .eval(&privileged_test_script(
+                    &runtime,
                     r"
-                __pi_begin_extension('ext.test', { name: 'Test' });
+                __pi_begin_extension(__pi_test_secret, 'ext.test', { name: 'Test' });
                 pi.registerTool({ name: 'b', execute: async (_callId, _input) => { return {}; } });
                 pi.registerTool({ name: 'a', execute: async (_callId, _input) => { return {}; } });
-                __pi_end_extension();
+                __pi_end_extension(__pi_test_secret);
             ",
-                )
+                ))
                 .await
                 .expect("eval");
 
@@ -24510,15 +32799,16 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
                 .expect("create runtime");
 
             runtime
-                .eval(
+                .eval(&privileged_test_script(
+                    &runtime,
                     r#"
-                __pi_validate_tool_input({
+                __pi_validate_tool_input(__pi_test_secret, {
                     type: ["object", "null"],
                     properties: { name: { type: "string" } },
                     required: ["name"]
                 }, null);
             "#,
-                )
+                ))
                 .await
                 .expect("null input should be allowed when schema permits null");
         });
@@ -24532,15 +32822,16 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
                 .expect("create runtime");
 
             let err = runtime
-                .eval(
+                .eval(&privileged_test_script(
+                    &runtime,
                     r#"
-                __pi_validate_tool_input({
+                __pi_validate_tool_input(__pi_test_secret, {
                     type: ["object", "null"],
                     properties: { name: { type: "string" } },
                     required: ["name"]
                 }, {});
             "#,
-                )
+                ))
                 .await
                 .expect_err("missing required field should throw");
 
@@ -24556,14 +32847,15 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
                 .expect("create runtime");
 
             let err = runtime
-                .eval(
+                .eval(&privileged_test_script(
+                    &runtime,
                     r#"
-                __pi_validate_tool_input({
+                __pi_validate_tool_input(__pi_test_secret, {
                     type: "object",
                     properties: { name: { type: "string" } }
                 }, "nope");
             "#,
-                )
+                ))
                 .await
                 .expect_err("non-object input should throw");
 
@@ -24579,15 +32871,16 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
                 .expect("create runtime");
 
             runtime
-                .eval(
+                .eval(&privileged_test_script(
+                    &runtime,
                     r#"
-                __pi_validate_tool_input({
+                __pi_validate_tool_input(__pi_test_secret, {
                     type: ["object", "string"],
                     properties: { name: { type: "string" } },
                     required: ["name"]
                 }, "ok");
             "#,
-                )
+                ))
                 .await
                 .expect("string input should be allowed when schema permits string");
         });
@@ -24601,14 +32894,15 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
                 .expect("create runtime");
 
             let err = runtime
-                .eval(
+                .eval(&privileged_test_script(
+                    &runtime,
                     r#"
-                __pi_validate_tool_input({
+                __pi_validate_tool_input(__pi_test_secret, {
                     type: ["object", "string"],
                     properties: { name: { type: "string" } }
                 }, null);
             "#,
-                )
+                ))
                 .await
                 .expect_err("null input should be rejected when schema disallows null");
 
@@ -24624,14 +32918,15 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
                 .expect("create runtime");
 
             let err = runtime
-                .eval(
+                .eval(&privileged_test_script(
+                    &runtime,
                     r#"
-                __pi_validate_tool_input({
+                __pi_validate_tool_input(__pi_test_secret, {
                     type: ["object", "string"],
                     properties: { name: { type: "string" } }
                 }, 42);
             "#,
-                )
+                ))
                 .await
                 .expect_err("number input should be rejected when schema allows only string");
 
@@ -24647,14 +32942,15 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
                 .expect("create runtime");
 
             runtime
-                .eval(
+                .eval(&privileged_test_script(
+                    &runtime,
                     r#"
-                __pi_validate_tool_input({
+                __pi_validate_tool_input(__pi_test_secret, {
                     type: "object",
                     properties: { name: { type: "string" } }
                 }, undefined);
             "#,
-                )
+                ))
                 .await
                 .expect("undefined input should be allowed when no required fields");
         });
@@ -24961,13 +33257,14 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
                 .expect("create runtime");
 
             runtime
-                .eval(
+                .eval(&privileged_test_script(
+                    &runtime,
                     r#"
             pi.tool("read", { path: "a.txt" });
             pi.exec("ls", ["-la"]);
             pi.http({ url: "https://example.com" });
         "#,
-                )
+                ))
                 .await
                 .expect("eval");
 
@@ -24992,7 +33289,8 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
                 .expect("create runtime");
 
             runtime
-                .eval(
+                .eval(&privileged_test_script(
+                    &runtime,
                     r#"
             fetch("https://example.com/upload", {
                 method: "POST",
@@ -25000,7 +33298,7 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
                 body: new Uint8Array([0, 1, 2, 255]),
             });
         "#,
-                )
+                ))
                 .await
                 .expect("eval");
 
@@ -25038,14 +33336,15 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
 
             // Set up a promise handler that stores the result
             runtime
-                .eval(
+                .eval(&privileged_test_script(
+                    &runtime,
                     r#"
             globalThis.result = null;
             pi.tool("read", { path: "test.txt" }).then(r => {
                 globalThis.result = r;
             });
         "#,
-                )
+                ))
                 .await
                 .expect("eval");
 
@@ -25133,6 +33432,58 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
     }
 
     #[test]
+    fn pijs_runtime_queue_overload_rejects_promise_exactly_once() {
+        futures::executor::block_on(async {
+            let mut config = PiJsRuntimeConfig::default();
+            config.limits.hostcall_fast_queue_capacity = 1;
+            config.limits.hostcall_overflow_queue_capacity = 1;
+            config.limits.hostcall_timeout_ms = Some(1_000);
+            let runtime = PiJsRuntime::with_clock_and_config(DeterministicClock::new(0), config)
+                .await
+                .expect("create bounded-queue runtime");
+
+            runtime
+                .eval(&privileged_test_script(
+                    &runtime,
+                    r#"
+            globalThis.overloadError = null;
+            void pi.tool("first", {});
+            void pi.tool("second", {});
+            pi.tool("rejected", {}).catch(error => {
+                globalThis.overloadError = { code: error.code, message: error.message };
+            });
+        "#,
+                ))
+                .await
+                .expect("enqueue overloaded hostcall");
+
+            assert_eq!(
+                runtime.pending_hostcall_count(),
+                3,
+                "the rejected request must remain tracked until its completion is delivered"
+            );
+            let stats = runtime.tick().await.expect("deliver overload completion");
+            assert!(stats.ran_macrotask);
+            assert_eq!(
+                runtime.pending_hostcall_count(),
+                2,
+                "overload delivery must finalize only the rejected request"
+            );
+            let error = runtime
+                .read_global_json("overloadError")
+                .await
+                .expect("read overload rejection");
+            assert_eq!(error["code"], "overloaded");
+            assert!(
+                error["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("Hostcall queue overloaded")),
+                "unexpected overload rejection: {error}"
+            );
+        });
+    }
+
+    #[test]
     fn pijs_runtime_tick_stats() {
         futures::executor::block_on(async {
             let runtime = PiJsRuntime::with_clock(DeterministicClock::new(0))
@@ -25171,10 +33522,11 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
                 .expect("create runtime");
 
             runtime
-                .eval(
+                .eval(&privileged_test_script(
+                    &runtime,
                     r"
                     globalThis.renderWidths = [];
-                    const ui = __pi_make_extension_ui(true);
+                    const ui = __pi_make_extension_ui(__pi_test_secret, true);
                     void ui.custom((_tui, _theme, _keybindings, onDone) => ({
                         render(width) {
                             globalThis.renderWidths.push(width);
@@ -25185,7 +33537,7 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
                         }
                     }), { width: 80 });
                     ",
-                )
+                ))
                 .await
                 .expect("start custom ui");
 
@@ -25297,6 +33649,386 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
         });
     }
 
+    /// `ui.setFooter` and `ui.setHeader` take a component factory. Sent as
+    /// text, the factory's source became the footer status and the terminal
+    /// title.
+    #[test]
+    fn pijs_footer_and_header_factories_send_no_source_text() {
+        futures::executor::block_on(async {
+            let runtime = PiJsRuntime::with_clock(DeterministicClock::new(0))
+                .await
+                .expect("create runtime");
+
+            runtime
+                .eval(&privileged_test_script(
+                    &runtime,
+                    r"
+                    const ui = __pi_make_extension_ui(__pi_test_secret, true);
+                    ui.setFooter((_tui, _theme, footerData) => ({ render: () => ['footer'] }));
+                    ui.setHeader((_tui, _theme) => ({ render: () => ['header'] }));
+                    ui.setFooter('plain footer');
+                    ",
+                ))
+                .await
+                .expect("eval");
+
+            let sent: Vec<(String, serde_json::Value)> = runtime
+                .drain_hostcall_requests()
+                .into_iter()
+                .filter_map(|request| match &request.kind {
+                    HostcallKind::Ui { op } => Some((op.clone(), request.payload.clone())),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(sent.len(), 1, "factories send nothing: {sent:?}");
+            assert_eq!(
+                sent.first()
+                    .map(|(op, payload)| (op.as_str(), &payload["statusText"])),
+                Some(("setStatus", &serde_json::json!("plain footer")))
+            );
+        });
+    }
+
+    struct DeferredHttpTestStream {
+        frames: std::collections::VecDeque<HostcallOutcome>,
+        pending_after_frames: bool,
+        polls: Rc<std::cell::Cell<usize>>,
+        drops: Rc<std::cell::Cell<usize>>,
+    }
+
+    impl DeferredHttpTestStream {
+        fn new(frames: Vec<HostcallOutcome>, pending_after_frames: bool) -> Self {
+            Self {
+                frames: frames.into(),
+                pending_after_frames,
+                polls: Rc::new(std::cell::Cell::new(0)),
+                drops: Rc::new(std::cell::Cell::new(0)),
+            }
+        }
+    }
+
+    impl futures::Stream for DeferredHttpTestStream {
+        type Item = HostcallOutcome;
+
+        fn poll_next(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Self::Item>> {
+            let this = self.get_mut();
+            this.polls.set(this.polls.get() + 1);
+            if let Some(frame) = this.frames.pop_front() {
+                std::task::Poll::Ready(Some(frame))
+            } else if this.pending_after_frames {
+                std::task::Poll::Pending
+            } else {
+                std::task::Poll::Ready(None)
+            }
+        }
+    }
+
+    impl Drop for DeferredHttpTestStream {
+        fn drop(&mut self) {
+            self.drops.set(self.drops.get() + 1);
+        }
+    }
+
+    #[test]
+    fn pijs_deferred_http_waits_for_consumer_credit_between_frames() {
+        futures::executor::block_on(async {
+            let runtime = PiJsRuntime::with_clock(DeterministicClock::new(0))
+                .await
+                .expect("runtime");
+            runtime
+                .eval("globalThis.response = pi.http({url:'https://example.com/',stream:true});")
+                .await
+                .expect("enqueue streaming request");
+            let requests = runtime.drain_hostcall_requests();
+            assert_eq!(requests.len(), 1);
+            let call_id = &requests[0].call_id;
+            let producer = DeferredHttpTestStream::new(
+                vec![
+                    HostcallOutcome::StreamChunk {
+                        sequence: 0,
+                        chunk: json!({"status": 200, "headers": {}}),
+                        is_final: false,
+                    },
+                    HostcallOutcome::StreamChunk {
+                        sequence: 1,
+                        chunk: json!({"body_bytes": "aGVsbG8="}),
+                        is_final: false,
+                    },
+                    HostcallOutcome::StreamChunk {
+                        sequence: 2,
+                        chunk: serde_json::Value::Null,
+                        is_final: true,
+                    },
+                ],
+                false,
+            );
+            let polls = Rc::clone(&producer.polls);
+            let drops = Rc::clone(&producer.drops);
+            runtime
+                .defer_hostcall_stream(call_id, Box::pin(producer))
+                .expect("defer stream");
+            runtime.tick().await.expect("initial header credit");
+            runtime.tick().await.expect("idle without a consumer");
+            assert_eq!(polls.get(), 1, "body must remain unpolled");
+            runtime
+                .eval("response.next().then(frame => { globalThis.head = frame.value; });")
+                .await
+                .expect("consume header");
+            runtime.tick().await.expect("one body credit");
+            runtime.tick().await.expect("idle without more demand");
+            assert_eq!(polls.get(), 2);
+            assert_eq!(get_global_json(&runtime, "head").await["status"], 200);
+            runtime
+                .eval("response.next().then(frame => { globalThis.body = frame.value; });")
+                .await
+                .expect("consume body");
+            runtime.tick().await.expect("terminal credit");
+            assert_eq!(polls.get(), 3);
+            assert_eq!(drops.get(), 1);
+            assert!(!runtime.has_deferred_hostcall(call_id));
+            assert!(!runtime.is_hostcall_active(call_id));
+            assert_eq!(
+                get_global_json(&runtime, "body").await["body_bytes"],
+                "aGVsbG8="
+            );
+        });
+    }
+
+    #[test]
+    fn pijs_deferred_http_cancel_drops_pending_future_immediately() {
+        futures::executor::block_on(async {
+            let runtime = PiJsRuntime::with_clock(DeterministicClock::new(0))
+                .await
+                .expect("runtime");
+            runtime
+                .eval("globalThis.response = pi.http({url:'https://example.com/',stream:true});")
+                .await
+                .expect("enqueue request");
+            let requests = runtime.drain_hostcall_requests();
+            assert_eq!(requests.len(), 1);
+            let call_id = &requests[0].call_id;
+            let producer = DeferredHttpTestStream::new(Vec::new(), true);
+            let drops = Rc::clone(&producer.drops);
+            runtime
+                .defer_hostcall_stream(call_id, Box::pin(producer))
+                .expect("defer stream");
+            runtime.tick().await.expect("poll pending headers");
+            assert_eq!(drops.get(), 0);
+            runtime
+                .eval("response.return(); response.return();")
+                .await
+                .expect("cancel twice");
+            assert_eq!(drops.get(), 1, "cancel must drop without a later tick");
+            assert!(!runtime.has_deferred_hostcall(call_id));
+            assert!(!runtime.is_hostcall_active(call_id));
+            runtime.tick().await.expect("deliver cancellation sentinel");
+            assert_eq!(runtime.pending_hostcall_count(), 0);
+        });
+    }
+
+    #[test]
+    fn pijs_deferred_http_watchdog_drops_idle_stream_in_same_tick() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let mut config = PiJsRuntimeConfig::default();
+            config.limits.hostcall_timeout_ms = Some(25);
+            let runtime =
+                PiJsRuntime::with_clock_and_config_with_policy(Arc::clone(&clock), config, None)
+                    .await
+                    .expect("runtime");
+            runtime
+                .eval("globalThis.response = pi.http({url:'https://example.com/',stream:true});")
+                .await
+                .expect("enqueue request");
+            let requests = runtime.drain_hostcall_requests();
+            assert_eq!(requests.len(), 1);
+            let call_id = &requests[0].call_id;
+            let producer = DeferredHttpTestStream::new(Vec::new(), true);
+            let drops = Rc::clone(&producer.drops);
+            runtime
+                .defer_hostcall_stream(call_id, Box::pin(producer))
+                .expect("defer stream");
+            clock.set(25);
+            runtime.tick().await.expect("fire host watchdog");
+            assert_eq!(
+                drops.get(),
+                1,
+                "no idle actor may retain a timed-out request"
+            );
+            assert!(!runtime.has_deferred_hostcall(call_id));
+            assert!(!runtime.is_hostcall_active(call_id));
+            runtime
+                .eval("response.next().catch(error => { globalThis.code = error.code; });")
+                .await
+                .expect("observe timeout");
+            assert_eq!(get_global_json(&runtime, "code").await, "timeout");
+        });
+    }
+
+    #[test]
+    fn pijs_deferred_http_root_deadline_applies_without_body_credit() {
+        futures::executor::block_on(async {
+            let runtime = PiJsRuntime::with_clock(DeterministicClock::new(0))
+                .await
+                .expect("runtime");
+            runtime
+                .eval("globalThis.response = pi.http({url:'https://example.com/',stream:true});")
+                .await
+                .expect("enqueue request");
+            let requests = runtime.drain_hostcall_requests();
+            assert_eq!(requests.len(), 1);
+            let call_id = &requests[0].call_id;
+            let producer = DeferredHttpTestStream::new(
+                vec![HostcallOutcome::StreamChunk {
+                    sequence: 0,
+                    chunk: json!({"status": 200, "headers": {}}),
+                    is_final: false,
+                }],
+                true,
+            );
+            let drops = Rc::clone(&producer.drops);
+            runtime
+                .defer_hostcall_stream(call_id, Box::pin(producer))
+                .expect("defer stream");
+            runtime.tick().await.expect("deliver header");
+            runtime.set_deferred_hostcall_deadline(call_id, Some(std::time::Instant::now()));
+            runtime.tick().await.expect("expire root deadline");
+            assert_eq!(drops.get(), 1);
+            assert!(!runtime.has_deferred_hostcall(call_id));
+            assert!(!runtime.is_hostcall_active(call_id));
+            runtime
+                .eval("response.next().then(() => response.next()).catch(error => { globalThis.code = error.code; });")
+                .await
+                .expect("observe root timeout after buffered header");
+            assert_eq!(get_global_json(&runtime, "code").await, "timeout");
+        });
+    }
+
+    #[test]
+    fn pijs_deferred_http_unexpected_eof_rejects_and_releases_tracker() {
+        futures::executor::block_on(async {
+            let runtime = PiJsRuntime::with_clock(DeterministicClock::new(0))
+                .await
+                .expect("runtime");
+            runtime
+                .eval("globalThis.response = pi.http({url:'https://example.com/',stream:true});")
+                .await
+                .expect("enqueue request");
+            let requests = runtime.drain_hostcall_requests();
+            assert_eq!(requests.len(), 1);
+            let call_id = &requests[0].call_id;
+            runtime
+                .defer_hostcall_stream(
+                    call_id,
+                    Box::pin(DeferredHttpTestStream::new(Vec::new(), false)),
+                )
+                .expect("defer malformed stream");
+            runtime.tick().await.expect("deliver EOF error");
+            assert!(!runtime.has_deferred_hostcall(call_id));
+            assert_eq!(runtime.pending_hostcall_count(), 0);
+            runtime
+                .eval("response.next().catch(error => { globalThis.code = error.code; });")
+                .await
+                .expect("observe error");
+            assert_eq!(get_global_json(&runtime, "code").await, "io");
+        });
+    }
+
+    #[test]
+    fn pijs_deferred_http_finalizes_actual_outcome_exactly_once() {
+        futures::executor::block_on(async {
+            for (cause, expected) in [
+                ("producer_error", "denied"),
+                ("cancel", "cancelled"),
+                ("root_deadline", "timeout"),
+                ("watchdog", "timeout"),
+                ("complete", "success"),
+            ] {
+                let clock = Arc::new(DeterministicClock::new(0));
+                let mut config = PiJsRuntimeConfig::default();
+                config.limits.hostcall_timeout_ms = Some(25);
+                let runtime = PiJsRuntime::with_clock_and_config_with_policy(
+                    Arc::clone(&clock),
+                    config,
+                    None,
+                )
+                .await
+                .expect("runtime");
+                runtime
+                    .eval(
+                        "globalThis.response = pi.http({url:'https://example.com/',stream:true});",
+                    )
+                    .await
+                    .expect("enqueue request");
+                let requests = runtime.drain_hostcall_requests();
+                let call_id = &requests[0].call_id;
+                let producer = DeferredHttpTestStream::new(Vec::new(), true);
+                let drops = Rc::clone(&producer.drops);
+                runtime
+                    .defer_hostcall_stream(call_id, Box::pin(producer))
+                    .expect("defer stream");
+                let outcomes = Rc::new(RefCell::new(Vec::<String>::new()));
+                let observed = Rc::clone(&outcomes);
+                runtime.set_deferred_hostcall_finalizer(
+                    call_id,
+                    Box::new(move |outcome| {
+                        observed.borrow_mut().push(match outcome {
+                            HostcallOutcome::Error { code, .. } => code.clone(),
+                            _ => "success".to_string(),
+                        });
+                    }),
+                );
+                match cause {
+                    "producer_error" => runtime.complete_hostcall(
+                        call_id,
+                        HostcallOutcome::Error {
+                            code: "denied".to_string(),
+                            message: "HTTP host is denied".to_string(),
+                        },
+                    ),
+                    "cancel" => assert!(runtime.cancel_hostcall(call_id)),
+                    "root_deadline" => runtime
+                        .set_deferred_hostcall_deadline(call_id, Some(std::time::Instant::now())),
+                    "watchdog" => clock.set(25),
+                    "complete" => runtime.complete_hostcall(
+                        call_id,
+                        HostcallOutcome::StreamChunk {
+                            sequence: 0,
+                            chunk: serde_json::Value::Null,
+                            is_final: true,
+                        },
+                    ),
+                    _ => unreachable!("known termination cause"),
+                }
+                runtime.tick().await.expect("deliver termination");
+                runtime
+                    .tick()
+                    .await
+                    .expect("settle duplicate opportunities");
+                assert_eq!(drops.get(), 1, "producer release for {cause}");
+                assert_eq!(
+                    outcomes.borrow().as_slice(),
+                    &[expected],
+                    "outcome for {cause}"
+                );
+                assert!(!runtime.has_deferred_hostcall(call_id));
+                assert!(
+                    !runtime.cancel_hostcall(call_id),
+                    "late cancellation for {cause}"
+                );
+                drop(runtime);
+                assert_eq!(
+                    outcomes.borrow().as_slice(),
+                    &[expected],
+                    "drop must not duplicate {cause}"
+                );
+            }
+        });
+    }
+
     #[test]
     fn pijs_hostcall_timeout_rejects_promise() {
         futures::executor::block_on(async {
@@ -25325,6 +34057,29 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
 
             let requests = runtime.drain_hostcall_requests();
             assert_eq!(requests.len(), 1);
+            let watchdog_timer_id = runtime
+                .hostcall_tracker
+                .borrow()
+                .call_to_timer
+                .get(&requests[0].call_id)
+                .copied()
+                .expect("hostcall timeout should have a watchdog timer");
+
+            runtime
+                .eval(&format!(
+                    r"
+                    globalThis.watchdogClearAttempt =
+                        __pi_clear_timeout_native({watchdog_timer_id});
+                    clearTimeout({watchdog_timer_id});
+                    "
+                ))
+                .await
+                .expect("attempt to cancel hostcall watchdog");
+            assert_eq!(
+                get_global_json(&runtime, "watchdogClearAttempt").await,
+                serde_json::json!(false),
+                "extension-visible timer cancellation must not clear hostcall watchdogs"
+            );
 
             clock.set(50);
             let stats = runtime.tick().await.expect("tick");
@@ -25359,6 +34114,49 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
                 get_global_json(&runtime, "value").await,
                 serde_json::Value::Null
             );
+        });
+    }
+
+    #[test]
+    fn pijs_process_exit_hostcall_is_attributed_to_runtime_owner() {
+        futures::executor::block_on(async {
+            let runtime = PiJsRuntime::with_clock_and_config_with_policy_for_extension(
+                DeterministicClock::new(0),
+                PiJsRuntimeConfig::default(),
+                None,
+                "ext.process-owner".to_string(),
+            )
+            .await
+            .expect("create owner-bound runtime");
+
+            runtime
+                .eval(
+                    r"
+                    globalThis.processExitError = null;
+                    try {
+                        process.exit(17);
+                    } catch (error) {
+                        globalThis.processExitError = error.code;
+                    }
+                    ",
+                )
+                .await
+                .expect("request process exit");
+            assert_eq!(
+                get_global_json(&runtime, "processExitError").await,
+                serde_json::json!("ERR_PROCESS_EXIT")
+            );
+
+            let requests = runtime.drain_hostcall_requests();
+            assert_eq!(requests.len(), 1);
+            let request = &requests[0];
+            assert!(matches!(
+                &request.kind,
+                HostcallKind::Events { op } if op == "exit"
+            ));
+            assert_eq!(request.payload, serde_json::json!({ "code": 17 }));
+            assert_eq!(request.extension_id.as_deref(), Some("ext.process-owner"));
+            assert_ne!(request.trace_id, 0);
         });
     }
 
@@ -25405,11 +34203,14 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
 
             let timer_id = runtime.set_timeout(10);
             runtime
-                .eval(&format!(
-                    r#"__pi_register_timer({timer_id}, () => {{
+                .eval(&privileged_test_script(
+                    &runtime,
+                    &format!(
+                        r#"__pi_register_timer(__pi_test_secret, {timer_id}, () => {{
                         globalThis.order.push("timer");
                         Promise.resolve().then(() => globalThis.order.push("timer-micro"));
                     }});"#
+                    ),
                 ))
                 .await
                 .expect("register timer");
@@ -25471,9 +34272,9 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
 
             let timer_id = runtime.set_timeout(10);
             runtime
-                .eval(&format!(
-                    r#"__pi_register_timer({timer_id}, () => globalThis.order.push("timer"));"#
-                ))
+                .eval(&privileged_test_script(&runtime, &format!(
+                    r#"__pi_register_timer(__pi_test_secret, {timer_id}, () => globalThis.order.push("timer"));"#
+                )))
                 .await
                 .expect("register timer");
 
@@ -25691,15 +34492,16 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
                 .expect("create runtime");
 
             runtime
-                .eval(
+                .eval(&privileged_test_script(
+                    &runtime,
                     r#"
                     globalThis.order = [];
-                    __pi_add_event_listener("evt", (payload) => {
+                    __pi_add_event_listener(__pi_test_secret, "evt", (payload) => {
                         globalThis.order.push(payload.n);
                         Promise.resolve().then(() => globalThis.order.push(payload.n + 1000));
                     });
                     "#,
-                )
+                ))
                 .await
                 .expect("install listener");
 
@@ -25758,15 +34560,16 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
             .expect("create runtime");
 
         runtime
-            .eval(
+            .eval(&privileged_test_script(
+                &runtime,
                 r#"
                 globalThis.order = [];
-                __pi_add_event_listener("evt", (payload) => {
+                __pi_add_event_listener(__pi_test_secret, "evt", (payload) => {
                     globalThis.order.push("event:" + payload.step);
                     Promise.resolve().then(() => globalThis.order.push("event-micro:" + payload.step));
                 });
                 "#,
-            )
+            ))
             .await
             .expect("init");
 
@@ -25800,12 +34603,12 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
                     let timer_id = runtime.set_timeout(delay_ms);
                     timers.push(timer_id);
                     runtime
-                        .eval(&format!(
-                            r#"__pi_register_timer({timer_id}, () => {{
+                        .eval(&privileged_test_script(&runtime, &format!(
+                            r#"__pi_register_timer(__pi_test_secret, {timer_id}, () => {{
                                 globalThis.order.push("timer:{step}");
                                 Promise.resolve().then(() => globalThis.order.push("timer-micro:{step}"));
                             }});"#
-                        ))
+                        )))
                         .await
                         .expect("register timer");
                 }
@@ -25846,6 +34649,178 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
+    fn pijs_tool_result_handlers_chain_valid_explicit_rewrites() {
+        futures::executor::block_on(async {
+            let runtime = PiJsRuntime::with_clock(DeterministicClock::new(0))
+                .await
+                .expect("create runtime");
+
+            runtime
+                .eval(&privileged_test_script(
+                    &runtime,
+                    r"
+                    globalThis.seen = [];
+                    globalThis.done = false;
+                    globalThis.original = {
+                        type: 'tool_result', toolName: 'read', toolCallId: 'read-1',
+                        input: { path: '/workspace/file.txt' },
+                        content: [{ type: 'text', text: 'secret output' }],
+                        details: { secret: 'private detail' }, isError: true,
+                        metadata: { source: 'host' },
+                        result: { content: [{ type: 'text', text: 'stale duplicate' }] }
+                    };
+
+                    __pi_begin_extension(__pi_test_secret, 'ext.capture', { name: 'ext.capture' });
+                    pi.on('tool_result', (event) => {
+                        globalThis.seen.push(event);
+                        return {
+                            content: [{ type: 'text', text: '[redacted]' }],
+                            toJSON() { throw new Error('extension toJSON must not run'); }
+                        };
+                    });
+                    pi.on('tool_result', (event) => {
+                        event.content[0].text = 'implicit mutation';
+                        event.result.content[0].text = 'implicit nested mutation';
+                        event.details.secret = 'implicit detail';
+                        event.input.path = '/wrong/path';
+                        event.metadata.source = 'wrong source';
+                        event.isError = false;
+                    });
+                    pi.on('tool_result', () => ({
+                        content: [{ type: 'text', text: 123 }],
+                        details: { invalid: 'must not leak through a malformed patch' }
+                    }));
+                    pi.on('tool_result', (event) => {
+                        globalThis.seen.push(event);
+                        return { details: { stage: 'captured' }, isError: false };
+                    });
+                    pi.on('tool_result', () => ({ content: null, details: null }));
+                    pi.on('tool_result', () => null);
+                    pi.events.on('tool_result', (event) => {
+                        globalThis.seen.push(event);
+                        // This is the read shape used by unmodified context-mode.
+                        globalThis.captured = JSON.stringify(event?.result ?? event?.output);
+                        return { content: [...event.content, { type: 'text', text: 'bus rewrite' }] };
+                    });
+                    pi.events.on('tool_result', (event) => {
+                        globalThis.seen.push(event);
+                        return null;
+                    });
+                    __pi_end_extension(__pi_test_secret);
+
+                    (async () => {
+                        globalThis.result = await __pi_dispatch_extension_event(
+                            __pi_test_secret, 'tool_result', globalThis.original, {}
+                        );
+                        globalThis.done = true;
+                    })();
+                    ",
+                ))
+                .await
+                .expect("eval");
+
+            assert_eq!(get_global_json(&runtime, "done").await, json!(true));
+            let seen = get_global_json(&runtime, "seen").await;
+            assert_eq!(seen.as_array().expect("handler observations").len(), 4);
+            assert_eq!(seen[0]["result"]["content"], seen[0]["content"]);
+            assert_eq!(seen[1]["content"][0]["text"], json!("[redacted]"));
+            assert_eq!(seen[1]["details"], json!({ "secret": "private detail" }));
+            for observation in seen.as_array().expect("observations") {
+                assert_eq!(observation["type"], json!("tool_result"));
+                assert_eq!(observation["toolName"], json!("read"));
+                assert_eq!(observation["toolCallId"], json!("read-1"));
+                assert_eq!(observation["input"]["path"], json!("/workspace/file.txt"));
+                assert_eq!(observation["metadata"]["source"], json!("host"));
+                assert_eq!(observation["isError"], json!(true));
+                assert_eq!(observation["result"]["isError"], json!(true));
+                assert_eq!(observation["result"]["content"], observation["content"]);
+                assert_eq!(observation["result"]["details"], observation["details"]);
+            }
+            assert_eq!(
+                seen[2]["result"],
+                json!({
+                    "content": [{ "type": "text", "text": "[redacted]" }],
+                    "details": { "stage": "captured" },
+                    "isError": true
+                })
+            );
+            let captured = get_global_json(&runtime, "captured").await;
+            let captured: serde_json::Value =
+                serde_json::from_str(captured.as_str().expect("captured output"))
+                    .expect("structured output");
+            assert_eq!(captured, seen[2]["result"]);
+            assert_eq!(
+                get_global_json(&runtime, "result").await,
+                json!({
+                    "content": [
+                        { "type": "text", "text": "[redacted]" },
+                        { "type": "text", "text": "bus rewrite" }
+                    ],
+                    "details": { "stage": "captured" }
+                })
+            );
+            let original = get_global_json(&runtime, "original").await;
+            assert_eq!(original["content"][0]["text"], json!("secret output"));
+            assert_eq!(original["details"], json!({ "secret": "private detail" }));
+            assert_eq!(original["input"]["path"], json!("/workspace/file.txt"));
+        });
+    }
+
+    #[test]
+    fn pijs_tool_result_noop_handlers_do_not_create_a_rewrite() {
+        futures::executor::block_on(async {
+            let runtime = PiJsRuntime::with_clock(DeterministicClock::new(0))
+                .await
+                .expect("create runtime");
+
+            runtime
+                .eval(&privileged_test_script(
+                    &runtime,
+                    r"
+                    globalThis.done = false;
+                    __pi_begin_extension(__pi_test_secret, 'ext.noop', { name: 'ext.noop' });
+                    pi.on('tool_result', (event) => {
+                        event.content.length = 0;
+                        event.result.details.nested.value = 'changed';
+                    });
+                    pi.on('tool_result', () => ({ content: null, details: null }));
+                    pi.on('tool_result', () => ({
+                        isError: true,
+                        result: { content: [{ type: 'text', text: 'unsupported return envelope' }] }
+                    }));
+                    pi.on('tool_result', () => 'invalid response');
+                    pi.events.on('tool_result', (event) => { globalThis.observed = event; });
+                    __pi_end_extension(__pi_test_secret);
+                    (async () => {
+                        const result = await __pi_dispatch_extension_event(
+                            __pi_test_secret, 'tool_result', {
+                                content: [{ type: 'text', text: 'original' }],
+                                details: { nested: { value: 'original' } }, isError: false
+                            }, {}
+                        );
+                        globalThis.wasUndefined = result === undefined;
+                        globalThis.done = true;
+                    })();
+                    ",
+                ))
+                .await
+                .expect("eval");
+
+            assert_eq!(get_global_json(&runtime, "done").await, json!(true));
+            assert_eq!(get_global_json(&runtime, "wasUndefined").await, json!(true));
+            let observed = get_global_json(&runtime, "observed").await;
+            assert_eq!(observed["content"][0]["text"], json!("original"));
+            assert_eq!(observed["result"]["content"], observed["content"]);
+            assert_eq!(
+                observed["result"]["details"],
+                json!({ "nested": { "value": "original" } })
+            );
+            assert_eq!(observed["result"]["isError"], json!(false));
+        });
+    }
+
+    #[test]
     fn pijs_events_on_returns_unsubscribe_and_removes_handler() {
         futures::executor::block_on(async {
             let runtime = PiJsRuntime::with_clock(DeterministicClock::new(0))
@@ -25853,24 +34828,25 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
                 .expect("create runtime");
 
             runtime
-                .eval(
+                .eval(&privileged_test_script(
+                    &runtime,
                     r#"
                     globalThis.seen = [];
                     globalThis.done = false;
 
-                    __pi_begin_extension("ext.b", { name: "ext.b" });
+                    __pi_begin_extension(__pi_test_secret, "ext.b", { name: "ext.b" });
                     const off = pi.events.on("custom_event", (payload, _ctx) => { globalThis.seen.push(payload); });
                     if (typeof off !== "function") throw new Error("expected unsubscribe function");
-                    __pi_end_extension();
+                    __pi_end_extension(__pi_test_secret);
 
                     (async () => {
-                      await __pi_dispatch_extension_event("custom_event", { n: 1 }, {});
+                      await __pi_dispatch_extension_event(__pi_test_secret, "custom_event", { n: 1 }, {});
                       off();
-                      await __pi_dispatch_extension_event("custom_event", { n: 2 }, {});
+                      await __pi_dispatch_extension_event(__pi_test_secret, "custom_event", { n: 2 }, {});
                       globalThis.done = true;
                     })();
                 "#,
-                )
+                ))
                 .await
                 .expect("eval");
 
@@ -25893,25 +34869,26 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
                 .expect("create runtime");
 
             runtime
-                .eval(
+                .eval(&privileged_test_script(
+                    &runtime,
                     r#"
                     globalThis.seen = [];
                     globalThis.done = false;
 
-                    __pi_begin_extension("ext.err", { name: "ext.err" });
+                    __pi_begin_extension(__pi_test_secret, "ext.err", { name: "ext.err" });
                     pi.events.on("custom_event", (_payload, _ctx) => { throw new Error("boom"); });
-                    __pi_end_extension();
+                    __pi_end_extension(__pi_test_secret);
 
-                    __pi_begin_extension("ext.ok", { name: "ext.ok" });
+                    __pi_begin_extension(__pi_test_secret, "ext.ok", { name: "ext.ok" });
                     pi.events.on("custom_event", (payload, _ctx) => { globalThis.seen.push(payload); });
-                    __pi_end_extension();
+                    __pi_end_extension(__pi_test_secret);
 
                     (async () => {
-                      await __pi_dispatch_extension_event("custom_event", { hello: "world" }, {});
+                      await __pi_dispatch_extension_event(__pi_test_secret, "custom_event", { hello: "world" }, {});
                       globalThis.done = true;
                     })();
                 "#,
-                )
+                ))
                 .await
                 .expect("eval");
 
@@ -25937,43 +34914,52 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
 
             // Extension that throws during registration
             runtime
-                .eval(
+                .eval(&privileged_test_script(
+                    &runtime,
                     r#"
                     globalThis.postCrashResult = null;
 
-                    __pi_begin_extension("ext.crash", { name: "ext.crash" });
+                    __pi_begin_extension(__pi_test_secret, "ext.crash", { name: "ext.crash" });
                     // Simulate a throw during registration by registering a handler then
                     // throwing - the handler should still be partially registered
                     throw new Error("registration boom");
                 "#,
-                )
+                ))
                 .await
                 .ok(); // May fail, that's fine
 
             // End the crashed extension context
-            runtime.eval(r"__pi_end_extension();").await.ok();
+            runtime
+                .eval(&privileged_test_script(
+                    &runtime,
+                    r"__pi_end_extension(__pi_test_secret);",
+                ))
+                .await
+                .ok();
 
             // Host can still load another extension after the crash
             runtime
-                .eval(
+                .eval(&privileged_test_script(
+                    &runtime,
                     r#"
-                    __pi_begin_extension("ext.ok", { name: "ext.ok" });
+                    __pi_begin_extension(__pi_test_secret, "ext.ok", { name: "ext.ok" });
                     pi.events.on("test_event", (p, _) => { globalThis.postCrashResult = p; });
-                    __pi_end_extension();
+                    __pi_end_extension(__pi_test_secret);
                 "#,
-                )
+                ))
                 .await
                 .expect("second extension should load");
 
             // Dispatch event - only the healthy extension should handle it
             runtime
-                .eval(
+                .eval(&privileged_test_script(
+                    &runtime,
                     r#"
                     (async () => {
-                        await __pi_dispatch_extension_event("test_event", { ok: true }, {});
+                        await __pi_dispatch_extension_event(__pi_test_secret, "test_event", { ok: true }, {});
                     })();
                 "#,
-                )
+                ))
                 .await
                 .expect("dispatch");
 
@@ -25992,39 +34978,40 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
                 .expect("create runtime");
 
             runtime
-                .eval(
+                .eval(&privileged_test_script(
+                    &runtime,
                     r#"
                     globalThis.handlerResults = [];
                     globalThis.dispatchDone = false;
 
                     // Extension A: will throw
-                    __pi_begin_extension("ext.a", { name: "ext.a" });
+                    __pi_begin_extension(__pi_test_secret, "ext.a", { name: "ext.a" });
                     pi.events.on("multi_test", (_p, _c) => {
                         globalThis.handlerResults.push("a-before-throw");
                         throw new Error("handler crash");
                     });
-                    __pi_end_extension();
+                    __pi_end_extension(__pi_test_secret);
 
                     // Extension B: should still run
-                    __pi_begin_extension("ext.b", { name: "ext.b" });
+                    __pi_begin_extension(__pi_test_secret, "ext.b", { name: "ext.b" });
                     pi.events.on("multi_test", (_p, _c) => {
                         globalThis.handlerResults.push("b-ok");
                     });
-                    __pi_end_extension();
+                    __pi_end_extension(__pi_test_secret);
 
                     // Extension C: should also still run
-                    __pi_begin_extension("ext.c", { name: "ext.c" });
+                    __pi_begin_extension(__pi_test_secret, "ext.c", { name: "ext.c" });
                     pi.events.on("multi_test", (_p, _c) => {
                         globalThis.handlerResults.push("c-ok");
                     });
-                    __pi_end_extension();
+                    __pi_end_extension(__pi_test_secret);
 
                     (async () => {
-                        await __pi_dispatch_extension_event("multi_test", {}, {});
+                        await __pi_dispatch_extension_event(__pi_test_secret, "multi_test", {}, {});
                         globalThis.dispatchDone = true;
                     })();
                 "#,
-                )
+                ))
                 .await
                 .expect("eval");
 
@@ -26061,18 +35048,19 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
 
             // Extension makes an invalid hostcall (unknown tool)
             runtime
-                .eval(
+                .eval(&privileged_test_script(
+                    &runtime,
                     r#"
                     globalThis.invalidResult = null;
                     globalThis.errCode = null;
 
-                    __pi_begin_extension("ext.bad", { name: "ext.bad" });
+                    __pi_begin_extension(__pi_test_secret, "ext.bad", { name: "ext.bad" });
                     pi.tool("completely_nonexistent_tool_xyz", { junk: true })
                         .then((r) => { globalThis.invalidResult = r; })
                         .catch((e) => { globalThis.errCode = e.code || "unknown"; });
-                    __pi_end_extension();
+                    __pi_end_extension(__pi_test_secret);
                 "#,
-                )
+                ))
                 .await
                 .expect("eval");
 
@@ -26106,54 +35094,64 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
 
             // Simulate a crash sequence: extension throws, then new ones load fine
             runtime
-                .eval(
+                .eval(&privileged_test_script(
+                    &runtime,
                     r#"
                     globalThis.loadOrder = [];
 
                     // Extension 1: loads fine
-                    __pi_begin_extension("ext.1", { name: "ext.1" });
+                    __pi_begin_extension(__pi_test_secret, "ext.1", { name: "ext.1" });
                     globalThis.loadOrder.push("1-loaded");
-                    __pi_end_extension();
+                    __pi_end_extension(__pi_test_secret);
                 "#,
-                )
+                ))
                 .await
                 .expect("ext 1");
 
             // Extension 2: crashes during eval
             runtime
-                .eval(
+                .eval(&privileged_test_script(
+                    &runtime,
                     r#"
-                    __pi_begin_extension("ext.2", { name: "ext.2" });
+                    __pi_begin_extension(__pi_test_secret, "ext.2", { name: "ext.2" });
                     globalThis.loadOrder.push("2-before-crash");
                     throw new Error("ext 2 crash");
                 "#,
-                )
+                ))
                 .await
                 .ok(); // Expected to fail
 
-            runtime.eval(r"__pi_end_extension();").await.ok();
+            runtime
+                .eval(&privileged_test_script(
+                    &runtime,
+                    r"__pi_end_extension(__pi_test_secret);",
+                ))
+                .await
+                .ok();
 
             // Extension 3: should still load after ext 2's crash
             runtime
-                .eval(
+                .eval(&privileged_test_script(
+                    &runtime,
                     r#"
-                    __pi_begin_extension("ext.3", { name: "ext.3" });
+                    __pi_begin_extension(__pi_test_secret, "ext.3", { name: "ext.3" });
                     globalThis.loadOrder.push("3-loaded");
-                    __pi_end_extension();
+                    __pi_end_extension(__pi_test_secret);
                 "#,
-                )
+                ))
                 .await
                 .expect("ext 3 should load after crash");
 
             // Extension 4: loads fine too
             runtime
-                .eval(
+                .eval(&privileged_test_script(
+                    &runtime,
                     r#"
-                    __pi_begin_extension("ext.4", { name: "ext.4" });
+                    __pi_begin_extension(__pi_test_secret, "ext.4", { name: "ext.4" });
                     globalThis.loadOrder.push("4-loaded");
-                    __pi_end_extension();
+                    __pi_end_extension(__pi_test_secret);
                 "#,
-                )
+                ))
                 .await
                 .expect("ext 4 should load");
 
@@ -26182,32 +35180,33 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
                 .expect("create runtime");
 
             runtime
-                .eval(
+                .eval(&privileged_test_script(
+                    &runtime,
                     r#"
                     globalThis.extAData = null;
                     globalThis.extBData = null;
                     globalThis.eventsDone = false;
 
                     // Extension A: sets its own state
-                    __pi_begin_extension("ext.isolated.a", { name: "ext.isolated.a" });
+                    __pi_begin_extension(__pi_test_secret, "ext.isolated.a", { name: "ext.isolated.a" });
                     pi.events.on("isolation_test", (_p, _c) => {
                         globalThis.extAData = "from-A";
                     });
-                    __pi_end_extension();
+                    __pi_end_extension(__pi_test_secret);
 
                     // Extension B: sets its own state independently
-                    __pi_begin_extension("ext.isolated.b", { name: "ext.isolated.b" });
+                    __pi_begin_extension(__pi_test_secret, "ext.isolated.b", { name: "ext.isolated.b" });
                     pi.events.on("isolation_test", (_p, _c) => {
                         globalThis.extBData = "from-B";
                     });
-                    __pi_end_extension();
+                    __pi_end_extension(__pi_test_secret);
 
                     (async () => {
-                        await __pi_dispatch_extension_event("isolation_test", {}, {});
+                        await __pi_dispatch_extension_event(__pi_test_secret, "isolation_test", {}, {});
                         globalThis.eventsDone = true;
                     })();
                 "#,
-                )
+                ))
                 .await
                 .expect("eval");
 
@@ -26225,6 +35224,148 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
                 serde_json::json!("from-B")
             );
         });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn host_fs_decision_helper_emits_structured_event() {
+        // bd-xhl7u: every host-filesystem allow/deny must carry runtime
+        // identity, active extension, and normalized path so full-suite
+        // interference is reconstructible from tracing captures. The guards
+        // call this helper from scheduler threads where thread-local
+        // subscribers do not apply, so the contract is pinned on the helper
+        // itself (call sites are compile-enforced at each guard exit).
+        use std::sync::Mutex as StdMutex;
+
+        #[derive(Debug, Clone)]
+        struct CapturedDecision {
+            level: tracing::Level,
+            fields: std::collections::BTreeMap<String, String>,
+        }
+
+        #[derive(Clone, Default)]
+        struct DecisionCapture {
+            events: std::sync::Arc<StdMutex<Vec<CapturedDecision>>>,
+        }
+
+        impl DecisionCapture {
+            fn snapshot(&self) -> Vec<CapturedDecision> {
+                self.events
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone()
+            }
+        }
+
+        impl<S> tracing_subscriber::Layer<S> for DecisionCapture
+        where
+            S: tracing::Subscriber,
+        {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                let mut fields = std::collections::BTreeMap::new();
+                let mut recorder = FieldRecorder(&mut fields);
+                event.record(&mut recorder);
+                self.events
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(CapturedDecision {
+                        level: *event.metadata().level(),
+                        fields,
+                    });
+            }
+        }
+
+        struct FieldRecorder<'a>(&'a mut std::collections::BTreeMap<String, String>);
+
+        impl tracing::field::Visit for FieldRecorder<'_> {
+            fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                self.0.insert(field.name().to_string(), value.to_string());
+            }
+
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                self.0
+                    .insert(field.name().to_string(), format!("{value:?}"));
+            }
+        }
+
+        let read_roots = StdMutex::new(vec![PathBuf::from("/tmp/registered-root")]);
+        let runtime = futures::executor::block_on(PiJsRuntime::with_clock_and_config_with_policy(
+            DeterministicClock::new(0),
+            PiJsRuntimeConfig::default(),
+            None,
+        ))
+        .expect("create diagnostic runtime");
+        let module_state = std::rc::Rc::clone(&runtime.module_state);
+        module_state
+            .borrow_mut()
+            .canonical_extension_roots
+            .push(PathBuf::from("/tmp/ext-a"));
+
+        let capture = DecisionCapture::default();
+        let subscriber = tracing_subscriber::registry().with(capture.clone());
+        let () = tracing::subscriber::with_default(subscriber, || {
+            log_host_fs_decision(
+                "read",
+                false,
+                "runtime-diag-1234",
+                Some("ext.b"),
+                "/tmp/ext-a/secret.txt",
+                &PathBuf::from("/private/tmp/ext-a/secret.txt"),
+                &PathBuf::from("/workspace"),
+                &read_roots,
+                &module_state,
+            );
+        });
+
+        let decisions = capture.snapshot();
+        assert_eq!(
+            decisions.len(),
+            1,
+            "exactly one decision event; got {decisions:#?}"
+        );
+        let event = &decisions[0];
+        assert_eq!(event.level, tracing::Level::WARN);
+        assert_eq!(
+            event.fields.get("decision").map(String::as_str),
+            Some("deny")
+        );
+        assert_eq!(event.fields.get("op").map(String::as_str), Some("read"));
+        assert_eq!(
+            event.fields.get("runtime_id").map(String::as_str),
+            Some("runtime-diag-1234")
+        );
+        assert_eq!(
+            event.fields.get("extension_id").map(String::as_str),
+            Some("ext.b")
+        );
+        assert!(
+            event
+                .fields
+                .get("normalized")
+                .is_some_and(|path| path.contains("secret.txt")),
+            "normalized path missing: {:#?}",
+            event.fields
+        );
+        assert!(
+            event
+                .fields
+                .get("read_roots")
+                .is_some_and(|roots| roots.contains("/tmp/registered-root")),
+            "registered read roots missing: {:#?}",
+            event.fields
+        );
+        assert!(
+            event
+                .fields
+                .get("extension_roots")
+                .is_some_and(|roots| roots.contains("/tmp/ext-a")),
+            "extension roots missing: {:#?}",
+            event.fields
+        );
     }
 
     #[test]
@@ -26260,7 +35401,7 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
                 import('node:module').then(({{ createRequire }}) => {{
                     const require = createRequire('/tmp/example.js');
                     const fs = require('node:fs');
-                    return __pi_with_extension_async("ext.b", async () => {{
+                    return __pi_with_extension_async(__pi_test_secret, "ext.b", async () => {{
                         try {{
                             globalThis.crossExtensionRead.value = fs.readFileSync({secret_path:?}, 'utf8');
                             globalThis.crossExtensionRead.ok = true;
@@ -26275,7 +35416,7 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
                 "#
             );
             runtime
-                .eval(&script)
+                .eval(&privileged_test_script(&runtime, &script))
                 .await
                 .expect("eval cross-extension read");
 
@@ -26320,7 +35461,7 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
                 import('node:module').then(({{ createRequire }}) => {{
                     const require = createRequire('/tmp/example.js');
                     const fs = require('node:fs');
-                    return __pi_with_extension_async("ext.legacy", async () => {{
+                    return __pi_with_extension_async(__pi_test_secret, "ext.legacy", async () => {{
                         try {{
                             globalThis.legacyRootRead.value = fs.readFileSync({asset_path:?}, 'utf8');
                             globalThis.legacyRootRead.ok = true;
@@ -26335,7 +35476,7 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
                 "#
             );
             runtime
-                .eval(&script)
+                .eval(&privileged_test_script(&runtime, &script))
                 .await
                 .expect("eval id-less extension root read");
 
@@ -26378,7 +35519,7 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
                 import('node:module').then(({{ createRequire }}) => {{
                     const require = createRequire('/tmp/example.js');
                     const fs = require('node:fs');
-                    return __pi_with_extension_async("ext.b", async () => {{
+                    return __pi_with_extension_async(__pi_test_secret, "ext.b", async () => {{
                         try {{
                             fs.writeFileSync({target_path:?}, 'owned');
                             globalThis.crossExtensionWrite.ok = true;
@@ -26394,7 +35535,7 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
                 "#
             );
             runtime
-                .eval(&script)
+                .eval(&privileged_test_script(&runtime, &script))
                 .await
                 .expect("eval cross-extension write");
 
@@ -26407,6 +35548,399 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
                 error.contains("host write denied"),
                 "expected host write denial, got: {error}"
             );
+        });
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pijs_registered_tmp_roots_reach_host_while_generic_tmp_stays_scoped() {
+        futures::executor::block_on(async {
+            let temp_dir = tempfile::tempdir_in("/tmp").expect("tempdir in /tmp");
+            let workspace = temp_dir.path().join("workspace");
+            let ext_root = temp_dir.path().join("ext-a");
+            std::fs::create_dir_all(&workspace).expect("mkdir workspace");
+            std::fs::create_dir_all(&ext_root).expect("mkdir extension");
+            let registered_path = ext_root.join("asset.txt");
+            std::fs::write(&registered_path, "registered-asset").expect("write asset");
+            let generic_dir = PathBuf::from(format!(
+                "/tmp/pijs-unregistered-{}",
+                uuid::Uuid::new_v4().simple()
+            ));
+            let generic_path = generic_dir.join("asset.txt");
+
+            let config = PiJsRuntimeConfig {
+                cwd: workspace.display().to_string(),
+                ..PiJsRuntimeConfig::default()
+            };
+            let runtime = PiJsRuntime::with_clock_and_config_with_policy(
+                DeterministicClock::new(0),
+                config,
+                None,
+            )
+            .await
+            .expect("create runtime");
+            runtime.add_extension_root_with_id(ext_root, Some("ext.a"));
+
+            let script = format!(
+                r#"
+                globalThis.tmpRootScope = {{}};
+                import('node:module').then(({{ createRequire }}) => {{
+                    const require = createRequire('/tmp/example.js');
+                    const fs = require('node:fs');
+                    return __pi_with_extension_async(__pi_test_secret, "ext.a", async () => {{
+                        globalThis.tmpRootScope.registeredA =
+                            fs.readFileSync({registered_path:?}, 'utf8');
+                        fs.mkdirSync({generic_dir:?}, {{ recursive: true }});
+                        fs.writeFileSync({generic_path:?}, 'generic-a');
+                        globalThis.tmpRootScope.genericA =
+                            fs.readFileSync({generic_path:?}, 'utf8');
+                    }}).then(() => __pi_with_extension_async(__pi_test_secret, "ext.b", async () => {{
+                        try {{
+                            fs.readFileSync({registered_path:?}, 'utf8');
+                            globalThis.tmpRootScope.registeredB = true;
+                        }} catch (err) {{
+                            globalThis.tmpRootScope.registeredB = false;
+                            globalThis.tmpRootScope.registeredBError =
+                                String((err && err.message) || err || '');
+                        }}
+                        globalThis.tmpRootScope.genericVisibleBeforeB =
+                            fs.existsSync({generic_path:?});
+                        fs.mkdirSync({generic_dir:?}, {{ recursive: true }});
+                        fs.writeFileSync({generic_path:?}, 'generic-b');
+                        globalThis.tmpRootScope.genericB =
+                            fs.readFileSync({generic_path:?}, 'utf8');
+                    }})).then(() => __pi_with_extension_async(__pi_test_secret, "ext.a", async () => {{
+                        globalThis.tmpRootScope.genericAAfter =
+                            fs.readFileSync({generic_path:?}, 'utf8');
+                    }}));
+                }}).finally(() => {{
+                    globalThis.tmpRootScope.done = true;
+                }});
+                "#
+            );
+            runtime
+                .eval(&privileged_test_script(&runtime, &script))
+                .await
+                .expect("eval registered and generic /tmp access");
+
+            let result = get_global_json(&runtime, "tmpRootScope").await;
+            assert_eq!(result["done"], serde_json::json!(true));
+            assert_eq!(result["registeredA"], serde_json::json!("registered-asset"));
+            assert_eq!(result["registeredB"], serde_json::json!(false));
+            assert!(
+                result["registeredBError"]
+                    .as_str()
+                    .is_some_and(|error| error.contains("host read denied"))
+            );
+            assert_eq!(result["genericVisibleBeforeB"], serde_json::json!(false));
+            assert_eq!(result["genericA"], serde_json::json!("generic-a"));
+            assert_eq!(result["genericB"], serde_json::json!("generic-b"));
+            assert_eq!(result["genericAAfter"], serde_json::json!("generic-a"));
+            assert!(!generic_path.exists(), "generic /tmp write escaped the VFS");
+        });
+    }
+
+    fn cached_vfs_scope_script(
+        ext_a: &Path,
+        ext_b: &Path,
+        cached_secret: &Path,
+        cross_root_link: &Path,
+        multi_hop_a: &Path,
+        multi_hop_b: &Path,
+        workspace_target: &Path,
+    ) -> String {
+        format!(
+            r#"
+            globalThis.vfsScope = {{}};
+            import('node:module').then(({{ createRequire }}) => {{
+                const require = createRequire('/tmp/example.js');
+                const fs = require('node:fs');
+                return __pi_with_extension_async(__pi_test_secret, "ext.a", async () => {{
+                    fs.mkdirSync({ext_a:?}, {{ recursive: true }});
+                    fs.writeFileSync({cached_secret:?}, 'cached-secret');
+                    globalThis.vfsScope.ownerRead = fs.readFileSync({cached_secret:?}, 'utf8');
+                }}).then(() => __pi_with_extension_async(__pi_test_secret, "ext.b", async () => {{
+                    try {{
+                        fs.readFileSync({cached_secret:?}, 'utf8');
+                        globalThis.vfsScope.cachedCrossRead = true;
+                    }} catch (err) {{
+                        globalThis.vfsScope.cachedCrossRead = false;
+                        globalThis.vfsScope.cachedCrossReadError =
+                            String((err && err.message) || err || '');
+                    }}
+
+                    const legacyState = globalThis.__pi_vfs_state;
+                    const safeApi = globalThis.__pi_vfs_api;
+                    globalThis.vfsScope.rawStatePresent =
+                        legacyState !== undefined && legacyState !== null;
+                    globalThis.vfsScope.safeApiExposesRawMaps = !!(
+                        safeApi && (safeApi.files || safeApi.dirs || safeApi.symlinks)
+                    );
+                    globalThis.vfsScope.safeApiKeys =
+                        safeApi ? Object.keys(safeApi).sort().join(',') : '';
+                    const visiblePaths =
+                        safeApi && typeof safeApi.listVisiblePaths === 'function'
+                            ? safeApi.listVisiblePaths()
+                            : {{ files: [] }};
+                    globalThis.vfsScope.safeApiVisibleSecret =
+                        visiblePaths.files.includes({cached_secret:?});
+
+                    fs.mkdirSync({ext_b:?}, {{ recursive: true }});
+                    fs.symlinkSync({workspace_target:?}, {cross_root_link:?});
+                    fs.symlinkSync({workspace_target:?}, {multi_hop_b:?});
+                    globalThis.vfsScope.ownerLinkRead =
+                        fs.readFileSync({cross_root_link:?}, 'utf8');
+                }})).then(() => __pi_with_extension_async(__pi_test_secret, "ext.a", async () => {{
+                    fs.symlinkSync({multi_hop_b:?}, {multi_hop_a:?});
+                    try {{
+                        fs.readFileSync({cross_root_link:?}, 'utf8');
+                        globalThis.vfsScope.crossLinkRead = true;
+                    }} catch (err) {{
+                        globalThis.vfsScope.crossLinkRead = false;
+                        globalThis.vfsScope.crossLinkReadError =
+                            String((err && err.message) || err || '');
+                    }}
+                    try {{
+                        fs.writeFileSync({cross_root_link:?}, 'tampered');
+                        globalThis.vfsScope.crossLinkWrite = true;
+                    }} catch (err) {{
+                        globalThis.vfsScope.crossLinkWrite = false;
+                        globalThis.vfsScope.crossLinkWriteError =
+                            String((err && err.message) || err || '');
+                    }}
+                    try {{
+                        fs.readFileSync({multi_hop_a:?}, 'utf8');
+                        globalThis.vfsScope.multiHopRead = true;
+                    }} catch (err) {{
+                        globalThis.vfsScope.multiHopRead = false;
+                        globalThis.vfsScope.multiHopReadError =
+                            String((err && err.message) || err || '');
+                    }}
+                    try {{
+                        fs.writeFileSync({multi_hop_a:?}, 'multi-hop-tamper');
+                        globalThis.vfsScope.multiHopWrite = true;
+                    }} catch (err) {{
+                        globalThis.vfsScope.multiHopWrite = false;
+                        globalThis.vfsScope.multiHopWriteError =
+                            String((err && err.message) || err || '');
+                    }}
+                    globalThis.vfsScope.workspaceValue =
+                        fs.readFileSync({workspace_target:?}, 'utf8');
+                }}));
+            }}).finally(() => {{
+                globalThis.vfsScope.done = true;
+            }});
+            "#
+        )
+    }
+
+    fn assert_cached_vfs_scope_result(result: &serde_json::Value) {
+        assert_eq!(result["done"], serde_json::json!(true));
+        assert_eq!(result["ownerRead"], serde_json::json!("cached-secret"));
+        assert_eq!(result["cachedCrossRead"], serde_json::json!(false));
+        assert!(
+            result["cachedCrossReadError"]
+                .as_str()
+                .is_some_and(|error| error.contains("host read denied"))
+        );
+        assert_eq!(result["rawStatePresent"], serde_json::json!(false));
+        assert_eq!(result["safeApiExposesRawMaps"], serde_json::json!(false));
+        assert_eq!(
+            result["safeApiKeys"],
+            serde_json::json!("listVisiblePaths,normalizePath")
+        );
+        assert_eq!(result["safeApiVisibleSecret"], serde_json::json!(false));
+        assert_eq!(
+            result["ownerLinkRead"],
+            serde_json::json!("workspace-value")
+        );
+        assert_eq!(result["crossLinkRead"], serde_json::json!(false));
+        assert!(
+            result["crossLinkReadError"]
+                .as_str()
+                .is_some_and(|error| error.contains("host read denied"))
+        );
+        assert_eq!(result["crossLinkWrite"], serde_json::json!(false));
+        assert!(
+            result["crossLinkWriteError"]
+                .as_str()
+                .is_some_and(|error| error.contains("host write denied"))
+        );
+        assert_eq!(result["multiHopRead"], serde_json::json!(false));
+        assert!(
+            result["multiHopReadError"]
+                .as_str()
+                .is_some_and(|error| error.contains("host read denied"))
+        );
+        assert_eq!(result["multiHopWrite"], serde_json::json!(false));
+        assert!(
+            result["multiHopWriteError"]
+                .as_str()
+                .is_some_and(|error| error.contains("host write denied"))
+        );
+        assert_eq!(
+            result["workspaceValue"],
+            serde_json::json!("workspace-value")
+        );
+    }
+
+    #[test]
+    fn pijs_cached_vfs_and_symlink_access_stays_extension_scoped() {
+        futures::executor::block_on(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let workspace = temp_dir.path().join("workspace");
+            let ext_a = temp_dir.path().join("ext-a");
+            let ext_b = temp_dir.path().join("ext-b");
+            std::fs::create_dir_all(&workspace).expect("mkdir workspace");
+            std::fs::create_dir_all(&ext_a).expect("mkdir ext-a");
+            std::fs::create_dir_all(&ext_b).expect("mkdir ext-b");
+            let cached_secret = ext_a.join("cached-secret.txt");
+            let cross_root_link = ext_b.join("workspace-link.txt");
+            let multi_hop_a = ext_a.join("multi-hop-a.txt");
+            let multi_hop_b = ext_b.join("multi-hop-b.txt");
+            let workspace_target = workspace.join("link-target.txt");
+            std::fs::write(&workspace_target, "workspace-value").expect("write workspace target");
+
+            let config = PiJsRuntimeConfig {
+                cwd: workspace.display().to_string(),
+                ..PiJsRuntimeConfig::default()
+            };
+            let runtime = PiJsRuntime::with_clock_and_config_with_policy(
+                DeterministicClock::new(0),
+                config,
+                None,
+            )
+            .await
+            .expect("create runtime");
+            runtime.add_extension_root_with_id(ext_a.clone(), Some("ext.a"));
+            runtime.add_extension_root_with_id(ext_b.clone(), Some("ext.b"));
+
+            let script = cached_vfs_scope_script(
+                &ext_a,
+                &ext_b,
+                &cached_secret,
+                &cross_root_link,
+                &multi_hop_a,
+                &multi_hop_b,
+                &workspace_target,
+            );
+            runtime
+                .eval(&privileged_test_script(&runtime, &script))
+                .await
+                .expect("eval cached VFS and cross-root symlink access");
+
+            let result = get_global_json(&runtime, "vfsScope").await;
+            assert_cached_vfs_scope_result(&result);
+        });
+    }
+
+    #[test]
+    fn pijs_vfs_file_descriptors_recheck_extension_scope_on_handoff() {
+        futures::executor::block_on(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let workspace = temp_dir.path().join("workspace");
+            let ext_a = temp_dir.path().join("ext-a");
+            let ext_b = temp_dir.path().join("ext-b");
+            std::fs::create_dir_all(&workspace).expect("mkdir workspace");
+            std::fs::create_dir_all(&ext_a).expect("mkdir ext-a");
+            std::fs::create_dir_all(&ext_b).expect("mkdir ext-b");
+            let fd_path = ext_a.join("fd-secret.txt");
+            let shared_path = workspace.join("shared-fd.txt");
+
+            let config = PiJsRuntimeConfig {
+                cwd: workspace.display().to_string(),
+                ..PiJsRuntimeConfig::default()
+            };
+            let runtime = PiJsRuntime::with_clock_and_config_with_policy(
+                DeterministicClock::new(0),
+                config,
+                None,
+            )
+            .await
+            .expect("create runtime");
+            runtime.add_extension_root_with_id(ext_a.clone(), Some("ext.a"));
+            runtime.add_extension_root_with_id(ext_b.clone(), Some("ext.b"));
+
+            let script = format!(
+                r#"
+                globalThis.fdScope = {{}};
+                import('node:module').then(({{ createRequire }}) => {{
+                    const require = createRequire('/tmp/example.js');
+                    const fs = require('node:fs');
+                    let fd;
+                    let sharedFd;
+                    return __pi_with_extension_async(__pi_test_secret, "ext.a", async () => {{
+                        fs.mkdirSync({ext_a:?}, {{ recursive: true }});
+                        fs.writeFileSync({fd_path:?}, 'fd-secret');
+                        fd = fs.openSync({fd_path:?}, 'r+');
+                        fs.writeFileSync({shared_path:?}, 'workspace-content');
+                        sharedFd = fs.openSync({shared_path:?}, 'r');
+                    }}).then(() => __pi_with_extension_async(__pi_test_secret, "ext.b", async () => {{
+                        for (const [name, operation] of [
+                            ['read', () => fs.readSync(fd, Buffer.alloc(9), 0, 9, 0)],
+                            ['write', () => fs.writeSync(fd, 'tampered', 0)],
+                            ['truncate', () => fs.ftruncateSync(fd, 1)],
+                            ['stat', () => fs.fstatSync(fd)],
+                            ['futimes', () => fs.futimesSync(fd, 0, 0)],
+                            ['close', () => fs.closeSync(fd)],
+                        ]) {{
+                            try {{
+                                operation();
+                                globalThis.fdScope[name] = true;
+                            }} catch (err) {{
+                                globalThis.fdScope[name] = false;
+                                globalThis.fdScope[name + 'Error'] =
+                                    String((err && err.message) || err || '');
+                            }}
+                        }}
+                        // Workspace paths are readable by both principals;
+                        // the open descriptor itself still belongs to ext.a.
+                        for (const [name, operation] of [
+                            ['sharedRead', () => fs.readSync(sharedFd, Buffer.alloc(32), 0, 32, 0)],
+                            ['sharedClose', () => fs.closeSync(sharedFd)],
+                        ]) {{
+                            try {{ operation(); globalThis.fdScope[name] = true; }}
+                            catch (_) {{ globalThis.fdScope[name] = false; }}
+                        }}
+                    }})).then(() => __pi_with_extension_async(__pi_test_secret, "ext.a", async () => {{
+                        globalThis.fdScope.ownerValue =
+                            fs.readFileSync({fd_path:?}, 'utf8');
+                        globalThis.fdScope.ownerSize = fs.fstatSync(fd).size;
+                        fs.closeSync(fd);
+                        fs.closeSync(sharedFd);
+                    }}));
+                }}).finally(() => {{
+                    globalThis.fdScope.done = true;
+                }});
+                "#
+            );
+            runtime
+                .eval(&privileged_test_script(&runtime, &script))
+                .await
+                .expect("eval cross-extension VFS fd handoff");
+
+            let result = get_global_json(&runtime, "fdScope").await;
+            assert_eq!(result["done"], serde_json::json!(true));
+            for (operation, expected_denial) in [
+                ("read", "host read denied"),
+                ("write", "host write denied"),
+                ("truncate", "host write denied"),
+                ("stat", "host read denied"),
+                ("futimes", "host write denied"),
+                ("close", "host read denied"),
+            ] {
+                assert_eq!(result[operation], serde_json::json!(false));
+                assert!(
+                    result[format!("{operation}Error")]
+                        .as_str()
+                        .is_some_and(|error| error.contains(expected_denial)),
+                    "expected {expected_denial} for {operation}: {result}"
+                );
+            }
+            assert_eq!(result["ownerValue"], serde_json::json!("fd-secret"));
+            assert_eq!(result["ownerSize"], serde_json::json!(9));
+            assert_eq!(result["sharedRead"], serde_json::json!(false));
+            assert_eq!(result["sharedClose"], serde_json::json!(false));
         });
     }
 
@@ -26467,13 +36001,14 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
                 .expect("create runtime");
 
             runtime
-                .eval(
+                .eval(&privileged_test_script(
+                    &runtime,
                     r#"
-                    __pi_begin_extension("ext.test", { name: "Test" });
+                    __pi_begin_extension(__pi_test_secret, "ext.test", { name: "Test" });
                     pi.events.emit("custom_event", { a: 1 });
-                    __pi_end_extension();
+                    __pi_end_extension(__pi_test_secret);
                 "#,
-                )
+                ))
                 .await
                 .expect("eval");
 
@@ -26671,6 +36206,135 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
+    fn pijs_pi_subagents_0_34_0_import_contract_and_validation_semantics() {
+        // Contract pinned to pi-subagents@0.34.0, npm integrity
+        // sha512-JGgSYaieZ/2QtsW6BwSV1SX6zMz+YpV0JXUjSTtgphpk+z5OOJVJ4D/tWnCxIURXKcgsam+1vQkQgQ5fhrasFA==.
+        futures::executor::block_on(async {
+            let runtime = PiJsRuntime::with_clock(DeterministicClock::new(0))
+                .await
+                .expect("create runtime");
+
+            runtime
+                .eval(
+                    r#"
+                    globalThis.piSubagentsContract = { done: false, error: "" };
+                    Promise.all([
+                      import("@earendil-works/pi-coding-agent"),
+                      import("@earendil-works/pi-tui"),
+                      import("@earendil-works/pi-ai"),
+                      import("@earendil-works/pi-agent-core"),
+                      import("typebox"),
+                      import("typebox/compile"),
+                    ]).then(([agent, tui, ai, agentCore, typebox, compiler]) => {
+                      const { Type } = typebox;
+                      const Task = Type.Object({
+                        agent: Type.String(),
+                        task: Type.String(),
+                      }, { additionalProperties: false });
+                      const Params = Type.Object({
+                        agent: Type.Optional(Type.String()),
+                        tasks: Type.Optional(Type.Array(Task, { minItems: 1 })),
+                        concurrency: Type.Optional(Type.Integer({ minimum: 1 })),
+                        config: Type.Optional(Type.Unsafe({
+                          anyOf: [
+                            { type: "object", additionalProperties: true },
+                            { type: "string" },
+                          ],
+                        })),
+                      }, { additionalProperties: false });
+                      const validator = compiler.Compile(Params);
+
+                      const structured = compiler.Compile({
+                        type: "object",
+                        required: ["items"],
+                        additionalProperties: false,
+                        properties: {
+                          items: {
+                            type: "array",
+                            minItems: 1,
+                            items: {
+                              type: "object",
+                              required: ["name"],
+                              additionalProperties: false,
+                              properties: { name: { type: "string", minLength: 1 } },
+                            },
+                          },
+                        },
+                      });
+
+                      tui.setCellDimensions({ widthPx: 10, heightPx: 20 });
+                      const errors = validator.Errors({ concurrency: 0, extra: true });
+                      globalThis.piSubagentsContract = {
+                        done: true,
+                        error: "",
+                        packageVersion: "0.34.0",
+                        keyText: agent.keyText("app.tools.expand"),
+                        markdownTheme: typeof agent.getMarkdownTheme(),
+                        aiExport: typeof ai.StringEnum,
+                        agentCoreExport: typeof agentCore.StringEnum,
+                        validSingle: validator.Check({ agent: "scout" }),
+                        validParallel: validator.Check({
+                          tasks: [{ agent: "reviewer", task: "audit" }],
+                          concurrency: 2,
+                          config: "{}",
+                        }),
+                        validUnsafeObject: validator.Check({ config: { mode: "custom" } }),
+                        invalidMinimum: validator.Check({ concurrency: 0 }),
+                        invalidNestedRequired: validator.Check({ tasks: [{ agent: "reviewer" }] }),
+                        invalidAdditional: validator.Check({ agent: "scout", unexpected: true }),
+                        invalidUnsafeUnion: validator.Check({ config: false }),
+                        errorPaths: errors.map((entry) => entry.instancePath),
+                        structuredValid: structured.Check({ items: [{ name: "one" }] }),
+                        structuredInvalid: structured.Check({ items: [{ name: "" }], extra: true }),
+                        cellDimensions: tui.getCellDimensions(),
+                        imageApi: [
+                          "allocateImageId", "calculateImageRows", "deleteAllKittyImages",
+                          "deleteKittyImage", "detectCapabilities", "encodeITerm2", "encodeKitty",
+                          "getCapabilities", "getImageDimensions", "getJpegDimensions",
+                          "getPngDimensions", "getGifDimensions", "getWebpDimensions", "hyperlink",
+                          "imageFallback", "renderImage", "resetCapabilitiesCache", "setCapabilities",
+                        ].every((name) => typeof tui[name] === "function"),
+                      };
+                    }).catch((error) => {
+                      globalThis.piSubagentsContract.done = true;
+                      globalThis.piSubagentsContract.error = String(error?.message || error || "");
+                    });
+                    "#,
+                )
+                .await
+                .expect("evaluate pinned pi-subagents import contract");
+
+            let result = get_global_json(&runtime, "piSubagentsContract").await;
+            assert_eq!(result["done"], serde_json::json!(true));
+            assert_eq!(result["error"], serde_json::json!(""));
+            assert_eq!(result["packageVersion"], serde_json::json!("0.34.0"));
+            assert_eq!(result["keyText"], serde_json::json!("ctrl+o"));
+            assert_eq!(result["markdownTheme"], serde_json::json!("object"));
+            assert_eq!(result["aiExport"], serde_json::json!("function"));
+            assert_eq!(result["agentCoreExport"], serde_json::json!("function"));
+            assert_eq!(result["validSingle"], serde_json::json!(true));
+            assert_eq!(result["validParallel"], serde_json::json!(true));
+            assert_eq!(result["validUnsafeObject"], serde_json::json!(true));
+            assert_eq!(result["invalidMinimum"], serde_json::json!(false));
+            assert_eq!(result["invalidNestedRequired"], serde_json::json!(false));
+            assert_eq!(result["invalidAdditional"], serde_json::json!(false));
+            assert_eq!(result["invalidUnsafeUnion"], serde_json::json!(false));
+            assert_eq!(
+                result["errorPaths"],
+                serde_json::json!(["/concurrency", "/extra"])
+            );
+            assert_eq!(result["structuredValid"], serde_json::json!(true));
+            assert_eq!(result["structuredInvalid"], serde_json::json!(false));
+            assert_eq!(
+                result["cellDimensions"],
+                serde_json::json!({ "widthPx": 10, "heightPx": 20 })
+            );
+            assert_eq!(result["imageApi"], serde_json::json!(true));
+        });
+    }
+
+    #[test]
     fn pijs_path_extended_functions() {
         futures::executor::block_on(async {
             let clock = Arc::new(DeterministicClock::new(0));
@@ -26682,7 +36346,7 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
                 .eval(
                     r"
                     globalThis.pathResults = {};
-                    import('node:path').then((path) => {
+                    import('node:path').then(({ posix: path }) => {
                         globalThis.pathResults.isAbsRoot = path.isAbsolute('/foo/bar');
                         globalThis.pathResults.isAbsRel = path.isAbsolute('foo/bar');
                         globalThis.pathResults.extJs = path.extname('/a/b/file.js');
@@ -26775,6 +36439,60 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
     }
 
     #[test]
+    fn pijs_fs_promises_access_preserves_write_mode_authorization() {
+        futures::executor::block_on(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let workspace = temp_dir.path().join("workspace");
+            let peer_root = workspace.join("peer-extension");
+            std::fs::create_dir_all(&peer_root).expect("create peer root");
+            let peer_file = peer_root.join("asset.txt");
+            std::fs::write(&peer_file, "peer data").expect("write peer file");
+
+            let config = PiJsRuntimeConfig {
+                cwd: workspace.display().to_string(),
+                ..PiJsRuntimeConfig::default()
+            };
+            let runtime = PiJsRuntime::with_clock_and_config_with_policy_for_extension(
+                DeterministicClock::new(0),
+                config,
+                None,
+                "ext.owner".to_string(),
+            )
+            .await
+            .expect("create owner runtime");
+            runtime.register_foreign_extension_root_boundary(peer_root.as_path(), "ext.peer");
+
+            let script = format!(
+                r"
+                globalThis.promisesAccessWrite = {{}};
+                import('node:fs').then((fs) =>
+                    fs.promises.access({peer_file:?}, fs.constants.W_OK)
+                        .then(() => {{ globalThis.promisesAccessWrite.allowed = true; }})
+                        .catch((error) => {{
+                            globalThis.promisesAccessWrite.allowed = false;
+                            globalThis.promisesAccessWrite.error =
+                                String((error && error.message) || error || '');
+                        }})
+                ).finally(() => {{ globalThis.promisesAccessWrite.done = true; }});
+                "
+            );
+            runtime
+                .eval(&script)
+                .await
+                .expect("evaluate promises.access");
+
+            let result = get_global_json(&runtime, "promisesAccessWrite").await;
+            assert_eq!(result["done"], serde_json::json!(true));
+            assert_eq!(result["allowed"], serde_json::json!(false));
+            assert!(
+                result["error"]
+                    .as_str()
+                    .is_some_and(|error| error.contains("host write denied"))
+            );
+        });
+    }
+
+    #[test]
     fn pijs_fs_sync_roundtrip_and_dirents() {
         futures::executor::block_on(async {
             let clock = Arc::new(DeterministicClock::new(0));
@@ -26833,6 +36551,70 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
             assert_eq!(r["isFile"], serde_json::json!(true));
             assert_eq!(r["direntHasMethods"], serde_json::json!(true));
             assert_eq!(r["names"], serde_json::json!(["hello.txt", "raw.bin"]));
+        });
+    }
+
+    #[test]
+    fn pijs_open_sync_prefers_vfs_overlay_over_shadowed_host_file() {
+        futures::executor::block_on(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let workspace = temp_dir.path().join("workspace");
+            std::fs::create_dir_all(&workspace).expect("create workspace");
+            let host_file = workspace.join("shadowed.txt");
+            std::fs::write(&host_file, "host-value").expect("write host fixture");
+
+            let config = PiJsRuntimeConfig {
+                cwd: workspace.display().to_string(),
+                ..PiJsRuntimeConfig::default()
+            };
+            let runtime = PiJsRuntime::with_clock_and_config_with_policy_for_extension(
+                DeterministicClock::new(0),
+                config,
+                None,
+                "ext.overlay".to_string(),
+            )
+            .await
+            .expect("create owner runtime");
+
+            let script = format!(
+                r"
+                globalThis.overlayOpen = {{}};
+                import('node:fs').then((fs) => {{
+                    fs.appendFileSync({host_file:?}, '-appended');
+                    globalThis.overlayOpen.appendedValue =
+                        fs.readFileSync({host_file:?}, 'utf8');
+                    fs.writeFileSync({host_file:?}, 'overlay-value');
+                    const fd = fs.openSync({host_file:?}, 'r');
+                    const bytes = Buffer.alloc(32);
+                    const count = fs.readSync(fd, bytes, 0, bytes.length, 0);
+                    fs.closeSync(fd);
+                    globalThis.overlayOpen.fdValue = bytes.subarray(0, count).toString('utf8');
+                    globalThis.overlayOpen.pathValue = fs.readFileSync({host_file:?}, 'utf8');
+                    globalThis.overlayOpen.done = true;
+                }}).catch((error) => {{
+                    globalThis.overlayOpen.error = String((error && error.stack) || error);
+                    globalThis.overlayOpen.done = false;
+                }});
+                "
+            );
+            runtime
+                .eval(&script)
+                .await
+                .expect("exercise overlay reopen");
+
+            let result = get_global_json(&runtime, "overlayOpen").await;
+            assert_eq!(result["done"], serde_json::json!(true), "{result}");
+            assert_eq!(
+                result["appendedValue"],
+                serde_json::json!("host-value-appended")
+            );
+            assert_eq!(result["fdValue"], serde_json::json!("overlay-value"));
+            assert_eq!(result["pathValue"], serde_json::json!("overlay-value"));
+            assert_eq!(
+                std::fs::read_to_string(&host_file).expect("read host fixture"),
+                "host-value",
+                "VFS overlay writes must not alter the shadowed host file"
+            );
         });
     }
 
@@ -26938,6 +36720,15 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
                               typeof missing === 'function' &&
                               typeof missing.default === 'function' &&
                               typeof missing.anyNestedProperty === 'function';
+                            globalThis.requireResults.missingValues = Object.values(missing);
+                            globalThis.requireResults.hasPrototype = 'prototype' in missing;
+                            Object.defineProperty(missing, 'fixed', { value: 11, enumerable: true });
+                            Object.defineProperty(missing, 'getterless', { get: undefined });
+                            Object.freeze(missing);
+                            globalThis.requireResults.frozen = Object.isFrozen(missing);
+                            globalThis.requireResults.fixed = missing.fixed;
+                            globalThis.requireResults.getterless = missing.getterless === undefined;
+                            globalThis.requireResults.frozenValues = Object.values(missing);
                         } catch (err) {
                             globalThis.requireResults.missingModuleThrows = true;
                             globalThis.requireResults.missingModuleIsStub = false;
@@ -26958,6 +36749,12 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
             assert_eq!(r["http2PathHeader"], serde_json::json!(":path"));
             assert_eq!(r["missingModuleThrows"], serde_json::json!(false));
             assert_eq!(r["missingModuleIsStub"], serde_json::json!(true));
+            assert_eq!(r["missingValues"], serde_json::json!([]));
+            assert_eq!(r["hasPrototype"], serde_json::json!(true));
+            assert_eq!(r["frozen"], serde_json::json!(true));
+            assert_eq!(r["fixed"], serde_json::json!(11));
+            assert_eq!(r["getterless"], serde_json::json!(true));
+            assert_eq!(r["frozenValues"], serde_json::json!([11]));
         });
     }
 
@@ -27821,6 +37618,123 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // one restart scenario with its full JS fixture
+    fn pijs_virtual_http_restart_retains_only_registered_owner_and_origin() {
+        futures::executor::block_on(async {
+            let runtime = PiJsRuntime::with_clock(DeterministicClock::new(0))
+                .await
+                .expect("create runtime");
+            runtime
+                .eval(&privileged_test_script(
+                    &runtime,
+                    r"
+                    globalThis.virtualRestartResult = null;
+                    (async () => {
+                        const results = {};
+                        const begin = id => {
+                            __pi_end_extension(__pi_test_secret);
+                            __pi_begin_extension(__pi_test_secret, id, { name: id });
+                        };
+                        const listen = port => __pi_virtual_http_listen('127.0.0.1', port, () => {
+                            let first = true;
+                            return {
+                                poll() {
+                                    if (first) { first = false; return { done: false, value: { status: 201, headers: {} } }; }
+                                    return { done: true };
+                                },
+                                next() { return Promise.resolve(this.poll()); },
+                                cancel() { results.cancelled = true; },
+                                finished: Promise.resolve(),
+                            };
+                        }, () => {});
+                        const rejected = (id, url = 'http://127.0.0.1:28180/v1/test') => {
+                            try { __pi_virtual_http_start(__pi_test_secret, id, { url }); return false; }
+                            catch (_) { return true; }
+                        };
+                        begin('route-owner');
+                        const original = listen(28180);
+                        const spec = { api: 'openai-completions', baseUrl: 'http://127.0.0.1:28180/v1', models: [{ id: 'test' }] };
+                        pi.registerProvider('bound', spec);
+                        pi.registerProvider('unbound', { ...spec, baseUrl: 'http://127.0.0.1:28181/v1', virtualHttpServer: 'virtual-http-server-1', virtualHttpOrigin: 'http://127.0.0.1:28181' });
+                        original.close();
+                        results.missingRejected = rejected('bound');
+
+                        begin('foreign-owner');
+                        const foreign = listen(28180);
+                        begin('route-owner');
+                        results.foreignRejected = rejected('bound');
+                        const differentPort = listen(28181);
+                        results.differentPortRejected = rejected('bound');
+                        results.lateBindingRejected = rejected('unbound', 'http://127.0.0.1:28181/v1/test');
+                        const replacement = listen(28180);
+                        results.invalidOriginsRejected = [
+                            'http://127.0.0.1:28181/v1/test',
+                            'http://user:password@127.0.0.1:28180/v1/test',
+                            'https://127.0.0.1:28180/v1/test',
+                            'http://example.com:28180/v1/test',
+                            'http://127.0.0.1:65536/v1/test',
+                            '/v1/test',
+                        ].every(url => rejected('bound', url));
+
+                        // Every `__pi_*` global, including `__pi_url_parse_native`,
+                        // is non-writable after setup; assigning it in this strict
+                        // eval would throw. Replace the writable parsers only.
+                        const originalURL = globalThis.URL;
+                        const originalJSONParse = JSON.parse;
+                        try {
+                            globalThis.URL = function() { return { protocol: 'http:', hostname: '127.0.0.1', port: '28180' }; };
+                            JSON.parse = () => ({ protocol: 'http:', hostname: '127.0.0.1', port: '28180' });
+                            results.replacedParsersRejected = rejected('bound', 'https://example.com/v1/test');
+                        } finally {
+                            globalThis.URL = originalURL;
+                            JSON.parse = originalJSONParse;
+                        }
+                        const stream = __pi_virtual_http_start(__pi_test_secret, 'bound', { url: 'http://127.0.0.1:28180/v1/test' });
+                        original.close();
+                        original.cancelRequests();
+                        const first = await __pi_provider_stream_simple_next(__pi_test_secret, stream);
+                        const last = await __pi_provider_stream_simple_next(__pi_test_secret, stream);
+                        results.replacementStatus = first.value.status;
+                        results.completed = last.done;
+                        results.staleHandleCancelledReplacement = results.cancelled === true;
+                        replacement.close();
+                        differentPort.close();
+                        begin('foreign-owner');
+                        foreign.close();
+                        __pi_end_extension(__pi_test_secret);
+                        const counts = __pi_runtime_registry_snapshot(__pi_test_secret);
+                        results.servers = counts.virtualHttpServers;
+                        results.requests = counts.virtualHttpRequests;
+                        results.streams = counts.providerStreams;
+                        globalThis.virtualRestartResult = results;
+                    })();
+                    ",
+                ))
+                .await
+                .expect("eval route restart isolation");
+            runtime.drain_microtasks().await.expect("drain");
+            assert_eq!(
+                get_global_json(&runtime, "virtualRestartResult").await,
+                json!({
+                    "missingRejected": true,
+                    "foreignRejected": true,
+                    "differentPortRejected": true,
+                    "lateBindingRejected": true,
+                    "invalidOriginsRejected": true,
+                    "replacedParsersRejected": true,
+                    "replacementStatus": 201,
+                    "completed": true,
+                    "staleHandleCancelledReplacement": false,
+                    "servers": 0,
+                    "requests": 0,
+                    "streams": 0,
+                })
+            );
+            assert!(runtime.drain_hostcall_requests().is_empty());
+        });
+    }
+
+    #[test]
     fn pijs_provider_stream_simple_error_cleans_up_registry() {
         futures::executor::block_on(async {
             let runtime = PiJsRuntime::with_clock(DeterministicClock::new(0))
@@ -27828,47 +37742,58 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
                 .expect("create runtime");
 
             runtime
-                .eval(
+                .eval(&privileged_test_script(
+                    &runtime,
                     r#"
-                    __pi_begin_extension("ext.provider.error", { name: "ext.provider.error" });
+                    __pi_begin_extension(__pi_test_secret, "ext.provider.error", { name: "ext.provider.error" });
                     pi.registerProvider("error-provider", {
                         api: "openai-completions",
                         baseUrl: "https://not-used.example.com",
                         models: [{ id: "err-model", name: "Error Model" }],
                         streamSimple: async function*(model, context, options) {
-                            yield "partial";
-                            throw new Error("stream explosion");
+                            globalThis.providerStreamErrorSignal = options.signal;
+                            try {
+                                yield "partial";
+                                throw new Error("stream explosion");
+                            } finally {
+                                globalThis.providerStreamErrorState.cleanupRan = true;
+                                globalThis.providerStreamErrorState.signalAbortedDuringCleanup =
+                                    options.signal.aborted === true;
+                            }
                         }
                     });
-                    __pi_end_extension();
+                    __pi_end_extension(__pi_test_secret);
 
                     globalThis.providerStreamErrorState = { done: false };
                     (async () => {
                         const streamId = await __pi_provider_stream_simple_start(
+                            __pi_test_secret,
                             "error-provider",
                             { id: "err-model" },
                             { messages: [] },
                             {},
                         );
                         globalThis.providerStreamErrorState.afterStart =
-                            __pi_runtime_registry_snapshot().providerStreams;
-                        const first = await __pi_provider_stream_simple_next(streamId);
+                            __pi_runtime_registry_snapshot(__pi_test_secret).providerStreams;
+                        const first = await __pi_provider_stream_simple_next(__pi_test_secret, streamId);
                         globalThis.providerStreamErrorState.first = first;
                         globalThis.providerStreamErrorState.afterFirst =
-                            __pi_runtime_registry_snapshot().providerStreams;
+                            __pi_runtime_registry_snapshot(__pi_test_secret).providerStreams;
                         try {
-                            await __pi_provider_stream_simple_next(streamId);
+                            await __pi_provider_stream_simple_next(__pi_test_secret, streamId);
                             globalThis.providerStreamErrorState.threw = false;
                         } catch (e) {
                             globalThis.providerStreamErrorState.threw = true;
                             globalThis.providerStreamErrorState.error = String((e && e.message) || e || '');
                         }
                         globalThis.providerStreamErrorState.afterError =
-                            __pi_runtime_registry_snapshot().providerStreams;
+                            __pi_runtime_registry_snapshot(__pi_test_secret).providerStreams;
+                        globalThis.providerStreamErrorState.signalAbortedAfterError =
+                            globalThis.providerStreamErrorSignal.aborted === true;
                         globalThis.providerStreamErrorState.done = true;
                     })();
                     "#,
-                )
+                ))
                 .await
                 .expect("eval provider stream error cleanup");
 
@@ -27880,6 +37805,12 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
             assert_eq!(state["threw"], serde_json::json!(true));
             assert_eq!(state["error"], serde_json::json!("stream explosion"));
             assert_eq!(state["afterError"], serde_json::json!(0));
+            assert_eq!(state["cleanupRan"], serde_json::json!(true));
+            assert_eq!(
+                state["signalAbortedDuringCleanup"],
+                serde_json::json!(false)
+            );
+            assert_eq!(state["signalAbortedAfterError"], serde_json::json!(true));
             assert_eq!(state["done"], serde_json::json!(true));
         });
     }
@@ -28071,8 +38002,8 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
                     r"
                     globalThis.urlResults = {};
                     import('node:url').then((url) => {
-                        globalThis.urlResults.fileToPath = url.fileURLToPath('file:///home/user/test.txt');
-                        globalThis.urlResults.pathToFile = url.pathToFileURL('/home/user/test.txt').href;
+                        globalThis.urlResults.fileToPath = url.fileURLToPath('file:///home/user/test.txt', { windows: false });
+                        globalThis.urlResults.pathToFile = url.pathToFileURL('/home/user/test.txt', { windows: false }).href;
 
                         const u = new url.URL('https://example.com/path?key=val#frag');
                         globalThis.urlResults.href = u.href;
@@ -28488,7 +38419,7 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
                 .eval(
                     r"
                     globalThis.pathResults2 = {};
-                    import('node:path').then((path) => {
+                    import('node:path').then(({ posix: path }) => {
                         // relative
                         globalThis.pathResults2.relSameDir = path.relative('/a/b/c', '/a/b/c/d');
                         globalThis.pathResults2.relUp = path.relative('/a/b/c', '/a/b');
@@ -28539,6 +38470,486 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
             // join doesn't normalize; normalize is separate
             let join_dots = r["joinDots"].as_str().unwrap();
             assert!(join_dots == "b" || join_dots == "a/../b");
+        });
+    }
+
+    #[test]
+    fn pijs_windows_path_defaults_survive_denied_environment_access() {
+        futures::executor::block_on(async {
+            for deny_env in [true, false] {
+                let clock = Arc::new(DeterministicClock::new(0));
+                let config = PiJsRuntimeConfig {
+                    cwd: r"C:\work\project".to_string(),
+                    env: HashMap::from([
+                        ("PI_PLATFORM".to_string(), "win32".to_string()),
+                        ("=D:".to_string(), r"D:\saved".to_string()),
+                    ]),
+                    deny_env,
+                    disk_cache_dir: None,
+                    ..PiJsRuntimeConfig::default()
+                };
+                let runtime = PiJsRuntime::with_clock_and_config_with_policy(
+                    Arc::clone(&clock),
+                    config,
+                    None,
+                )
+                .await
+                .expect("create Windows-path runtime");
+                runtime
+                    .eval(
+                        r"
+                        Promise.all([import('node:path'), import('node:fs')]).then(([mod, fs]) => {
+                            const path = mod.default;
+                            const file = path.resolve('note.txt');
+                            fs.writeFileSync(file, 'windows path content');
+                            globalThis.windowsPathDefaults = {
+                                platform: process.platform,
+                                envPlatform: process.env.PI_PLATFORM ?? null,
+                                native: path === mod.win32 && mod.join === path.join,
+                                namespaces: path.posix === mod.posix && path.win32 === mod.win32,
+                                sep: mod.sep,
+                                delimiter: mod.delimiter,
+                                cwd: path.resolve(),
+                                currentDrive: path.resolve('c:src', '..', 'file.rs'),
+                                savedDrive: path.resolve('D:next'),
+                                otherDrive: path.resolve('E:next'),
+                                rooted: path.resolve('C:\\previous', '\\rooted'),
+                                read: fs.readFileSync(path.join(process.cwd(), '.', 'note.txt'), 'utf8'),
+                                done: true,
+                            };
+                        }).catch((error) => {
+                            globalThis.windowsPathDefaults = { error: String(error) };
+                        });
+                        ",
+                    )
+                    .await
+                    .expect("eval Windows default path workflow");
+                drain_until_idle(&runtime, &clock).await;
+                let actual = get_global_json(&runtime, "windowsPathDefaults").await;
+                let saved_drive = if deny_env {
+                    r"D:\next"
+                } else {
+                    r"D:\saved\next"
+                };
+                assert_eq!(
+                    actual,
+                    serde_json::json!({
+                        "platform": "win32",
+                        "envPlatform": if deny_env { serde_json::Value::Null } else { serde_json::json!("win32") },
+                        "native": true,
+                        "namespaces": true,
+                        "sep": "\\",
+                        "delimiter": ";",
+                        "cwd": r"C:\work\project",
+                        "currentDrive": r"c:\work\project\file.rs",
+                        "savedDrive": saved_drive,
+                        "otherDrive": r"E:\next",
+                        "rooted": r"C:\rooted",
+                        "read": "windows path content",
+                        "done": true,
+                    }),
+                    "Windows metadata and path behavior, deny_env={deny_env}"
+                );
+                assert!(runtime.drain_hostcall_requests().is_empty());
+            }
+        });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn pijs_windows_fs_preserves_paths_at_host_boundaries() {
+        // Probe the actual built-in modules in an isolated context. The full
+        // runtime seals its native hooks; this fixture leaves production
+        // authorization untouched and performs no host filesystem I/O.
+        let runtime = rquickjs::Runtime::new().expect("quickjs runtime");
+        let state = Rc::new(RefCell::new(
+            PiJsModuleState::new().with_disk_cache_dir(None),
+        ));
+        runtime.set_loader(
+            PiJsResolver {
+                state: Rc::clone(&state),
+            },
+            PiJsLoader { state },
+        );
+        let context = rquickjs::Context::full(&runtime).expect("quickjs context");
+        context.with(|ctx| {
+            ctx.eval::<(), _>(
+                r"
+                const cwd = '\\\\server\\share\\project';
+                globalThis.pi = { process: { cwd } };
+                globalThis.process = { platform: 'win32', cwd: () => cwd, env: {} };
+                globalThis.windowsFsHostPaths = {};
+                let extensionId = 'ext.one';
+                const calls = [];
+                globalThis.__pi_get_current_extension_id = () => extensionId;
+                globalThis.__pi_host_temp_roots_json = () =>
+                    JSON.stringify(['T:/', '//?/Z:/', '//temp/share']);
+                globalThis.__pi_host_is_registered_fs_path = (path) => {
+                    calls.push(['registered', path]);
+                    return false;
+                };
+                globalThis.__pi_host_check_read_access = (path) => calls.push(['checkRead', path]);
+                globalThis.__pi_host_check_write_access = (path) => calls.push(['checkWrite', path]);
+                globalThis.__pi_host_read_file_sync = (path) => {
+                    calls.push(['read', path]);
+                    throw new Error('fixture read probe');
+                };
+                globalThis.__pi_host_stat_sync = (path, follow) => {
+                    calls.push(['stat', path, follow]);
+                    return JSON.stringify({ kind: 'file', size: 7 });
+                };
+                globalThis.__pi_host_read_dir_sync = (path) => {
+                    calls.push(['readdir', path]);
+                    return JSON.stringify([{ name: 'child.txt', kind: 'file' }]);
+                };
+                Promise.all([import('node:path'), import('node:fs')]).then(([mod, fs]) => {
+                    const path = mod.default;
+                    const inputs = [
+                        path.join('C:\\work', 'file.txt'),
+                        path.resolve('file.txt'),
+                        path.toNamespacedPath('C:\\work\\file.txt'),
+                        path.toNamespacedPath(path.resolve('file.txt')),
+                        path.join('\\\\.\\pipe', 'file.txt'),
+                    ];
+                    windowsFsHostPaths.rows = inputs.map((input) => {
+                        calls.length = 0;
+                        let readProbed = false;
+                        try { fs.readFileSync(input); } catch (error) {
+                            readProbed = String(error).includes('fixture read probe');
+                        }
+                        fs.statSync(input);
+                        fs.lstatSync(input);
+                        fs.readdirSync(path.dirname(input));
+                        fs.writeFileSync(input, new Uint8Array([1]));
+                        const normalized = __pi_vfs_api.normalizePath(input);
+                        return {
+                            readProbed,
+                            normalized,
+                            repeated: __pi_vfs_api.normalizePath(normalized),
+                            calls: calls.slice(),
+                        };
+                    });
+                    windowsFsHostPaths.temp = ['T:\\private.txt', '\\\\?\\Z:\\private.txt', '\\\\temp\\share\\private.txt'].map((input) => {
+                        calls.length = 0;
+                        fs.writeFileSync(input, new Uint8Array([1, 2]));
+                        const canonical = fs.realpathSync(input);
+                        extensionId = 'ext.two';
+                        const visibleToOther = fs.existsSync(input);
+                        extensionId = 'ext.one';
+                        const size = fs.statSync(input).size;
+                        return { canonical, visibleToOther, size, calls: calls.slice() };
+                    });
+                    windowsFsHostPaths.roots = [
+                        'C:\\..\\..', '\\\\server\\share\\..\\..',
+                        '\\\\?\\C:\\..\\..', '\\\\?\\UNC\\server\\share\\..\\..',
+                    ].map((input) => fs.realpathSync(input));
+                    windowsFsHostPaths.done = true;
+                }).catch((error) => {
+                    windowsFsHostPaths.error = String(error);
+                });
+                ",
+            )
+            .expect("evaluate Windows host-boundary fixture");
+        });
+        for _ in 0..64 {
+            if !runtime.execute_pending_job().expect("run import job") {
+                break;
+            }
+        }
+        let actual = context.with(|ctx| {
+            let value: Value<'_> = ctx.globals().get("windowsFsHostPaths").expect("result");
+            js_to_json(&value).expect("convert result")
+        });
+        assert_eq!(actual["done"], json!(true), "{actual}");
+        let expected_paths = [
+            (
+                "C:/work/file.txt",
+                "C:/work/file.txt",
+                "C:/work",
+                "C:/work/child.txt",
+            ),
+            (
+                "//server/share/project/file.txt",
+                "//server/share/project/file.txt",
+                "//server/share/project",
+                "//server/share/project/child.txt",
+            ),
+            (
+                "//?/C:/work/file.txt",
+                r"\\?\C:\work\file.txt",
+                r"\\?\C:\work",
+                r"\\?\C:\work\child.txt",
+            ),
+            (
+                "//?/UNC/server/share/project/file.txt",
+                r"\\?\UNC\server\share\project\file.txt",
+                r"\\?\UNC\server\share\project",
+                r"\\?\UNC\server\share\project\child.txt",
+            ),
+            (
+                "//./pipe/file.txt",
+                r"\\.\pipe\file.txt",
+                r"\\.\pipe",
+                r"\\.\pipe\child.txt",
+            ),
+        ];
+        assert_eq!(
+            actual["rows"].as_array().expect("rows").len(),
+            expected_paths.len()
+        );
+        for (row, (normalized, file, dir, child)) in actual["rows"]
+            .as_array()
+            .expect("rows")
+            .iter()
+            .zip(expected_paths)
+        {
+            assert_eq!(
+                row,
+                &json!({
+                    "readProbed": true,
+                    "normalized": normalized,
+                    "repeated": normalized,
+                    "calls": [
+                        ["checkRead", file], ["read", file],
+                        ["checkRead", file], ["stat", file, true],
+                        ["checkRead", file], ["stat", file, false],
+                        ["checkRead", dir], ["readdir", dir], ["checkRead", child],
+                        ["checkWrite", file], ["stat", file, true],
+                    ],
+                }),
+                "host boundary for {normalized}"
+            );
+        }
+        let temp_paths = [
+            ("T:/private.txt", "T:/private.txt"),
+            ("//?/Z:/private.txt", r"\\?\Z:\private.txt"),
+            ("//temp/share/private.txt", "//temp/share/private.txt"),
+        ];
+        assert_eq!(
+            actual["temp"].as_array().expect("temp results").len(),
+            temp_paths.len()
+        );
+        for (row, (canonical, native)) in actual["temp"]
+            .as_array()
+            .expect("temp results")
+            .iter()
+            .zip(temp_paths)
+        {
+            assert_eq!(
+                row,
+                &json!({
+                    "canonical": canonical,
+                    "visibleToOther": false,
+                    "size": 2,
+                    "calls": [["registered", native], ["registered", native], ["registered", native], ["registered", native]],
+                }),
+                "private temp namespace for {canonical}"
+            );
+        }
+        assert_eq!(
+            actual["roots"],
+            json!(["C:/", "//server/share", "//?/C:/", "//?/UNC/server/share"])
+        );
+    }
+
+    #[test]
+    fn pijs_windows_fs_workflows_keep_drive_and_share_roots() {
+        futures::executor::block_on(async {
+            for (cwd, root, uses_unc) in [
+                (r"C:\", "C:/", false),
+                (r"\\server\share", "//server/share", true),
+                (r"\\?\C:\", "//?/C:/", false),
+                (r"\\?\UNC\server\share", "//?/UNC/server/share", true),
+            ] {
+                // UNC boundary and root behavior is covered without I/O by
+                // the probe fixture above. Do not contact an arbitrary live
+                // network share when this test runs on Windows.
+                if cfg!(windows) && uses_unc {
+                    continue;
+                }
+                let clock = Arc::new(DeterministicClock::new(0));
+                let config = PiJsRuntimeConfig {
+                    cwd: cwd.to_string(),
+                    env: HashMap::from([("PI_PLATFORM".to_string(), "win32".to_string())]),
+                    deny_env: true,
+                    disk_cache_dir: None,
+                    ..PiJsRuntimeConfig::default()
+                };
+                let runtime = PiJsRuntime::with_clock_and_config_with_policy(
+                    Arc::clone(&clock),
+                    config,
+                    None,
+                )
+                .await
+                .expect("create Windows filesystem runtime");
+                let fixture = format!("pijs-roots-{}", uuid::Uuid::new_v4().simple());
+                runtime
+                    .context
+                    .with(|ctx| ctx.globals().set("windowsFsFixture", fixture))
+                    .await
+                    .expect("set unique fixture prefix");
+                runtime
+                    .eval(
+                        r"
+                        Promise.all([import('node:path'), import('node:fs')]).then(([mod, fs]) => {
+                            const path = mod.default;
+                            const fileName = windowsFsFixture + '-file.txt';
+                            const projectName = windowsFsFixture + '-project';
+                            const aliasName = windowsFsFixture + '-alias';
+                            const owned = new Map([[aliasName, 'alias'], [fileName, 'file.txt'], [projectName, 'project']]);
+                            const file = path.resolve(fileName);
+                            fs.writeFileSync(file, 'root file');
+                            fs.mkdirSync(path.resolve(projectName, 'links'));
+                            fs.symlinkSync('..\\..\\' + fileName, path.resolve(projectName, 'links', 'file-link'));
+                            fs.symlinkSync(path.resolve(projectName), path.resolve(aliasName));
+                            const clamped = process.cwd() + '\\..\\..\\' + fileName;
+                            globalThis.windowsFsRoots = {
+                                native: path === mod.win32,
+                                root: fs.realpathSync(process.cwd()),
+                                clamped: fs.readFileSync(clamped, 'utf8'),
+                                linked: fs.readFileSync(path.resolve(aliasName, 'links', 'file-link'), 'utf8'),
+                                entries: fs.readdirSync(process.cwd()).filter((name) => owned.has(name)).map((name) => owned.get(name)),
+                                aliasEntries: fs.readdirSync(path.resolve(aliasName)).filter((name) => name === 'links'),
+                                done: true,
+                            };
+                        }).catch((error) => {
+                            globalThis.windowsFsRoots = { error: String(error) };
+                        });
+                        ",
+                    )
+                    .await
+                    .expect("evaluate Windows filesystem workflow");
+                drain_until_idle(&runtime, &clock).await;
+                let actual = get_global_json(&runtime, "windowsFsRoots").await;
+                assert_eq!(
+                    actual,
+                    json!({
+                        "native": true,
+                        "root": root,
+                        "clamped": "root file",
+                        "linked": "root file",
+                        "entries": ["alias", "file.txt", "project"],
+                        "aliasEntries": ["links"],
+                        "done": true,
+                    }),
+                    "filesystem workflow at {cwd}"
+                );
+                assert!(runtime.drain_hostcall_requests().is_empty());
+            }
+        });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn pijs_explicit_windows_paths_preserve_drives_and_unc_roots_on_unix() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let config = PiJsRuntimeConfig {
+                cwd: "/virtual/project".to_string(),
+                env: HashMap::from([("PI_PLATFORM".to_string(), "linux".to_string())]),
+                deny_env: true,
+                disk_cache_dir: None,
+                ..PiJsRuntimeConfig::default()
+            };
+            let runtime =
+                PiJsRuntime::with_clock_and_config_with_policy(Arc::clone(&clock), config, None)
+                    .await
+                    .expect("create Unix-path runtime");
+            runtime
+                .eval(
+                    r"
+                    import('node:path').then((mod) => {
+                        const path = mod.win32;
+                        const invalid = [
+                            () => path.join('C:\\work', {}),
+                            () => path.resolve('C:\\work', null),
+                            () => path.basename('file.txt', 1),
+                            () => path.normalize(undefined),
+                            () => path.parse([]),
+                            () => path.format(null),
+                            () => path.relative('C:\\work', false),
+                        ];
+                        globalThis.windowsPathRoots = {
+                            nativePosix: mod.default === mod.posix && mod.sep === '/',
+                            posixUnchanged: mod.posix.normalize('/a/b/../c') === '/a/c',
+                            driveRoot: path.normalize('C:/../project'),
+                            driveRelative: path.normalize('C:../project'),
+                            uncRoot: path.normalize('\\\\server\\share\\dir\\..\\..\\file'),
+                            bareShare: path.normalize('\\\\server\\share'),
+                            joinShare: path.join('\\\\server', 'share', 'dir', '..', 'file'),
+                            ordinaryRoot: path.join('//', 'server', 'share'),
+                            relativeDrive: path.join('folder', 'C:', 'file'),
+                            exposedDrive: path.normalize('folder\\..\\C:\\file'),
+                            trailing: path.normalize('C:/temp//foo/../'),
+                            caseRelative: path.relative('C:\\Work\\src', 'c:\\work\\tests\\case.rs'),
+                            sameRelative: path.relative('C:\\Work', 'c:\\work'),
+                            differentDrive: path.relative('C:\\work', 'D:\\source\\file'),
+                            sharedServer: path.relative('\\\\srv\\one\\dir', '\\\\srv\\two\\file'),
+                            differentServer: path.relative('\\\\a\\share', '\\\\b\\share\\file'),
+                            resolveSequence: path.resolve('C:\\base', 'C:src', '..', 'out'),
+                            parseDrive: path.parse('C:/source/file.test.rs'),
+                            parseShare: path.parse('\\\\server\\share\\file.txt'),
+                            dirname: path.dirname('C:\\source\\child\\'),
+                            suffix: path.basename('C:\\source\\FILE.TXT', '.txt'),
+                            hiddenExtension: path.extname('C:\\source\\.env'),
+                            parentExtension: path.extname('..'),
+                            extension: path.extname('C:\\source\\file.rs\\'),
+                            format: path.format({ root: 'C:\\', name: 'file', ext: 'rs' }),
+                            absolute: [path.isAbsolute('C:relative'), path.isAbsolute('C:/root'), path.isAbsolute('\\root')],
+                            namespace: path.toNamespacedPath('\\\\server\\share\\file'),
+                            namespaceNormalize: path.normalize('\\\\?\\C:\\path\\..'),
+                            namespaceResolve: path.resolve('\\\\?\\C:\\path', '\\file'),
+                            invalid: invalid.map((call) => {
+                                try { call(); return false; } catch (error) { return error instanceof TypeError; }
+                            }),
+                            done: true,
+                        };
+                    }).catch((error) => {
+                        globalThis.windowsPathRoots = { error: String(error) };
+                    });
+                    ",
+                )
+                .await
+                .expect("eval Windows drive and share workflows");
+            drain_until_idle(&runtime, &clock).await;
+            let actual = get_global_json(&runtime, "windowsPathRoots").await;
+            assert_eq!(
+                actual,
+                serde_json::json!({
+                    "nativePosix": true,
+                    "posixUnchanged": true,
+                    "driveRoot": r"C:\project",
+                    "driveRelative": r"C:..\project",
+                    "uncRoot": r"\\server\share\file",
+                    "bareShare": "\\\\server\\share\\",
+                    "joinShare": r"\\server\share\file",
+                    "ordinaryRoot": r"\server\share",
+                    "relativeDrive": r".\folder\C:\file",
+                    "exposedDrive": r".\C:\file",
+                    "trailing": "C:\\temp\\",
+                    "caseRelative": r"..\tests\case.rs",
+                    "sameRelative": "",
+                    "differentDrive": r"D:\source\file",
+                    "sharedServer": r"..\..\two\file",
+                    "differentServer": r"\\b\share\file",
+                    "resolveSequence": r"C:\base\out",
+                    "parseDrive": { "root": "C:/", "dir": "C:/source", "base": "file.test.rs", "ext": ".rs", "name": "file.test" },
+                    "parseShare": { "root": "\\\\server\\share\\", "dir": "\\\\server\\share\\", "base": "file.txt", "ext": ".txt", "name": "file" },
+                    "dirname": r"C:\source",
+                    "suffix": "FILE.TXT",
+                    "hiddenExtension": "",
+                    "parentExtension": "",
+                    "extension": ".rs",
+                    "format": r"C:\file.rs",
+                    "absolute": [false, true, true],
+                    "namespace": r"\\?\UNC\server\share\file",
+                    "namespaceNormalize": r"\\?\C:",
+                    "namespaceResolve": r"\\?\file",
+                    "invalid": [true, true, true, true, true, true, true],
+                    "done": true,
+                })
+            );
+            assert!(runtime.drain_hostcall_requests().is_empty());
         });
     }
 
@@ -28849,18 +39260,30 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
                 .await
                 .expect("create runtime");
 
+            #[allow(clippy::literal_string_with_formatting_args)] // JS template literal, not a format string
             runtime
                 .eval(
                     r#"
                     globalThis.piAiFailClosed = {};
                     (async () => {
                         const ai = await import('@mariozechner/pi-ai');
+                        const rejectStream = async (name) => {
+                            const stream = ai[name]("model", "hi");
+                            const events = [];
+                            for await (const event of stream) events.push(event);
+                            const result = await stream.result();
+                            if (events.length !== 1 || events[0].type !== "error" ||
+                                result.stopReason !== "error") {
+                                throw new Error(`${name}: missing terminal bridge error`);
+                            }
+                            throw new Error(result.errorMessage);
+                        };
                         const checks = [
                             ["complete", () => ai.complete("model", [{ role: "user", content: "hi" }])],
                             ["completeSimple", () => ai.completeSimple("model", "hi")],
-                            ["streamSimpleAnthropic", async () => { for await (const _ of ai.streamSimpleAnthropic("model", "hi")) {} }],
-                            ["streamSimpleOpenAIResponses", async () => { for await (const _ of ai.streamSimpleOpenAIResponses("model", "hi")) {} }],
-                            ["streamSimpleOpenAICompletions", async () => { for await (const _ of ai.streamSimpleOpenAICompletions("model", "hi")) {} }],
+                            ["streamSimpleAnthropic", () => rejectStream("streamSimpleAnthropic")],
+                            ["streamSimpleOpenAIResponses", () => rejectStream("streamSimpleOpenAIResponses")],
+                            ["streamSimpleOpenAICompletions", () => rejectStream("streamSimpleOpenAICompletions")],
                             ["getModel", () => ai.getModel()],
                             ["getApiProvider", () => ai.getApiProvider()],
                             ["getModels", () => ai.getModels()],
@@ -28921,6 +39344,120 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
                     "{name} error should be fail-closed, got {message:?}"
                 );
             }
+        });
+    }
+
+    /// gh #178 (point 5): `isContextOverflow` from the virtual pi-ai module
+    /// must agree with the host classifier for the same inputs, so custom
+    /// compaction/recovery extensions see the verdict the agent loop uses.
+    #[test]
+    fn pijs_pi_ai_is_context_overflow_matches_host_classifier() {
+        const MESSAGES: &[&str] = &[
+            "prompt is too long: 150000 tokens > 120000 maximum",
+            "Input is too long for requested model.",
+            "This request exceeds the context window of the model",
+            "input token count 210000 exceeds the maximum number of tokens allowed",
+            "maximum prompt length is 32768",
+            "This model's maximum context length is 8192 tokens",
+            "exceeds the limit of 4096",
+            "context_length_exceeded",
+            "context length exceeded",
+            "400 status code (no body)",
+            "413 (no body)",
+            "too many tokens",
+            "token limit exceeded",
+            "rate limit exceeded, retry after 3s",
+            "overloaded_error: the server is overloaded",
+            "connection reset by peer",
+            "invalid api key",
+            "",
+        ];
+        let expected: Vec<bool> = MESSAGES
+            .iter()
+            .map(|m| crate::error::is_context_overflow(m, None, None))
+            .collect();
+        assert!(expected.iter().any(|v| *v) && expected.iter().any(|v| !*v));
+
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+
+            runtime
+                .eval(&format!(
+                    r#"
+                    globalThis.piAiOverflow = {{}};
+                    (async () => {{
+                        const ai = await import('@mariozechner/pi-ai');
+                        const messages = {messages};
+                        globalThis.piAiOverflow.fromString = messages.map((m) => ai.isContextOverflow(m));
+                        globalThis.piAiOverflow.fromError = messages.map((m) =>
+                            ai.isContextOverflow({{ role: "assistant", stopReason: "error", errorMessage: m, usage: {{ input: 10, output: 1, cacheRead: 0 }} }}, 200000));
+                        // A clean stop never classifies on text alone.
+                        globalThis.piAiOverflow.stopText = ai.isContextOverflow({{ stopReason: "stop", errorMessage: "prompt is too long" }}, 200000);
+                        // Silent overflow: reported input (+ cache reads) above the window.
+                        globalThis.piAiOverflow.silent = ai.isContextOverflow({{ stopReason: "stop", usage: {{ input: 150000, cacheRead: 60000, output: 5 }} }}, 200000);
+                        globalThis.piAiOverflow.silentUnderWindow = ai.isContextOverflow({{ stopReason: "stop", usage: {{ input: 150000, cacheRead: 40000, output: 5 }} }}, 200000);
+                        globalThis.piAiOverflow.silentNoWindow = ai.isContextOverflow({{ stopReason: "stop", usage: {{ input: 999999 }} }});
+                        // bd-5tuh8: non-stop reasons never classify, even
+                        // when usage blows far past the window or the error
+                        // text matches an overflow pattern.
+                        globalThis.piAiOverflow.toolUseOverWindow = ai.isContextOverflow({{ stopReason: "toolUse", usage: {{ input: 150000, cacheRead: 60000, output: 5 }} }}, 200000);
+                        globalThis.piAiOverflow.lengthOverWindow = ai.isContextOverflow({{ stopReason: "length", usage: {{ input: 150000, cacheRead: 60000, output: 5 }} }}, 200000);
+                        globalThis.piAiOverflow.abortedWithText = ai.isContextOverflow({{ stopReason: "aborted", errorMessage: "prompt is too long" }}, 200000);
+                        globalThis.piAiOverflow.noReasonOverWindow = ai.isContextOverflow({{ usage: {{ input: 150000, cacheRead: 60000, output: 5 }} }}, 200000);
+                        globalThis.piAiOverflow.stopWindowZeroEdge = ai.isContextOverflow({{ stopReason: "stop", usage: {{ input: 150000, cacheRead: 60000, output: 5 }} }}, 0);
+                        globalThis.piAiOverflow.garbage = [ai.isContextOverflow(null), ai.isContextOverflow(undefined), ai.isContextOverflow(42), ai.isContextOverflow({{}})];
+                        globalThis.piAiOverflow.defaultExport = typeof ai.default.isContextOverflow;
+                        globalThis.piAiOverflow.done = true;
+                    }})();
+                    "#,
+                    messages = serde_json::to_string(MESSAGES).expect("json messages"),
+                ))
+                .await
+                .expect("eval isContextOverflow");
+
+            drain_until_idle(&runtime, &clock).await;
+
+            let r = get_global_json(&runtime, "piAiOverflow").await;
+            assert_eq!(r["done"], serde_json::json!(true));
+            assert_eq!(r["defaultExport"], serde_json::json!("function"));
+            for (idx, message) in MESSAGES.iter().enumerate() {
+                assert_eq!(
+                    r["fromString"][idx],
+                    serde_json::json!(expected[idx]),
+                    "string form disagrees with host classifier for {message:?}"
+                );
+                assert_eq!(
+                    r["fromError"][idx],
+                    serde_json::json!(expected[idx]),
+                    "error-message form disagrees with host classifier for {message:?}"
+                );
+            }
+            assert_eq!(r["stopText"], serde_json::json!(false));
+            assert_eq!(r["silent"], serde_json::json!(true));
+            assert!(crate::error::is_context_overflow(
+                "",
+                Some(210_000),
+                Some(200_000)
+            ));
+            assert_eq!(r["silentUnderWindow"], serde_json::json!(false));
+            assert!(!crate::error::is_context_overflow(
+                "",
+                Some(190_000),
+                Some(200_000)
+            ));
+            assert_eq!(r["toolUseOverWindow"], serde_json::json!(false));
+            assert_eq!(r["lengthOverWindow"], serde_json::json!(false));
+            assert_eq!(r["abortedWithText"], serde_json::json!(false));
+            assert_eq!(r["noReasonOverWindow"], serde_json::json!(false));
+            assert_eq!(r["stopWindowZeroEdge"], serde_json::json!(false));
+            assert_eq!(r["silentNoWindow"], serde_json::json!(false));
+            assert_eq!(
+                r["garbage"],
+                serde_json::json!([false, false, false, false])
+            );
         });
     }
 
@@ -28987,6 +39524,156 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
             assert_eq!(r["streamType"], json!("function"));
             assert_eq!(r["streamSimpleType"], json!("function"));
             assert_eq!(r["modelId"], json!("gpt-5.5"));
+        });
+    }
+
+    #[test]
+    fn pijs_pi_ai_aliases_share_one_immutable_module_identity() {
+        futures::executor::block_on(async {
+            let runtime = PiJsRuntime::with_clock(DeterministicClock::new(0))
+                .await
+                .expect("create runtime");
+
+            runtime
+                .eval(
+                    r"
+                    globalThis.piAiAliasIdentity = {};
+                    Promise.all([
+                        import('@mariozechner/pi-ai'),
+                        import('@earendil-works/pi-ai'),
+                        import('@earendil-works/pi-ai/compat'),
+                        import('@mariozechner/pi-agent-core'),
+                    ]).then(([canonical, current, compat, legacy]) => {
+                        const resetBefore = globalThis.__pi_reset_api_provider_registry;
+                        current.registerApiProvider({
+                            api: 'alias-identity-api',
+                            stream: async function* () {},
+                            streamSimple: async function* () {},
+                        }, 'alias-source');
+                        globalThis.piAiAliasIdentity = {
+                            sameRegister:
+                                canonical.registerApiProvider === current.registerApiProvider &&
+                                current.registerApiProvider === compat.registerApiProvider &&
+                                compat.registerApiProvider === legacy.registerApiProvider,
+                            canonicalCount: canonical.getApiProviders().length,
+                            currentCount: current.getApiProviders().length,
+                            compatCount: compat.getApiProviders().length,
+                            legacyCount: legacy.getApiProviders().length,
+                            resetIntact:
+                                globalThis.__pi_reset_api_provider_registry === resetBefore,
+                            done: true,
+                        };
+                    }).catch((error) => {
+                        globalThis.piAiAliasIdentity = {
+                            error: String((error && error.stack) || error),
+                            done: false,
+                        };
+                    });
+                    ",
+                )
+                .await
+                .expect("load mixed pi-ai aliases");
+
+            let result = get_global_json(&runtime, "piAiAliasIdentity").await;
+            assert_eq!(result["done"], serde_json::json!(true), "{result}");
+            assert_eq!(result["sameRegister"], serde_json::json!(true));
+            assert_eq!(result["canonicalCount"], serde_json::json!(1));
+            assert_eq!(result["currentCount"], serde_json::json!(1));
+            assert_eq!(result["compatCount"], serde_json::json!(1));
+            assert_eq!(result["legacyCount"], serde_json::json!(1));
+            assert_eq!(result["resetIntact"], serde_json::json!(true));
+        });
+    }
+
+    #[test]
+    fn pijs_pi_ai_register_api_provider_dispatches_and_unregisters() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+
+            runtime
+                .eval(
+                    r"
+                    globalThis.piAiRegisteredApiProvider = {};
+                    (async () => {
+                        const ai = await import('@earendil-works/pi-ai/compat');
+                        const makeStream = (model, text) => {
+                            const events = ai.createAssistantMessageEventStream();
+                            events.push({ type: 'text_delta', delta: text });
+                            events.push({
+                                type: 'done',
+                                message: {
+                                    role: 'assistant',
+                                    content: [{ type: 'text', text }],
+                                    api: model.api,
+                                    provider: model.provider,
+                                    model: model.id,
+                                    stopReason: 'stop',
+                                },
+                            });
+                            return events;
+                        };
+                        ai.registerApiProvider({
+                            api: 'fixture-api',
+                            stream: (model) => makeStream(model, 'full'),
+                            streamSimple: (model) => makeStream(model, 'simple'),
+                        }, 'fixture-source');
+
+                        const model = { api: 'fixture-api', provider: 'fixture', id: 'fixture-model' };
+                        const provider = ai.getApiProvider('fixture-api');
+                        const events = [];
+                        for await (const event of ai.streamSimple(model, [])) {
+                            events.push(event.type + ':' + (event.delta || ''));
+                        }
+                        const completed = await ai.completeSimple(model, []);
+                        let mismatched = '';
+                        try {
+                            ai.streamSimple({ api: 'wrong-api' }, []);
+                        } catch (error) {
+                            mismatched = String((error && error.message) || error || '');
+                        }
+                        globalThis.piAiRegisteredApiProvider = {
+                            providerApi: provider && provider.api,
+                            providerStream: typeof (provider && provider.stream),
+                            providerStreamSimple: typeof (provider && provider.streamSimple),
+                            providersBeforeUnregister: ai.getApiProviders().length,
+                            events,
+                            completedText: completed.content[0].text,
+                            mismatched,
+                        };
+                        ai.unregisterApiProviders('fixture-source');
+                        globalThis.piAiRegisteredApiProvider.providersAfterUnregister = ai.getApiProviders().length;
+                    })().catch((error) => {
+                        globalThis.piAiRegisteredApiProvider.error = String((error && error.message) || error || '');
+                    });
+                    ",
+                )
+                .await
+                .expect("eval registerApiProvider");
+
+            drain_until_idle(&runtime, &clock).await;
+
+            let result = get_global_json(&runtime, "piAiRegisteredApiProvider").await;
+            assert_eq!(
+                result["error"],
+                serde_json::Value::Null,
+                "unexpected error: {result:?}"
+            );
+            assert_eq!(result["providerApi"], json!("fixture-api"));
+            assert_eq!(result["providerStream"], json!("function"));
+            assert_eq!(result["providerStreamSimple"], json!("function"));
+            assert_eq!(result["providersBeforeUnregister"], json!(1));
+            assert_eq!(result["providersAfterUnregister"], json!(0));
+            assert_eq!(result["events"], json!(["text_delta:simple", "done:"]));
+            assert_eq!(result["completedText"], json!("simple"));
+            assert!(
+                result["mismatched"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("No API provider registered")),
+                "unregistered API lookup must fail closed: {result:?}"
+            );
         });
     }
 
@@ -29073,13 +39760,16 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
                             { maxTokens: 12 }
                         );
                         globalThis.piAiBridge.simple = await ai.completeSimple("mock-model", "hello", { maxTokens: 4 });
+                        globalThis.piAiBridge.shorthand = await ai.completeSimple("hello", { maxTokens: 3 });
                         globalThis.piAiBridge.model = await ai.getModel();
                         globalThis.piAiBridge.provider = await ai.getApiProvider();
                         globalThis.piAiBridge.models = await ai.getModels();
                         globalThis.piAiBridge.stream = [];
-                        for await (const chunk of ai.streamSimpleOpenAIResponses("mock-model", "stream")) {
-                            globalThis.piAiBridge.stream.push(chunk);
+                        const stream = ai.streamSimpleOpenAIResponses("mock-model", "stream");
+                        for await (const event of stream) {
+                            if (event.type === "text_delta") globalThis.piAiBridge.stream.push(event.delta);
                         }
+                        globalThis.piAiBridge.streamResult = await stream.result();
                         globalThis.piAiBridge.done = true;
                     })().catch((e) => {
                         globalThis.piAiBridge.error = String((e && e.message) || e || "");
@@ -29124,16 +39814,27 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
                                 .and_then(serde_json::Value::as_bool)
                                 .unwrap_or(false);
                             if simple {
+                                assert_eq!(request.payload["context"], json!("hello"));
+                                if request.payload["model"].is_null() {
+                                    assert_eq!(request.payload["options"]["maxTokens"], json!(3));
+                                } else {
+                                    assert_eq!(request.payload["model"], json!("mock-model"));
+                                    assert_eq!(request.payload["options"]["maxTokens"], json!(4));
+                                }
                                 runtime.complete_hostcall(
                                     request.call_id,
                                     HostcallOutcome::Success(json!("bridge-simple")),
                                 );
                             } else {
-                                assert_eq!(
-                                    request.payload["context"][0]["content"],
-                                    json!("hello")
-                                );
-                                assert_eq!(request.payload["options"]["maxTokens"], json!(12));
+                                if request.payload["context"].is_array() {
+                                    assert_eq!(
+                                        request.payload["context"][0]["content"],
+                                        json!("hello")
+                                    );
+                                    assert_eq!(request.payload["options"]["maxTokens"], json!(12));
+                                } else {
+                                    assert_eq!(request.payload["context"], json!("stream"));
+                                }
                                 runtime.complete_hostcall(
                                     request.call_id,
                                     HostcallOutcome::Success(json!({
@@ -29175,10 +39876,16 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
             assert_eq!(r["error"], serde_json::Value::Null);
             assert_eq!(r["complete"]["text"], json!("bridge-complete"));
             assert_eq!(r["simple"], json!("bridge-simple"));
+            assert_eq!(r["shorthand"], json!("bridge-simple"));
             assert_eq!(r["model"]["modelId"], json!("mock-model"));
             assert_eq!(r["provider"], json!("mock-provider"));
             assert_eq!(r["models"][0]["id"], json!("mock-model"));
-            assert_eq!(r["stream"][0], json!("bridge-simple"));
+            assert_eq!(r["stream"][0], json!("bridge-complete"));
+            assert_eq!(r["streamResult"]["stopReason"], json!("stop"));
+            assert_eq!(
+                r["streamResult"]["content"][0]["text"],
+                json!("bridge-complete")
+            );
         });
     }
 
@@ -29436,8 +40143,101 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
             drain_until_idle(&runtime, &clock).await;
 
             let result = get_global_json(&runtime, "fsStreamCopy").await;
-            assert_eq!(result["done"], serde_json::json!(true));
+            assert_eq!(
+                result["done"],
+                serde_json::json!(true),
+                "stream copy failed: {result}"
+            );
             assert_eq!(result["value"], serde_json::json!("stream-data-123"));
+        });
+    }
+
+    #[test]
+    fn pijs_fs_create_write_stream_releases_fd_after_write_error() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+
+            runtime
+                .eval(
+                    r#"
+                    globalThis.fsStreamWriteError = { done: false };
+                    (async () => {
+                        const fs = await import("node:fs");
+                        const stream = fs.createWriteStream("/tmp/write-error.txt");
+                        const fd = stream.fd;
+                        stream.on("error", () => {});
+
+                        const originalError = await new Promise((resolve) => {
+                          stream.write({
+                            toString() {
+                              throw new Error("injected stream conversion failure");
+                            }
+                          }, "utf8", (err) => resolve(String((err && err.message) || err || "")));
+                        });
+
+                        let fdReleased = false;
+                        try {
+                          fs.closeSync(fd);
+                        } catch (err) {
+                          fdReleased = String((err && err.message) || err || "").includes("EBADF");
+                        }
+
+                        const destroyed = fs.createWriteStream("/tmp/destroy-error.txt");
+                        const destroyedFd = destroyed.fd;
+                        let destroyError = "";
+                        destroyed.on("error", (err) => {
+                          destroyError = String((err && err.message) || err || "");
+                        });
+                        destroyed.destroy(new Error("intentional stream destroy error"));
+
+                        let destroyFdReleased = false;
+                        try {
+                          fs.closeSync(destroyedFd);
+                        } catch (err) {
+                          destroyFdReleased = String((err && err.message) || err || "").includes("EBADF");
+                        }
+
+                        globalThis.fsStreamWriteError = {
+                          done: true,
+                          originalError,
+                          fdReleased,
+                          destroyError,
+                          destroyFdReleased,
+                        };
+                    })().catch((err) => {
+                        globalThis.fsStreamWriteError = {
+                          done: false,
+                          error: String((err && err.message) || err || ""),
+                        };
+                    });
+                    "#,
+                )
+                .await
+                .expect("evaluate write stream error regression");
+
+            drain_until_idle(&runtime, &clock).await;
+
+            let result = get_global_json(&runtime, "fsStreamWriteError").await;
+            assert_eq!(
+                result["done"],
+                serde_json::json!(true),
+                "write-stream error regression failed: {result}"
+            );
+            assert!(
+                result["originalError"]
+                    .as_str()
+                    .is_some_and(|error| error.contains("injected stream conversion failure"))
+            );
+            assert_eq!(result["fdReleased"], serde_json::json!(true));
+            assert!(
+                result["destroyError"]
+                    .as_str()
+                    .is_some_and(|error| error.contains("intentional stream destroy error"))
+            );
+            assert_eq!(result["destroyFdReleased"], serde_json::json!(true));
         });
     }
 
@@ -30033,6 +40833,7 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
         });
     }
 
+    #[cfg(unix)]
     #[test]
     fn pijs_exec_sync_throws_when_stdout_exceeds_max_buffer() {
         futures::executor::block_on(async {
@@ -30264,6 +41065,7 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
         });
     }
 
+    #[cfg(unix)]
     #[test]
     fn pijs_exec_file_sync_throws_when_stdout_exceeds_max_buffer() {
         futures::executor::block_on(async {

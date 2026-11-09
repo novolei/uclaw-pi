@@ -61,6 +61,7 @@ fn test_model_entry() -> ModelEntry {
             reasoning: true,
             input: vec![crate::provider::InputType::Text],
             cost: crate::provider::ModelCost {
+                audio: None,
                 input: 0.0,
                 output: 0.0,
                 cache_read: 0.0,
@@ -110,6 +111,7 @@ fn build_test_app(cwd: PathBuf) -> PiApp {
         model_entry.clone(),
         vec![model_entry.clone()],
         vec![model_entry],
+        None,
         Vec::new(),
         event_tx,
         test_runtime_handle(),
@@ -119,6 +121,7 @@ fn build_test_app(cwd: PathBuf) -> PiApp {
         Some(KeyBindings::new()),
         Vec::new(),
         Usage::default(),
+        None,
     )
 }
 
@@ -147,7 +150,7 @@ fn prepare_startup_changelog_skips_disk_write_when_persistence_disabled() {
         false,
         false,
         "1.0.0",
-        changelog,
+        || changelog,
     );
 
     assert_eq!(
@@ -182,7 +185,7 @@ fn prepare_startup_changelog_writes_when_persistence_enabled() {
         false,
         true,
         "1.0.0",
-        "## 1.0.0\n- Added startup changelog notices\n\n## 0.9.0\n- Previous release\n",
+        || "## 1.0.0\n- Added startup changelog notices\n\n## 0.9.0\n- Previous release\n",
     );
 
     assert!(matches!(startup, Some(StartupChangelog::Full { .. })));
@@ -201,6 +204,21 @@ fn extract_file_references_removes_indented_ref_line_without_leaving_blank_white
     let (cleaned, refs) = app.extract_file_references("Summary:\n  @notes.txt\nNext line");
 
     assert_eq!(cleaned, "Summary:\nNext line");
+    assert_eq!(refs, vec!["notes.txt".to_string()]);
+}
+
+/// An `@` reference to an empty file keeps its token: nothing is attached
+/// for an empty file, so stripping the token too erased the mention.
+#[test]
+fn extract_file_references_keeps_a_reference_to_an_empty_file() {
+    let dir = tempdir();
+    std::fs::write(dir.path().join("notes.txt"), "hi").expect("write file");
+    std::fs::write(dir.path().join("todo.md"), "").expect("write file");
+    let mut app = build_test_app(dir.path().to_path_buf());
+
+    let (cleaned, refs) = app.extract_file_references("use @notes.txt to fill in @todo.md");
+
+    assert_eq!(cleaned, "use to fill in @todo.md");
     assert_eq!(refs, vec!["notes.txt".to_string()]);
 }
 
@@ -281,6 +299,102 @@ fn render_header_uses_cycle_thinking_binding_hint() {
 
     assert!(header.contains("shift+tab: thinking"), "header: {header}");
     assert!(!header.contains("ctrl+t: thinking"), "header: {header}");
+    assert!(
+        header.contains("\x1b]0;Pi · openai/gpt-5.2 · ready\x07"),
+        "live header must emit the delight terminal title: {header:?}"
+    );
+}
+
+/// Issue #200: a named session (via `/name` or a resumed named session)
+/// titles the terminal tab after itself; unnamed sessions keep the model
+/// label (pinned by `render_header_uses_cycle_thinking_binding_hint`).
+#[test]
+fn render_header_titles_terminal_after_session_name() {
+    let dir = tempdir();
+    let mut app = build_test_app(dir.path().to_path_buf());
+    app.set_terminal_size(200, 40);
+    {
+        let mut session = app.session.try_lock().expect("session lock");
+        session.set_name("refactor-plan");
+    }
+
+    let header = app.render_header();
+    assert!(
+        header.contains("\x1b]0;Pi · refactor-plan · ready\x07"),
+        "named session must title the tab after itself: {header:?}"
+    );
+}
+
+/// gh #214: a models.json `name` shows in the header, the terminal title and
+/// the powerline, while the identity string used for selection stays
+/// provider/id. An entry without a distinct name still shows provider/id.
+#[test]
+fn a_model_display_name_renders_but_identity_stays_provider_id() {
+    let dir = tempdir();
+    let mut app = build_test_app(dir.path().to_path_buf());
+    app.set_terminal_size(200, 40);
+    app.startup_welcome.clear();
+    assert_eq!(model_display_label(&app.model_entry), "openai/gpt-5.2");
+    assert_eq!(session_model_line(&app.model_entry), "openai/gpt-5.2");
+
+    app.model_entry.model.name = "GPT Five Two".to_string();
+    let view = app.view();
+    assert!(view.contains("(GPT Five Two)"), "header: {view}");
+    assert!(view.contains("Pi · GPT Five Two"), "terminal title: {view}");
+    assert_eq!(app.model, "openai/gpt-5.2", "identity is untouched");
+    assert_eq!(
+        session_model_line(&app.model_entry),
+        "GPT Five Two (openai/gpt-5.2)"
+    );
+}
+
+#[test]
+fn live_view_renders_default_welcome_and_powerline_status() {
+    let dir = tempdir();
+    let mut app = build_test_app(dir.path().to_path_buf());
+    app.set_terminal_size(200, 40);
+    app.startup_welcome.clear();
+
+    let view = app.view();
+
+    assert!(view.contains("Welcome to Pi!"), "view: {view}");
+    assert!(view.contains("Tip: Type /help"), "view: {view}");
+    assert!(view.contains("ACT"), "powerline mode missing: {view}");
+    assert!(
+        view.contains("ctx: 0%"),
+        "powerline context missing: {view}"
+    );
+}
+
+#[test]
+fn quiet_startup_does_not_render_welcome_screen_fallback() {
+    let dir = tempdir();
+    let mut app = build_test_app(dir.path().to_path_buf());
+    app.set_terminal_size(200, 40);
+    app.config.quiet_startup = Some(true);
+    app.startup_welcome.clear();
+
+    let view = app.view();
+
+    assert!(!view.contains("Welcome to Pi!"), "view: {view}");
+    assert!(!view.contains("Tip: Type /help"), "view: {view}");
+}
+
+#[test]
+fn live_view_applies_rich_markdown_enhancements() {
+    let dir = tempdir();
+    let mut app = build_test_app(dir.path().to_path_buf());
+    app.set_terminal_size(200, 40);
+    app.messages.push(ConversationMessage::new(
+        MessageRole::Assistant,
+        "Use #ff5500 for \\alpha.".to_string(),
+        None,
+    ));
+
+    let view = app.view();
+
+    assert!(view.contains('α'), "LaTeX enhancement missing: {view}");
+    assert!(view.contains("■ #ff5500"), "hex swatch missing: {view}");
 }
 
 #[test]
@@ -466,6 +580,7 @@ fn drive_tool_pressure(app: &mut PiApp, trace: &mut TuiDegradationDrillTrace) {
         name: "bash".to_string(),
         tool_id: "tool-pressure".to_string(),
         is_error: false,
+        output: None,
     });
     trace.event();
 }
@@ -588,4 +703,830 @@ fn tui_degradation_drill_preserves_input_and_semantics_under_pressure() {
     drive_resize_pressure(&mut app, &mut trace);
     finish_agent_and_preserve_input(&mut app, &mut trace);
     assert_tui_degradation_evidence(&app, &mut trace);
+}
+
+/// bd-cv653.3.1: `/model <role> <spec>` assigns a session-scoped role
+/// override and records a role-tagged ModelChange entry; `/model <role>`
+/// alone reports the assignment; unknown role-like tokens never assign.
+#[test]
+fn slash_model_role_assignment_and_query() {
+    let dir = tempdir();
+    let mut app = build_test_app(dir.path().to_path_buf());
+
+    // Assign: exact provider/model match against available_models.
+    let result = app.handle_slash_model("advisor openai/gpt-5.2");
+    assert!(result.is_none(), "role assignment is a status-only action");
+    assert_eq!(
+        app.role_model_overrides
+            .get(&crate::models::ModelRole::Advisor),
+        Some(&("openai".to_string(), "gpt-5.2".to_string())),
+        "override recorded for the advisor role"
+    );
+
+    // Session carries a role-tagged ModelChange entry.
+    let guard = app.session.try_lock().expect("session lock");
+    let role_entries: Vec<_> = guard
+        .entries_for_current_path()
+        .iter()
+        .filter_map(|e| match e {
+            crate::session::SessionEntry::ModelChange(mc) => Some(mc),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        role_entries
+            .iter()
+            .any(|mc| mc.role.as_deref() == Some("advisor")
+                && mc.provider == "openai"
+                && mc.model_id == "gpt-5.2"),
+        "role-tagged ModelChange entry present"
+    );
+    drop(guard);
+
+    // Query: `/model advisor` reports the assignment without changing state.
+    app.status_message = None;
+    let result = app.handle_slash_model("advisor");
+    assert!(result.is_none());
+    let status = app.status_message.clone().unwrap_or_default();
+    assert!(
+        status.contains("advisor") && status.contains("openai/gpt-5.2"),
+        "query reports assignment, got: {status}"
+    );
+
+    // Planted negative: a two-token pattern whose first token is NOT a role
+    // must not create any override.
+    let before = app.role_model_overrides.len();
+    let _ = app.handle_slash_model("notarole openai/gpt-5.2");
+    assert_eq!(
+        app.role_model_overrides.len(),
+        before,
+        "non-role first token must not assign"
+    );
+}
+
+/// bd-cv653.3.9: the todo footer is state-driven — a TodoSummary message
+/// renders the compact line in the next frame's view; `None` clears it and
+/// the chrome height accounting tracks both states.
+#[test]
+fn todo_summary_message_drives_footer_line() {
+    let dir = tempdir();
+    let mut app = build_test_app(dir.path().to_path_buf());
+    app.set_terminal_size(100, 30);
+
+    let base_height = app.view_effective_conversation_height();
+    assert!(app.todo_summary.is_none());
+    assert!(!app.view().contains("1/2 · implement"));
+
+    app.handle_pi_message(PiMsg::TodoSummary {
+        summary: Some("1/2 · implement".to_string()),
+    });
+    let view = app.view();
+    assert!(view.contains("todo"), "footer label rendered");
+    assert!(view.contains("1/2 · implement"), "summary rendered");
+    assert_eq!(
+        app.view_effective_conversation_height(),
+        base_height.saturating_sub(2),
+        "todo footer consumes two chrome rows"
+    );
+
+    app.handle_pi_message(PiMsg::TodoSummary { summary: None });
+    assert!(app.todo_summary.is_none());
+    assert!(!app.view().contains("1/2 · implement"));
+    assert_eq!(app.view_effective_conversation_height(), base_height);
+}
+
+/// bd-cv653.3.8: an ask card owns the input line — the question renders as a
+/// system card, numbered answers advance through the questions, and answers
+/// Issue #197: `/new` must restore the configured default thinking level
+/// (clamped to the model), not hard-code `off`.
+#[test]
+fn new_session_thinking_level_resolves_configured_default() {
+    let dir = tempdir();
+    let mut app = build_test_app(dir.path().to_path_buf());
+
+    app.config.default_thinking_level = Some("max".to_string());
+    assert_eq!(
+        app.new_session_thinking_level(),
+        app.model_entry
+            .clamp_thinking_level(crate::model::ThinkingLevel::Max)
+    );
+
+    app.config.default_thinking_level = Some("low".to_string());
+    assert_eq!(
+        app.new_session_thinking_level(),
+        crate::model::ThinkingLevel::Low
+    );
+
+    // Unset resolves exactly like launch: XHigh clamped to the model.
+    app.config.default_thinking_level = None;
+    assert_eq!(
+        app.new_session_thinking_level(),
+        app.model_entry
+            .clamp_thinking_level(crate::model::ThinkingLevel::XHigh)
+    );
+}
+
+#[test]
+fn cancelled_ask_cards_release_the_editor_for_a_successor() {
+    let dir = tempdir();
+    let mut app = build_test_app(dir.path().to_path_buf());
+    let tool = crate::ask::AskTool::new(crate::ask::AskPolicy::Error);
+    app.ask_tool = Some(tool.clone());
+    app.input.set_value("original draft");
+    let request: crate::ask::AskRequest = serde_json::from_value(serde_json::json!({
+        "questions": [{"question":"Choose?", "options":[{"label":"A"},{"label":"B"}]}]
+    }))
+    .unwrap();
+    for id in ["cancelled-active", "cancelled-buffered", "successor"] {
+        tool.register_channel_ui_request_for_tests(id);
+    }
+    for id in ["cancelled-active", "cancelled-buffered"] {
+        let _ = app.handle_pi_message(PiMsg::AskUiRequest(crate::ask::AskUiRequest {
+            id: id.to_string(),
+            request: request.clone(),
+        }));
+    }
+    app.input.set_value("unfinished answer");
+    for id in ["cancelled-active", "cancelled-buffered"] {
+        tool.respond_ui(
+            id,
+            crate::ask::AskResponse {
+                answers: Vec::new(),
+                dismissed: true,
+            },
+        );
+    }
+    let _ = app.handle_pi_message(PiMsg::AskUiRequest(crate::ask::AskUiRequest {
+        id: "successor".to_string(),
+        request: request.clone(),
+    }));
+    assert_eq!(app.active_ask_ui.as_ref().unwrap().request.id, "successor");
+    assert!(app.ask_ui_queue.is_empty());
+    assert_eq!(app.input_card_order.len(), 1);
+    assert!(app.input.value().is_empty());
+    assert_eq!(app.card_draft_snapshot.as_deref(), Some("original draft"));
+    let _ = app.handle_pi_message(PiMsg::AskUiRequest(crate::ask::AskUiRequest {
+        id: "cancelled-active".to_string(),
+        request,
+    }));
+    assert!(app.ask_ui_queue.is_empty());
+    assert!(tool.channel_ui_request_is_pending("successor"));
+    app.agent_state = AgentState::ToolRunning;
+    tool.respond_ui(
+        "successor",
+        crate::ask::AskResponse {
+            answers: Vec::new(),
+            dismissed: true,
+        },
+    );
+    let _ = app.update(Message::new(KeyMsg::from_type(KeyType::Enter)));
+    assert!(app.active_ask_ui.is_none());
+    assert_eq!(app.input.value(), "original draft");
+    assert!(app.message_queue.lock().unwrap().pop_steering().is_empty());
+}
+
+/// Route to AskTool::respond_ui (an expired request surfaces a status).
+#[test]
+fn ask_card_consumes_input_and_advances_questions() {
+    let dir = tempdir();
+    let mut app = build_test_app(dir.path().to_path_buf());
+    app.set_terminal_size(100, 30);
+    let tool = crate::ask::AskTool::new(crate::ask::AskPolicy::Recommended);
+    app.ask_tool = Some(tool);
+
+    let request: crate::ask::AskRequest = serde_json::from_value(serde_json::json!({
+        "questions": [
+            {"id": "q1", "question": "Pick one?", "recommended": 0,
+             "options": [{"label": "Alpha"}, {"label": "Beta"}]},
+            {"id": "q2", "question": "And another?",
+             "options": [{"label": "Left"}, {"label": "Right"}]}
+        ]
+    }))
+    .expect("ask request");
+    if let Some(tool) = app.ask_tool.as_ref() {
+        tool.register_channel_ui_request_for_tests("req-1");
+    }
+    app.handle_pi_message(PiMsg::AskUiRequest(crate::ask::AskUiRequest {
+        id: "req-1".to_string(),
+        request,
+    }));
+
+    let view = app.view();
+    assert!(view.contains("question 1 of 2"), "card rendered");
+    assert!(view.contains("Alpha (recommended)"), "recommended badge");
+
+    // First answer advances to the second card.
+    app.submit_message("2");
+    assert!(app.view().contains("question 2 of 2"));
+
+    // Second answer completes; with no pending reply slot (this request was
+    // injected directly, not via install_channel_ui) the expiry status shows.
+    app.submit_message("left");
+    assert!(app.active_ask_ui.is_none());
+    assert_eq!(
+        app.status_message.as_deref(),
+        Some("Ask request expired before the answer")
+    );
+
+    // A fresh card can be dismissed with 'cancel'.
+    let request: crate::ask::AskRequest = serde_json::from_value(serde_json::json!({
+        "questions": [{"question": "Again?", "options": [{"label": "A"}, {"label": "B"}]}]
+    }))
+    .expect("ask request 2");
+    if let Some(tool) = app.ask_tool.as_ref() {
+        tool.register_channel_ui_request_for_tests("req-2");
+    }
+    app.handle_pi_message(PiMsg::AskUiRequest(crate::ask::AskUiRequest {
+        id: "req-2".to_string(),
+        request,
+    }));
+    app.submit_message("cancel");
+    assert!(app.active_ask_ui.is_none());
+}
+
+/// gh #184: ask cards arrive while the ask tool is still executing, i.e.
+/// while the agent is busy. Enter must answer the card instead of queueing
+/// the text as a steering message, and Escape must dismiss the card rather
+/// than abort the turn.
+#[test]
+fn ask_card_answer_is_not_queued_as_steering_while_agent_busy() {
+    let dir = tempdir();
+    let mut app = build_test_app(dir.path().to_path_buf());
+    app.set_terminal_size(100, 30);
+    app.ask_tool = Some(crate::ask::AskTool::new(crate::ask::AskPolicy::Recommended));
+
+    let request: crate::ask::AskRequest = serde_json::from_value(json!({
+        "questions": [
+            {"id": "q1", "question": "Retry or dump?",
+             "options": [{"label": "Retry"}, {"label": "Dump"}]},
+            {"id": "q2", "question": "Where?",
+             "options": [{"label": "Here"}, {"label": "There"}]}
+        ]
+    }))
+    .expect("ask request");
+    if let Some(tool) = app.ask_tool.as_ref() {
+        tool.register_channel_ui_request_for_tests("req-busy");
+    }
+    app.handle_pi_message(PiMsg::AskUiRequest(crate::ask::AskUiRequest {
+        id: "req-busy".to_string(),
+        request,
+    }));
+    app.agent_state = AgentState::ToolRunning;
+    assert!(app.view().contains("question 1 of 2"));
+
+    // Number selection through the real Enter keybinding path.
+    app.input.set_value("2");
+    let _ = app.update(Message::new(KeyMsg::from_type(KeyType::Enter)));
+    assert!(
+        app.view().contains("question 2 of 2"),
+        "Enter must advance the card while busy"
+    );
+    assert!(
+        app.input.value().is_empty(),
+        "the first answer must be cleared before the next question"
+    );
+    let queued = app
+        .message_queue
+        .lock()
+        .expect("message queue")
+        .pop_steering();
+    assert!(
+        queued.is_empty(),
+        "card answer must not be queued as steering"
+    );
+    assert_ne!(
+        app.status_message.as_deref(),
+        Some("Queued steering message")
+    );
+
+    // Free text is accepted the same way.
+    app.input.set_value("somewhere else");
+    let _ = app.update(Message::new(KeyMsg::from_type(KeyType::Enter)));
+    assert!(
+        app.active_ask_ui.is_none(),
+        "card completes after last answer"
+    );
+    assert!(
+        app.input.value().is_empty(),
+        "editor cleared after answering"
+    );
+
+    // Escape dismisses a fresh card without aborting the turn.
+    let request: crate::ask::AskRequest = serde_json::from_value(json!({
+        "questions": [{"question": "Again?", "options": [{"label": "A"}, {"label": "B"}]}]
+    }))
+    .expect("ask request 2");
+    if let Some(tool) = app.ask_tool.as_ref() {
+        tool.register_channel_ui_request_for_tests("req-busy-2");
+    }
+    app.handle_pi_message(PiMsg::AskUiRequest(crate::ask::AskUiRequest {
+        id: "req-busy-2".to_string(),
+        request,
+    }));
+    assert!(app.active_ask_ui.is_some());
+    let _ = app.update(Message::new(KeyMsg::from_type(KeyType::Esc)));
+    assert!(app.active_ask_ui.is_none(), "Escape dismisses the card");
+    assert_ne!(
+        app.status_message.as_deref(),
+        Some("Aborting request..."),
+        "Escape on a card must not abort the turn"
+    );
+    assert_eq!(app.agent_state, AgentState::ToolRunning);
+}
+
+/// bd-1qol9 harness helpers: a minimal text-answer extension card.
+fn ext_input_card(id: &str, prompt_text: &str) -> ExtensionUiRequest {
+    ExtensionUiRequest::new(
+        id,
+        "input",
+        serde_json::json!({
+            "title": "Ext",
+            "message": prompt_text,
+            "extension_id": "ext-cards"
+        }),
+    )
+    .with_extension_id(Some("ext-cards".to_string()))
+}
+
+/// bd-1qol9 mixed arrival order (extension FIRST, ask SECOND): exactly one
+/// card may own the editor; the later ask queues behind and promotes only
+/// after the extension resolves, so answers can never be reordered.
+#[test]
+fn mixed_cards_extension_then_ask_serialize_in_arrival_order() {
+    let dir = tempdir();
+    let mut app = build_test_app(dir.path().to_path_buf());
+    app.set_terminal_size(100, 30);
+    app.ask_tool = Some(crate::ask::AskTool::new(crate::ask::AskPolicy::Recommended));
+
+    app.handle_pi_message(PiMsg::ExtensionUiRequest(ext_input_card("e1", "Say?")));
+    assert_eq!(
+        app.active_input_card_kind,
+        Some(InputCardKind::Extension),
+        "extension activates first"
+    );
+
+    let request: crate::ask::AskRequest = serde_json::from_value(json!({
+        "questions": [{"question": "Which?", "options": [{"label": "A"}]}]
+    }))
+    .expect("ask request");
+    if let Some(tool) = app.ask_tool.as_ref() {
+        tool.register_channel_ui_request_for_tests("a1");
+    }
+    app.handle_pi_message(PiMsg::AskUiRequest(crate::ask::AskUiRequest {
+        id: "a1".to_string(),
+        request,
+    }));
+    assert_eq!(
+        app.active_input_card_kind,
+        Some(InputCardKind::Extension),
+        "later ask must NOT steal the editor from the active card"
+    );
+    assert!(app.active_ask_ui.is_none());
+
+    // The ext-active answer routes to the EXTENSION parser, not the ask one:
+    // an arbitrary string would fail numeric ask parsing but succeed here.
+    app.input.set_value("free-form reply");
+    let _ = app.update(Message::new(KeyMsg::from_type(KeyType::Enter)));
+    assert!(app.active_extension_ui.is_none(), "ext resolved");
+    assert_eq!(app.active_input_card_kind, Some(InputCardKind::Ask));
+    assert!(app.view().contains("question 1 of 1"), "ask promoted");
+    assert!(
+        app.card_draft_snapshot.is_none(),
+        "the consumed extension answer must not become a draft"
+    );
+
+    app.input.set_value("A");
+    let _ = app.update(Message::new(KeyMsg::from_type(KeyType::Enter)));
+    assert!(app.active_ask_ui.is_none());
+    assert!(app.active_input_card_kind.is_none());
+}
+
+/// bd-1qol9 reverse order (ask FIRST, extension SECOND) plus draft
+/// capture/restore across answer and Escape resolution paths.
+#[test]
+fn mixed_cards_ask_then_ext_preserve_drafts_across_resolution_paths() {
+    let dir = tempdir();
+    let mut app = build_test_app(dir.path().to_path_buf());
+    app.set_terminal_size(100, 30);
+    app.ask_tool = Some(crate::ask::AskTool::new(crate::ask::AskPolicy::Recommended));
+
+    // Preexisting steering draft gets snapshotted + cleared on activation.
+    app.input.set_value("cargo test -- --filter bd_1");
+    let request: crate::ask::AskRequest = serde_json::from_value(json!({
+        "questions": [{"question": "Run tests?", "options": [{"label": "Yes"}, {"label": "No"}]}]
+    }))
+    .expect("ask request");
+    if let Some(tool) = app.ask_tool.as_ref() {
+        tool.register_channel_ui_request_for_tests("a-order");
+    }
+    app.handle_pi_message(PiMsg::AskUiRequest(crate::ask::AskUiRequest {
+        id: "a-order".to_string(),
+        request,
+    }));
+    assert!(
+        app.input.value().is_empty(),
+        "card activation clears the captured draft"
+    );
+    assert!(app.card_draft_snapshot.is_some());
+
+    app.handle_pi_message(PiMsg::ExtensionUiRequest(ext_input_card("e-order", "Env?")));
+    assert_eq!(app.active_input_card_kind, Some(InputCardKind::Ask));
+
+    // Answer the ACTIVE ask through the REAL Enter path; the queued ext
+    // promotes automatically afterward.
+    app.input.set_value("Yes");
+    let _ = app.update(Message::new(KeyMsg::from_type(KeyType::Enter)));
+    assert_eq!(app.active_input_card_kind, Some(InputCardKind::Extension));
+
+    // Generic Escape dismisses the promoted EXTENSION card without aborting
+    // anything and restores the pre-card draft into the empty editor.
+    app.agent_state = AgentState::ToolRunning;
+    let _ = app.update(Message::new(KeyMsg::from_type(KeyType::Esc)));
+    assert!(app.active_extension_ui.is_none());
+    assert!(app.active_input_card_kind.is_none());
+    assert_ne!(
+        app.status_message.as_deref(),
+        Some("Aborting request..."),
+        "Escape on a card never aborts the turn"
+    );
+    assert_eq!(
+        app.input.value(),
+        "cargo test -- --filter bd_1",
+        "explicit merge policy restores the draft after the last card settles"
+    );
+    assert_eq!(app.agent_state, AgentState::ToolRunning);
+    app.agent_state = AgentState::Idle;
+}
+
+/// bd-q66i1: normal (non-Escape) completion clears each consumed answer
+/// before successor activation, then restores only the genuine pre-card draft
+/// after the final card settles.
+#[test]
+fn normal_card_resolution_restores_only_the_preexisting_draft() {
+    let dir = tempdir();
+    let mut app = build_test_app(dir.path().to_path_buf());
+    app.set_terminal_size(100, 30);
+    app.ask_tool = Some(crate::ask::AskTool::new(crate::ask::AskPolicy::Recommended));
+    app.input.set_value("keep this draft");
+
+    app.handle_pi_message(PiMsg::ExtensionUiRequest(ext_input_card(
+        "e-normal", "Env?",
+    )));
+    let request: crate::ask::AskRequest = serde_json::from_value(json!({
+        "questions": [{"question": "Proceed?", "options": [{"label": "Yes"}]}]
+    }))
+    .expect("ask request");
+    if let Some(tool) = app.ask_tool.as_ref() {
+        tool.register_channel_ui_request_for_tests("a-normal");
+    }
+    app.handle_pi_message(PiMsg::AskUiRequest(crate::ask::AskUiRequest {
+        id: "a-normal".to_string(),
+        request,
+    }));
+
+    app.input.set_value("extension answer");
+    let _ = app.update(Message::new(KeyMsg::from_type(KeyType::Enter)));
+    assert_eq!(app.active_input_card_kind, Some(InputCardKind::Ask));
+    assert!(
+        app.input.value().is_empty(),
+        "successor starts with an empty editor"
+    );
+    assert_eq!(app.card_draft_snapshot.as_deref(), Some("keep this draft"));
+
+    app.input.set_value("Yes");
+    let _ = app.update(Message::new(KeyMsg::from_type(KeyType::Enter)));
+    assert!(app.active_input_card_kind.is_none());
+    assert_eq!(app.input.value(), "keep this draft");
+    assert!(app.card_draft_snapshot.is_none());
+}
+
+/// bd-q66i1: Escape resolves exactly one order-ledger entry. The historical
+/// double-pop skipped the second Ask entry and stranded the following
+/// extension card.
+#[test]
+fn escape_advances_one_card_at_a_time_across_ask_ask_extension() {
+    let dir = tempdir();
+    let mut app = build_test_app(dir.path().to_path_buf());
+    app.set_terminal_size(100, 30);
+    app.ask_tool = Some(crate::ask::AskTool::new(crate::ask::AskPolicy::Recommended));
+
+    for (id, label) in [("a-first", "First?"), ("a-second", "Second?")] {
+        let request: crate::ask::AskRequest = serde_json::from_value(json!({
+            "questions": [{"question": label, "options": [{"label": "Yes"}]}]
+        }))
+        .expect("ask request");
+        if let Some(tool) = app.ask_tool.as_ref() {
+            tool.register_channel_ui_request_for_tests(id);
+        }
+        app.handle_pi_message(PiMsg::AskUiRequest(crate::ask::AskUiRequest {
+            id: id.to_string(),
+            request,
+        }));
+    }
+    app.handle_pi_message(PiMsg::ExtensionUiRequest(ext_input_card(
+        "e-third", "Third?",
+    )));
+
+    let _ = app.update(Message::new(KeyMsg::from_type(KeyType::Esc)));
+    assert_eq!(app.active_input_card_kind, Some(InputCardKind::Ask));
+    assert_eq!(
+        app.active_ask_ui
+            .as_ref()
+            .map(|card| card.request.id.as_str()),
+        Some("a-second")
+    );
+    assert_eq!(app.input_card_order.front(), Some(&InputCardKind::Ask));
+
+    let _ = app.update(Message::new(KeyMsg::from_type(KeyType::Esc)));
+    assert_eq!(app.active_input_card_kind, Some(InputCardKind::Extension));
+    assert_eq!(
+        app.active_extension_ui
+            .as_ref()
+            .map(|request| request.id.as_str()),
+        Some("e-third")
+    );
+
+    let _ = app.update(Message::new(KeyMsg::from_type(KeyType::Esc)));
+    assert!(app.active_input_card_kind.is_none());
+    assert!(app.input_card_order.is_empty());
+}
+
+/// gh #198: an approval/ask card arrives while the tool that raised it is
+/// still running, so the agent is never `Idle` while the card is pending. The
+/// editor used to be hidden (and its rows dropped from the layout budget) for
+/// the whole time the card asked the user to type an answer, so the prompt
+/// looked like an inert transcript line and timed out unanswered. While a
+/// card is pending the editor must render and be budgeted exactly as when
+/// idle; once the card resolves mid-turn it goes back to hidden.
+#[test]
+fn pending_ask_card_keeps_editor_visible_while_turn_is_running() {
+    let dir = tempdir();
+    let mut app = build_test_app(dir.path().to_path_buf());
+    app.set_terminal_size(100, 30);
+    app.ask_tool = Some(crate::ask::AskTool::new(crate::ask::AskPolicy::Recommended));
+    app.agent_state = AgentState::ToolRunning;
+    app.current_tool = Some("bash".to_string());
+
+    assert!(
+        !app.editor_input_is_available(),
+        "no card pending: a running turn hides the editor"
+    );
+    let busy_height = app.view_effective_conversation_height();
+    let busy_view = app.view();
+    assert!(
+        !busy_view.contains("Enter: send"),
+        "no card pending: the editor header must not render mid-turn"
+    );
+
+    let request: crate::ask::AskRequest = serde_json::from_value(json!({
+        "questions": [{
+            "question": "Allow the `bash` tool to run?",
+            "options": [{"label": "Allow"}, {"label": "Deny"}]
+        }]
+    }))
+    .expect("ask request");
+    if let Some(tool) = app.ask_tool.as_ref() {
+        tool.register_channel_ui_request_for_tests("a-approval");
+    }
+    app.handle_pi_message(PiMsg::AskUiRequest(crate::ask::AskUiRequest {
+        id: "a-approval".to_string(),
+        request,
+    }));
+    assert_eq!(app.active_input_card_kind, Some(InputCardKind::Ask));
+    assert_eq!(app.agent_state, AgentState::ToolRunning);
+
+    assert!(
+        app.editor_input_is_available(),
+        "a pending card must expose the editor even though the turn is running"
+    );
+    assert!(
+        app.view_effective_conversation_height() < busy_height,
+        "the editor rows must come out of the conversation budget so the card and editor both fit"
+    );
+    let card_view = app.view();
+    assert!(
+        card_view.contains("Allow the `bash` tool to run?"),
+        "the card itself renders in the conversation"
+    );
+    assert!(
+        card_view.contains("Enter: send"),
+        "the editor header renders alongside the pending card"
+    );
+
+    // Answer through the real Enter path: the card resolves, the turn is
+    // still running, and the editor hides again.
+    app.input.set_value("1");
+    let _ = app.update(Message::new(KeyMsg::from_type(KeyType::Enter)));
+    assert!(app.active_ask_ui.is_none());
+    assert!(app.active_input_card_kind.is_none());
+    assert_eq!(app.agent_state, AgentState::ToolRunning);
+    assert!(
+        !app.editor_input_is_available(),
+        "card resolved mid-turn: the editor hides until the turn ends"
+    );
+    app.agent_state = AgentState::Idle;
+}
+
+/// gh #229: with an ask card pending mid-turn the classic stack rendered the
+/// editor (see the test above) but still routed every keystroke to the
+/// spinner, so the "enter a number" instruction could not be followed. Typed
+/// characters must reach the editor while the card is pending, and the
+/// answer must resolve the card through the ordinary Enter path.
+#[test]
+fn pending_ask_card_routes_typed_keys_to_the_editor_mid_turn() {
+    let dir = tempdir();
+    let mut app = build_test_app(dir.path().to_path_buf());
+    app.set_terminal_size(100, 30);
+    app.ask_tool = Some(crate::ask::AskTool::new(crate::ask::AskPolicy::Recommended));
+    app.agent_state = AgentState::ToolRunning;
+    app.current_tool = Some("bash".to_string());
+
+    // No card yet: a running turn swallows keystrokes (the editor is hidden).
+    let _ = app.update(Message::new(KeyMsg::from_char('x')));
+    assert_eq!(app.input.value(), "", "keys must not reach a hidden editor");
+
+    let request: crate::ask::AskRequest = serde_json::from_value(json!({
+        "questions": [{
+            "question": "Allow the `bash` tool to run?",
+            "options": [{"label": "Allow"}, {"label": "Deny"}]
+        }]
+    }))
+    .expect("ask request");
+    if let Some(tool) = app.ask_tool.as_ref() {
+        tool.register_channel_ui_request_for_tests("a-approval-keys");
+    }
+    app.handle_pi_message(PiMsg::AskUiRequest(crate::ask::AskUiRequest {
+        id: "a-approval-keys".to_string(),
+        request,
+    }));
+    assert_eq!(app.active_input_card_kind, Some(InputCardKind::Ask));
+    assert_eq!(app.agent_state, AgentState::ToolRunning);
+
+    // Spinner ticks still belong to the spinner while the card is pending.
+    let _ = app.update(app.spinner.tick());
+    assert_eq!(
+        app.input.value(),
+        "",
+        "a spinner tick must not touch the editor"
+    );
+
+    let _ = app.update(Message::new(KeyMsg::from_char('1')));
+    assert_eq!(
+        app.input.value(),
+        "1",
+        "typed characters must reach the editor while a card is pending mid-turn"
+    );
+
+    let _ = app.update(Message::new(KeyMsg::from_type(KeyType::Enter)));
+    assert!(
+        app.active_ask_ui.is_none(),
+        "Enter answers the pending card"
+    );
+    assert!(app.active_input_card_kind.is_none());
+    assert_eq!(
+        app.input.value(),
+        "",
+        "the answer is consumed from the editor"
+    );
+    assert_eq!(app.agent_state, AgentState::ToolRunning);
+
+    // Card resolved, turn still running: keystrokes go back to the spinner.
+    let _ = app.update(Message::new(KeyMsg::from_char('y')));
+    assert_eq!(
+        app.input.value(),
+        "",
+        "keys must not reach the editor once the card resolves"
+    );
+    app.agent_state = AgentState::Idle;
+}
+
+/// bd-q66i1: turn-end invalidation treats partial card input as consumed and
+/// restores the genuine draft captured before the card burst.
+#[test]
+fn agent_done_discards_partial_extension_answer_and_restores_draft() {
+    let dir = tempdir();
+    let mut app = build_test_app(dir.path().to_path_buf());
+    app.set_terminal_size(100, 30);
+    app.input.set_value("original draft");
+    app.handle_pi_message(PiMsg::ExtensionUiRequest(ext_input_card(
+        "e-invalidated",
+        "Answer?",
+    )));
+    app.input.set_value("partial card answer");
+
+    let _ = app.handle_pi_message(PiMsg::AgentDone {
+        usage: None,
+        stop_reason: StopReason::Aborted,
+        error_message: None,
+    });
+
+    assert!(app.active_extension_ui.is_none());
+    assert!(app.active_input_card_kind.is_none());
+    assert_eq!(app.input.value(), "original draft");
+    assert!(app.card_draft_snapshot.is_none());
+}
+
+/// bd-1qol9 terminal/abort cleanup: AgentDone invalidates the ACTIVE ask,
+/// every QUEUED card of both kinds, and answers them fail-closed BEFORE any
+/// RunPending/idle input can run. Mutation-sensitive: before this fix the
+/// queues survived the turn boundary and could swallow the next idle prompt.
+#[test]
+fn agent_done_invalidates_all_outstanding_cards_before_idle() {
+    let dir = tempdir();
+    let mut app = build_test_app(dir.path().to_path_buf());
+    app.set_terminal_size(100, 30);
+    app.ask_tool = Some(crate::ask::AskTool::new(crate::ask::AskPolicy::Recommended));
+
+    let request: crate::ask::AskRequest = serde_json::from_value(json!({
+        "questions": [{"question": "Active?", "options": [{"label": "A"}]}]
+    }))
+    .expect("active ask");
+    if let Some(tool) = app.ask_tool.as_ref() {
+        tool.register_channel_ui_request_for_tests("a-done");
+        tool.register_channel_ui_request_for_tests("a-queued");
+    }
+    app.handle_pi_message(PiMsg::AskUiRequest(crate::ask::AskUiRequest {
+        id: "a-done".to_string(),
+        request,
+    }));
+    app.handle_pi_message(PiMsg::AskUiRequest(crate::ask::AskUiRequest {
+        id: "a-queued".to_string(),
+        request: serde_json::from_value(json!({
+            "questions": [{"question": "Queued?", "options": [{"label": "B"}]}]
+        }))
+        .expect("queued ask"),
+    }));
+    app.handle_pi_message(PiMsg::ExtensionUiRequest(ext_input_card("e-done", "late?")));
+
+    assert!(!app.ask_ui_queue.is_empty());
+    assert!(!app.extension_ui_queue.is_empty());
+
+    app.pending_inputs
+        .push_back(PendingInput::Text("queued user input".to_string()));
+    let cmd = app.handle_pi_message(PiMsg::AgentDone {
+        usage: None,
+        stop_reason: StopReason::Aborted,
+        error_message: None,
+    });
+
+    assert!(cmd.is_some(), "idle handoff still schedules RunPending");
+    assert!(app.active_ask_ui.is_none());
+    assert!(app.active_extension_ui.is_none());
+    assert!(app.ask_ui_queue.is_empty(), "queued asks invalidated");
+    assert!(app.extension_ui_queue.is_empty(), "queued exts invalidated");
+    assert!(app.active_input_card_kind.is_none());
+    assert!(
+        app.status_message.as_deref() == Some("Question dismissed")
+            || app
+                .status_message
+                .as_deref()
+                .is_some_and(|msg| msg.starts_with("Ask request expired")),
+        "dismissal surfaced: {:?}",
+        app.status_message
+    );
+}
+
+#[test]
+fn export_paths_are_chosen_the_same_way_for_both_stacks() {
+    // These two are free functions rather than `PiApp` methods so the ftui
+    // stack's `/export` lands the same file in the same place. Pin the naming
+    // here, where both callers can be broken by one change.
+    use super::{default_export_path, resolve_output_path};
+
+    let cwd = std::path::Path::new("/work/project");
+
+    let mut saved = crate::session::Session::in_memory();
+    saved.path = Some(std::path::PathBuf::from("/sessions/2026-09-20-abc.jsonl"));
+    assert_eq!(
+        default_export_path(cwd, &saved),
+        std::path::PathBuf::from("/work/project/pi-session-2026-09-20-abc.html"),
+        "a saved session is named after its file stem"
+    );
+
+    let unsaved = crate::session::Session::in_memory();
+    let expected = format!(
+        "/work/project/pi-session-unsaved-{}.html",
+        crate::session_picker::truncate_session_id(&unsaved.header.id, 8)
+    );
+    assert_eq!(
+        default_export_path(cwd, &unsaved),
+        std::path::PathBuf::from(expected),
+        "an unsaved session falls back to a truncated id, not a bare name"
+    );
+
+    assert_eq!(
+        resolve_output_path(cwd, "report.html"),
+        std::path::PathBuf::from("/work/project/report.html"),
+        "a relative argument resolves against the working directory"
+    );
+    assert_eq!(
+        resolve_output_path(cwd, "  /tmp/elsewhere.html  "),
+        std::path::PathBuf::from("/tmp/elsewhere.html"),
+        "an absolute argument is taken as given, after trimming"
+    );
+    assert_eq!(
+        resolve_output_path(cwd, "   "),
+        std::path::PathBuf::from("/work/project/pi-session.html"),
+        "whitespace is not a filename"
+    );
 }

@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use asupersync::channel::mpsc;
 use asupersync::runtime::{reactor::create_reactor, RuntimeBuilder, RuntimeHandle};
-use asupersync::sync::Mutex as AMutex;
+use asupersync::sync::{Mutex as AMutex, OwnedMutexGuard};
 use pi::agent::{ToolApprovalDecision, ToolApprovalHandler};
 use pi::agent_cx::AgentCx;
 use pi::sdk::{create_agent_session, AbortHandle, AgentEvent, AgentSessionHandle, SessionOptions};
@@ -31,7 +31,7 @@ use crate::acl::{demux, Acl};
 use crate::approval::{make_approval_handler, ApprovalRegistry};
 use crate::events::{event, EventSink};
 use crate::tool_bridge::{tool_output_text, ToolRequestSink, ToolResultRegistry};
-use crate::tool_factory::UclawToolFactory;
+use crate::tool_factory::{UclawToolFactory, PI_BUILTIN_TOOLS};
 
 /// An API key string that never appears in `Debug` output (so it can ride inside
 /// a `#[derive(Debug)]` command without leaking into logs).
@@ -164,6 +164,13 @@ impl EngineConfig {
             session_dir: self.session_dir.clone(),
             no_session: self.no_session,
             working_directory: self.working_directory.clone(),
+            // Keep the F5 boundary explicit: pi contributes only its core
+            // file/shell tools; uClaw layers its own (ask_user, browser, MCP,
+            // skills, …) on top via `UclawToolFactory`. Since pi 0.3 the
+            // implicit default set grew to ~19 tools (ask, web_search, jobs,
+            // hub, lsp, debug, todo, …), several of which need pi's own host UI
+            // or overlap uClaw tools — so never fall through to it.
+            enabled_tools: Some(PI_BUILTIN_TOOLS.iter().map(|s| (*s).to_string()).collect()),
             ..Default::default()
         }
     }
@@ -189,6 +196,16 @@ pub struct PiEngine {
     _thread: JoinHandle<()>,
 }
 
+/// Stack for the engine thread (which polls every task of its `current_thread`
+/// runtime inside `block_on`) and for the runtime's own worker thread.
+///
+/// pi 0.8's session-creation and agent-turn futures no longer fit the 2 MiB
+/// default in an unoptimised build: the first `Prompt` aborted the whole app
+/// with "thread 'pi-engine' has overflowed its stack". Upstream's CLI hit the
+/// same wall and uses the same 16 MiB (`RUNTIME_WORKER_STACK_BYTES` in pi's
+/// main.rs). The reservation is virtual; pages are committed only when touched.
+const ENGINE_STACK_BYTES: usize = 16 * 1024 * 1024;
+
 impl PiEngine {
     /// Spawn the dedicated asupersync engine thread.
     #[must_use]
@@ -200,6 +217,7 @@ impl PiEngine {
         let (cmd_tx, cmd_rx) = mpsc::channel::<EngineCmd>(1024);
         let thread = std::thread::Builder::new()
             .name("pi-engine".into())
+            .stack_size(ENGINE_STACK_BYTES)
             .spawn(move || run_engine_thread(cmd_rx, sink, tool_request_sink, config))
             .expect("spawn pi-engine thread");
         Self {
@@ -229,7 +247,11 @@ fn run_engine_thread(
             return;
         }
     };
-    let runtime = match RuntimeBuilder::current_thread().with_reactor(reactor).build() {
+    let runtime = match RuntimeBuilder::current_thread()
+        .with_reactor(reactor)
+        .thread_stack_size(ENGINE_STACK_BYTES)
+        .build()
+    {
         Ok(r) => r,
         Err(e) => {
             emit_error(&sink, "", format!("engine runtime init failed: {e:?}"));
@@ -497,7 +519,12 @@ async fn start_run(
             }
         };
 
-        match handle.lock(&cx_task).await {
+        // Owned guard: asupersync 0.5's borrowed `MutexGuard` is `!Send`, and this
+        // task holds the session across the prompt await. Do NOT switch to
+        // `spawn_local` instead — a cross-thread wake of a local task can leave
+        // the current_thread driver parked in its reactor until an unrelated
+        // timer fires (observed: random ~60 s stalls before provider requests).
+        match OwnedMutexGuard::lock(Arc::clone(&handle), &cx_task).await {
             Ok(mut guard) => {
                 let res = match kind {
                     RunKind::Prompt { input, context } => {
