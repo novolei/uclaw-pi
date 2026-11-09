@@ -26,6 +26,7 @@ pub mod llm_config;
 pub mod local_llm;
 pub mod mcp;
 pub mod memory;
+pub mod memory_core;
 pub mod memubot;
 pub mod notification;
 pub mod persona;

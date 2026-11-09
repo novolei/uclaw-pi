@@ -214,6 +214,10 @@ pub struct AppState {
     /// `memory_core::service` (spawned in main.rs Stage 3).
     pub memory_core: Arc<crate::memory_core::MemoryCore>,
 
+    /// Runtime control of the MemoryCore model download/load (models toggle,
+    /// retry). Created here, started by `memory_core::service::spawn` in Stage 3.
+    pub memory_core_service: Arc<crate::memory_core::service::ServiceHandle>,
+
     /// PR1 of 阶段 4 — registry mapping backend name → adapter. Empty
     /// HashMap in PR1; PR2-PR14 add concrete adapters one by one. See
     /// `docs/superpowers/specs/2026-05-29-stage4-memory-adapter-design.md`.
@@ -1063,6 +1067,10 @@ impl AppState {
             data_dir.join("models").join("memory"),
             crate::memory_core::MemoryCoreConfig::default(),
         ));
+        let memory_core_service = crate::memory_core::service::ServiceHandle::new(
+            memory_core.clone(),
+            std::sync::Arc::new(crate::memory_core::service::RealModelOps::new(memory_core.clone())),
+        );
 
         Ok(Self {
             data_dir,
@@ -1094,6 +1102,7 @@ impl AppState {
             memu_client,
             memory_graph_store,
             memory_core,
+            memory_core_service,
             memory_adapters,
             // Default backend for the unified `memory_unified_*` IPC family. (The
             // agent prompt routes separately via

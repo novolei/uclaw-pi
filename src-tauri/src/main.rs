@@ -310,7 +310,7 @@ fn main() {
                 let provider_service = state.provider_service.clone();
                 let memory_graph_store = state.memory_graph_store.clone();
                 let db = state.db.clone();
-                let memory_core = state.memory_core.clone();
+                let memory_core_service = state.memory_core_service.clone();
                 let app_handle = app.handle().clone();
                 let files_rail_service = state.files_rail_service.clone();
                 // M1-T7 — capture llm_config for the in-Stage-3 prewarm spawn.
@@ -322,9 +322,14 @@ fn main() {
                     // Stage 3: 注册后台服务
                     tracing::info!("[Stage 3] Registering background services...");
                     uclaw_core::memory_core::service::spawn(
-                        memory_core,
+                        memory_core_service,
                         data_dir.join("bucket_seal").join("chunks.db"),
-                        None,
+                        Some(std::sync::Arc::new({
+                            let h = app_handle.clone();
+                            move |s: &uclaw_core::memory_core::status::MemoryCoreStatus| {
+                                let _ = h.emit("memory-core:status", s);
+                            }
+                        })),
                     );
                     tracing::info!("[Stage 3] MemoryCore service started");
                     // Snapshot config at boot — services read their flags once at startup.
@@ -1008,6 +1013,9 @@ fn main() {
             uclaw_core::commands::settings::get_http_api_enabled,
             uclaw_core::commands::settings::set_http_api_enabled,
             uclaw_core::commands::settings::get_pi_engine_enabled,
+            uclaw_core::commands::memory_core::memory_core_get_status,
+            uclaw_core::commands::memory_core::memory_core_set_models_enabled,
+            uclaw_core::commands::memory_core::memory_core_retry_download,
             uclaw_core::commands::settings::set_pi_engine_enabled,
             uclaw_core::commands::settings::get_skills_sh_api_key_set,
             uclaw_core::commands::settings::set_skills_sh_api_key,

@@ -186,9 +186,10 @@ mod tests {
         for i in 1..=10u64 {
             core.update_status_progress(|s| s.index.docs = i);
         }
-        // first passes, the rest within 250 ms are dropped
+        // first notifies, the rest within 250 ms are stored silently
         assert_eq!(n.load(Ordering::SeqCst), 1);
-        assert_eq!(core.status().index.docs, 1);
+        // ...but the state is always stored, so the final tick is never lost
+        assert_eq!(core.status().index.docs, 10);
         // a non-progress change always goes through
         assert!(core.update_status(|s| s.index.docs = 99));
         assert_eq!(n.load(Ordering::SeqCst), 2);

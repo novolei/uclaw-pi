@@ -98,7 +98,15 @@ impl MemoryCore {
 
     /// Snapshot of the observable engine status.
     pub fn status(&self) -> MemoryCoreStatus {
-        self.status.read().map(|g| g.clone()).unwrap_or_default()
+        self.status.read().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    /// The notifier runs on whatever thread changed the status, possibly while
+    /// `load_lock` is held, so it must be cheap and must NOT call `try_load_models`
+    /// (or anything else that takes `load_lock`).
+    #[cfg(test)]
+    pub(crate) fn status_lock_for_test(&self) -> std::sync::RwLockWriteGuard<'_, MemoryCoreStatus> {
+        self.status.write().unwrap()
     }
 
     pub fn set_notifier(&self, n: Option<StatusNotifier>) {
@@ -110,8 +118,12 @@ impl MemoryCore {
     /// Apply `f` to the status. If anything (other than `seq`) changed, bump `seq`,
     /// store, and invoke the notifier (outside the lock). Returns whether it changed.
     pub fn update_status(&self, f: impl FnOnce(&mut MemoryCoreStatus)) -> bool {
+        self.apply_status(f, true)
+    }
+
+    fn apply_status(&self, f: impl FnOnce(&mut MemoryCoreStatus), notify: bool) -> bool {
         let new = {
-            let Ok(mut g) = self.status.write() else { return false };
+            let mut g = self.status.write().unwrap_or_else(|p| p.into_inner());
             let mut next = g.clone();
             f(&mut next);
             next.seq = g.seq;
@@ -122,25 +134,30 @@ impl MemoryCore {
             *g = next.clone();
             next
         };
-        let notifier = self.notifier.lock().ok().and_then(|g| g.clone());
-        if let Some(n) = notifier {
-            n(&new);
+        if notify {
+            let notifier = self.notifier.lock().ok().and_then(|g| g.clone());
+            if let Some(n) = notifier {
+                n(&new);
+            }
         }
         true
     }
 
-    /// Like `update_status` but dropped entirely when a progress update was applied
-    /// less than 250 ms ago (for download progress ticks).
+    /// Like `update_status` but for download progress ticks: the new state is
+    /// ALWAYS stored (so `status()` never misses a final tick); only the notifier
+    /// call is dropped when the previous progress notification was < 250 ms ago.
     pub fn update_status_progress(&self, f: impl FnOnce(&mut MemoryCoreStatus)) -> bool {
-        {
-            let Ok(mut last) = self.last_progress_notify.lock() else { return false };
+        let notify = {
+            let mut last = self.last_progress_notify.lock().unwrap_or_else(|p| p.into_inner());
             let now = std::time::Instant::now();
             if last.is_some_and(|t| now.duration_since(t) < PROGRESS_THROTTLE) {
-                return false;
+                false
+            } else {
+                *last = Some(now);
+                true
             }
-            *last = Some(now);
-        }
-        self.update_status(f)
+        };
+        self.apply_status(f, notify)
     }
 
     /// Sync `embedderLoaded` / `rerankerLoaded` / `mode` with what is actually loaded.
@@ -174,6 +191,19 @@ impl MemoryCore {
         }
     }
 
+    /// Drop the loaded embedder / reranker (back to keyword mode). Waits for any
+    /// in-flight load, so a load can never land after this returns.
+    pub fn unload_models(&self) {
+        let _load = self.load_lock.lock().unwrap_or_else(|p| p.into_inner());
+        if let Ok(mut g) = self.embedder.write() {
+            *g = None;
+        }
+        if let Ok(mut g) = self.reranker.write() {
+            *g = None;
+        }
+        self.refresh_model_status();
+    }
+
     /// Load whichever models are on disk and not yet loaded. Idempotent.
     /// Returns true iff the embedder is loaded afterwards.
     pub fn try_load_models(&self) -> bool {
@@ -201,6 +231,8 @@ impl MemoryCore {
             }
         }
         self.refresh_model_status();
+        // Pending/vector counts depend on the loaded embedder's model id.
+        self.refresh_index_status(false);
         self.embedder().is_some()
     }
 
