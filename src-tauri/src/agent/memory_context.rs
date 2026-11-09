@@ -42,6 +42,9 @@ pub struct MemoryContextInputs<'a> {
     /// When `Some`, append a `<recalled_memories>` block from this adapter
     /// backend (off when `None` → unchanged behavior).
     pub adapter_recall: Option<AdapterRecall<'a>>,
+    /// When `Some`, run a hybrid `MemoryCore` search for `query` and put its
+    /// `<relevant_memories>` block first in the context.
+    pub core: Option<Arc<crate::memory_core::MemoryCore>>,
 }
 
 /// Result of [`load_context`]. The caller emits `recall_event` with its own
@@ -51,23 +54,33 @@ pub struct LoadedMemoryContext {
     pub recall_event: Option<Value>,
 }
 
-/// Concatenate the three optional blocks in the canonical order
-/// (graph → session → browser). Returns `None` when nothing is present.
+/// Concatenate the optional blocks in the canonical order
+/// core → adapter → graph → session → browser. Returns `None` when nothing is
+/// present.
+///
+/// Why this order: downstream truncation (`PiPromptContext::compose`'s recall cap)
+/// cuts from the tail, so the small, query-matched blocks go first and the long
+/// graph block can no longer push them out. The core block (MemoryCore hybrid
+/// hits) is the highest-precision source, so it leads; the adapter block
+/// (≤ limit × 200 chars, also query-matched) follows; then the graph recall
+/// block, and finally the session and browser blocks.
 fn compose_memory_context(
+    core_block: Option<&str>,
     graph_block: Option<String>,
     session_block: Option<&str>,
     browser_block: Option<&str>,
     adapter_block: Option<&str>,
 ) -> Option<String> {
-    let mut out = graph_block.unwrap_or_default();
+    let mut out = core_block.map(str::to_string).unwrap_or_default();
+    if let Some(a) = adapter_block {
+        out.push_str(a);
+    }
+    out.push_str(&graph_block.unwrap_or_default());
     if let Some(s) = session_block {
         out.push_str(s);
     }
     if let Some(b) = browser_block {
         out.push_str(b);
-    }
-    if let Some(a) = adapter_block {
-        out.push_str(a);
     }
     if out.is_empty() {
         None
@@ -112,18 +125,21 @@ impl PiPromptContext {
             (self.recall, CAP_RECALL),
             (self.gbrain, CAP_GBRAIN),
         ];
+        // Caps and the total budget count CHARACTERS, not bytes: with byte
+        // counting a CJK block (3 bytes/char) got a third of its intended room.
         let mut kept: Vec<String> = Vec::new();
         let mut used = 0usize;
         for (block, cap) in dims {
             let Some(mut b) = block else { continue };
             if b.trim().is_empty() { continue; }
-            if b.len() > cap {
-                let mut n = cap;
-                while n > 0 && !b.is_char_boundary(n) { n -= 1; }
-                b.truncate(n);
+            let mut chars = b.chars().count();
+            if chars > cap {
+                let cut = b.char_indices().nth(cap).map_or(b.len(), |(i, _)| i);
+                b.truncate(cut);
+                chars = cap;
             }
-            if used + b.len() > total_budget { break; }
-            used += b.len();
+            if used + chars > total_budget { break; }
+            used += chars;
             kept.push(b);
         }
         if kept.is_empty() { None } else { Some(kept.join("\n\n")) }
@@ -171,10 +187,62 @@ async fn recall_adapter_block(ar: &AdapterRecall<'_>, query: &str) -> Option<Str
     Some(block)
 }
 
+/// Start a `MemoryCore` search on the blocking pool (the search is sync and can
+/// take hundreds of ms with models loaded). Resolves to the rendered block;
+/// any DB error / join error logs a warning and yields `None`.
+fn spawn_core_search(
+    core: Option<Arc<crate::memory_core::MemoryCore>>,
+    query: &str,
+) -> Option<tokio::task::JoinHandle<Option<String>>> {
+    let core = core?;
+    let q = query.to_string();
+    Some(tokio::task::spawn_blocking(move || {
+        match core.search(&q, core.config().limit) {
+            Ok(hits) => crate::memory_core::MemoryCore::render_block(&hits),
+            Err(e) => {
+                tracing::warn!(error = %e, "MemoryCore search failed; skipping");
+                None
+            }
+        }
+    }))
+}
+
+/// Upper bound on how long `load_context` waits for the MemoryCore search,
+/// measured from when the search was spawned. Kept well under the pi path's
+/// `PI_RECALL_DEADLINE_MS` (1500 ms) so a slow search drops only the core block
+/// instead of the whole memory context. 1300 ms fits English/skill queries
+/// (p50 ~1.1 s on CPU) while leaving ~200 ms headroom for composing the prompt.
+const CORE_SEARCH_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1300);
+
+/// Await the core search until `deadline`. On timeout, logs a warning and yields
+/// `None`; the blocking task is detached (not aborted) and finishes in the background.
+async fn join_core_search(
+    h: Option<tokio::task::JoinHandle<Option<String>>>,
+    deadline: tokio::time::Instant,
+) -> Option<String> {
+    match tokio::time::timeout_at(deadline, h?).await {
+        Ok(Ok(b)) => b,
+        Ok(Err(e)) => {
+            tracing::warn!(error = %e, "MemoryCore search task failed; skipping");
+            None
+        }
+        Err(_) => {
+            tracing::warn!(
+                timeout_ms = CORE_SEARCH_TIMEOUT.as_millis() as u64,
+                "MemoryCore search timed out; dropping core block"
+            );
+            None
+        }
+    }
+}
+
 /// Assemble the prompt memory block from graph recall + session KV + the
 /// caller-supplied browser context. On recall-plan failure, logs a warning and
 /// returns empty (matches the prior "proceed without memory context" path).
 pub async fn load_context(inputs: MemoryContextInputs<'_>) -> LoadedMemoryContext {
+    // Spawned first so the MemoryCore search runs concurrently with graph recall.
+    let core_deadline = tokio::time::Instant::now() + CORE_SEARCH_TIMEOUT;
+    let core_handle = spawn_core_search(inputs.core.clone(), inputs.query);
     let plan = match inputs
         .recall_engine
         .build_recall_plan(inputs.space_id, inputs.query, false)
@@ -183,7 +251,9 @@ pub async fn load_context(inputs: MemoryContextInputs<'_>) -> LoadedMemoryContex
         Ok(plan) => plan,
         Err(e) => {
             tracing::warn!(error = %e, "Memory recall failed, proceeding without memory context");
-            return LoadedMemoryContext { context: None, recall_event: None };
+            let core_block = join_core_search(core_handle, core_deadline).await;
+            let context = compose_memory_context(core_block.as_deref(), None, None, None, None);
+            return LoadedMemoryContext { context, recall_event: None };
         }
     };
 
@@ -220,10 +290,13 @@ pub async fn load_context(inputs: MemoryContextInputs<'_>) -> LoadedMemoryContex
         None => None,
     };
 
+    let core_block: Option<String> = join_core_search(core_handle, core_deadline).await;
+
     if total > 0 {
         let budget = inputs.recall_engine.config().token_budget;
         let graph_block = MemoryRecallEngine::format_recall_for_prompt(&plan, budget);
         let context = compose_memory_context(
+            core_block.as_deref(),
             Some(graph_block),
             session_block.as_deref(),
             inputs.browser_ctx.as_deref(),
@@ -277,6 +350,7 @@ pub async fn load_context(inputs: MemoryContextInputs<'_>) -> LoadedMemoryContex
     } else {
         // No graph recall — still inject session + browser + adapter aux memory.
         let context = compose_memory_context(
+            core_block.as_deref(),
             None,
             session_block.as_deref(),
             inputs.browser_ctx.as_deref(),
@@ -293,43 +367,74 @@ mod tests {
     #[test]
     fn compose_orders_graph_session_browser() {
         let out =
-            compose_memory_context(Some("<g>\n".into()), Some("<s>\n"), Some("<b>\n"), None).unwrap();
+            compose_memory_context(None, Some("<g>\n".into()), Some("<s>\n"), Some("<b>\n"), None).unwrap();
         assert_eq!(out, "<g>\n<s>\n<b>\n");
     }
 
     #[test]
     fn compose_all_none_is_none() {
-        assert!(compose_memory_context(None, None, None, None).is_none());
+        assert!(compose_memory_context(None, None, None, None, None).is_none());
     }
 
     #[test]
     fn compose_session_only_when_no_graph() {
-        let out = compose_memory_context(None, Some("<s>\n"), None, None).unwrap();
+        let out = compose_memory_context(None, None, Some("<s>\n"), None, None).unwrap();
         assert_eq!(out, "<s>\n");
     }
 
     #[test]
     fn compose_browser_only() {
-        let out = compose_memory_context(None, None, Some("<b>\n"), None).unwrap();
+        let out = compose_memory_context(None, None, None, Some("<b>\n"), None).unwrap();
         assert_eq!(out, "<b>\n");
     }
 
     #[test]
     fn compose_empty_graph_string_with_no_aux_is_none() {
         // A graph_block of "" (defensive) + no aux → None, not Some("").
-        assert!(compose_memory_context(Some(String::new()), None, None, None).is_none());
+        assert!(compose_memory_context(None, Some(String::new()), None, None, None).is_none());
     }
 
     #[test]
-    fn compose_appends_adapter_block_last() {
+    fn compose_puts_adapter_block_first() {
         let out = compose_memory_context(
+            None,
             Some("<g>\n".into()),
             Some("<s>\n"),
             Some("<b>\n"),
             Some("<a>\n"),
         )
         .unwrap();
-        assert_eq!(out, "<g>\n<s>\n<b>\n<a>\n");
+        assert_eq!(out, "<a>\n<g>\n<s>\n<b>\n");
+    }
+
+    #[test]
+    fn compose_puts_core_block_first() {
+        let out = compose_memory_context(
+            Some("<c>\n"),
+            Some("<g>\n".into()),
+            Some("<s>\n"),
+            Some("<b>\n"),
+            Some("<a>\n"),
+        )
+        .unwrap();
+        assert_eq!(out, "<c>\n<a>\n<g>\n<s>\n<b>\n");
+    }
+
+    #[tokio::test]
+    async fn join_core_search_times_out_without_blocking() {
+        let slow = tokio::task::spawn_blocking(|| {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            Some("late".to_string())
+        });
+        let t = std::time::Instant::now();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(50);
+        assert!(join_core_search(Some(slow), deadline).await.is_none());
+        assert!(t.elapsed() < std::time::Duration::from_millis(400), "must not wait for the task");
+
+        let fast = tokio::task::spawn_blocking(|| Some("hit".to_string()));
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        assert_eq!(join_core_search(Some(fast), deadline).await.as_deref(), Some("hit"));
+        assert!(join_core_search(None, deadline).await.is_none());
     }
 
     #[tokio::test]
@@ -399,13 +504,33 @@ mod tests {
     }
     #[test]
     fn pi_context_per_dim_cap_truncates_recall_on_char_boundary() {
-        // recall block far over CAP_RECALL must be truncated to <= cap, never
-        // splitting a UTF-8 codepoint.
-        let huge = "电".repeat(5000); // 3 bytes each = 15000 bytes > CAP_RECALL
+        // recall block far over CAP_RECALL must be truncated to <= cap chars,
+        // never splitting a UTF-8 codepoint.
+        let huge = "电".repeat(20_000);
         let out = PiPromptContext { recall: Some(huge), ..Default::default() }
             .compose(1_000_000);
         let s = out.unwrap();
-        assert!(s.len() <= 8_000, "recall capped to CAP_RECALL=8000, got {}", s.len());
+        assert_eq!(s.chars().count(), 8_000, "recall capped to CAP_RECALL=8000 chars");
         assert!(std::str::from_utf8(s.as_bytes()).is_ok(), "no broken codepoint");
+    }
+
+    #[test]
+    fn pi_context_caps_count_chars_not_bytes() {
+        // 5000 CJK chars = 15000 bytes: under the 8000-char cap, so kept whole.
+        // (Byte counting used to cut this to ~2,666 chars.)
+        let cjk = "电".repeat(5_000);
+        let s = PiPromptContext { recall: Some(cjk), ..Default::default() }
+            .compose(12_000)
+            .unwrap();
+        assert_eq!(s.chars().count(), 5_000);
+        // The total budget is in chars too: 1500 + 5000 CJK chars fit in 7000.
+        let s = PiPromptContext {
+            facts: Some("事".repeat(1_500)),
+            recall: Some("电".repeat(5_000)),
+            ..Default::default()
+        }
+        .compose(7_000)
+        .unwrap();
+        assert!(s.contains('电'), "recall must survive a char-denominated budget");
     }
 }

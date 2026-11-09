@@ -1,0 +1,5 @@
+{"id":"pet-zh","lang":"zh","category":"profile","query":"我家的猫叫什么","expect_any":["团子"]}
+{"id":"pet-en","lang":"en","category":"profile","query":"What's my cat's name?","expect_any":["团子","Tuanzi"]}
+{"id":"city-zh","lang":"zh","category":"profile","query":"我住在哪个城市","expect_any":["杭州","Hangzhou"]}
+{"id":"name-en","lang":"en","category":"profile","query":"what should you call me","expect_word":["AB"]}
+{"id":"skill-zh","lang":"zh","category":"skill","query":"下载视频提示 cookie 过期怎么办","expect_any":["yt-dlp-cookie-error-diagnosis"]}

@@ -310,6 +310,7 @@ fn main() {
                 let provider_service = state.provider_service.clone();
                 let memory_graph_store = state.memory_graph_store.clone();
                 let db = state.db.clone();
+                let memory_core = state.memory_core.clone();
                 let app_handle = app.handle().clone();
                 let files_rail_service = state.files_rail_service.clone();
                 // M1-T7 — capture llm_config for the in-Stage-3 prewarm spawn.
@@ -320,6 +321,11 @@ fn main() {
                 tauri::async_runtime::spawn(async move {
                     // Stage 3: 注册后台服务
                     tracing::info!("[Stage 3] Registering background services...");
+                    uclaw_core::memory_core::service::spawn(
+                        memory_core,
+                        data_dir.join("bucket_seal").join("chunks.db"),
+                    );
+                    tracing::info!("[Stage 3] MemoryCore service started");
                     // Snapshot config at boot — services read their flags once at startup.
                     let memubot_config = memubot_config_arc.read().await.clone();
 

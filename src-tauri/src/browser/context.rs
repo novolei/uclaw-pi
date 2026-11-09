@@ -1327,7 +1327,17 @@ mod tests {
         )
         .unwrap();
 
-        assert!(script.contains("const __uclawParams = {\"options\":{\"enabled\":true},\"roomId\":\"douyin-room-1\"};"));
+        // Compare parsed JSON, not raw text: key order depends on whether
+        // serde_json's `preserve_order` feature is unified into the build.
+        let params_json = script
+            .split("const __uclawParams = ")
+            .nth(1)
+            .and_then(|rest| rest.split("; const __uclawUserFn").next())
+            .expect("params literal in script");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(params_json).unwrap(),
+            serde_json::json!({ "roomId": "douyin-room-1", "options": { "enabled": true } })
+        );
         assert!(script.contains("const __uclawUserFn = (async (params) =>"));
         assert!(script.contains("return await __uclawUserFn(__uclawParams);"));
     }

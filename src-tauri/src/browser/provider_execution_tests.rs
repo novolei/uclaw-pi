@@ -308,6 +308,7 @@ async fn selected_cli_route_uses_official_adapter_without_runtime_pack() {
     let options = BrowserProviderActionRouteOptions::default()
         .with_feature_flags(flags)
         .with_disabled_provider(LOCAL_CHROMIUM_PROVIDER_ID)
+        .with_runtime_report(unready_runtime_report())
         .with_playwright_cli_command(fake_cli)
         .with_playwright_cli_cwd(temp.path());
     let executor = BrowserProviderActionExecutor::new(ctx_mgr).with_route_options(options);
@@ -378,6 +379,7 @@ async fn selected_cli_route_executes_screenshot_with_filename() {
     let options = BrowserProviderActionRouteOptions::default()
         .with_feature_flags(flags)
         .with_disabled_provider(LOCAL_CHROMIUM_PROVIDER_ID)
+        .with_runtime_report(unready_runtime_report())
         .with_playwright_cli_command(fake_cli)
         .with_playwright_cli_cwd(temp.path());
     let executor = BrowserProviderActionExecutor::new(ctx_mgr).with_route_options(options);
@@ -487,6 +489,7 @@ async fn failed_cli_route_retries_with_mcp_and_records_route_evidence() {
     let options = BrowserProviderActionRouteOptions::default()
         .with_feature_flags(flags)
         .with_disabled_provider(LOCAL_CHROMIUM_PROVIDER_ID)
+        .with_runtime_report(unready_runtime_report())
         .with_playwright_cli_command(fake_cli)
         .with_playwright_cli_cwd(temp.path());
     let executor = BrowserProviderActionExecutor::new(ctx_mgr).with_route_options(options);
@@ -631,6 +634,16 @@ fn ready_runtime_report() -> BrowserRuntimePackStatusReport {
     let paths =
         BrowserRuntimePackPaths::from_root(Path::new("/tmp/uclaw-browser-runtime"), &manifest);
     runtime_report_for_paths(manifest, paths)
+}
+
+/// A runtime report that is present but not ready, so CLI-route tests use the
+/// injected fake `playwright-cli` instead of the machine's installed runtime pack
+/// (`execute_playwright_cli_route` falls back to probing `~/.uclaw-pi` otherwise).
+fn unready_runtime_report() -> BrowserRuntimePackStatusReport {
+    let mut report = ready_runtime_report();
+    report.ready = false;
+    report.can_run_browser_tasks = false;
+    report
 }
 
 fn runtime_report_for_paths(
