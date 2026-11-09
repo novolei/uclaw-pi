@@ -68,6 +68,23 @@ test.describe('Settings › 记忆 engine card (dev:mock-tauri)', () => {
     await expect(toggle).not.toBeChecked()
     await expect(modePill(page)).toContainText('仅关键词')
     await expect(page.getByText('当前仅按关键词找回记忆')).toBeVisible()
+    // The models stay on disk, so turning them back on needs no download.
+    await expect(page.getByText(/开启后立即可用，模型已在本机/)).toBeVisible()
+    await expect(page.getByText(/首次开启会下载/)).toHaveCount(0)
+  })
+
+  test('off with no models on disk promises the first download', async ({ page }) => {
+    await openMemorySettings(page, 'off')
     await expect(page.getByText(/首次开启会下载约 1\.1 GB 模型/)).toBeVisible()
+  })
+
+  test('a failed model load shows a callout and 重试 reloads to hybrid', async ({ page }) => {
+    await openMemorySettings(page, 'loadfailed')
+    const alert = page.getByRole('alert')
+    await expect(alert.getByText('模型加载失败')).toBeVisible()
+    await expect(page.getByText('正在加载模型')).toHaveCount(0)
+    await alert.getByRole('button', { name: '重试' }).click()
+    await expect(modePill(page)).toContainText('混合检索', { timeout: 15_000 })
+    await expect(page.getByRole('list', { name: '本地模型' }).getByText('已就绪')).toHaveCount(2)
   })
 })
