@@ -14,3 +14,8 @@ src-tauri/src/lib.rs                 merge=union
 src-tauri/src/world/mod.rs           merge=union
 src-tauri/src/world/adapters/mod.rs  merge=union
 src-tauri/src/runtime/mod.rs         merge=union
+
+# Vendored third-party sources stay byte-identical to upstream, so
+# `git diff --check` (scripts/ci/diff-check.sh) must not flag their
+# whitespace.
+crates/pi/vendor/**                  -whitespace
