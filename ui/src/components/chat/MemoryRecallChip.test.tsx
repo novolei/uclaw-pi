@@ -182,4 +182,29 @@ describe('MemoryRecallChip', () => {
     expect(screen.queryByText('常驻')).toBeNull()
     expect(screen.getByText('相关')).toBeInTheDocument()
   })
+
+  it.each(['mouse', 'keyboard'] as const)(
+    'opening by %s focuses the panel, not the keyword hint, and the hint ring is focus-visible only',
+    async (how) => {
+      const user = userEvent.setup()
+      renderChip(makeEvent({ coreHits: CORE_HITS, mode: 'keyword' }))
+      const chip = screen.getByRole('button', { name: /参考了 3 条记忆/ })
+      if (how === 'mouse') {
+        await user.click(chip)
+      } else {
+        chip.focus()
+        await user.keyboard('{Enter}')
+      }
+      const panel = await screen.findByRole('dialog', { name: '本轮参考的记忆' })
+      const hint = screen.getByRole('button', { name: '开启本地检索模型' })
+      expect(panel).toHaveFocus()
+      expect(hint).not.toHaveFocus()
+      // Ring classes only behind :focus-visible — never plain :focus.
+      expect(hint.className).toMatch(/focus-visible:ring-2/)
+      expect(hint.className).not.toMatch(/(^|\s)focus:/)
+      // Tab still reaches it from the panel (non-modal popover, no trap).
+      await user.tab()
+      expect(hint).toHaveFocus()
+    },
+  )
 })

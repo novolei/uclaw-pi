@@ -87,7 +87,7 @@ sweep — fades ≤120 ms or instant (`motion-safe:` / `motion-reduce:` variants
 - **Stats.** `StatPill` — quiet label (`text-foreground/80`), toned value (`neutral |
   success | warning | danger`). A row of pills should read as data. Text that sits on a
   tinted surface (pill values, callout titles) uses the `-strong` variants
-  (`text-success-strong` …: the tone mixed 65 % with `--foreground`), and secondary
+  (`text-success-strong` …: the tone mixed 60 % with `--foreground`), and secondary
   text on a tint uses `text-foreground/75` — plain `--success` / `--muted-foreground`
   drop below 4.5:1 on their tints in several themes.
 
@@ -123,7 +123,7 @@ the-finals themes) — premium means quiet. Each theme pulls the hues ≤4° tow
 hue (ocean → blue, forest/qingye → green, slate/warm-paper → earth, the-finals → warm)
 and sets its own saturation/lightness, so kinds harmonize instead of looking pasted on.
 Badge text is solved per theme for **≥ 4.5:1 on its `-bg` and on the theme card**
-(guarded by `ui/src/styles/memory-tokens.test.ts`, which also enforces the hue budget
+(guarded by `ui/src/styles/memory-tokens.test.ts`, which also enforces the hue budget, the `-strong` / `foreground/75–80` text on tints
 above and progress fill ≥ 3:1 on track). Progress fill is neutral or the theme's brand
 tone, never a status hue (the-finals uses warm cream, not its red; black uses neutral
 silver, because its gold brand tone is indistinguishable from its warning amber). Color is never the only signal: badges always carry the label.

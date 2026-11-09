@@ -11,6 +11,9 @@ import { test, expect, type Page } from '@playwright/test'
 
 test.describe.configure({ timeout: 60_000 })
 
+/** The header's 模式 StatPill (avoids matching the same words elsewhere). */
+const modePill = (page: Page) => page.locator('[data-tone]', { hasText: '模式' })
+
 async function openMemorySettings(page: Page, state: string): Promise<void> {
   await page.addInitScript(() => {
     try {
@@ -34,7 +37,7 @@ test.describe('Settings › 记忆 engine card (dev:mock-tauri)', () => {
     await expect(page.getByText('正在下载模型')).toBeVisible()
     await expect(bar).toBeVisible()
     await expect(page.getByText(/MB \/ 1\.14 GB/)).toBeVisible()
-    await expect(page.getByText('仅关键词')).toBeVisible()
+    await expect(modePill(page)).toContainText('仅关键词')
 
     // Progress advances as status events arrive.
     const first = Number(await bar.getAttribute('aria-valuenow'))
@@ -43,7 +46,7 @@ test.describe('Settings › 记忆 engine card (dev:mock-tauri)', () => {
       .toBeGreaterThan(first)
 
     // Download done → models load → hybrid mode, both models ready.
-    await expect(page.getByText('混合检索')).toBeVisible({ timeout: 40_000 })
+    await expect(modePill(page)).toContainText('混合检索', { timeout: 40_000 })
     await expect(bar).toHaveCount(0)
     const models = page.getByRole('list', { name: '本地模型' })
     await expect(models.getByText('已就绪')).toHaveCount(2)
@@ -56,14 +59,14 @@ test.describe('Settings › 记忆 engine card (dev:mock-tauri)', () => {
 
   test('toggling the models off switches to keyword-only copy', async ({ page }) => {
     await openMemorySettings(page, 'ready')
-    await expect(page.getByText('混合检索')).toBeVisible()
+    await expect(modePill(page)).toContainText('混合检索')
 
     const toggle = page.getByRole('switch', { name: '使用本地检索模型' })
     await expect(toggle).toBeChecked()
     await toggle.click()
 
     await expect(toggle).not.toBeChecked()
-    await expect(page.getByText('仅关键词')).toBeVisible()
+    await expect(modePill(page)).toContainText('仅关键词')
     await expect(page.getByText('当前仅按关键词找回记忆')).toBeVisible()
     await expect(page.getByText(/首次开启会下载约 1\.1 GB 模型/)).toBeVisible()
   })
