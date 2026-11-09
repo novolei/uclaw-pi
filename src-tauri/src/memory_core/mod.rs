@@ -27,7 +27,7 @@ pub struct MemoryCoreConfig {
 
 impl Default for MemoryCoreConfig {
     fn default() -> Self {
-        Self { bm25_top: 50, vector_top: 50, rrf_k: 60.0, rerank_top_n: 20, min_rerank_score: 0.05, limit: 6 }
+        Self { bm25_top: 50, vector_top: 50, rrf_k: 60.0, rerank_top_n: 6, min_rerank_score: 0.05, limit: 6 }
     }
 }
 
