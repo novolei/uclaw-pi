@@ -5,6 +5,7 @@
 //! Locking rule (Ruling 8): the app DB mutex is never held while embedding.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -16,6 +17,7 @@ use super::segment::segment;
 use super::MemoryCore;
 
 const SYNC_INTERVAL: Duration = Duration::from_secs(60);
+static CHUNKS_UNREADABLE_WARNED: AtomicBool = AtomicBool::new(false);
 const MODEL_RETRY: Duration = Duration::from_secs(30 * 60);
 
 /// One BM25-only sync pass over graph + chunk docs.
@@ -29,10 +31,16 @@ pub fn run_sync_cycle(core: &MemoryCore, chunks_db_path: &Path) -> anyhow::Resul
     {
         Ok(d) => d,
         Err(e) => {
-            tracing::warn!("memory_core: chunks db unreadable, skipping sync cycle: {e}");
+            // Warn on the first failure only; debug while it stays broken.
+            if CHUNKS_UNREADABLE_WARNED.swap(true, Ordering::Relaxed) {
+                tracing::debug!("memory_core: chunks db unreadable, skipping sync cycle: {e}");
+            } else {
+                tracing::warn!("memory_core: chunks db unreadable, skipping sync cycle: {e}");
+            }
             return Ok(None);
         }
     };
+    CHUNKS_UNREADABLE_WARNED.store(false, Ordering::Relaxed);
     let conn = core.db().lock().map_err(|_| anyhow::anyhow!("memory db lock poisoned"))?;
     let mut docs = index::graph_docs(&conn)?;
     docs.extend(chunk_docs);
@@ -89,51 +97,53 @@ async fn ensure_models(core: &Arc<MemoryCore>, client: &reqwest::Client) -> bool
     true
 }
 
-/// Spawn the background task. Must be called from within a Tokio runtime
-/// context (e.g. `tauri::async_runtime::spawn`'s task).
+/// Download (retrying every 30 min on failure) and then load the models.
+/// Runs independently of the sync loop so BM25 indexing never waits on it.
+async fn model_task(core: Arc<MemoryCore>) {
+    let client = match reqwest::Client::builder().connect_timeout(Duration::from_secs(15)).build() {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!("memory_core: http client build failed, no model download: {e}");
+            return;
+        }
+    };
+    while !ensure_models(&core, &client).await {
+        tokio::time::sleep(MODEL_RETRY).await;
+    }
+    load_models(&core).await;
+}
+
+async fn load_models(core: &Arc<MemoryCore>) {
+    let c = core.clone();
+    match tokio::task::spawn_blocking(move || c.try_load_models()).await {
+        Ok(true) => tracing::info!("memory_core: models loaded"),
+        Ok(false) => tracing::warn!("memory_core: model load did not produce an embedder"),
+        Err(e) => tracing::warn!("memory_core: model load task failed: {e}"),
+    }
+}
+
+/// Spawn the background tasks (called from a Tauri/Tokio async context).
+/// Model download/load runs in its own task; the sync loop never waits on it
+/// and embeds as soon as `core.embedder()` becomes available.
 pub fn spawn(core: Arc<MemoryCore>, chunks_db_path: PathBuf) {
+    tauri::async_runtime::spawn(model_task(core.clone()));
     tauri::async_runtime::spawn(async move {
         let chunks_db_path = Arc::new(chunks_db_path);
         // Warm up jieba once so the first sync doesn't pay for dictionary load mid-lock.
         let _ = tokio::task::spawn_blocking(|| segment("预热")).await;
 
-        // (1) Immediate BM25-only sync.
-        cycle(&core, &chunks_db_path).await;
-
-        let client = match reqwest::Client::builder().connect_timeout(Duration::from_secs(15)).build() {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::warn!("memory_core: http client build failed: {e}");
-                loop {
-                    tokio::time::sleep(SYNC_INTERVAL).await;
-                    cycle(&core, &chunks_db_path).await;
-                }
-            }
-        };
-
-        // (2) Fetch models; on failure keep BM25-only syncs and retry in 30 min.
-        loop {
-            if ensure_models(&core, &client).await {
-                break;
-            }
-            let deadline = tokio::time::Instant::now() + MODEL_RETRY;
-            while tokio::time::Instant::now() < deadline {
-                tokio::time::sleep(SYNC_INTERVAL).await;
-                cycle(&core, &chunks_db_path).await;
-            }
-        }
-
-        // (3) Load models off the async threads, then full sync with embeddings.
-        let c = core.clone();
-        let loaded = tokio::task::spawn_blocking(move || c.try_load_models()).await.unwrap_or(false);
-        if loaded {
-            tracing::info!("memory_core: models loaded");
-        }
-
-        // (4) Steady state.
+        let mut last_load_retry = tokio::time::Instant::now();
         loop {
             cycle(&core, &chunks_db_path).await;
             tokio::time::sleep(SYNC_INTERVAL).await;
+            // Models on disk but embedder missing (a load failed): retry at most every 30 min.
+            if core.embedder().is_none()
+                && models::is_ready(core.models_root(), &BGE_M3_INT8)
+                && last_load_retry.elapsed() >= MODEL_RETRY
+            {
+                last_load_retry = tokio::time::Instant::now();
+                load_models(&core).await;
+            }
         }
     });
 }

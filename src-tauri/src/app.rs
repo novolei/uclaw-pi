@@ -210,13 +210,13 @@ pub struct AppState {
     // Memory graph store for Steward memory system
     pub memory_graph_store: Arc<MemoryGraphStore>,
 
-    /// PR1 of 阶段 4 — registry mapping backend name → adapter. Empty
-    /// HashMap in PR1; PR2-PR14 add concrete adapters one by one. See
-    /// `docs/superpowers/specs/2026-05-29-stage4-memory-adapter-design.md`.
     /// Hybrid memory retrieval core (P1); its index is kept fresh by
     /// `memory_core::service` (spawned in main.rs Stage 3).
     pub memory_core: Arc<crate::memory_core::MemoryCore>,
 
+    /// PR1 of 阶段 4 — registry mapping backend name → adapter. Empty
+    /// HashMap in PR1; PR2-PR14 add concrete adapters one by one. See
+    /// `docs/superpowers/specs/2026-05-29-stage4-memory-adapter-design.md`.
     pub memory_adapters:
         std::sync::Arc<std::collections::HashMap<String, std::sync::Arc<dyn crate::memory_adapter::MemoryAdapter>>>,
 
@@ -1042,10 +1042,10 @@ impl AppState {
             bucket_seal_adapter.clone() as std::sync::Arc<dyn crate::memory_adapter::MemoryAdapter>,
         );
 
-        // PR P2-①: memU is now embedder-only — its MemUEmbedder (above) feeds
-        // bucket_seal's vector recall, which is the default backend. The former
-        // MemUAdapter recall-backend registration was retired here; memU no
-        // longer participates in the unified recall registry.
+        // PR P2-①: the former MemUAdapter recall-backend registration was
+        // retired here; memU no longer participates in the unified recall
+        // registry, and (P1) no longer feeds bucket_seal embeddings either —
+        // MemoryCore owns embeddings.
 
         // 阶段 4: GbrainAdapter exposes gbrain's durable-knowledge search through
         // the registry. Registered unconditionally — it holds the always-present
@@ -1099,8 +1099,8 @@ impl AppState {
             // agent prompt routes separately via
             // MemoryRecallConfig.prompt_recall_backend, not this default.) Flipped
             // to "bucket_seal" now that it is a capable backend: FTS5 + vector
-            // recall over real embeddings (memU FastEmbed) + cascade-sealed
-            // summaries. The flip is inert today (no memory_unified_* callers yet)
+            // recall (embeddings now owned by MemoryCore; bucket_seal uses
+            // InertEmbedder) + cascade-sealed summaries. The flip is inert today (no memory_unified_* callers yet)
             // and forward-looking; callers can still target any registered backend
             // explicitly or via a "name:" namespace prefix.
             default_memory_backend: std::sync::Arc::new(std::sync::RwLock::new(
