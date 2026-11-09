@@ -48,6 +48,21 @@ without it — and is harmless now that it is pure-Rust fsqlite. pi runs with
 hashline_edit) so pi's larger implicit default set (ask, web_search, jobs, hub,
 lsp, …) never leaks in; `workspace_trusted` stays upstream's default `false`
 (project `.uclaw-pi/settings.json`, extensions and project MCP are not loaded).
+pi still adds its `xdev` dispatcher to the tool schema (essential tier).
+
+Runtime requirements the engine must keep (both found by the smoke test):
+
+- **16 MiB stack** for the `pi-engine` thread and runtime worker — pi 0.8's
+  futures overflow the 2 MiB default in debug builds (upstream's CLI uses the
+  same 16 MiB).
+- Run prompts with `RuntimeHandle::spawn` holding an `OwnedMutexGuard`, **not**
+  `spawn_local`: cross-thread wakes of local tasks can leave the
+  current_thread driver parked in kqueue (~60 s stalls, ~4% of runs).
+
+Smoke test recipe (not committed): a mock OpenAI-compatible SSE server that
+returns one `ls` tool call then text, plus a tiny example that spawns
+`PiEngine`, sends `Configure` (provider `deepseek`, `base_url` = the mock,
+`api` = `openai-completions`) + `Prompt`, and waits for `chat:stream-complete`.
 `asupersync` in the engine must stay on the same minor as pi (currently 0.5).
 
 ## Local patches (re-apply on every sync)
