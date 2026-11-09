@@ -204,11 +204,29 @@ fn spawn_core_search(
     }))
 }
 
-async fn join_core_search(h: Option<tokio::task::JoinHandle<Option<String>>>) -> Option<String> {
-    match h?.await {
-        Ok(b) => b,
-        Err(e) => {
+/// Upper bound on how long `load_context` waits for the MemoryCore search,
+/// measured from when the search was spawned. Kept well under the pi path's
+/// `PI_RECALL_DEADLINE_MS` (1500 ms) so a slow search drops only the core block
+/// instead of the whole memory context.
+const CORE_SEARCH_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1000);
+
+/// Await the core search until `deadline`. On timeout, logs a warning and yields
+/// `None`; the blocking task is detached (not aborted) and finishes in the background.
+async fn join_core_search(
+    h: Option<tokio::task::JoinHandle<Option<String>>>,
+    deadline: tokio::time::Instant,
+) -> Option<String> {
+    match tokio::time::timeout_at(deadline, h?).await {
+        Ok(Ok(b)) => b,
+        Ok(Err(e)) => {
             tracing::warn!(error = %e, "MemoryCore search task failed; skipping");
+            None
+        }
+        Err(_) => {
+            tracing::warn!(
+                timeout_ms = CORE_SEARCH_TIMEOUT.as_millis() as u64,
+                "MemoryCore search timed out; dropping core block"
+            );
             None
         }
     }
@@ -219,6 +237,7 @@ async fn join_core_search(h: Option<tokio::task::JoinHandle<Option<String>>>) ->
 /// returns empty (matches the prior "proceed without memory context" path).
 pub async fn load_context(inputs: MemoryContextInputs<'_>) -> LoadedMemoryContext {
     // Spawned first so the MemoryCore search runs concurrently with graph recall.
+    let core_deadline = tokio::time::Instant::now() + CORE_SEARCH_TIMEOUT;
     let core_handle = spawn_core_search(inputs.core.clone(), inputs.query);
     let plan = match inputs
         .recall_engine
@@ -228,7 +247,7 @@ pub async fn load_context(inputs: MemoryContextInputs<'_>) -> LoadedMemoryContex
         Ok(plan) => plan,
         Err(e) => {
             tracing::warn!(error = %e, "Memory recall failed, proceeding without memory context");
-            let core_block = join_core_search(core_handle).await;
+            let core_block = join_core_search(core_handle, core_deadline).await;
             let context = compose_memory_context(core_block.as_deref(), None, None, None, None);
             return LoadedMemoryContext { context, recall_event: None };
         }
@@ -267,7 +286,7 @@ pub async fn load_context(inputs: MemoryContextInputs<'_>) -> LoadedMemoryContex
         None => None,
     };
 
-    let core_block: Option<String> = join_core_search(core_handle).await;
+    let core_block: Option<String> = join_core_search(core_handle, core_deadline).await;
 
     if total > 0 {
         let budget = inputs.recall_engine.config().token_budget;
@@ -395,6 +414,23 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out, "<c>\n<a>\n<g>\n<s>\n<b>\n");
+    }
+
+    #[tokio::test]
+    async fn join_core_search_times_out_without_blocking() {
+        let slow = tokio::task::spawn_blocking(|| {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            Some("late".to_string())
+        });
+        let t = std::time::Instant::now();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(50);
+        assert!(join_core_search(Some(slow), deadline).await.is_none());
+        assert!(t.elapsed() < std::time::Duration::from_millis(400), "must not wait for the task");
+
+        let fast = tokio::task::spawn_blocking(|| Some("hit".to_string()));
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        assert_eq!(join_core_search(Some(fast), deadline).await.as_deref(), Some("hit"));
+        assert!(join_core_search(None, deadline).await.is_none());
     }
 
     #[tokio::test]
