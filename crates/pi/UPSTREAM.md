@@ -71,7 +71,7 @@ Every hunk is marked `uclaw-patch` in the source. Keep this list in sync.
 
 | # | Files | What / why | Upstreamable? |
 |---|---|---|---|
-| P1 | `src/auth.rs` | Split the 4 **public** installed-app Google OAuth client id/secret literals with `concat!()` so GitHub push-protection stops false-positiving. Runtime values identical. | No (repo-hosting workaround) |
+| P1 | `src/auth.rs`, `src/secrets.rs` | Split the 4 **public** installed-app Google OAuth client id/secret literals (auth.rs) and the fake Slack bot-token test fixture (secrets.rs) with `concat!()` so GitHub push-protection stops false-positiving. Runtime values identical. Applied directly in the import commit, since push protection scans every commit. | No (repo-hosting workaround) |
 | P2 | `Cargo.toml` | Remove all `[[bin]]`/`[[example]]`/`[[bench]]`/`[[test]]` targets and set `autoexamples/autotests/autobenches = false` (those dirs are not vendored). | No |
 | P3 | `src/config.rs`, `src/migrations.rs` | Project dir `.pi` → `.uclaw-pi` (`Config::project_dir()`), plus `migrate_project_dir()` that renames a legacy `<cwd>/.pi` on first use (never touches `~/.pi`); called by `uclaw-pi-engine`. | No (branding) |
 | P4 | `src/mcp/config.rs`, `src/workspace_trust.rs` | Follow-up to P3: upstream hardcodes `.pi/mcp.json` (MCP load + trust scan) and `.pi/...` trust-surface labels; point them at `.uclaw-pi`. New in this sync. | Partly — upstream could use `Config::project_dir()` |
