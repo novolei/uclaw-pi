@@ -3,3 +3,4 @@
 
 pub mod segment;
 pub mod models;
+pub mod embed;
