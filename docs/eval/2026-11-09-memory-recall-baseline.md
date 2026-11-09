@@ -255,3 +255,25 @@ and passes zh hit@5 (66.7% >= 65%) and pi hit / stored (68.6% >= 60%). The fix i
 the same next lever as above: a faster reranker or cheaper first stage. Raising
 `CORE_SEARCH_TIMEOUT` toward the 1500 ms pi deadline would win back part of the
 pi-context hits, but leaves less margin for the other recall blocks.
+
+## After timeout 1.3 s + skip-rerank-when-busy (release build, 2026-11-09)
+
+Commit 324ef829: `CORE_SEARCH_TIMEOUT` 1000 → 1300 ms (still ~200 ms under the pi
+path's 1500 ms recall deadline) and `Reranker::try_rerank` (a search that timed
+out keeps running detached; the next search no longer queues behind it on the
+reranker mutex but keeps its fused RRF order). Measured with a **release** build
+(possible now that the Metal toolchain is installed), defaults otherwise
+unchanged (`rerank_top_n` 6).
+
+| | 1 s timeout (debug, opt deps) | **1.3 s + try_rerank (release)** |
+|---|---|---|
+| fact present in composed pi context | 67.6% | **83.8%** |
+| …zh / en | 70.4% / 60.0% | **81.5% / 90.0%** |
+| pi hit / stored | 71.4% | **88.6%** |
+| memory_core hit@5 (all / zh / en) | 67.6% / 66.7% / 70.0% | 67.6% / 66.7% / 70.0% |
+| memory_core p50 (all / en / skill) | 511 / 1138 / 1227 ms | 496 / 1132 / 1132 ms |
+
+Release vs debug barely moves latency: inference runs in the prebuilt native
+ONNX Runtime, so the remaining cost is model compute. English and skill queries
+(~1.1 s) now fit inside the 1.3 s budget, which is where the pi-context gain
+comes from; ranked hit@5 is unchanged because ranking didn't change.
