@@ -112,7 +112,9 @@ export function memoryEngineState(s: MemoryCoreStatus): MemoryEngineState {
       if (s.embedderLoaded) return 'ready'
       // Files on disk but the load failed: say so instead of "loading" forever.
       if (s.loadError) return 'loadFailed'
-      return 'loading'
+      // "Loading" claims the models are on disk; before the first download
+      // status arrives (models not on disk yet) it is still "preparing".
+      return s.modelsOnDisk ? 'loading' : 'queued'
   }
 }
 

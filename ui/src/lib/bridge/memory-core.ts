@@ -40,6 +40,8 @@ export interface MemoryCoreStatus {
   download: MemoryDownloadStatus | null
   /** Last model load error (files on disk, load failed); null once a load succeeds or models are off. */
   loadError: string | null
+  /** Both models are fully on disk (so turning them on loads instead of downloading). */
+  modelsOnDisk: boolean
   index: MemoryIndexStatus
 }
 

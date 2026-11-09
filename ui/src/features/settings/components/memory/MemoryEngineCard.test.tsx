@@ -122,6 +122,12 @@ describe('MemoryEngineCard', () => {
     expect(await screen.findByText('正在加载模型')).toBeInTheDocument()
   })
 
+  it('off with the models already on disk: no download promise', async () => {
+    await renderState('offondisk')
+    expect(screen.getByText(/开启后立即可用，模型已在本机/)).toBeInTheDocument()
+    expect(screen.queryByText(/首次开启会下载/)).toBeNull()
+  })
+
   it('off: keyword-only explanation and the first-download size', async () => {
     await renderState('off')
     expect(screen.getByRole('switch', { name: '使用本地检索模型' })).not.toBeChecked()

@@ -185,6 +185,7 @@ async fn ensure_models(
     }
     // Only reached with a download in flight or everything already on disk.
     guarded_update(core, keep_going, false, |s| {
+        s.models_on_disk = true; // both specs are ready at this point
         if let Some(d) = s.download.as_mut() {
             d.phase = DownloadPhase::Done;
             d.downloaded_bytes = d.total_bytes;
@@ -344,7 +345,13 @@ impl ServiceHandle {
         let load_failed = st.load_error.is_some() && !st.embedder_loaded;
         if load_failed && !download_failed && self.desired() {
             let me = self.clone();
-            let ready = tokio::task::spawn_blocking(move || me.ops.models_ready()).await.unwrap_or(false);
+            let ready = tokio::task::spawn_blocking(move || {
+                let ready = me.ops.models_ready();
+                me.core.update_status(|s| s.models_on_disk = ready);
+                ready
+            })
+            .await
+            .unwrap_or(false);
             if ready {
                 // Back to "loading" right away; the load reports its own outcome.
                 self.core.update_status(|s| s.load_error = None);
@@ -382,6 +389,7 @@ impl ServiceHandle {
 
     async fn apply_desired(self: &Arc<Self>, enabled: bool) {
         let ready = self.ops.models_ready(); // stat calls: not under `ctl`
+        self.core.update_status(|s| s.models_on_disk = ready);
         let (spawn_task, was_waiting) = {
             let mut c = self.ctl.lock().unwrap_or_else(|p| p.into_inner());
             c.desired = enabled;
@@ -457,6 +465,14 @@ impl ServiceHandle {
             let me = self.clone();
             let keep: Arc<dyn Fn() -> bool + Send + Sync> = Arc::new(move || me.desired());
             let ok = self.ops.download(keep).await;
+            {
+                let me = self.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    let ready = me.ops.models_ready();
+                    me.core.update_status(|s| s.models_on_disk = ready);
+                })
+                .await;
+            }
             if self.finish_if_off() {
                 self.core.update_status(|s| s.download = None);
                 return;
@@ -505,6 +521,7 @@ pub fn spawn(handle: Arc<ServiceHandle>, chunks_db_path: PathBuf, notifier: Opti
             tokio::task::spawn_blocking(move || {
                 let on = models_enabled(&c);
                 c.update_status(|s| s.models_enabled = on);
+                c.refresh_models_on_disk();
                 c.refresh_index_status(false);
                 on
             })
@@ -850,6 +867,25 @@ mod tests {
         assert!(c.update_status(|s| s.index.docs = 7));
         assert_eq!(c.status().index.docs, 7);
     }
+
+    #[tokio::test]
+    async fn toggle_and_download_refresh_models_on_disk() {
+        let ops = FakeOps::new(false, true, &[]);
+        let (h, c) = handle_with(ops.clone(), Duration::from_secs(3600));
+        let st = h.set_models_enabled(false).await.unwrap();
+        assert!(!st.models_on_disk);
+        h.set_models_enabled(true).await.unwrap();
+        assert!(!c.status().models_on_disk, "still downloading");
+        wait_until("download start", || ops.downloads.load(Ordering::SeqCst) == 1).await;
+        ops.gate.as_ref().unwrap().add_permits(1); // download succeeds -> files ready
+        wait_until("load", || ops.loaded.load(Ordering::SeqCst)).await;
+        assert!(c.status().models_on_disk, "refreshed after the download");
+        // Files removed behind our back: the next toggle re-stats.
+        ops.ready.store(false, Ordering::SeqCst);
+        let st = h.set_models_enabled(false).await.unwrap();
+        assert!(!st.models_on_disk);
+    }
+
     #[tokio::test]
     async fn retry_reruns_a_failed_load_when_files_are_ready() {
         let ops = FakeOps::new(true, false, &[]);
@@ -859,6 +895,7 @@ mod tests {
         let st = h.set_models_enabled(true).await.unwrap();
         assert_eq!(ops.loads.load(Ordering::SeqCst), 1);
         assert!(st.load_error.is_some(), "load failure is visible");
+        assert!(st.models_on_disk);
 
         ops.fail_load.store(false, Ordering::SeqCst);
         let st = h.retry_download().await;
@@ -906,6 +943,7 @@ mod tests {
         let st = core.status();
         let err = st.load_error.expect("load_error set");
         assert!(err.contains("bge-m3"), "{err}");
+        assert!(st.models_on_disk);
         assert!(!st.embedder_loaded);
         // Unload clears it (back to plain keyword mode).
         core.unload_models();
@@ -919,5 +957,6 @@ mod tests {
         assert!(!c.try_load_models()); // nothing on disk: nothing attempted, nothing failed
         let st = c.status();
         assert!(st.load_error.is_none());
+        assert!(!st.models_on_disk);
     }
 }

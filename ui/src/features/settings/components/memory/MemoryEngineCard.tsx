@@ -301,7 +301,7 @@ function ErrorDetails({ reason }: { reason: string }) {
   )
 }
 
-function OffBody() {
+function OffBody({ modelsOnDisk }: { modelsOnDisk: boolean }) {
   return (
     <div className="flex gap-2.5 rounded-lg bg-muted/50 px-3 py-3">
       <Search aria-hidden size={14} className="mt-[3px] shrink-0 text-muted-foreground" />
@@ -309,7 +309,9 @@ function OffBody() {
         <div className="text-[13px] font-medium leading-5 text-foreground">当前仅按关键词找回记忆</div>
         <p className="mt-0.5 text-[12px] leading-[18px] text-foreground/75">
           开启后，助手能理解意思相近的说法：问“出差安排”，也能想起“下周去上海开会”。
-          首次开启会下载约 1.1 GB 模型，之后完全在本机运行。
+          {modelsOnDisk
+            ? '开启后立即可用，模型已在本机。'
+            : '首次开启会下载约 1.1 GB 模型，之后完全在本机运行。'}
         </p>
       </div>
     </div>
@@ -521,7 +523,7 @@ export function MemoryEngineCard(): React.ReactElement {
                   busy={pending}
                 />
               )}
-              {state === 'off' && <OffBody />}
+              {state === 'off' && <OffBody modelsOnDisk={status.modelsOnDisk} />}
               {state === 'loading' && <LoadingModelsBody />}
             </FadeIn>
           </div>

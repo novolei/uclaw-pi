@@ -30,6 +30,10 @@ describe('useMemoryCoreStatus helpers', () => {
     expect(memoryEngineState(memoryCoreFixture('downloading'))).toBe('downloading')
     expect(memoryEngineState(memoryCoreFixture('loading'))).toBe('loading')
     expect(memoryEngineState(memoryCoreFixture('loadfailed'))).toBe('loadFailed')
+    expect(memoryEngineState(memoryCoreFixture('offondisk'))).toBe('off')
+    // "loading" claims the files are on disk: before the first download status
+    // (models not on disk yet) it reads as "preparing" instead.
+    expect(memoryEngineState({ ...memoryCoreFixture('loading'), download: null, modelsOnDisk: false })).toBe('queued')
     // a stale load error never hides a loaded embedder
     expect(memoryEngineState({ ...memoryCoreFixture('ready'), loadError: 'x' })).toBe('ready')
     expect(memoryCoreAttention(memoryCoreFixture('loadfailed'))).toBe('failed')

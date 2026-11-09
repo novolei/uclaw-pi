@@ -210,6 +210,19 @@ impl MemoryCore {
         self.refresh_index_status(false);
     }
 
+    /// Both model specs are fully on disk (stat calls only).
+    pub fn models_on_disk(&self) -> bool {
+        models::is_ready(&self.models_root, &models::BGE_M3_INT8)
+            && models::is_ready(&self.models_root, &models::BGE_RERANKER_V2_M3_INT8)
+    }
+
+    /// Re-stat the model files and store `models_on_disk`.
+    pub fn refresh_models_on_disk(&self) -> bool {
+        let on_disk = self.models_on_disk();
+        self.update_status(|s| s.models_on_disk = on_disk);
+        on_disk
+    }
+
     /// Load whichever models are on disk and not yet loaded. Idempotent.
     /// Returns true iff the embedder is loaded afterwards.
     pub fn try_load_models(&self) -> bool {
@@ -245,7 +258,11 @@ impl MemoryCore {
         }
         // Set on any failure, cleared when this attempt had none.
         let load_error = (!errors.is_empty()).then(|| errors.join("\n"));
-        self.update_status(|s| s.load_error = load_error);
+        let on_disk = self.models_on_disk();
+        self.update_status(|s| {
+            s.load_error = load_error;
+            s.models_on_disk = on_disk;
+        });
         self.refresh_model_status();
         // Pending/vector counts depend on the loaded embedder's model id.
         self.refresh_index_status(false);
