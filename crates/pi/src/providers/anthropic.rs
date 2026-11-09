@@ -7,20 +7,22 @@ use crate::auth::unmark_anthropic_oauth_bearer_token;
 use crate::error::{Error, Result};
 use crate::http::client::Client;
 use crate::model::{
-    AssistantMessage, ContentBlock, Message, RedactedThinkingContent, StopReason, StreamEvent,
-    TextContent, ThinkingContent, ThinkingLevel, ToolCall, Usage, UserContent,
+    AssistantMessage, ContentBlock, Message, RedactedThinkingContent, StopDetails, StopReason,
+    StreamEvent, TextContent, ThinkingContent, ThinkingLevel, ToolCall, Usage, UserContent,
 };
 use crate::models::CompatConfig;
 use crate::provider::{CacheRetention, Context, Provider, StreamOptions, ToolDef};
 use crate::provider_metadata::canonical_provider_id;
 use crate::sse::SseStream;
 use async_trait::async_trait;
-use futures::StreamExt;
-use futures::stream::{self, Stream};
+use futures::stream::Stream;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs;
 use std::pin::Pin;
+
+mod transport;
 
 // ============================================================================
 // Constants
@@ -36,6 +38,12 @@ const ANTHROPIC_OAUTH_BETA_FLAGS: &str = "claude-code-20250219,oauth-2025-04-20"
 /// Beta flag for Anthropic prompt caching.
 /// Override via `PI_ANTHROPIC_CACHE_BETA_FLAG`.
 const ANTHROPIC_CACHE_BETA_FLAG: &str = "prompt-caching-2024-07-31";
+/// Beta flag for the extended (1h) prompt-cache TTL. Only sent when the request
+/// actually carries a `ttl: "1h"` cache breakpoint (first-party API + `Long`
+/// retention); relays commonly reject both the flag and the `ttl` field.
+const ANTHROPIC_EXTENDED_CACHE_TTL_BETA_FLAG: &str = "extended-cache-ttl-2025-04-11";
+/// Beta flag that accompanies `speed: "fast"` (fast mode, `/fast`).
+const ANTHROPIC_FAST_MODE_BETA_FLAG: &str = "fast-mode-2026-02-01";
 const KIMI_SHARE_DIR_ENV_KEY: &str = "KIMI_SHARE_DIR";
 
 fn anthropic_oauth_beta_flags() -> String {
@@ -50,6 +58,43 @@ fn anthropic_cache_beta_flag() -> String {
         .ok()
         .filter(|v| !v.is_empty())
         .unwrap_or_else(|| ANTHROPIC_CACHE_BETA_FLAG.to_string())
+}
+
+/// True when `base_url` targets Anthropic's first-party API host.
+///
+/// Relays and proxies (custom `base_url`s) generally accept the plain
+/// `{"type":"ephemeral"}` marker but reject the extended `ttl` field, so the
+/// 1h TTL is only emitted for the first-party endpoint.
+fn is_first_party_anthropic_base_url(base_url: &str) -> bool {
+    base_url
+        .strip_prefix("https://api.anthropic.com")
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+}
+
+/// Derive the prompt-cache breakpoint marker for a request, if any.
+///
+/// This is the single source of truth for both the request body
+/// (`cache_control` on the system block and the last tool) and the header
+/// assembly (the extended-TTL beta flag is sent iff the returned marker
+/// carries a `ttl`), so the two can never drift apart.
+fn anthropic_cache_control_for(
+    retention: CacheRetention,
+    base_url: &str,
+) -> Option<AnthropicCacheControl> {
+    match retention {
+        CacheRetention::None => None,
+        CacheRetention::Short => Some(AnthropicCacheControl {
+            r#type: "ephemeral",
+            ttl: None,
+        }),
+        CacheRetention::Long => Some(AnthropicCacheControl {
+            r#type: "ephemeral",
+            // The 1h TTL requires the extended-cache-ttl beta and is only
+            // supported on the first-party API; degrade to the default 5m
+            // TTL elsewhere instead of risking a 400 from a relay.
+            ttl: is_first_party_anthropic_base_url(base_url).then_some("1h"),
+        }),
+    }
 }
 
 #[inline]
@@ -175,9 +220,13 @@ where
             if path.starts_with('\\') || path.starts_with('/') {
                 Some(std::path::PathBuf::from(format!("{drive}{path}")))
             } else {
-                let mut combined = std::path::PathBuf::from(drive);
-                combined.push(path);
-                Some(combined)
+                // Write the separator out: `PathBuf::push` suppresses it after
+                // a bare drive prefix, leaving the drive-RELATIVE `C:Users\me`
+                // instead of a rooted home. See `auth::home_dir_with_env_lookup`.
+                Some(std::path::PathBuf::from(format!(
+                    "{drive}{}{path}",
+                    std::path::MAIN_SEPARATOR
+                )))
             }
         })
 }
@@ -298,6 +347,112 @@ pub struct AnthropicProvider {
     base_url: String,
     provider: String,
     compat: Option<CompatConfig>,
+    /// Set once the API rejects fast mode for this model or account, so later
+    /// turns stop asking for it instead of paying a failed request each time.
+    fast_mode_rejected: std::sync::atomic::AtomicBool,
+}
+
+/// Whether an error response means the model or account can't use fast mode:
+/// a 400 saying `speed` is not supported, or a 429 because the account lacks
+/// the fast-mode entitlement (same rule as OMP's `FastModeUnsupported`).
+fn fast_mode_unsupported(status: u16, body: &str) -> bool {
+    let body = body.to_ascii_lowercase();
+    match status {
+        400 => body.contains("speed") && body.contains("not support"),
+        429 => body.contains("rate_limit_error") && body.contains("fast mode"),
+        _ => false,
+    }
+}
+
+/// Whether an Anthropic(-compatible) model on the `anthropic-messages`
+/// transport uses the modern adaptive-thinking API (`thinking: {type:"adaptive"}`
+/// plus `output_config.effort`) rather than the deprecated fixed-budget
+/// extended-thinking API (`thinking: {type:"enabled", budget_tokens:N}`).
+///
+/// Returns `None` for non-Claude ids (e.g. MiniMax over the Anthropic-compatible
+/// transport) so the caller keeps the legacy budget path. This is a *fallback*
+/// heuristic only: `compat.forceAdaptiveThinking` from the catalog is
+/// authoritative (gh #117), so newer models can be onboarded as data without a
+/// code change here.
+///
+/// Adaptive thinking is GA on Claude Opus 4.6/4.7/4.8, Sonnet 4.6, and the
+/// Claude Fable/Mythos (5.x) families; `budget_tokens` is rejected (400) on
+/// Opus 4.7/4.8/Fable/Mythos and deprecated on Opus 4.6 / Sonnet 4.6. Older
+/// models (Opus/Sonnet 4.5 and earlier, Claude 3.x, all Haiku) require
+/// `budget_tokens`.
+/// Ref: https://platform.claude.com/docs/en/build-with-claude/adaptive-thinking
+pub(crate) fn anthropic_model_uses_adaptive_thinking(model_id: &str) -> Option<bool> {
+    const ADAPTIVE_PREFIXES: [&str; 8] = [
+        "claude-opus-4-6",
+        "claude-opus-4-7",
+        "claude-opus-4-8",
+        "claude-opus-5",
+        "claude-sonnet-4-6",
+        "claude-sonnet-5",
+        "claude-fable-",
+        "claude-mythos-",
+    ];
+    let lower = model_id.to_ascii_lowercase();
+    let pos = lower.find("claude-")?;
+    let id = &lower[pos..];
+    Some(
+        ADAPTIVE_PREFIXES
+            .iter()
+            .any(|prefix| id.starts_with(prefix)),
+    )
+}
+
+/// Map pi's thinking level onto the Anthropic `output_config.effort` value for
+/// adaptive-thinking models. A per-model `thinkingLevelMap` from the catalog
+/// (gh #117) overrides the default mapping (e.g. mapping `xhigh -> max`),
+/// keyed by the lowercase `ThinkingLevel` name.
+///
+/// Default mapping: `minimal`/`low -> "low"`, `medium -> "medium"`,
+/// `high -> "high"`, `xhigh -> "xhigh"`, `max -> "max"` (Anthropic has no
+/// `minimal` effort — it collapses to the nearest Anthropic tier). `off`
+/// yields `None` (no effort emitted; thinking is not enabled for `off`).
+pub(crate) fn anthropic_effort_for_level(
+    level: ThinkingLevel,
+    compat: Option<&CompatConfig>,
+) -> Option<String> {
+    if let Some(map) = compat.and_then(|c| c.thinking_level_map.as_ref())
+        && let Some(mapped) = map.get(level.to_string().as_str())
+    {
+        return mapped.clone();
+    }
+    match level {
+        ThinkingLevel::Off => None,
+        ThinkingLevel::Minimal | ThinkingLevel::Low => Some("low".to_string()),
+        ThinkingLevel::Medium => Some("medium".to_string()),
+        ThinkingLevel::High => Some("high".to_string()),
+        ThinkingLevel::XHigh => Some("xhigh".to_string()),
+        ThinkingLevel::Max => Some("max".to_string()),
+    }
+}
+
+/// Mark the last content block of the last user-role message with a
+/// prompt-cache breakpoint so each turn re-reads the previous turn's cached
+/// conversation history instead of paying full input price for it (parity
+/// with pi-mono's `convertMessages`). Trailing assistant messages and block
+/// kinds that cannot carry `cache_control` are left untouched.
+fn mark_last_user_block_for_caching(
+    messages: &mut [AnthropicMessage<'_>],
+    cache_control: Option<AnthropicCacheControl>,
+) {
+    if let Some(cc) = cache_control
+        && let Some(last_message) = messages.last_mut()
+        && last_message.role == "user"
+        && let Some(last_block) = last_message.content.last_mut()
+    {
+        match last_block {
+            AnthropicContent::Text { cache_control, .. }
+            | AnthropicContent::Image { cache_control, .. }
+            | AnthropicContent::ToolResult { cache_control, .. } => {
+                *cache_control = Some(cc);
+            }
+            AnthropicContent::Thinking { .. } | AnthropicContent::ToolUse { .. } => {}
+        }
+    }
 }
 
 impl AnthropicProvider {
@@ -309,7 +464,20 @@ impl AnthropicProvider {
             base_url: ANTHROPIC_API_URL.to_string(),
             provider: "anthropic".to_string(),
             compat: None,
+            fast_mode_rejected: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Whether this request asks for fast mode (`speed: "fast"`): a
+    /// `priority` service tier on the first-party Anthropic provider that
+    /// hasn't already been rejected. Relays and Anthropic-compatible
+    /// backends never get it.
+    fn fast_mode(&self, options: &StreamOptions) -> bool {
+        self.provider == "anthropic"
+            && options.service_tier.as_deref() == Some("priority")
+            && !self
+                .fast_mode_rejected
+                .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Override the provider name reported in streamed events.
@@ -349,29 +517,71 @@ impl AnthropicProvider {
         context: &'a Context<'_>,
         options: &StreamOptions,
     ) -> AnthropicRequest<'a> {
-        let messages = context
+        let mut messages: Vec<AnthropicMessage<'_>> = context
             .messages
             .iter()
             .map(convert_message_to_anthropic)
             .collect();
 
+        // Prompt-cache breakpoints. One marker on the system block, one on the
+        // last tool, and one on the last user message's final content block
+        // (incremental conversation-history caching — parity with pi-mono's
+        // `convertMessages`). Anthropic caches everything before a marked
+        // block. `CacheRetention::None` emits no markers anywhere — cache
+        // writes bill at 1.25x, so caching must be strictly opt-in.
+        let cache_control = anthropic_cache_control_for(options.cache_retention, &self.base_url);
+
+        mark_last_user_block_for_caching(&mut messages, cache_control);
+
         let tools: Option<Vec<AnthropicTool<'_>>> = if context.tools.is_empty() {
             None
         } else {
-            Some(
-                context
-                    .tools
-                    .iter()
-                    .map(convert_tool_to_anthropic)
-                    .collect(),
-            )
+            let mut tools: Vec<AnthropicTool<'_>> = context
+                .tools
+                .iter()
+                .map(convert_tool_to_anthropic)
+                .collect();
+            if let Some(last) = tools.last_mut() {
+                last.cache_control = cache_control;
+            }
+            Some(tools)
         };
 
-        // Build thinking configuration if enabled
-        let thinking = options.thinking_level.and_then(|level| {
-            if level == ThinkingLevel::Off {
-                None
-            } else {
+        // Decide between the modern adaptive-thinking API and the legacy
+        // fixed-budget extended-thinking API. Catalog metadata
+        // (`compat.forceAdaptiveThinking`) is authoritative; the model-id
+        // heuristic is consulted only when the catalog is silent (gh #116/#117).
+        let adaptive = self
+            .compat
+            .as_ref()
+            .and_then(|compat| compat.force_adaptive_thinking)
+            .or_else(|| anthropic_model_uses_adaptive_thinking(&self.model))
+            .unwrap_or(false);
+
+        // Build thinking configuration if enabled.
+        let level = options
+            .thinking_level
+            .filter(|level| *level != ThinkingLevel::Off);
+        let (thinking, output_config) = match level {
+            None => (None, None),
+            Some(level) if adaptive => {
+                // Modern path: adaptive thinking + effort. `budget_tokens` is
+                // rejected (400) on Opus 4.7/4.8/Fable/Mythos and deprecated on
+                // Opus 4.6 / Sonnet 4.6. `display: "summarized"` keeps pi's
+                // thinking-stream visible (the default is "omitted" on the
+                // newest models).
+                let thinking = AnthropicThinking {
+                    r#type: "adaptive",
+                    budget_tokens: None,
+                    display: Some("summarized"),
+                };
+                let output_config = AnthropicOutputConfig {
+                    effort: anthropic_effort_for_level(level, self.compat.as_ref()),
+                };
+                (Some(thinking), Some(output_config))
+            }
+            Some(level) => {
+                // Legacy path: fixed-budget extended thinking.
                 let budget = options.thinking_budgets.as_ref().map_or_else(
                     || level.default_budget(),
                     |b| match level {
@@ -381,23 +591,31 @@ impl AnthropicProvider {
                         ThinkingLevel::Medium => b.medium,
                         ThinkingLevel::High => b.high,
                         ThinkingLevel::XHigh => b.xhigh,
+                        ThinkingLevel::Max => b.max,
                     },
                 );
-                Some(AnthropicThinking {
+                let thinking = AnthropicThinking {
                     r#type: "enabled",
-                    budget_tokens: budget,
-                })
+                    budget_tokens: Some(budget),
+                    display: None,
+                };
+                (Some(thinking), None)
             }
-        });
+        };
 
         let mut max_tokens = options.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS);
-        if let Some(t) = &thinking {
-            if max_tokens <= t.budget_tokens {
-                max_tokens = t.budget_tokens + 4096;
-            }
+        if let Some(budget) = thinking.as_ref().and_then(|t| t.budget_tokens)
+            && max_tokens <= budget
+        {
+            max_tokens = budget + 4096;
         }
 
-        let temperature = if thinking.is_some() {
+        // Adaptive-thinking models reject sampling params (`temperature`,
+        // `top_p`, `top_k`) with a 400; legacy extended thinking requires
+        // `temperature = 1.0`.
+        let temperature = if adaptive {
+            None
+        } else if thinking.is_some() {
             Some(1.0)
         } else {
             options.temperature
@@ -406,12 +624,28 @@ impl AnthropicProvider {
         AnthropicRequest {
             model: &self.model,
             messages,
-            system: context.system_prompt.as_deref(),
+            // An empty system prompt must be omitted entirely: as a bare
+            // string it was tolerated, but a `{"type":"text","text":""}`
+            // block is rejected by the API (min length 1). pi-mono's falsy
+            // check (`context.systemPrompt &&`) skips it the same way.
+            system: context
+                .system_prompt
+                .as_deref()
+                .filter(|text| !text.is_empty())
+                .map(|text| {
+                    vec![AnthropicSystemBlock {
+                        r#type: "text",
+                        text,
+                        cache_control,
+                    }]
+                }),
             max_tokens,
             temperature,
             tools,
             stream: true,
             thinking,
+            output_config,
+            speed: self.fast_mode(options).then_some("fast"),
         }
     }
 }
@@ -514,22 +748,36 @@ impl Provider for AnthropicProvider {
         if anthropic_bearer_token {
             beta_flags.push(anthropic_oauth_beta_flags());
         }
-        if options.cache_retention != CacheRetention::None {
+        // Derived from the same helper that emits the body's cache_control
+        // markers, so headers and body cannot drift: whenever the body carries
+        // markers the right flags are present, and the extended-TTL beta is
+        // sent iff a marker would carry `ttl: "1h"`. (A degenerate request
+        // with no system prompt, no tools, and no markable trailing user
+        // block sends the flags without any marker — a harmless no-op.)
+        if let Some(cache_control) =
+            anthropic_cache_control_for(options.cache_retention, &self.base_url)
+        {
             beta_flags.push(anthropic_cache_beta_flag());
+            if cache_control.ttl.is_some() {
+                beta_flags.push(ANTHROPIC_EXTENDED_CACHE_TTL_BETA_FLAG.to_string());
+            }
+        }
+        if request_body.speed.is_some() {
+            beta_flags.push(ANTHROPIC_FAST_MODE_BETA_FLAG.to_string());
         }
         if !beta_flags.is_empty() {
             request = request.header("anthropic-beta", beta_flags.join(","));
         }
 
         // Apply provider-specific custom headers from compat config.
-        if let Some(compat) = &self.compat {
-            if let Some(custom_headers) = &compat.custom_headers {
-                request = super::apply_headers_ignoring_blank_auth_overrides(
-                    request,
-                    custom_headers,
-                    &["authorization", "x-api-key"],
-                );
-            }
+        if let Some(compat) = &self.compat
+            && let Some(custom_headers) = &compat.custom_headers
+        {
+            request = super::apply_headers_ignoring_blank_auth_overrides(
+                request,
+                custom_headers,
+                &["authorization", "x-api-key"],
+            );
         }
 
         // Per-request headers from StreamOptions (highest priority).
@@ -539,7 +787,27 @@ impl Provider for AnthropicProvider {
             &["authorization", "x-api-key"],
         );
 
-        let request = request.json(&request_body)?;
+        let rewritten_body = super::offer_before_provider_request(
+            options,
+            self.name(),
+            self.api(),
+            self.model_id(),
+            &self.base_url,
+            &request_body,
+            |value| {
+                super::validate_streamed_json_rewrite(
+                    value,
+                    &["model"],
+                    &["messages"],
+                    &[("stream", serde_json::Value::Bool(true))],
+                )
+            },
+        )
+        .await;
+        let request = match &rewritten_body {
+            Some(body) => request.json(body)?,
+            None => request.json(&request_body)?,
+        };
 
         let response = Box::pin(request.send()).await?;
         let status = response.status();
@@ -548,95 +816,30 @@ impl Provider for AnthropicProvider {
                 .text()
                 .await
                 .unwrap_or_else(|e| format!("<failed to read body: {e}>"));
+            // Fast mode exists only on some models and accounts. When the API
+            // refuses it, run the turn at standard speed rather than failing
+            // it, and stop asking for the rest of this model's use.
+            if request_body.speed.is_some() && fast_mode_unsupported(status, &body) {
+                self.fast_mode_rejected
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                tracing::warn!(
+                    model = %self.model,
+                    "Anthropic rejected fast mode; continuing at standard speed: {body}"
+                );
+                return self.stream(context, options).await;
+            }
             return Err(Error::provider(
                 self.name(),
                 format!("Anthropic API error (HTTP {status}): {body}"),
             ));
         }
 
-        // Create SSE stream for streaming responses.
-        let event_source = SseStream::new(response.bytes_stream());
-
-        // Create stream state
-        let model = self.model.clone();
-        let api = self.api().to_string();
-        let provider = self.name().to_string();
-
-        let stream = stream::unfold(
-            StreamState::new(event_source, model, api, provider),
-            |mut state| async move {
-                if state.done {
-                    return None;
-                }
-                loop {
-                    match state.event_source.next().await {
-                        Some(Ok(msg)) => {
-                            state.transient_error_count = 0;
-                            if msg.event == "ping" {
-                                // Skip ping events
-                            } else {
-                                match state.process_event(&msg.data) {
-                                    Ok(Some(event)) => {
-                                        if matches!(
-                                            &event,
-                                            StreamEvent::Done { .. } | StreamEvent::Error { .. }
-                                        ) {
-                                            state.done = true;
-                                        }
-                                        return Some((Ok(event), state));
-                                    }
-                                    Ok(None) => {}
-                                    Err(e) => {
-                                        state.done = true;
-                                        return Some((Err(e), state));
-                                    }
-                                }
-                            }
-                        }
-                        Some(Err(e)) => {
-                            // WriteZero, WouldBlock, and TimedOut errors are transient (e.g. empty SSE
-                            // frames when TLS buffers are full). Skip them and
-                            // keep reading, but cap consecutive occurrences to
-                            // avoid infinite loops.
-                            const MAX_CONSECUTIVE_TRANSIENT_ERRORS: usize = 5;
-                            if e.kind() == std::io::ErrorKind::WriteZero
-                                || e.kind() == std::io::ErrorKind::WouldBlock
-                                || e.kind() == std::io::ErrorKind::TimedOut
-                            {
-                                state.transient_error_count += 1;
-                                if state.transient_error_count <= MAX_CONSECUTIVE_TRANSIENT_ERRORS {
-                                    tracing::warn!(
-                                        kind = ?e.kind(),
-                                        count = state.transient_error_count,
-                                        "Transient error in SSE stream, continuing"
-                                    );
-                                    continue;
-                                }
-                                tracing::warn!(
-                                    kind = ?e.kind(),
-                                    "Error persisted after {MAX_CONSECUTIVE_TRANSIENT_ERRORS} \
-                                     consecutive attempts, treating as fatal"
-                                );
-                            }
-                            state.done = true;
-                            let err = Error::api(format!("SSE error: {e}"));
-                            return Some((Err(err), state));
-                        }
-                        // Stream ended before message_stop (e.g.
-                        // network disconnect).  Emit Done so the
-                        // agent loop receives the partial message.
-                        None => {
-                            state.done = true;
-                            let reason = state.partial.stop_reason;
-                            let message = std::mem::take(&mut state.partial);
-                            return Some((Ok(StreamEvent::Done { reason, message }), state));
-                        }
-                    }
-                }
-            },
-        );
-
-        Ok(Box::pin(stream))
+        Ok(transport::response_stream(
+            response,
+            self.model.clone(),
+            self.api().to_string(),
+            self.name().to_string(),
+        ))
     }
 }
 
@@ -686,6 +889,7 @@ where
                 model,
                 usage: Usage::default(),
                 stop_reason: StopReason::Stop,
+                stop_details: None,
                 error_message: None,
                 timestamp: chrono::Utc::now().timestamp_millis(),
             },
@@ -715,7 +919,7 @@ where
                 Ok(self.handle_content_block_stop(index))
             }
             AnthropicStreamEvent::MessageDelta { delta, usage } => {
-                self.handle_message_delta(&delta, usage);
+                self.handle_message_delta(&delta, usage)?;
                 Ok(None)
             }
             AnthropicStreamEvent::MessageStop => {
@@ -784,12 +988,16 @@ where
                     },
                 );
                 self.partial.content.push(ContentBlock::ToolCall(ToolCall {
-                    id,
-                    name,
+                    id: id.clone(),
+                    name: name.clone(),
                     arguments: serde_json::Value::Null,
                     thought_signature: None,
                 }));
-                StreamEvent::ToolCallStart { content_index }
+                StreamEvent::ToolCallStart {
+                    content_index,
+                    id,
+                    name,
+                }
             }
             AnthropicContentBlock::RedactedThinking { data } => {
                 // Redacted thinking arrives in a single `content_block_start` —
@@ -857,10 +1065,10 @@ where
                 // The Anthropic API sends signature_delta for thinking blocks
                 // to deliver the thinking_signature required for multi-turn
                 // extended thinking conversations.
-                if let Some(sig) = signature {
-                    if let Some(ContentBlock::Thinking(t)) = self.partial.content.get_mut(idx) {
-                        t.thinking_signature = Some(sig);
-                    }
+                if let Some(sig) = signature
+                    && let Some(ContentBlock::Thinking(t)) = self.partial.content.get_mut(idx)
+                {
+                    t.thinking_signature = Some(sig);
                 }
                 None
             }
@@ -891,15 +1099,24 @@ where
             }
             Some(ContentBlock::ToolCall(tc)) => {
                 if let Some(accum) = self.tool_accums.remove(&index) {
-                    let arguments: serde_json::Value = match serde_json::from_str(&accum.json) {
-                        Ok(args) => args,
-                        Err(e) => {
-                            tracing::warn!(
-                                error = %e,
-                                raw = %accum.json,
-                                "Failed to parse tool arguments as JSON"
-                            );
-                            serde_json::Value::Null
+                    // Final tool arguments are execution authority. Validate
+                    // the original JSON before Value can erase duplicate keys.
+                    // Empty input remains a sentinel so the transport can
+                    // distinguish "no deltas" from an observed empty fragment.
+                    let arguments = if accum.json.trim().is_empty() {
+                        serde_json::Value::Null
+                    } else {
+                        match super::openai::parse_final_tool_arguments(&accum.json) {
+                            Ok(arguments) => arguments,
+                            Err(reason) => {
+                                // Arguments may contain credentials, commands,
+                                // or file contents; never echo them in logs.
+                                tracing::warn!(
+                                    reason,
+                                    "Rejected invalid or ambiguous tool arguments"
+                                );
+                                serde_json::Value::Null
+                            }
                         }
                     };
                     let tool_call = ToolCall {
@@ -931,21 +1148,33 @@ where
         &mut self,
         delta: &AnthropicMessageDelta,
         usage: Option<AnthropicDeltaUsage>,
-    ) {
-        if let Some(stop_reason) = delta.stop_reason {
+    ) -> Result<()> {
+        if let Some(stop_reason) = delta.stop_reason.as_deref() {
             self.partial.stop_reason = match stop_reason {
-                AnthropicStopReason::MaxTokens => StopReason::Length,
-                AnthropicStopReason::ToolUse => StopReason::ToolUse,
-                AnthropicStopReason::EndTurn | AnthropicStopReason::StopSequence => {
-                    StopReason::Stop
+                "end_turn" | "stop_sequence" => StopReason::Stop,
+                // Our normalized model has one truncation outcome; Anthropic's
+                // context-window stop is therefore intentionally represented as
+                // `Length`, alongside ordinary output-token exhaustion.
+                "max_tokens" | "model_context_window_exceeded" => StopReason::Length,
+                "tool_use" => StopReason::ToolUse,
+                "pause_turn" => StopReason::PauseTurn,
+                "refusal" => StopReason::Refusal,
+                unknown => {
+                    return Err(Error::provider(
+                        "anthropic",
+                        format!("unsupported Anthropic stop_reason `{unknown}`"),
+                    ));
                 }
             };
+            self.partial.stop_details.clone_from(&delta.stop_details);
         }
 
         if let Some(u) = usage {
             self.partial.usage.output = u.output_tokens;
             self.recompute_total_tokens();
         }
+
+        Ok(())
     }
 }
 
@@ -958,7 +1187,7 @@ pub struct AnthropicRequest<'a> {
     model: &'a str,
     messages: Vec<AnthropicMessage<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    system: Option<&'a str>,
+    system: Option<Vec<AnthropicSystemBlock<'a>>>,
     max_tokens: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
@@ -967,12 +1196,35 @@ pub struct AnthropicRequest<'a> {
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     thinking: Option<AnthropicThinking>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_config: Option<AnthropicOutputConfig>,
+    /// `"fast"` requests fast mode (`/fast`); sent with the fast-mode beta.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    speed: Option<&'static str>,
 }
 
+/// Thinking configuration. Two shapes share this struct:
+/// - Legacy fixed-budget extended thinking: `{"type":"enabled","budget_tokens":N}`.
+/// - Modern adaptive thinking: `{"type":"adaptive","display":"summarized"}`.
+///
+/// `budget_tokens` is rejected (400) on Opus 4.7/4.8/Fable/Mythos and deprecated
+/// on Opus 4.6 / Sonnet 4.6; adaptive thinking + `output_config.effort` is the
+/// modern path (gh #116).
 #[derive(Debug, Serialize)]
 struct AnthropicThinking {
     r#type: &'static str,
-    budget_tokens: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    budget_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    display: Option<&'static str>,
+}
+
+/// `output_config` carries the modern `effort` control for adaptive-thinking
+/// models (`low`/`medium`/`high`/`xhigh`/`max`). `high` is the API default.
+#[derive(Debug, Serialize)]
+struct AnthropicOutputConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    effort: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -985,7 +1237,11 @@ struct AnthropicMessage<'a> {
 #[serde(tag = "type", rename_all = "snake_case")]
 enum AnthropicContent<'a> {
     Text {
-        text: &'a str,
+        text: Cow<'a, str>,
+        /// Prompt-cache breakpoint for incremental conversation caching.
+        /// Set only on the final block of the last user-role message.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<AnthropicCacheControl>,
     },
     Thinking {
         thinking: &'a str,
@@ -993,6 +1249,8 @@ enum AnthropicContent<'a> {
     },
     Image {
         source: AnthropicImageSource<'a>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<AnthropicCacheControl>,
     },
     ToolUse {
         id: &'a str,
@@ -1004,6 +1262,8 @@ enum AnthropicContent<'a> {
         content: Vec<AnthropicToolResultContent<'a>>,
         #[serde(skip_serializing_if = "Option::is_none")]
         is_error: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<AnthropicCacheControl>,
     },
 }
 
@@ -1017,7 +1277,7 @@ struct AnthropicImageSource<'a> {
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum AnthropicToolResultContent<'a> {
-    Text { text: &'a str },
+    Text { text: Cow<'a, str> },
     Image { source: AnthropicImageSource<'a> },
 }
 
@@ -1025,7 +1285,31 @@ enum AnthropicToolResultContent<'a> {
 struct AnthropicTool<'a> {
     name: &'a str,
     description: &'a str,
-    input_schema: &'a serde_json::Value,
+    input_schema: Cow<'a, serde_json::Value>,
+    /// Prompt-cache breakpoint. Set on the LAST tool only: Anthropic caches
+    /// everything up to and including a marked block, so one marker covers
+    /// the whole tools array.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_control: Option<AnthropicCacheControl>,
+}
+
+/// Typed system-prompt block. The `system` field must be an array of blocks
+/// (rather than a bare string) for a block to carry `cache_control`.
+#[derive(Debug, Serialize)]
+struct AnthropicSystemBlock<'a> {
+    r#type: &'static str,
+    text: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_control: Option<AnthropicCacheControl>,
+}
+
+/// Prompt-cache breakpoint marker (`{"type":"ephemeral"}`, optionally with
+/// `"ttl":"1h"`). See [`anthropic_cache_control_for`].
+#[derive(Debug, Clone, Copy, Serialize)]
+struct AnthropicCacheControl {
+    r#type: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ttl: Option<&'static str>,
 }
 
 // ============================================================================
@@ -1139,20 +1423,12 @@ enum AnthropicDelta {
 
 /// Stop reason from `message_delta`.
 ///
-/// Using an enum avoids allocating a `String` for the stop reason.
-#[derive(Debug, Clone, Copy, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum AnthropicStopReason {
-    EndTurn,
-    MaxTokens,
-    ToolUse,
-    StopSequence,
-}
-
 #[derive(Debug, Deserialize)]
 struct AnthropicMessageDelta {
     #[serde(default)]
-    stop_reason: Option<AnthropicStopReason>,
+    stop_reason: Option<String>,
+    #[serde(default)]
+    stop_details: Option<StopDetails>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1173,7 +1449,8 @@ fn convert_message_to_anthropic(message: &Message) -> AnthropicMessage<'_> {
         Message::Custom(custom) => AnthropicMessage {
             role: "user",
             content: vec![AnthropicContent::Text {
-                text: &custom.content,
+                text: Cow::Borrowed(&custom.content),
+                cache_control: None,
             }],
         },
         Message::Assistant(assistant) => AnthropicMessage {
@@ -1192,9 +1469,9 @@ fn convert_message_to_anthropic(message: &Message) -> AnthropicMessage<'_> {
                     .content
                     .iter()
                     .filter_map(|block| match block {
-                        ContentBlock::Text(t) => {
-                            Some(AnthropicToolResultContent::Text { text: &t.text })
-                        }
+                        ContentBlock::Text(t) => Some(AnthropicToolResultContent::Text {
+                            text: Cow::Borrowed(&t.text),
+                        }),
                         ContentBlock::Image(img) => Some(AnthropicToolResultContent::Image {
                             source: AnthropicImageSource {
                                 r#type: "base64",
@@ -1202,10 +1479,16 @@ fn convert_message_to_anthropic(message: &Message) -> AnthropicMessage<'_> {
                                 data: &img.data,
                             },
                         }),
+                        // Messages API has no video/audio block; degrade to
+                        // the text placeholder (gh #212).
+                        ContentBlock::Media(media) => Some(AnthropicToolResultContent::Text {
+                            text: Cow::Owned(media.placeholder()),
+                        }),
                         _ => None,
                     })
                     .collect(),
                 is_error: if result.is_error { Some(true) } else { None },
+                cache_control: None,
             }],
         },
     }
@@ -1213,17 +1496,28 @@ fn convert_message_to_anthropic(message: &Message) -> AnthropicMessage<'_> {
 
 fn convert_user_content(content: &UserContent) -> Vec<AnthropicContent<'_>> {
     match content {
-        UserContent::Text(text) => vec![AnthropicContent::Text { text }],
+        UserContent::Text(text) => vec![AnthropicContent::Text {
+            text: Cow::Borrowed(text),
+            cache_control: None,
+        }],
         UserContent::Blocks(blocks) => blocks
             .iter()
             .filter_map(|block| match block {
-                ContentBlock::Text(t) => Some(AnthropicContent::Text { text: &t.text }),
+                ContentBlock::Text(t) => Some(AnthropicContent::Text {
+                    text: Cow::Borrowed(&t.text),
+                    cache_control: None,
+                }),
                 ContentBlock::Image(img) => Some(AnthropicContent::Image {
                     source: AnthropicImageSource {
                         r#type: "base64",
                         media_type: &img.mime_type,
                         data: &img.data,
                     },
+                    cache_control: None,
+                }),
+                ContentBlock::Media(media) => Some(AnthropicContent::Text {
+                    text: Cow::Owned(media.placeholder()),
+                    cache_control: None,
                 }),
                 _ => None,
             })
@@ -1233,7 +1527,10 @@ fn convert_user_content(content: &UserContent) -> Vec<AnthropicContent<'_>> {
 
 fn convert_content_block_to_anthropic(block: &ContentBlock) -> Option<AnthropicContent<'_>> {
     match block {
-        ContentBlock::Text(t) => Some(AnthropicContent::Text { text: &t.text }),
+        ContentBlock::Text(t) => Some(AnthropicContent::Text {
+            text: Cow::Borrowed(&t.text),
+            cache_control: None,
+        }),
         ContentBlock::ToolCall(tc) => Some(AnthropicContent::ToolUse {
             id: &tc.id,
             name: &tc.name,
@@ -1245,6 +1542,15 @@ fn convert_content_block_to_anthropic(block: &ContentBlock) -> Option<AnthropicC
         ContentBlock::Thinking(t) => {
             t.thinking_signature
                 .as_ref()
+                // Only echo a signature that is actually an Anthropic one.
+                // A session recorded on the openai-responses route stores its
+                // raw reasoning item (a JSON object) in `thinking_signature`;
+                // on a mid-session switch to an Anthropic model that JSON would
+                // be sent as an Anthropic `signature` and rejected with a 400.
+                // Anthropic signatures are opaque base64 tokens, so they never
+                // begin with `{` — foreign JSON payloads are dropped, matching
+                // the TS reference's cross-model signature stripping.
+                .filter(|sig| !is_foreign_reasoning_signature(sig))
                 .map(|sig| AnthropicContent::Thinking {
                     thinking: &t.thinking,
                     signature: sig,
@@ -1253,15 +1559,24 @@ fn convert_content_block_to_anthropic(block: &ContentBlock) -> Option<AnthropicC
         // Images and redacted-thinking markers don't round-trip back to the
         // Anthropic input surface — Anthropic discards redacted-thinking on
         // subsequent turns, so we do the same.
-        ContentBlock::Image(_) | ContentBlock::RedactedThinking(_) => None,
+        ContentBlock::Image(_) | ContentBlock::Media(_) | ContentBlock::RedactedThinking(_) => None,
     }
+}
+
+/// True when a `thinking_signature` is a foreign (non-Anthropic) reasoning
+/// payload rather than a native Anthropic base64 signature. The openai-responses
+/// route stores its raw reasoning item — a JSON object — in this field; a native
+/// Anthropic signature is opaque base64 and can never begin with `{`.
+fn is_foreign_reasoning_signature(signature: &str) -> bool {
+    signature.trim_start().starts_with('{')
 }
 
 fn convert_tool_to_anthropic(tool: &ToolDef) -> AnthropicTool<'_> {
     AnthropicTool {
         name: &tool.name,
         description: &tool.description,
-        input_schema: &tool.parameters,
+        input_schema: super::tool_schema::anthropic_tool_schema(&tool.parameters),
+        cache_control: None,
     }
 }
 
@@ -1279,10 +1594,41 @@ mod tests {
     use serde_json::json;
     use std::collections::HashMap;
     use std::io::{Read, Write};
-    use std::net::TcpListener;
+    use std::net::{TcpListener, TcpStream};
     use std::path::PathBuf;
     use std::sync::mpsc;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn thinking_block_drops_foreign_reasoning_signature() {
+        // A native Anthropic signature (opaque base64) is echoed back.
+        let native = ContentBlock::Thinking(ThinkingContent {
+            thinking: "step".to_string(),
+            thinking_signature: Some("Cg8KDXNvbWViYXNlNjQ=".to_string()),
+        });
+        match convert_content_block_to_anthropic(&native) {
+            Some(AnthropicContent::Thinking { signature, .. }) => {
+                assert_eq!(signature, "Cg8KDXNvbWViYXNlNjQ=");
+            }
+            other => panic!("expected thinking block with signature, got {other:?}"),
+        }
+
+        // A foreign openai-responses raw reasoning item (JSON) is dropped so it
+        // is never sent to Anthropic as a signature (would 400).
+        let foreign = ContentBlock::Thinking(ThinkingContent {
+            thinking: "step".to_string(),
+            thinking_signature: Some(
+                r#"{"type":"reasoning","id":"rs_1","encrypted_content":"x"}"#.to_string(),
+            ),
+        });
+        assert!(
+            convert_content_block_to_anthropic(&foreign).is_none(),
+            "foreign JSON reasoning signature must be dropped, not echoed to Anthropic"
+        );
+
+        assert!(is_foreign_reasoning_signature("  {\"type\":\"reasoning\"}"));
+        assert!(!is_foreign_reasoning_signature("Cg8KDXNvbWViYXNlNjQ="));
+    }
 
     #[test]
     fn home_dir_lookup_falls_back_to_userprofile() {
@@ -1303,6 +1649,63 @@ mod tests {
         });
 
         assert_eq!(home, Some(PathBuf::from("D:\\Users\\Grace")));
+    }
+
+    /// A `HOMEPATH` with no leading separator must still root against the
+    /// drive; joining it with `PathBuf::push` would leave the drive-relative
+    /// `D:Users\Grace`, which resolves against the current directory on D:.
+    #[test]
+    fn home_dir_lookup_roots_homepath_without_leading_separator() {
+        let home = home_dir_with_env_lookup(|key| match key {
+            "HOMEDRIVE" => Some("D:".to_string()),
+            "HOMEPATH" => Some("Users\\Grace".to_string()),
+            _ => None,
+        })
+        .expect("HOMEDRIVE/HOMEPATH home");
+
+        assert_eq!(home, PathBuf::from("D:/Users\\Grace"));
+        #[cfg(windows)]
+        assert!(home.has_root(), "home must be rooted on the drive");
+    }
+
+    /// gh #212: the Messages API has text/image/document blocks only, so a
+    /// media block degrades to a text placeholder in user content and tool
+    /// results and the payload never reaches the wire.
+    #[test]
+    fn test_convert_media_block_degrades_to_placeholder() {
+        let media = crate::model::MediaContent {
+            data: "AAAA".to_string(),
+            mime_type: "audio/wav".to_string(),
+            name: Some("voice.wav".to_string()),
+        };
+        let content = UserContent::Blocks(vec![
+            ContentBlock::Text(TextContent::new("listen")),
+            ContentBlock::Media(media.clone()),
+        ]);
+        let wire = serde_json::to_value(convert_user_content(&content)).expect("serialize");
+        assert_eq!(
+            wire,
+            json!([
+                { "type": "text", "text": "listen" },
+                { "type": "text", "text": "[media omitted: voice.wav, audio/wav, 3 B]" },
+            ])
+        );
+
+        let result = Message::tool_result(crate::model::ToolResultMessage {
+            tool_call_id: "call_media".to_string(),
+            tool_name: "read_media".to_string(),
+            content: vec![ContentBlock::Media(media)],
+            details: None,
+            is_error: false,
+            timestamp: 0,
+        });
+        let wire = serde_json::to_value(convert_message_to_anthropic(&result)).expect("serialize");
+        assert_eq!(wire["content"][0]["type"], "tool_result");
+        assert_eq!(
+            wire["content"][0]["content"],
+            json!([{ "type": "text", "text": "[media omitted: voice.wav, audio/wav, 3 B]" }])
+        );
+        assert!(!wire.to_string().contains("AAAA"));
     }
 
     #[test]
@@ -1358,26 +1761,35 @@ mod tests {
                 medium: 9000,
                 high: 16384,
                 xhigh: 32768,
+                max: 65536,
             }),
             ..Default::default()
         };
 
         let request = provider.build_request(&context, &options);
         assert_eq!(request.model, "claude-test");
-        assert_eq!(request.system, Some("System prompt"));
+        let system = request.system.as_ref().expect("system blocks");
+        assert_eq!(system.len(), 1);
+        assert_eq!(system[0].r#type, "text");
+        assert_eq!(system[0].text, "System prompt");
+        // Default retention is None: no cache breakpoint on the system block.
+        assert!(system[0].cache_control.is_none());
         assert_eq!(request.temperature, Some(1.0)); // thinking forces temperature to 1.0
         assert!(request.stream);
         assert_eq!(request.max_tokens, 13_096);
 
         let thinking = request.thinking.expect("thinking config");
         assert_eq!(thinking.r#type, "enabled");
-        assert_eq!(thinking.budget_tokens, 9000);
+        assert_eq!(thinking.budget_tokens, Some(9000));
+        assert!(thinking.display.is_none());
+        // Legacy (non-adaptive) model: no modern effort knob.
+        assert!(request.output_config.is_none());
 
         assert_eq!(request.messages.len(), 1);
         assert_eq!(request.messages[0].role, "user");
         assert_eq!(request.messages[0].content.len(), 1);
         match &request.messages[0].content[0] {
-            AnthropicContent::Text { text } => assert_eq!(*text, "Ping"),
+            AnthropicContent::Text { text, .. } => assert_eq!(text.as_ref(), "Ping"),
             other => panic!(),
         }
 
@@ -1398,6 +1810,59 @@ mod tests {
     }
 
     #[test]
+    fn build_request_projects_root_tool_variants_without_changing_the_tool_contract() {
+        let parameters = json!({
+            "oneOf": [
+                {
+                    "type":"object",
+                    "properties":{"action":{"const":"read"},"path":{"type":"string"}},
+                    "required":["action","path"],
+                    "additionalProperties":false
+                },
+                {
+                    "type":"object",
+                    "properties":{"action":{"const":"list"},"recursive":{"type":"boolean"}},
+                    "required":["action"],
+                    "additionalProperties":false
+                }
+            ]
+        });
+        let context = Context::owned(
+            None,
+            vec![],
+            vec![ToolDef {
+                name: "workspace".to_string(),
+                description: "Read or list the workspace.".to_string(),
+                parameters: parameters.clone(),
+            }],
+        );
+        let options = StreamOptions {
+            cache_retention: CacheRetention::Short,
+            ..Default::default()
+        };
+        let provider = AnthropicProvider::new("claude-test");
+        let request = provider.build_request(&context, &options);
+        let body = serde_json::to_value(&request).expect("serialize request");
+        let schema = &body["tools"][0]["input_schema"];
+        assert_eq!(schema["type"], "object");
+        assert!(schema.get("oneOf").is_none());
+        assert_eq!(schema["required"], json!(["action"]));
+        assert_eq!(schema["properties"]["path"]["type"], "string");
+        assert_eq!(schema["properties"]["recursive"]["type"], "boolean");
+        assert_eq!(
+            body["tools"][0]["cache_control"],
+            json!({"type":"ephemeral"})
+        );
+        assert_eq!(context.tools[0].parameters, parameters);
+        let validator = jsonschema::options()
+            .with_draft(jsonschema::Draft::Draft202012)
+            .build(&context.tools[0].parameters)
+            .expect("original tool contract");
+        assert!(validator.is_valid(&json!({"action":"read","path":"src/lib.rs"})));
+        assert!(!validator.is_valid(&json!({"action":"read","recursive":true})));
+    }
+
+    #[test]
     fn test_build_request_omits_optional_fields_by_default() {
         let provider = AnthropicProvider::new("claude-test");
         let context = Context::default();
@@ -1405,11 +1870,427 @@ mod tests {
 
         let request = provider.build_request(&context, &options);
         assert_eq!(request.model, "claude-test");
-        assert_eq!(request.system, None);
+        assert!(request.system.is_none());
         assert!(request.tools.is_none());
         assert!(request.thinking.is_none());
+        assert!(request.output_config.is_none());
         assert_eq!(request.max_tokens, DEFAULT_MAX_TOKENS);
         assert!(request.stream);
+    }
+
+    fn cache_test_tool(name: &str) -> ToolDef {
+        ToolDef {
+            name: name.to_string(),
+            description: format!("{name} tool"),
+            parameters: json!({ "type": "object" }),
+        }
+    }
+
+    fn cache_test_context() -> Context<'static> {
+        Context {
+            system_prompt: Some("System prompt".to_string().into()),
+            messages: vec![Message::User(crate::model::UserMessage {
+                content: UserContent::Text("Ping".to_string()),
+                timestamp: 0,
+            })]
+            .into(),
+            tools: vec![cache_test_tool("alpha"), cache_test_tool("beta")].into(),
+        }
+    }
+
+    /// Short retention: one `{"type":"ephemeral"}` breakpoint on the system
+    /// block, one on the LAST tool only, and one on the last user message's
+    /// final content block (incremental conversation caching — pi-mono
+    /// parity), and all survive serde serialization to the wire body.
+    #[test]
+    fn test_build_request_short_retention_marks_system_and_last_tool_only() {
+        let provider = AnthropicProvider::new("claude-test");
+        let context = cache_test_context();
+        let options = StreamOptions {
+            cache_retention: CacheRetention::Short,
+            ..Default::default()
+        };
+
+        let request = provider.build_request(&context, &options);
+        let system = request.system.as_ref().expect("system blocks");
+        assert_eq!(system.len(), 1);
+        let system_cc = system[0].cache_control.as_ref().expect("system marker");
+        assert_eq!(system_cc.r#type, "ephemeral");
+        assert!(system_cc.ttl.is_none(), "Short retention must not set ttl");
+        let tools = request.tools.as_ref().expect("tools");
+        assert_eq!(tools.len(), 2);
+        assert!(
+            tools[0].cache_control.is_none(),
+            "only the last tool carries the marker"
+        );
+        assert!(tools[1].cache_control.is_some());
+
+        let body = serde_json::to_value(&request).expect("serialize request");
+        assert_eq!(
+            body["system"][0]["cache_control"],
+            json!({ "type": "ephemeral" })
+        );
+        assert_eq!(
+            body["tools"][1]["cache_control"],
+            json!({ "type": "ephemeral" })
+        );
+        assert!(
+            body["tools"][0].get("cache_control").is_none(),
+            "non-final tools must not carry cache_control"
+        );
+        assert_eq!(
+            body["messages"][0]["content"][0]["cache_control"],
+            json!({ "type": "ephemeral" }),
+            "last user message's final block carries the history breakpoint"
+        );
+        let wire = body.to_string();
+        assert_eq!(
+            wire.matches("cache_control").count(),
+            3,
+            "exactly three breakpoints: system + last tool + last user block"
+        );
+    }
+
+    /// The conversation-history breakpoint goes only on user-role trailing
+    /// messages; a trailing assistant message must stay unmarked (pi-mono
+    /// guards on `lastMessage.role === "user"`).
+    #[test]
+    fn test_build_request_short_retention_skips_marker_on_trailing_assistant() {
+        let provider = AnthropicProvider::new("claude-test");
+        let mut context = cache_test_context();
+        let mut messages = context.messages.to_vec();
+        messages.push(Message::Assistant(
+            AssistantMessage {
+                content: vec![ContentBlock::Text(TextContent {
+                    text: "Pong".to_string(),
+                    text_signature: None,
+                })],
+                ..Default::default()
+            }
+            .into(),
+        ));
+        context.messages = messages.into();
+        let options = StreamOptions {
+            cache_retention: CacheRetention::Short,
+            ..Default::default()
+        };
+
+        let body = serde_json::to_value(provider.build_request(&context, &options))
+            .expect("serialize request");
+        assert!(
+            body["messages"][1]["content"][0]
+                .get("cache_control")
+                .is_none(),
+            "trailing assistant content must not carry a cache breakpoint"
+        );
+        // System + last tool markers still present.
+        assert_eq!(body.to_string().matches("cache_control").count(), 2);
+    }
+
+    /// An empty system prompt must be omitted entirely: the API rejects
+    /// `{"type":"text","text":""}` blocks (min length 1), and pi-mono's
+    /// falsy check skips it the same way.
+    #[test]
+    fn test_build_request_empty_system_prompt_is_omitted() {
+        let provider = AnthropicProvider::new("claude-test");
+        let mut context = cache_test_context();
+        context.system_prompt = Some(String::new().into());
+        let options = StreamOptions {
+            cache_retention: CacheRetention::Short,
+            ..Default::default()
+        };
+
+        let request = provider.build_request(&context, &options);
+        assert!(
+            request.system.is_none(),
+            "Some(\"\") must serialize as no system field, not an empty block"
+        );
+        let body = serde_json::to_value(&request).expect("serialize request");
+        assert!(body.get("system").is_none());
+    }
+
+    /// None retention (the default) must emit zero `cache_control` markers —
+    /// cache writes bill at 1.25x, so caching is strictly opt-in.
+    #[test]
+    fn test_build_request_none_retention_emits_no_cache_control() {
+        let provider = AnthropicProvider::new("claude-test");
+        let context = cache_test_context();
+        let options = StreamOptions::default();
+
+        let body = serde_json::to_value(provider.build_request(&context, &options))
+            .expect("serialize request");
+        assert!(
+            !body.to_string().contains("cache_control"),
+            "CacheRetention::None must not emit any cache_control marker"
+        );
+    }
+
+    /// Long retention against the first-party API gets `ttl: "1h"` (which the
+    /// header assembly pairs with the extended-cache-ttl beta flag).
+    #[test]
+    fn test_build_request_long_retention_first_party_uses_1h_ttl() {
+        // Default base_url is the first-party endpoint.
+        let provider = AnthropicProvider::new("claude-test");
+        let context = cache_test_context();
+        let options = StreamOptions {
+            cache_retention: CacheRetention::Long,
+            ..Default::default()
+        };
+
+        let request = provider.build_request(&context, &options);
+        let system = request.system.as_ref().expect("system blocks");
+        let system_cc = system[0].cache_control.as_ref().expect("system marker");
+        assert_eq!(system_cc.ttl, Some("1h"));
+
+        let body = serde_json::to_value(&request).expect("serialize request");
+        assert_eq!(
+            body["system"][0]["cache_control"],
+            json!({ "type": "ephemeral", "ttl": "1h" })
+        );
+        assert_eq!(
+            body["tools"][1]["cache_control"],
+            json!({ "type": "ephemeral", "ttl": "1h" })
+        );
+    }
+
+    /// Long retention through a relay (non-first-party base_url) degrades to
+    /// the default 5m TTL: markers are emitted, but no `ttl` field.
+    #[test]
+    fn test_build_request_long_retention_relay_degrades_to_default_ttl() {
+        let provider = AnthropicProvider::new("claude-test")
+            .with_base_url("https://relay.example.com/v1/messages");
+        let context = cache_test_context();
+        let options = StreamOptions {
+            cache_retention: CacheRetention::Long,
+            ..Default::default()
+        };
+
+        let request = provider.build_request(&context, &options);
+        let system = request.system.as_ref().expect("system blocks");
+        let system_cc = system[0].cache_control.as_ref().expect("system marker");
+        assert!(system_cc.ttl.is_none(), "relays must not receive ttl");
+        assert!(
+            !serde_json::to_value(&request)
+                .expect("serialize request")
+                .to_string()
+                .contains("ttl"),
+            "no ttl anywhere in the relay body"
+        );
+    }
+
+    /// The ttl decision (and therefore the extended-TTL beta flag, which is
+    /// derived from `ttl.is_some()` in `stream()`) hinges on the base URL.
+    #[test]
+    fn test_anthropic_cache_control_for_matrix() {
+        for base_url in [
+            "https://api.anthropic.com/v1/messages",
+            "https://api.anthropic.com",
+            "https://relay.example.com/v1/messages",
+        ] {
+            assert!(
+                anthropic_cache_control_for(CacheRetention::None, base_url).is_none(),
+                "None emits no marker for {base_url}"
+            );
+            let short =
+                anthropic_cache_control_for(CacheRetention::Short, base_url).expect("short marker");
+            assert!(short.ttl.is_none(), "Short never sets ttl for {base_url}");
+        }
+        let long_first_party = anthropic_cache_control_for(
+            CacheRetention::Long,
+            "https://api.anthropic.com/v1/messages",
+        )
+        .expect("long marker");
+        assert_eq!(long_first_party.ttl, Some("1h"));
+        let long_relay = anthropic_cache_control_for(
+            CacheRetention::Long,
+            "https://relay.example.com/v1/messages",
+        )
+        .expect("long marker");
+        assert!(long_relay.ttl.is_none());
+        // Prefix-alike hosts are NOT first-party.
+        assert!(!is_first_party_anthropic_base_url(
+            "https://api.anthropic.com.evil.example/v1/messages"
+        ));
+        assert!(!is_first_party_anthropic_base_url(
+            "http://api.anthropic.com/v1/messages"
+        ));
+    }
+
+    /// gh #116: an adaptive-thinking Anthropic model must emit the modern
+    /// `thinking: {type:"adaptive", display:"summarized"}` + `output_config.effort`
+    /// wire shape at every thinking level — never the deprecated `budget_tokens`
+    /// — and must omit `temperature` (sampling params are rejected on these
+    /// models). This asserts the exact serialized JSON (the proof).
+    #[test]
+    fn test_build_request_adaptive_thinking_effort_wire_format() {
+        let provider = AnthropicProvider::new("claude-opus-4-8");
+
+        let cases = [
+            (ThinkingLevel::Minimal, "low"),
+            (ThinkingLevel::Low, "low"),
+            (ThinkingLevel::Medium, "medium"),
+            (ThinkingLevel::High, "high"),
+            (ThinkingLevel::XHigh, "xhigh"),
+        ];
+        for (level, effort) in cases {
+            let options = StreamOptions {
+                max_tokens: Some(16_000),
+                temperature: Some(0.7),
+                thinking_level: Some(level),
+                ..Default::default()
+            };
+            let body = serde_json::to_value(provider.build_request(&Context::default(), &options))
+                .expect("serialize request");
+            assert_eq!(
+                body["thinking"],
+                json!({ "type": "adaptive", "display": "summarized" }),
+                "level {level:?}: adaptive thinking wire shape"
+            );
+            assert_eq!(
+                body["output_config"],
+                json!({ "effort": effort }),
+                "level {level:?}: output_config.effort"
+            );
+            assert!(
+                body["thinking"].get("budget_tokens").is_none(),
+                "level {level:?}: adaptive must not emit deprecated budget_tokens"
+            );
+            assert!(
+                body.get("temperature").is_none(),
+                "level {level:?}: adaptive models reject temperature"
+            );
+        }
+
+        // `off`: no thinking, no effort, still no temperature on adaptive models.
+        let options = StreamOptions {
+            thinking_level: Some(ThinkingLevel::Off),
+            temperature: Some(0.7),
+            ..Default::default()
+        };
+        let body = serde_json::to_value(provider.build_request(&Context::default(), &options))
+            .expect("serialize request");
+        assert!(body.get("thinking").is_none(), "off: no thinking");
+        assert!(body.get("output_config").is_none(), "off: no output_config");
+        assert!(body.get("temperature").is_none(), "off: no temperature");
+    }
+
+    /// Pre-adaptive Anthropic(-compatible) models keep the legacy fixed-budget
+    /// extended-thinking path (`thinking: {type:"enabled", budget_tokens}`) with
+    /// `temperature = 1.0` and no `output_config`. MiniMax (Anthropic-compatible,
+    /// non-Claude id) must also stay on the budget path.
+    #[test]
+    fn test_build_request_legacy_model_keeps_budget_tokens() {
+        for model in [
+            "claude-opus-4-5",
+            "claude-3-5-sonnet-20241022",
+            "claude-sonnet-4-5",
+            "MiniMax-M3",
+        ] {
+            let provider = AnthropicProvider::new(model);
+            let options = StreamOptions {
+                max_tokens: Some(16_000),
+                thinking_level: Some(ThinkingLevel::High),
+                ..Default::default()
+            };
+            let context = Context::default();
+            let request = provider.build_request(&context, &options);
+            let thinking = request.thinking.as_ref().expect("thinking config");
+            assert_eq!(thinking.r#type, "enabled", "{model}: legacy budget path");
+            assert!(
+                thinking.budget_tokens.is_some(),
+                "{model}: budget_tokens set"
+            );
+            assert!(thinking.display.is_none(), "{model}: no display field");
+            assert!(request.output_config.is_none(), "{model}: no output_config");
+            assert_eq!(request.temperature, Some(1.0), "{model}: temperature 1.0");
+        }
+    }
+
+    /// gh #117: catalog metadata is authoritative. `forceAdaptiveThinking`
+    /// overrides the built-in model-id heuristic in both directions.
+    #[test]
+    fn test_build_request_force_adaptive_thinking_overrides_heuristic() {
+        // true: an id the heuristic does NOT recognize still goes adaptive.
+        let compat = CompatConfig {
+            force_adaptive_thinking: Some(true),
+            ..CompatConfig::default()
+        };
+        let provider = AnthropicProvider::new("some-new-anthropic-model").with_compat(Some(compat));
+        let options = StreamOptions {
+            thinking_level: Some(ThinkingLevel::High),
+            ..Default::default()
+        };
+        let context = Context::default();
+        let request = provider.build_request(&context, &options);
+        let thinking = request.thinking.as_ref().expect("thinking config");
+        assert_eq!(thinking.r#type, "adaptive");
+        assert_eq!(thinking.display, Some("summarized"));
+        assert!(thinking.budget_tokens.is_none());
+        assert_eq!(
+            request
+                .output_config
+                .as_ref()
+                .and_then(|c| c.effort.as_deref()),
+            Some("high")
+        );
+        assert!(request.temperature.is_none());
+
+        // false: an id the heuristic WOULD treat as adaptive is forced legacy.
+        let compat = CompatConfig {
+            force_adaptive_thinking: Some(false),
+            ..CompatConfig::default()
+        };
+        let provider = AnthropicProvider::new("claude-opus-4-8").with_compat(Some(compat));
+        let context = Context::default();
+        let request = provider.build_request(&context, &options);
+        assert_eq!(
+            request.thinking.as_ref().expect("thinking config").r#type,
+            "enabled"
+        );
+        assert!(request.output_config.is_none());
+    }
+
+    /// gh #117: a per-model `thinkingLevelMap` remaps the effort value
+    /// (e.g. `xhigh -> max`), overriding the transport's default mapping.
+    #[test]
+    fn test_build_request_thinking_level_map_overrides_effort() {
+        let mut map = HashMap::new();
+        map.insert("xhigh".to_string(), Some("max".to_string()));
+        let compat = CompatConfig {
+            thinking_level_map: Some(map),
+            ..CompatConfig::default()
+        };
+        let provider = AnthropicProvider::new("claude-opus-4-8").with_compat(Some(compat));
+        let options = StreamOptions {
+            thinking_level: Some(ThinkingLevel::XHigh),
+            ..Default::default()
+        };
+        let context = Context::default();
+        let request = provider.build_request(&context, &options);
+        assert_eq!(
+            request
+                .output_config
+                .as_ref()
+                .and_then(|c| c.effort.as_deref()),
+            Some("max"),
+            "thinkingLevelMap xhigh->max must win over the default xhigh"
+        );
+    }
+
+    #[test]
+    fn nullable_effort_map_suppresses_explicitly_unsupported_tier() {
+        let compat = CompatConfig {
+            thinking_level_map: Some(HashMap::from([("xhigh".to_string(), None)])),
+            ..CompatConfig::default()
+        };
+        assert_eq!(
+            anthropic_effort_for_level(ThinkingLevel::XHigh, Some(&compat)),
+            None
+        );
+        assert_eq!(
+            anthropic_effort_for_level(ThinkingLevel::High, Some(&compat)),
+            Some("high".to_string())
+        );
     }
 
     #[test]
@@ -1602,6 +2483,102 @@ mod tests {
     }
 
     #[test]
+    fn all_stable_anthropic_stop_reasons_are_handled() {
+        let cases = [
+            ("end_turn", StopReason::Stop),
+            ("max_tokens", StopReason::Length),
+            ("stop_sequence", StopReason::Stop),
+            ("tool_use", StopReason::ToolUse),
+            ("pause_turn", StopReason::PauseTurn),
+            ("refusal", StopReason::Refusal),
+            ("model_context_window_exceeded", StopReason::Length),
+        ];
+
+        for (wire_reason, expected_reason) in cases {
+            let mut delta = json!({ "stop_reason": wire_reason });
+            if wire_reason == "refusal" {
+                delta["stop_details"] = json!({
+                    "type": "refusal",
+                    "category": "cyber",
+                    "explanation": "The request could enable cyber harm."
+                });
+            }
+            let events = vec![
+                json!({
+                    "type": "message_start",
+                    "message": { "usage": { "input_tokens": 5 } }
+                }),
+                json!({
+                    "type": "message_delta",
+                    "delta": delta,
+                    "usage": { "output_tokens": 7 }
+                }),
+                json!({ "type": "message_stop" }),
+            ];
+
+            let out = collect_events(&events);
+            assert_eq!(out.len(), 2, "{wire_reason}");
+            let StreamEvent::Done { reason, message } = &out[1] else {
+                panic!("expected terminal Done event for {wire_reason}");
+            };
+            assert_eq!(*reason, expected_reason, "{wire_reason}");
+            assert_eq!(message.stop_reason, expected_reason, "{wire_reason}");
+            assert_eq!(message.usage.total_tokens, 12, "{wire_reason}");
+
+            if wire_reason == "refusal" {
+                assert_eq!(
+                    message.stop_details.as_ref().map(|details| (
+                        details.kind.as_str(),
+                        details.category.as_deref(),
+                        details.explanation.as_deref(),
+                    )),
+                    Some((
+                        "refusal",
+                        Some("cyber"),
+                        Some("The request could enable cyber harm."),
+                    )),
+                );
+            } else {
+                assert!(message.stop_details.is_none(), "{wire_reason}");
+            }
+        }
+    }
+
+    #[test]
+    fn unknown_anthropic_stop_reason_is_an_explicit_protocol_error() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async {
+            let byte_stream = stream::iter(vec![Ok::<_, std::io::Error>(
+                b"data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"future_reason\"}}\n\n"
+                    .to_vec(),
+            )]);
+            let mut state = StreamState::new(
+                crate::sse::SseStream::new(Box::pin(byte_stream)),
+                "claude-test".to_string(),
+                "anthropic-messages".to_string(),
+                "anthropic".to_string(),
+            );
+            let event = state
+                .event_source
+                .next()
+                .await
+                .expect("event")
+                .expect("SSE event");
+            let error = state
+                .process_event(&event.data)
+                .expect_err("unknown stop reason must fail the protocol");
+            assert!(
+                error
+                    .to_string()
+                    .contains("unsupported Anthropic stop_reason `future_reason`"),
+                "unexpected error: {error}"
+            );
+        });
+    }
+
+    #[test]
     fn test_usage_total_tokens_saturates_on_large_values() {
         let events = vec![
             json!({
@@ -1697,6 +2674,40 @@ mod tests {
             .filter(|item| matches!(item, Ok(StreamEvent::Done { .. })))
             .count();
         assert_eq!(done_count, 1, "expected exactly one terminal Done event");
+    }
+
+    #[test]
+    fn test_stream_rejects_transport_eof_before_message_stop() {
+        let body = [
+            r#"data: {"type":"message_start","message":{"usage":{"input_tokens":1}}}"#,
+            "",
+            r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+            "",
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partial"}}"#,
+            "",
+        ]
+        .join("\n");
+
+        let out = collect_stream_items_from_body(&body);
+        assert!(
+            out.iter()
+                .any(|item| matches!(item, Ok(StreamEvent::TextDelta { delta, .. }) if delta == "partial")),
+            "partial content should be emitted before the terminal error"
+        );
+        assert!(
+            !out.iter()
+                .any(|item| matches!(item, Ok(StreamEvent::Done { .. }))),
+            "premature EOF must never be reported as Done"
+        );
+        let error = out
+            .last()
+            .expect("terminal stream item")
+            .as_ref()
+            .expect_err("premature EOF must be a stream error")
+            .to_string();
+        assert!(error.contains("message_stop"), "{error}");
+        assert!(error.contains("unexpected EOF"), "{error}");
+        assert!(crate::error::is_retryable_error(&error, None, None));
     }
 
     #[test]
@@ -1859,6 +2870,24 @@ mod tests {
             captured.headers.get("anthropic-beta").map(String::as_str),
             Some("prompt-caching-2024-07-31")
         );
+        // Short retention: breakpoint marker present, no ttl anywhere.
+        assert!(captured.body.contains("\"cache_control\""));
+        assert!(!captured.body.contains("\"ttl\""));
+    }
+
+    /// Long retention through a relay base URL (the test server is not
+    /// api.anthropic.com): the caching beta is sent, but the extended-TTL
+    /// beta flag and the `ttl` field are both withheld together.
+    #[test]
+    fn test_stream_long_retention_via_relay_omits_extended_ttl_flag() {
+        let captured = run_stream_and_capture_headers(CacheRetention::Long)
+            .expect("captured request for long retention via relay");
+        assert_eq!(
+            captured.headers.get("anthropic-beta").map(String::as_str),
+            Some("prompt-caching-2024-07-31")
+        );
+        assert!(captured.body.contains("\"cache_control\""));
+        assert!(!captured.body.contains("\"ttl\""));
     }
 
     #[test]
@@ -2025,6 +3054,120 @@ mod tests {
         assert_eq!(provider.name(), "kimi-for-coding");
     }
 
+    fn fast_stream_setup(base_url: String) -> (AnthropicProvider, Context<'static>, StreamOptions) {
+        let provider = AnthropicProvider::new("claude-test").with_base_url(base_url);
+        let context = Context {
+            system_prompt: None,
+            messages: vec![Message::User(crate::model::UserMessage {
+                content: UserContent::Text("ping".to_string()),
+                timestamp: 0,
+            })]
+            .into(),
+            tools: Vec::new().into(),
+        };
+        let options = StreamOptions {
+            api_key: Some("sk-ant-test-key".to_string()),
+            service_tier: Some("priority".to_string()),
+            ..Default::default()
+        };
+        (provider, context, options)
+    }
+
+    fn drain_stream(provider: &AnthropicProvider, context: &Context<'_>, options: &StreamOptions) {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async {
+            let mut stream = provider.stream(context, options).await.expect("stream");
+            while let Some(event) = stream.next().await {
+                if matches!(event.expect("stream event"), StreamEvent::Done { .. }) {
+                    break;
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn fast_mode_sends_speed_and_beta_to_first_party_anthropic_only() {
+        let (base_url, rx) = spawn_test_server(200, "text/event-stream", &success_sse_body());
+        let (provider, context, options) = fast_stream_setup(base_url);
+        drain_stream(&provider, &context, &options);
+        let captured = rx.recv_timeout(Duration::from_secs(2)).expect("request");
+        let body: Value = serde_json::from_str(&captured.body).expect("request json");
+        assert_eq!(body["speed"], "fast");
+        let betas = captured.headers.get("anthropic-beta").expect("beta header");
+        assert!(
+            betas
+                .split(',')
+                .any(|flag| flag == ANTHROPIC_FAST_MODE_BETA_FLAG),
+            "{betas}"
+        );
+
+        // Anthropic-compatible relays and a request without the tier get
+        // neither the field nor (via speed) the beta.
+        let relay = AnthropicProvider::new("m").with_provider_name("minimax");
+        let request = serde_json::to_value(relay.build_request(&context, &options)).unwrap();
+        assert!(request.get("speed").is_none());
+        let plain = StreamOptions {
+            service_tier: None,
+            ..options
+        };
+        let request = serde_json::to_value(provider.build_request(&context, &plain)).unwrap();
+        assert!(request.get("speed").is_none());
+    }
+
+    #[test]
+    fn rejected_fast_mode_retries_at_standard_speed_and_stops_asking() {
+        let rejection = r#"{"type":"error","error":{"type":"invalid_request_error","message":"speed: fast mode is not supported for this model"}}"#;
+        let ok = success_sse_body();
+        let (base_url, rx) = spawn_test_server_sequence(vec![
+            (400, "application/json", rejection),
+            (200, "text/event-stream", &ok),
+            (200, "text/event-stream", &ok),
+        ]);
+        let (provider, context, options) = fast_stream_setup(base_url);
+
+        // The turn succeeds: the rejected request is retried without speed.
+        drain_stream(&provider, &context, &options);
+        let first = rx.recv_timeout(Duration::from_secs(2)).expect("first");
+        let retry = rx.recv_timeout(Duration::from_secs(2)).expect("retry");
+        assert!(first.body.contains(r#""speed":"fast""#), "{}", first.body);
+        assert!(!retry.body.contains("speed"), "{}", retry.body);
+        assert!(
+            !retry
+                .headers
+                .get("anthropic-beta")
+                .is_some_and(|betas| betas.contains(ANTHROPIC_FAST_MODE_BETA_FLAG))
+        );
+
+        // The next turn doesn't ask again.
+        drain_stream(&provider, &context, &options);
+        let next = rx.recv_timeout(Duration::from_secs(2)).expect("next");
+        assert!(!next.body.contains("speed"), "{}", next.body);
+    }
+
+    #[test]
+    fn fast_mode_rejection_is_recognized_narrowly() {
+        assert!(fast_mode_unsupported(
+            400,
+            r#"{"error":{"type":"invalid_request_error","message":"`speed` is not supported on this model"}}"#
+        ));
+        assert!(fast_mode_unsupported(
+            429,
+            r#"{"error":{"type":"rate_limit_error","message":"Fast mode requires extra usage"}}"#
+        ));
+        // Unrelated 400s and ordinary rate limits stay errors.
+        assert!(!fast_mode_unsupported(
+            400,
+            r#"{"error":{"type":"invalid_request_error","message":"max_tokens: 99999999 is too large"}}"#
+        ));
+        assert!(!fast_mode_unsupported(
+            429,
+            r#"{"error":{"type":"rate_limit_error","message":"Number of request tokens has exceeded your rate limit"}}"#
+        ));
+        assert!(!fast_mode_unsupported(500, "speed not supported"));
+    }
+
     #[derive(Debug)]
     struct CapturedRequest {
         headers: HashMap<String, String>,
@@ -2033,6 +3176,78 @@ mod tests {
 
     fn run_stream_and_capture_headers(cache_retention: CacheRetention) -> Option<CapturedRequest> {
         run_stream_and_capture_headers_with_api_key(cache_retention, "sk-ant-test-key")
+    }
+
+    /// bd-n0hjg: the regression test for the whole fixture class (bd-eg6ng).
+    ///
+    /// Eleven provider fixtures used to treat a socket read timeout as fatal or
+    /// as end-of-request. That only breaks under contention — when the client
+    /// has not been scheduled before the fixture's first read — so on an idle
+    /// machine the timeout arm is never even reached and a mutation probe
+    /// cannot fail. I could not prove those conversions any other way: with the
+    /// deadline forced into the past AND a 1ms poll, all 68 tests still passed,
+    /// because the request was already buffered.
+    ///
+    /// This reproduces the condition deliberately instead of waiting for load:
+    /// the CLIENT connects and then says nothing for longer than the two
+    /// seconds the old code allowed. Against the old fixture the read returned
+    /// `WouldBlock` and the header scan then failed as
+    /// `expect("request header boundary")` — a SLOW request misreported as a
+    /// MALFORMED one. Against the current fixture the read waits and the
+    /// request parses.
+    ///
+    /// One provider is enough: the eleven conversions are textually identical,
+    /// so a second copy of this would be ceremony. It lives beside the fixture
+    /// it drives rather than in tests/common, because each provider owns its
+    /// own in-module fixture and there is no shared mock to put it next to.
+    #[test]
+    fn a_fixture_waits_out_a_client_slower_than_the_old_read_timeout() {
+        // Comfortably past the 2s the old code allowed, well inside the 30s
+        // budget the current code gives the whole exchange.
+        const CLIENT_SILENCE: Duration = Duration::from_millis(2_500);
+
+        let (url, rx) = spawn_test_server(200, "text/event-stream", "data: [DONE]\n\n");
+        let authority = url
+            .trim_start_matches("http://")
+            .split('/')
+            .next()
+            .expect("fixture URL has an authority")
+            .to_string();
+
+        let started = Instant::now();
+        let client = std::thread::spawn(move || {
+            let mut socket = TcpStream::connect(&authority).expect("connect to fixture");
+            // The point of the test: connected, then silent past the old window.
+            std::thread::sleep(CLIENT_SILENCE);
+            let body = r#"{"model":"claude-test"}"#;
+            let request = format!(
+                "POST /v1/messages HTTP/1.1\r\nHost: {authority}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            socket
+                .write_all(request.as_bytes())
+                .expect("write the delayed request");
+            socket.flush().expect("flush the delayed request");
+        });
+
+        let captured = rx
+            .recv_timeout(Duration::from_secs(20))
+            .expect("the fixture must still capture a request from a slow client");
+        client.join().expect("client thread");
+
+        assert!(
+            started.elapsed() >= CLIENT_SILENCE,
+            "the client did not actually stay silent, so this proves nothing"
+        );
+        assert_eq!(
+            captured.body, r#"{"model":"claude-test"}"#,
+            "the body must arrive whole, not truncated at the read timeout"
+        );
+        assert_eq!(
+            captured.headers.get("content-type").map(String::as_str),
+            Some("application/json"),
+            "headers must parse; truncation shows up here first"
+        );
     }
 
     fn run_stream_and_capture_headers_with_api_key(
@@ -2132,84 +3347,110 @@ mod tests {
         content_type: &str,
         body: &str,
     ) -> (String, mpsc::Receiver<CapturedRequest>) {
+        spawn_test_server_sequence(vec![(status_code, content_type, body)])
+    }
+
+    /// Serve one response per connection, in order, then stop accepting.
+    fn spawn_test_server_sequence(
+        responses: Vec<(u16, &str, &str)>,
+    ) -> (String, mpsc::Receiver<CapturedRequest>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
         let addr = listener.local_addr().expect("local addr");
         let (tx, rx) = mpsc::channel();
-        let body = body.to_string();
-        let content_type = content_type.to_string();
+        let responses: Vec<(u16, String, String)> = responses
+            .into_iter()
+            .map(|(status, content_type, body)| {
+                (status, content_type.to_string(), body.to_string())
+            })
+            .collect();
 
         std::thread::spawn(move || {
-            let (mut socket, _) = listener.accept().expect("accept");
-            socket
-                .set_read_timeout(Some(Duration::from_secs(2)))
-                .expect("set read timeout");
+            for (status_code, content_type, body) in responses {
+                let (mut socket, _) = listener.accept().expect("accept");
+                // 250ms is the POLLING interval; the deadline below is the budget.
+                // Treating a timed-out read as end-of-request truncated `bytes` and
+                // the header scan then failed as "request header boundary", which
+                // reads as a malformed request rather than a slow one — the reason
+                // this shape is worse than an outright panic (bd-eg6ng).
+                socket
+                    .set_read_timeout(Some(Duration::from_millis(250)))
+                    .expect("set read timeout");
+                let deadline = std::time::Instant::now() + Duration::from_secs(30);
 
-            let mut bytes = Vec::new();
-            let mut chunk = [0_u8; 4096];
-            loop {
-                match socket.read(&mut chunk) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        bytes.extend_from_slice(&chunk[..n]);
-                        if bytes.windows(4).any(|window| window == b"\r\n\r\n") {
-                            break;
+                let mut bytes = Vec::new();
+                let mut chunk = [0_u8; 4096];
+                loop {
+                    match socket.read(&mut chunk) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            bytes.extend_from_slice(&chunk[..n]);
+                            if bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+                                break;
+                            }
                         }
+                        Err(err)
+                            if err.kind() == std::io::ErrorKind::WouldBlock
+                                || err.kind() == std::io::ErrorKind::TimedOut =>
+                        {
+                            assert!(
+                                std::time::Instant::now() < deadline,
+                                "fixture timed out waiting for request headers"
+                            );
+                        }
+                        Err(err) => panic!(),
                     }
-                    Err(err)
-                        if err.kind() == std::io::ErrorKind::WouldBlock
-                            || err.kind() == std::io::ErrorKind::TimedOut =>
-                    {
-                        break;
-                    }
-                    Err(err) => panic!(),
                 }
-            }
 
-            let header_end = bytes
-                .windows(4)
-                .position(|window| window == b"\r\n\r\n")
-                .expect("request header boundary");
-            let header_text = String::from_utf8_lossy(&bytes[..header_end]).to_string();
-            let headers = parse_headers(&header_text);
-            let mut request_body = bytes[header_end + 4..].to_vec();
+                let header_end = bytes
+                    .windows(4)
+                    .position(|window| window == b"\r\n\r\n")
+                    .expect("request header boundary");
+                let header_text = String::from_utf8_lossy(&bytes[..header_end]).to_string();
+                let headers = parse_headers(&header_text);
+                let mut request_body = bytes[header_end + 4..].to_vec();
 
-            let content_length = headers
-                .get("content-length")
-                .and_then(|value| value.parse::<usize>().ok())
-                .unwrap_or(0);
-            while request_body.len() < content_length {
-                match socket.read(&mut chunk) {
-                    Ok(0) => break,
-                    Ok(n) => request_body.extend_from_slice(&chunk[..n]),
-                    Err(err)
-                        if err.kind() == std::io::ErrorKind::WouldBlock
-                            || err.kind() == std::io::ErrorKind::TimedOut =>
-                    {
-                        break;
+                let content_length = headers
+                    .get("content-length")
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .unwrap_or(0);
+                while request_body.len() < content_length {
+                    match socket.read(&mut chunk) {
+                        Ok(0) => break,
+                        Ok(n) => request_body.extend_from_slice(&chunk[..n]),
+                        Err(err)
+                            if err.kind() == std::io::ErrorKind::WouldBlock
+                                || err.kind() == std::io::ErrorKind::TimedOut =>
+                        {
+                            assert!(
+                                std::time::Instant::now() < deadline,
+                                "fixture timed out waiting for the request body"
+                            );
+                        }
+                        Err(err) => panic!(),
                     }
-                    Err(err) => panic!(),
                 }
+
+                let captured = CapturedRequest {
+                    headers,
+                    body: String::from_utf8_lossy(&request_body).to_string(),
+                };
+                tx.send(captured).expect("send captured request");
+
+                let reason = match status_code {
+                    400 => "Bad Request",
+                    401 => "Unauthorized",
+                    500 => "Internal Server Error",
+                    _ => "OK",
+                };
+                let response = format!(
+                    "HTTP/1.1 {status_code} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket
+                    .write_all(response.as_bytes())
+                    .expect("write response");
+                socket.flush().expect("flush response");
             }
-
-            let captured = CapturedRequest {
-                headers,
-                body: String::from_utf8_lossy(&request_body).to_string(),
-            };
-            tx.send(captured).expect("send captured request");
-
-            let reason = match status_code {
-                401 => "Unauthorized",
-                500 => "Internal Server Error",
-                _ => "OK",
-            };
-            let response = format!(
-                "HTTP/1.1 {status_code} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            socket
-                .write_all(response.as_bytes())
-                .expect("write response");
-            socket.flush().expect("flush response");
         });
 
         (format!("http://{addr}/messages"), rx)
@@ -2463,6 +3704,8 @@ mod tests {
             StopReason::Stop => "stop",
             StopReason::Length => "length",
             StopReason::ToolUse => "tool_use",
+            StopReason::PauseTurn => "pause_turn",
+            StopReason::Refusal => "refusal",
             StopReason::Error => "error",
             StopReason::Aborted => "aborted",
         }
@@ -2531,6 +3774,108 @@ mod tests {
             captured.headers.get("x-api-key").map(String::as_str),
             Some("sk-ant-test-key"),
         );
+    }
+
+    /// bd-dzddo: a `before_provider_request` rewrite must reach the wire on
+    /// the Anthropic route (hook breadth beyond the Responses API), with
+    /// `stream: true` re-imposed on the accepted rewrite.
+    #[test]
+    fn test_before_provider_request_rewrite_reaches_wire() {
+        let (base_url, rx) = spawn_test_server(200, "text/event-stream", &success_sse_body());
+        let provider = AnthropicProvider::new("claude-test").with_base_url(base_url);
+        let context = Context {
+            system_prompt: None,
+            messages: vec![Message::User(crate::model::UserMessage {
+                content: UserContent::Text("hi".to_string()),
+                timestamp: 0,
+            })]
+            .into(),
+            tools: Vec::new().into(),
+        };
+        let options = StreamOptions {
+            api_key: Some("sk-ant-test-key".to_string()),
+            before_provider_request: Some(crate::provider::BeforeProviderRequestHook::new(
+                |event| {
+                    Box::pin(async move {
+                        let mut payload = event.payload;
+                        payload["metadata"] = serde_json::json!({"user_id": "pi-rewrite-marker"});
+                        payload["stream"] = serde_json::json!(false);
+                        Some(payload)
+                    })
+                },
+            )),
+            ..Default::default()
+        };
+
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async {
+            let mut stream = provider.stream(&context, &options).await.expect("stream");
+            while let Some(event) = stream.next().await {
+                if matches!(event.expect("stream event"), StreamEvent::Done { .. }) {
+                    break;
+                }
+            }
+        });
+
+        let captured = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("captured request");
+        let body: serde_json::Value = serde_json::from_str(&captured.body).expect("json body");
+        assert_eq!(body["metadata"]["user_id"], "pi-rewrite-marker");
+        assert_eq!(
+            body["stream"],
+            serde_json::Value::Bool(true),
+            "stream: true must be re-imposed on accepted rewrites"
+        );
+    }
+
+    /// bd-dzddo: a structurally invalid rewrite must fail open — the original
+    /// request body goes out unchanged.
+    #[test]
+    fn test_before_provider_request_invalid_rewrite_fails_open() {
+        let (base_url, rx) = spawn_test_server(200, "text/event-stream", &success_sse_body());
+        let provider = AnthropicProvider::new("claude-test").with_base_url(base_url);
+        let context = Context {
+            system_prompt: None,
+            messages: vec![Message::User(crate::model::UserMessage {
+                content: UserContent::Text("hi".to_string()),
+                timestamp: 0,
+            })]
+            .into(),
+            tools: Vec::new().into(),
+        };
+        let options = StreamOptions {
+            api_key: Some("sk-ant-test-key".to_string()),
+            before_provider_request: Some(crate::provider::BeforeProviderRequestHook::new(
+                |_event| Box::pin(async move { Some(serde_json::json!("not an object")) }),
+            )),
+            ..Default::default()
+        };
+
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async {
+            let mut stream = provider.stream(&context, &options).await.expect("stream");
+            while let Some(event) = stream.next().await {
+                if matches!(event.expect("stream event"), StreamEvent::Done { .. }) {
+                    break;
+                }
+            }
+        });
+
+        let captured = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("captured request");
+        let body: serde_json::Value = serde_json::from_str(&captured.body).expect("json body");
+        assert_eq!(body["model"], "claude-test");
+        assert!(
+            body.get("metadata").is_none(),
+            "rejected rewrite must not alter the body"
+        );
+        assert!(body["messages"].is_array());
     }
 
     #[test]

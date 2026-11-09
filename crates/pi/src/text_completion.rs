@@ -1,0 +1,1041 @@
+//! Bounded, terminal-validated completions for tool-free auxiliary model calls.
+//!
+//! Deltas are previews, not a successful response. Only a clean terminal
+//! message may become a side answer or an advisor verdict. The terminal
+//! message is authoritative, including for providers that emit no deltas.
+
+use futures::{Stream, StreamExt};
+
+use crate::error::{Error, Result};
+use crate::model::{ContentBlock, StopReason, StreamEvent};
+
+mod request;
+pub use request::with_timeout_and_abort;
+pub use request::{RequestStop, with_timeout};
+
+/// Auxiliary calls request only a few hundred tokens. Bound host-side output
+/// too: a provider or extension is not obliged to honor max_tokens.
+pub const MAX_TEXT_BYTES: usize = 64 * 1024;
+const MAX_STREAM_EVENTS: usize = 65_536;
+/// A ready stream must return control to its deadline/owner, not consume the
+/// entire event budget in one poll. This is a scheduling bound, independent
+/// of the request-wide event and output bounds.
+const READY_EVENT_BATCH: usize = 64;
+/// Bound the raw input before cloning or applying the detector. A projection
+/// that cannot inspect a field must omit it, never send an unscreened prefix.
+pub const MAX_INPUT_BYTES: usize = 256 * 1024;
+const MAX_INPUT_PARTS: usize = 256;
+pub const OMITTED_INPUT: &str = "[context omitted: auxiliary privacy scan budget]";
+
+/// Compiled privacy policy for tool-free secondary model requests.
+///
+/// These requests never need executable credentials, so disabling the primary
+/// agent's reversible vault does not disable their existing privacy floor.
+/// Configured patterns extend that floor; block mode refuses the request.
+#[derive(Clone, Debug, Default)]
+pub struct AuxiliaryPrivacy {
+    mode: crate::secrets::SecretsMode,
+    extra_patterns: Vec<regex::Regex>,
+}
+
+/// An owned projection of the privacy policy at task admission. Foreground
+/// admission may add discoveries from the complete task input, then freeze it.
+/// Background work may retain this snapshot, never a borrowed Agent or its
+/// mutable vault. Results cannot export restorable secret placeholders.
+#[derive(Clone)]
+pub struct AuxiliaryPrivacySnapshot {
+    privacy: AuxiliaryPrivacy,
+    known_secrets: crate::secrets::SecretVault,
+}
+
+impl AuxiliaryPrivacySnapshot {
+    #[must_use]
+    pub fn from_privacy(privacy: AuxiliaryPrivacy) -> Self {
+        Self {
+            privacy,
+            known_secrets: crate::secrets::SecretVault::default(),
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn with_vault(
+        privacy: AuxiliaryPrivacy,
+        known_secrets: &crate::secrets::SecretVault,
+    ) -> Self {
+        Self {
+            privacy,
+            known_secrets: known_secrets.clone(),
+        }
+    }
+
+    /// Remember discoveries across the complete, bounded task input before
+    /// preparing individual requests. This private snapshot never mutates the
+    /// live Agent vault. The caller owns the input shape and byte limits and
+    /// excludes binary image evidence from this text-only projection.
+    pub(crate) fn capture_json(&mut self, value: &serde_json::Value) -> Result<()> {
+        redact_json_with_vault(value, &self.privacy, &mut self.known_secrets)?;
+        Ok(())
+    }
+
+    /// Screen provider-bound fields using the frozen policy and discoveries.
+    /// The returned text cannot export restorable secret placeholders.
+    pub(crate) fn project_inputs(&self, parts: &[&str]) -> Result<Vec<String>> {
+        redact_inputs_with_vault(parts, &self.privacy, &self.known_secrets)
+    }
+
+    /// Project a bounded complete native result before any durable output or
+    /// completion notice. The caller owns the serialization-size budget.
+    pub(crate) fn project_json(&self, value: &serde_json::Value) -> Result<serde_json::Value> {
+        redact_json_with_vault(value, &self.privacy, &mut self.known_secrets.clone())
+    }
+}
+
+impl AuxiliaryPrivacy {
+    /// Provider-free checkpoints may redact locally even when outbound
+    /// requests are blocked. Preserve the same configured detector patterns.
+    pub(crate) fn local_redaction(&self) -> Self {
+        Self {
+            mode: crate::secrets::SecretsMode::Obfuscate,
+            extra_patterns: self.extra_patterns.clone(),
+        }
+    }
+
+    #[must_use]
+    pub fn from_settings(settings: Option<&crate::secrets::SecretsSettings>) -> Self {
+        let mode = crate::secrets::SecretsMode::from_setting(
+            settings.and_then(|settings| settings.mode.as_deref()),
+        );
+        let extra_patterns = settings
+            .and_then(|settings| settings.extra_patterns.as_deref())
+            .map(crate::secrets::compile_extra_patterns)
+            .unwrap_or_default();
+        Self {
+            mode: if mode == crate::secrets::SecretsMode::Block {
+                mode
+            } else {
+                crate::secrets::SecretsMode::Obfuscate
+            },
+            extra_patterns,
+        }
+    }
+}
+
+/// Screen a complete set of text inputs before formatting or truncation.
+///
+/// Tool-free side requests never need executable credentials. These context
+/// projections apply the built-in detector and configured patterns; block
+/// mode refuses before provider admission. Discovery spans every part
+/// before any replacement, so a later assignment also protects earlier bare
+/// echoes. Disposable-vault IDs become non-restorable markers before a prompt
+/// reaches another model or a verdict is injected into the main conversation.
+/// Authentication headers and caller-owned text are not touched.
+pub fn redact_inputs(parts: &[&str], privacy: &AuxiliaryPrivacy) -> Result<Vec<String>> {
+    redact_inputs_with_vault(parts, privacy, &crate::secrets::SecretVault::default())
+}
+
+/// Preserve discoveries from the live conversation without sharing its
+/// mutable vault or exporting reversible IDs to a secondary model.
+pub fn redact_inputs_with_vault(
+    parts: &[&str],
+    privacy: &AuxiliaryPrivacy,
+    known_secrets: &crate::secrets::SecretVault,
+) -> Result<Vec<String>> {
+    let bytes = parts
+        .iter()
+        .try_fold(0usize, |total, part| total.checked_add(part.len()));
+    if parts.len() > MAX_INPUT_PARTS || bytes.is_none_or(|total| total > MAX_INPUT_BYTES) {
+        return Err(Error::validation(
+            "PI_AUXILIARY_INPUT_LIMIT: input exceeds the auxiliary privacy scan budget",
+        ));
+    }
+    let mut vault = known_secrets.clone();
+    let protected = redact_json_with_vault(&serde_json::json!(parts), privacy, &mut vault)?;
+    let serde_json::Value::Array(protected) = protected else {
+        return Err(Error::validation(
+            "auxiliary privacy projection changed input shape",
+        ));
+    };
+    protected
+        .into_iter()
+        .map(|part| match part {
+            serde_json::Value::String(text) => Ok(text),
+            _ => Err(Error::validation(
+                "auxiliary privacy projection changed text type",
+            )),
+        })
+        .collect()
+}
+
+/// Screen an already bounded structured projection. Callers own the input
+/// budget: a full compaction has a larger allowance than a short side request.
+/// Keeping JSON structure preserves assignment context and anchored patterns.
+/// The supplied vault must be a private projection snapshot. Successful scans
+/// retain discoveries for subsequent projections without changing a live Agent.
+/// Secret-bearing primitives become non-restorable text in this descriptive
+/// projection; clean primitives retain their types. Never use this projection
+/// as executable tool arguments or write it back into the original transcript.
+pub fn redact_json_with_vault(
+    value: &serde_json::Value,
+    privacy: &AuxiliaryPrivacy,
+    known_secrets: &mut crate::secrets::SecretVault,
+) -> Result<serde_json::Value> {
+    let mut vault = known_secrets.clone();
+    // Discover over the complete structure before masking any field. Unlike
+    // executable arguments, a summary does not need to round-trip credentials:
+    // refusing a numeric match here can make a long session uncompactionable.
+    // Keep the operational transform's strict primitive policy unchanged.
+    crate::secrets::discover_outbound_json(
+        value,
+        &mut vault,
+        privacy.mode,
+        &privacy.extra_patterns,
+    )?;
+    let protected = crate::secrets::mask_known_json(value, &vault)?;
+    let protected = redact_json_placeholders(protected, &vault)?;
+    *known_secrets = vault;
+    Ok(protected)
+}
+
+fn redact_json_placeholders(
+    value: serde_json::Value,
+    vault: &crate::secrets::SecretVault,
+) -> Result<serde_json::Value> {
+    use serde_json::Value;
+    match value {
+        Value::String(text) => Ok(Value::String(vault.redact_placeholders(&text))),
+        Value::Array(values) => values
+            .into_iter()
+            .map(|value| redact_json_placeholders(value, vault))
+            .collect::<Result<Vec<_>>>()
+            .map(Value::Array),
+        Value::Object(values) => {
+            let mut protected = serde_json::Map::new();
+            for (key, value) in values {
+                let key = vault.redact_placeholders(&key);
+                let value = redact_json_placeholders(value, vault)?;
+                if protected.insert(key, value).is_some() {
+                    return Err(Error::validation(
+                        "PI_AUXILIARY_KEY_COLLISION: redaction would merge structured fields",
+                    ));
+                }
+            }
+            Ok(Value::Object(protected))
+        }
+        primitive => Ok(primitive),
+    }
+}
+
+/// Drain one tool-free completion without retaining cumulative previews.
+///
+/// Reject missing terminal events, transport/provider errors, incomplete stop
+/// reasons, tool calls, empty answers, and oversized replies. A caller owns
+/// the wall-clock deadline around both stream creation and this drain.
+/// Ready streams yield after a bounded batch so that outer deadline and
+/// cancellation futures are polled even when the provider never returns Pending.
+pub async fn collect_text<S>(mut stream: S, max_bytes: usize) -> Result<String>
+where
+    S: Stream<Item = Result<StreamEvent>> + Unpin,
+{
+    let mut delta_bytes = 0usize;
+    let mut event_count = 0usize;
+    while let Some(event) = stream.next().await {
+        event_count += 1;
+        if event_count > MAX_STREAM_EVENTS {
+            return Err(Error::api("text completion exceeded stream event budget"));
+        }
+        match event? {
+            StreamEvent::TextDelta { delta, .. } => {
+                delta_bytes = delta_bytes
+                    .checked_add(delta.len())
+                    .filter(|bytes| *bytes <= max_bytes)
+                    .ok_or_else(|| Error::api("text completion exceeded output byte budget"))?;
+            }
+            StreamEvent::TextEnd { content, .. } if content.len() > max_bytes => {
+                return Err(Error::api("text completion exceeded output byte budget"));
+            }
+            StreamEvent::ToolCallStart { .. }
+            | StreamEvent::ToolCallDelta { .. }
+            | StreamEvent::ToolCallEnd { .. } => {
+                return Err(Error::api(
+                    "tool-free text completion requested a tool call",
+                ));
+            }
+            StreamEvent::Error { reason, error } => {
+                if reason == StopReason::Aborted || error.stop_reason == StopReason::Aborted {
+                    return Err(Error::Aborted);
+                }
+                return Err(Error::api(error.error_message.unwrap_or_else(|| {
+                    "provider reported a failed text completion".to_string()
+                })));
+            }
+            StreamEvent::Done { reason, message } => {
+                if reason == StopReason::Aborted || message.stop_reason == StopReason::Aborted {
+                    return Err(Error::Aborted);
+                }
+                if let Some(error) = message.error_message {
+                    return Err(Error::api(error));
+                }
+                if reason != StopReason::Stop || message.stop_reason != StopReason::Stop {
+                    return Err(Error::api(format!(
+                        "text completion did not finish cleanly (event: {reason:?}, message: {:?})",
+                        message.stop_reason
+                    )));
+                }
+                let mut answer = String::new();
+                for block in message.content {
+                    match block {
+                        ContentBlock::Text(text) => {
+                            if text.text.len() > max_bytes.saturating_sub(answer.len()) {
+                                return Err(Error::api(
+                                    "text completion exceeded output byte budget",
+                                ));
+                            }
+                            answer.push_str(&text.text);
+                        }
+                        ContentBlock::ToolCall(_) => {
+                            return Err(Error::api(
+                                "tool-free text completion requested a tool call",
+                            ));
+                        }
+                        _ => {}
+                    }
+                }
+                if answer.trim().is_empty() {
+                    return Err(Error::api("text completion returned empty reply"));
+                }
+                return Ok(answer);
+            }
+            _ => {}
+        }
+        if event_count.is_multiple_of(READY_EVENT_BATCH) {
+            yield_ready_batch().await;
+        }
+    }
+    Err(Error::api(
+        "text completion stream ended without Done event",
+    ))
+}
+
+/// Yield exactly once after real progress. An idle provider is never
+/// self-woken: its next() future continues to own readiness notification.
+pub async fn yield_ready_batch() {
+    let mut yielded = false;
+    std::future::poll_fn(|cx| {
+        if yielded {
+            std::task::Poll::Ready(())
+        } else {
+            yielded = true;
+            cx.waker().wake_by_ref();
+            std::task::Poll::Pending
+        }
+    })
+    .await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{AssistantMessage, TextContent, ToolCall};
+    use std::future::Future;
+    use std::time::Duration;
+
+    fn done(text: &str) -> StreamEvent {
+        StreamEvent::Done {
+            reason: StopReason::Stop,
+            message: AssistantMessage {
+                content: vec![ContentBlock::Text(TextContent::new(text))],
+                stop_reason: StopReason::Stop,
+                ..Default::default()
+            },
+        }
+    }
+
+    fn delta(text: &str) -> StreamEvent {
+        StreamEvent::TextDelta {
+            content_index: 0,
+            delta: text.to_string(),
+        }
+    }
+
+    async fn read(events: Vec<StreamEvent>, max_bytes: usize) -> Result<String> {
+        collect_text(futures::stream::iter(events.into_iter().map(Ok)), max_bytes).await
+    }
+
+    #[test]
+    fn terminal_abort_stays_typed_for_callers_with_fallback_candidates() {
+        futures::executor::block_on(async {
+            for (event_reason, message_reason) in [
+                (StopReason::Aborted, StopReason::Stop),
+                (StopReason::Stop, StopReason::Aborted),
+            ] {
+                for is_error in [false, true] {
+                    let message = AssistantMessage {
+                        content: vec![ContentBlock::Text(TextContent::new("partial answer"))],
+                        stop_reason: message_reason,
+                        error_message: Some("provider cancellation".to_string()),
+                        ..Default::default()
+                    };
+                    let event = if is_error {
+                        StreamEvent::Error {
+                            reason: event_reason,
+                            error: message,
+                        }
+                    } else {
+                        StreamEvent::Done {
+                            reason: event_reason,
+                            message,
+                        }
+                    };
+                    assert!(matches!(read(vec![event], 64).await, Err(Error::Aborted))); // ubs:ignore -- Regression requires a typed terminal abort, never a retryable API error.
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn input_discovery_protects_echoes_across_parts_without_exporting_vault_ids() {
+        let secret = "r4nd0mCredentialValue123456";
+        let assignment = format!("API_KEY={secret}");
+        let parts = [secret, assignment.as_str(), "ordinary context"];
+        let protected = redact_inputs(&parts, &AuxiliaryPrivacy::default()).unwrap();
+        assert_eq!(
+            protected,
+            [
+                "<pi-secret:redacted>",
+                "API_KEY=<pi-secret:redacted>",
+                "ordinary context",
+            ]
+        );
+        assert_eq!(parts[0], secret, "source input is not mutated");
+        let mut other_vault = crate::secrets::SecretVault::default();
+        let _ = crate::secrets::obfuscate("sk-differentCredential123456789", &mut other_vault, &[]);
+        assert_eq!(
+            other_vault.restore(&protected.join("\n")),
+            protected.join("\n")
+        );
+    }
+
+    #[test]
+    fn task_snapshot_captures_late_input_secrets_before_projecting_earlier_items() -> Result<()> {
+        let secret = "r4nd0mCredentialValue123456";
+        let mut snapshot = AuxiliaryPrivacySnapshot::from_privacy(AuxiliaryPrivacy::default());
+        snapshot.capture_json(&serde_json::json!([
+            {"earlier_echo":secret}, {"api_key":secret},
+        ]))?;
+        let protected = snapshot.project_inputs(&[secret, "ordinary context"])?;
+        assert_eq!(protected, ["<pi-secret:redacted>", "ordinary context"]); // ubs:ignore -- Admission must discover across the whole batch before individual request screening.
+        let retained = snapshot.project_json(&serde_json::json!({"text":secret}))?;
+        assert_eq!(retained, serde_json::json!({"text":"<pi-secret:redacted>"})); // ubs:ignore -- Provider echoes must remain protected at retained-result publication.
+        Ok(())
+    }
+
+    #[test]
+    fn task_input_discoveries_remain_private_and_block_before_admission() -> Result<()> {
+        let secret = "r4nd0mCredentialValue123456";
+        let source = crate::secrets::SecretVault::default();
+        let original = AuxiliaryPrivacySnapshot::with_vault(AuxiliaryPrivacy::default(), &source);
+        let mut admitted = original.clone();
+        admitted.capture_json(&serde_json::json!({"api_key":secret}))?;
+        assert_eq!(source.mask(secret), secret); // ubs:ignore -- Task discoveries must never mutate the live Agent vault.
+        assert_eq!(original.project_inputs(&[secret])?, vec![secret]); // ubs:ignore -- Separately captured task snapshots must not share mutable discoveries.
+        assert_eq!(
+            admitted.project_inputs(&[secret])?,
+            vec!["<pi-secret:redacted>"]
+        ); // ubs:ignore -- The admitted task must retain its own discoveries.
+        let privacy = AuxiliaryPrivacy::from_settings(Some(&crate::secrets::SecretsSettings {
+            mode: Some("block".to_string()),
+            ..Default::default()
+        }));
+        let mut blocked = AuxiliaryPrivacySnapshot::from_privacy(privacy);
+        let error = blocked
+            .capture_json(&serde_json::json!({"api_key":secret}))
+            .expect_err("blocked input"); // ubs:ignore -- Blocking policy must refuse complete input before any background request can be admitted.
+        assert!(error.to_string().contains("PI_SECRET_BLOCK")); // ubs:ignore -- Preserve the named block error without echoing the source.
+        assert!(!error.to_string().contains(secret)); // ubs:ignore -- Error paths cannot disclose the blocked value.
+        Ok(())
+    }
+
+    #[test]
+    fn input_projection_handles_multiline_keys_and_preserves_clean_text_exactly() {
+        let key = concat!(
+            "-----BEGIN ",
+            "PRIVATE KEY-----\nprivate\\material\"here\n-----END PRIVATE KEY-----"
+        );
+        let clean = "  α\r\n  code: C:\\work\\file\t\"quoted\"  ";
+        let protected = redact_inputs(&[clean, key], &AuxiliaryPrivacy::default()).unwrap();
+        assert_eq!(protected, [clean, "<pi-secret:redacted>"]);
+        assert!(
+            redact_inputs(&[], &AuxiliaryPrivacy::default())
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn input_budget_refuses_without_exposing_or_slicing_the_input() {
+        let input = "x".repeat(MAX_INPUT_BYTES);
+        assert_eq!(
+            redact_inputs(&[&input], &AuxiliaryPrivacy::default()).unwrap(),
+            std::slice::from_ref(&input)
+        );
+        let error =
+            redact_inputs(&[&input, "SECRET-CANARY"], &AuxiliaryPrivacy::default()).unwrap_err();
+        assert!(error.to_string().contains("PI_AUXILIARY_INPUT_LIMIT"));
+        assert!(!error.to_string().contains("SECRET-CANARY"));
+        assert!(
+            redact_inputs(&vec![""; MAX_INPUT_PARTS + 1], &AuxiliaryPrivacy::default()).is_err()
+        );
+    }
+
+    #[test]
+    fn configured_auxiliary_patterns_extend_the_privacy_floor_in_every_mode() {
+        let custom = "ACME-123456";
+        let built_in = "sk-abcdefghijklmnopqrstuvwxyz012345";
+        for mode in [None, Some("obfuscate"), Some("off")] {
+            let settings = crate::secrets::SecretsSettings {
+                mode: mode.map(str::to_string),
+                extra_patterns: Some(vec![r"ACME-\d{6}".to_string()]),
+            };
+            let privacy = AuxiliaryPrivacy::from_settings(Some(&settings));
+            let protected = redact_inputs(&[custom, built_in, "clean context"], &privacy)
+                .expect("obfuscated auxiliary fields");
+            assert_eq!(
+                protected,
+                [
+                    "<pi-secret:redacted>",
+                    "<pi-secret:redacted>",
+                    "clean context"
+                ],
+            );
+        }
+        let privacy = AuxiliaryPrivacy::from_settings(Some(&crate::secrets::SecretsSettings {
+            mode: Some("block".to_string()),
+            extra_patterns: Some(vec![r"ACME-\d{6}".to_string()]),
+        }));
+        for secret in [custom, built_in] {
+            let error = redact_inputs(&["clean context", secret], &privacy).unwrap_err();
+            assert!(error.to_string().contains("PI_SECRET_BLOCK"));
+            assert!(!error.to_string().contains(secret));
+        }
+        assert_eq!(
+            redact_inputs(&["clean context"], &privacy).unwrap(),
+            ["clean context"],
+        );
+    }
+
+    #[test]
+    fn seeded_projection_protects_known_values_without_mutating_the_live_vault() {
+        let known = "rememberedCredentialValue123456";
+        let later = "anotherCredentialValue654321";
+        let mut vault = crate::secrets::SecretVault::default();
+        let _ = crate::secrets::obfuscate(&format!("API_KEY={known}"), &mut vault, &[]);
+        let later_assignment = format!("API_KEY={later}");
+        let protected = redact_inputs_with_vault(
+            &[known, later, &later_assignment],
+            &AuxiliaryPrivacy::default(),
+            &vault,
+        )
+        .unwrap();
+        assert_eq!(
+            protected,
+            [
+                "<pi-secret:redacted>",
+                "<pi-secret:redacted>",
+                "API_KEY=<pi-secret:redacted>",
+            ],
+        );
+        assert_eq!(
+            vault.mask(later),
+            later,
+            "new discoveries remain disposable"
+        );
+        assert_eq!(vault.mask(known), "<pi-secret:000001>");
+        let block = AuxiliaryPrivacy::from_settings(Some(&crate::secrets::SecretsSettings {
+            mode: Some("block".to_string()),
+            ..Default::default()
+        }));
+        let error = redact_inputs_with_vault(&[known], &block, &vault).unwrap_err();
+        assert!(error.to_string().contains("PI_SECRET_BLOCK"));
+        assert!(!error.to_string().contains(known));
+    }
+
+    #[test]
+    fn auxiliary_projection_redacts_numeric_assignments_and_prior_echoes() {
+        let number = 1_234_567_890_123_456_u64;
+        let source = serde_json::json!([
+            number,
+            format!("earlier echo: {number}"),
+            {"api_key": number, "limit": 3, "enabled": true, "optional": null}
+        ]);
+        let original = source.clone();
+        let mut vault = crate::secrets::SecretVault::default();
+        let protected = redact_json_with_vault(&source, &AuxiliaryPrivacy::default(), &mut vault)
+            .expect("descriptive context can redact a numeric credential");
+        assert_eq!(
+            protected,
+            serde_json::json!([
+                "<pi-secret:redacted>",
+                "earlier echo: <pi-secret:redacted>",
+                {"api_key": "<pi-secret:redacted>", "limit": 3, "enabled": true, "optional": null}
+            ])
+        );
+        assert_eq!(
+            source, original,
+            "persisted/executable source remains untouched"
+        );
+        assert!(!protected.to_string().contains(&number.to_string()));
+        // The private projection snapshot retains discoveries for later chunks.
+        let later = redact_json_with_vault(
+            &serde_json::json!({"echo": number}),
+            &AuxiliaryPrivacy::default(),
+            &mut vault,
+        )
+        .expect("remembered numeric echo");
+        assert_eq!(later, serde_json::json!({"echo": "<pi-secret:redacted>"}));
+        assert_eq!(vault.restore(&protected.to_string()), protected.to_string());
+    }
+
+    #[test]
+    fn auxiliary_projection_patterns_cover_primitives_without_erasing_clean_types() {
+        let source = serde_json::json!({
+            "number": 731_942, "boolean": true, "missing": null,
+            "echo": "true", "embedded": "prefix731942suffix",
+            "clean": [42, 1.25, false, "ordinary"]
+        });
+        for mode in ["obfuscate", "off"] {
+            let privacy = AuxiliaryPrivacy::from_settings(Some(&crate::secrets::SecretsSettings {
+                mode: Some(mode.to_string()),
+                extra_patterns: Some(vec![r"^(731942|true|null)$".to_string()]),
+            }));
+            let protected = redact_json_with_vault(
+                &source,
+                &privacy,
+                &mut crate::secrets::SecretVault::default(),
+            )
+            .expect("auxiliary privacy floor includes scalar matches");
+            assert_eq!(
+                protected,
+                serde_json::json!({
+                    "number": "<pi-secret:redacted>",
+                    "boolean": "<pi-secret:redacted>",
+                    "missing": "<pi-secret:redacted>",
+                    "echo": "<pi-secret:redacted>",
+                    "embedded": "prefix<pi-secret:redacted>suffix",
+                    "clean": [42, 1.25, false, "ordinary"]
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn auxiliary_projection_preserves_clean_structured_values_exactly() {
+        let source = serde_json::json!({
+            "arguments": {"line": 31, "ratio": -0.125, "recursive": false},
+            "items": [null, true, false, 0, "  α\r\n\\quoted\"  ", {}, []]
+        });
+        let mut vault = crate::secrets::SecretVault::default();
+        assert_eq!(
+            redact_json_with_vault(&source, &AuxiliaryPrivacy::default(), &mut vault).unwrap(),
+            source
+        );
+        assert_eq!(vault.len(), 0);
+    }
+
+    #[test]
+    #[allow(clippy::trivial_regex)] // `obfuscate` takes compiled patterns
+    fn auxiliary_block_policy_still_refuses_detected_and_remembered_primitives() {
+        let privacy = AuxiliaryPrivacy::from_settings(Some(&crate::secrets::SecretsSettings {
+            mode: Some("block".to_string()),
+            extra_patterns: Some(vec![r"^(731942|true|null)$".to_string()]),
+        }));
+        for source in [
+            serde_json::json!({"api_key": 1_234_567_890_123_456_u64}),
+            serde_json::json!(731_942),
+            serde_json::json!(true),
+            serde_json::json!(null),
+        ] {
+            let mut vault = crate::secrets::SecretVault::default();
+            let error = redact_json_with_vault(&source, &privacy, &mut vault).unwrap_err();
+            assert!(error.to_string().contains("PI_SECRET_BLOCK"));
+            assert_eq!(vault.len(), 0, "refusal must not commit discoveries");
+        }
+        let mut vault = crate::secrets::SecretVault::default();
+        let number = "900123";
+        let _ = crate::secrets::obfuscate(
+            number,
+            &mut vault,
+            &[regex::Regex::new(r"^900123$").unwrap()],
+        );
+        let error = redact_json_with_vault(&serde_json::json!(900_123), &privacy, &mut vault)
+            .expect_err("remembered values remain blocked without a matching current pattern");
+        assert!(error.to_string().contains("PI_SECRET_BLOCK"));
+        assert!(!error.to_string().contains(number));
+        assert_eq!(vault.len(), 1);
+    }
+
+    #[test]
+    fn auxiliary_numeric_redaction_does_not_weaken_operational_argument_validation() {
+        let source = serde_json::json!({"api_key": 1_234_567_890_123_456_u64});
+        let mut vault = crate::secrets::SecretVault::default();
+        let error = crate::secrets::transform_outbound_json(
+            &source,
+            &mut vault,
+            crate::secrets::SecretsMode::Obfuscate,
+            &[],
+        )
+        .expect_err("executable arguments must not change numeric credentials into strings");
+        assert!(error.to_string().contains("PI_SECRET_JSON_PRIMITIVE"));
+        assert_eq!(vault.len(), 0);
+        assert!(source["api_key"].is_number());
+    }
+
+    #[test]
+    fn auxiliary_key_collision_rolls_back_all_new_discoveries() {
+        let privacy = AuxiliaryPrivacy::from_settings(Some(&crate::secrets::SecretsSettings {
+            extra_patterns: Some(vec![r"ACME-\d{4}".to_string()]),
+            ..Default::default()
+        }));
+        let source = serde_json::json!({"ACME-1111": 1, "ACME-2222": 2});
+        let original = source.clone();
+        let mut vault = crate::secrets::SecretVault::default();
+        let _ =
+            crate::secrets::obfuscate("API_KEY=rememberedCredentialValue123456", &mut vault, &[]);
+        let before = vault.mask("rememberedCredentialValue123456");
+        let error = redact_json_with_vault(&source, &privacy, &mut vault)
+            .expect_err("non-restorable key markers must not discard an object member");
+        assert!(error.to_string().contains("PI_AUXILIARY_KEY_COLLISION"));
+        assert!(!error.to_string().contains("ACME-"));
+        assert_eq!(vault.len(), 1);
+        assert_eq!(vault.mask("rememberedCredentialValue123456"), before);
+        assert_eq!(vault.mask("ACME-1111 ACME-2222"), "ACME-1111 ACME-2222");
+        assert_eq!(source, original);
+    }
+
+    #[test]
+    fn auxiliary_depth_refusal_does_not_commit_earlier_discoveries() {
+        let mut nested = serde_json::json!(42);
+        for _ in 0..130 {
+            nested = serde_json::Value::Array(vec![nested]);
+        }
+        let source = serde_json::json!([
+            {"api_key": 1_234_567_890_123_456_u64},
+            nested
+        ]);
+        let mut vault = crate::secrets::SecretVault::default();
+        let error = redact_json_with_vault(&source, &AuxiliaryPrivacy::default(), &mut vault)
+            .expect_err("the existing structured depth bound remains authoritative");
+        assert!(error.to_string().contains("PI_SECRET_JSON_DEPTH"));
+        assert_eq!(vault.len(), 0);
+        assert_eq!(vault.mask("1234567890123456"), "1234567890123456");
+    }
+
+    #[test]
+    fn terminal_only_provider_returns_its_answer() {
+        asupersync::test_utils::run_test(|| async {
+            assert_eq!(read(vec![done("complete")], 8).await.unwrap(), "complete");
+        });
+    }
+
+    #[test]
+    fn terminal_text_is_authoritative_and_not_duplicated() {
+        asupersync::test_utils::run_test(|| async {
+            let text = read(vec![delta("preview"), done("final answer")], 64)
+                .await
+                .unwrap();
+            assert_eq!(text, "final answer");
+        });
+    }
+
+    #[test]
+    fn clean_done_does_not_wait_for_connection_close() {
+        asupersync::test_utils::run_test(|| async {
+            let stream =
+                futures::stream::iter([Ok(done("done"))]).chain(futures::stream::pending());
+            assert_eq!(collect_text(stream, 16).await.unwrap(), "done");
+        });
+    }
+
+    #[test]
+    fn partial_text_without_done_is_not_a_success() {
+        asupersync::test_utils::run_test(|| async {
+            let error = read(vec![delta("BLOCKER\nunfinished rationale")], 64)
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("without Done"));
+            assert!(read(Vec::new(), 64).await.is_err());
+        });
+    }
+
+    #[test]
+    fn provider_error_after_text_is_not_a_success() {
+        asupersync::test_utils::run_test(|| async {
+            let error = StreamEvent::Error {
+                reason: StopReason::Error,
+                error: AssistantMessage {
+                    error_message: Some("upstream unavailable".to_string()),
+                    stop_reason: StopReason::Error,
+                    ..Default::default()
+                },
+            };
+            assert!(
+                read(vec![delta("partial"), error], 64)
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("upstream unavailable")
+            );
+        });
+    }
+
+    #[test]
+    fn transport_error_is_preserved() {
+        asupersync::test_utils::run_test(|| async {
+            let stream =
+                futures::stream::iter([Ok(delta("partial")), Err(Error::api("connection reset"))]);
+            assert!(
+                collect_text(stream, 64)
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("connection reset")
+            );
+        });
+    }
+
+    #[test]
+    fn incomplete_and_inconsistent_stop_reasons_are_rejected() {
+        asupersync::test_utils::run_test(|| async {
+            for stop in [
+                StopReason::Length,
+                StopReason::Error,
+                StopReason::Aborted,
+                StopReason::ToolUse,
+                StopReason::PauseTurn,
+            ] {
+                let mut event = done("not complete");
+                if let StreamEvent::Done { reason, .. } = &mut event {
+                    *reason = stop;
+                }
+                assert!(read(vec![event], 64).await.is_err());
+                let mut event = done("not complete");
+                if let StreamEvent::Done { message, .. } = &mut event {
+                    message.stop_reason = stop;
+                }
+                assert!(read(vec![event], 64).await.is_err());
+            }
+        });
+    }
+
+    #[test]
+    fn clean_stop_with_error_payload_is_rejected() {
+        asupersync::test_utils::run_test(|| async {
+            let mut event = done("partial");
+            if let StreamEvent::Done { message, .. } = &mut event {
+                message.error_message = Some("failed".to_string());
+            }
+            assert!(read(vec![event], 64).await.is_err());
+        });
+    }
+
+    #[test]
+    fn empty_terminal_does_not_fall_back_to_stale_preview() {
+        asupersync::test_utils::run_test(|| async {
+            assert!(
+                read(vec![delta("stale preview"), done(" \n")], 64)
+                    .await
+                    .is_err()
+            );
+        });
+    }
+
+    #[test]
+    fn streaming_and_terminal_tool_calls_are_rejected() {
+        asupersync::test_utils::run_test(|| async {
+            let start = StreamEvent::ToolCallStart {
+                content_index: 0,
+                id: "call-1".to_string(),
+                name: "bash".to_string(),
+            };
+            assert!(read(vec![start, done("answer")], 64).await.is_err());
+            let mut event = done("answer");
+            if let StreamEvent::Done { message, .. } = &mut event {
+                message.content.push(ContentBlock::ToolCall(ToolCall {
+                    id: "call-1".to_string(),
+                    name: "bash".to_string(),
+                    arguments: serde_json::json!({"command": "echo unexpected"}),
+                    thought_signature: None,
+                }));
+            }
+            assert!(read(vec![event], 64).await.is_err());
+        });
+    }
+
+    #[test]
+    fn output_budget_is_bytes_and_applies_to_deltas_and_terminal() {
+        asupersync::test_utils::run_test(|| async {
+            assert!(
+                read(vec![delta("abcd"), delta("e"), done("ok")], 4)
+                    .await
+                    .is_err()
+            );
+            assert!(read(vec![done("abcde")], 4).await.is_err());
+            assert!(read(vec![done("éé")], 3).await.is_err());
+            assert_eq!(read(vec![done("éé")], 4).await.unwrap(), "éé");
+        });
+    }
+
+    #[test]
+    fn terminal_budget_is_shared_across_text_blocks() {
+        asupersync::test_utils::run_test(|| async {
+            let mut event = done("abc");
+            if let StreamEvent::Done { message, .. } = &mut event {
+                message
+                    .content
+                    .push(ContentBlock::Text(TextContent::new("def")));
+            }
+            assert!(read(vec![event.clone()], 5).await.is_err());
+            assert_eq!(read(vec![event], 6).await.unwrap(), "abcdef");
+        });
+    }
+
+    #[test]
+    fn empty_delta_flood_is_bounded() {
+        asupersync::test_utils::run_test(|| async {
+            let stream = futures::stream::iter((0..=MAX_STREAM_EVENTS).map(|_| Ok(delta(""))));
+            assert!(
+                collect_text(stream, 64)
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("event budget")
+            );
+        });
+    }
+
+    #[test]
+    fn zero_deadline_never_polls_request() {
+        asupersync::test_utils::run_test(|| async {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            let polled = AtomicBool::new(false);
+            let result = with_timeout(Duration::ZERO, async {
+                polled.store(true, Ordering::SeqCst);
+                42
+            })
+            .await;
+            assert_eq!(result, Err(RequestStop::TimedOut));
+            assert!(!polled.load(Ordering::SeqCst));
+        });
+    }
+
+    #[test]
+    fn deadline_drops_pending_request() {
+        asupersync::test_utils::run_test(|| async {
+            use std::sync::Arc;
+            use std::sync::atomic::{AtomicBool, Ordering};
+            struct OnDrop(Arc<AtomicBool>);
+            impl Drop for OnDrop {
+                fn drop(&mut self) {
+                    self.0.store(true, Ordering::SeqCst);
+                }
+            }
+            let dropped = Arc::new(AtomicBool::new(false));
+            let guard = OnDrop(Arc::clone(&dropped));
+            let request = async move {
+                let _guard = guard;
+                futures::future::pending::<()>().await;
+            };
+            assert_eq!(
+                with_timeout(Duration::from_millis(10), request).await,
+                Err(RequestStop::TimedOut)
+            );
+            assert!(dropped.load(Ordering::SeqCst));
+        });
+    }
+
+    #[test]
+    fn ready_stream_returns_pending_after_each_bounded_batch() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let seen = AtomicUsize::new(0);
+        let stream = futures::stream::iter((0..MAX_STREAM_EVENTS).map(|_| {
+            seen.fetch_add(1, Ordering::SeqCst);
+            Ok(delta(""))
+        }));
+        let mut request = std::pin::pin!(collect_text(stream, 64));
+        let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
+        for batch in 1..=3 {
+            assert!(request.as_mut().poll(&mut cx).is_pending());
+            assert_eq!(seen.load(Ordering::SeqCst), batch * READY_EVENT_BATCH);
+        }
+    }
+
+    #[test]
+    fn terminal_response_survives_multiple_cooperative_batches() {
+        asupersync::test_utils::run_test(|| async {
+            let stream = futures::stream::iter((0..READY_EVENT_BATCH * 3).map(|_| Ok(delta(""))))
+                .chain(futures::stream::iter([Ok(done("complete"))]));
+            assert_eq!(collect_text(stream, 64).await.unwrap(), "complete");
+        });
+    }
+
+    #[test]
+    fn idle_stream_does_not_self_wake() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct WakeCount(AtomicUsize);
+        impl futures::task::ArcWake for WakeCount {
+            fn wake_by_ref(arc_self: &Arc<Self>) {
+                arc_self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let wakes = Arc::new(WakeCount(AtomicUsize::new(0)));
+        let waker = futures::task::waker(Arc::clone(&wakes));
+        let mut cx = std::task::Context::from_waker(&waker);
+        let mut request = std::pin::pin!(collect_text(futures::stream::pending(), 64));
+        assert!(request.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(wakes.0.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn short_terminal_response_does_not_need_a_scheduling_round_trip() {
+        let mut request = std::pin::pin!(collect_text(
+            futures::stream::iter([Ok(done("complete"))]),
+            64,
+        ));
+        let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
+        assert!(matches!(
+            request.as_mut().poll(&mut cx),
+            std::task::Poll::Ready(Ok(answer)) if answer == "complete"
+        ));
+    }
+
+    #[test]
+    fn cancelling_after_a_ready_batch_stops_the_live_collector() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        let owner = crate::agent_cx::AgentCx::from_cx(
+            runtime.request_cx_with_budget(asupersync::Budget::new()),
+        );
+        runtime.block_on(async {
+            let seen = AtomicUsize::new(0);
+            let stream = futures::stream::iter((0..MAX_STREAM_EVENTS).map(|_| {
+                seen.fetch_add(1, Ordering::SeqCst);
+                Ok(delta(""))
+            }));
+            let mut request = std::pin::pin!(owner.with_current(with_timeout(
+                Duration::from_secs(30),
+                collect_text(stream, 64),
+            )));
+            assert!(futures::poll!(&mut request).is_pending());
+            assert_eq!(seen.load(Ordering::SeqCst), READY_EVENT_BATCH);
+            owner.cancel_with(
+                asupersync::types::CancelKind::User,
+                Some("stream cancelled"),
+            );
+            assert!(matches!(request.await, Err(RequestStop::Cancelled)));
+            assert_eq!(seen.load(Ordering::SeqCst), READY_EVENT_BATCH);
+            assert!(!asupersync::Cx::current().unwrap().is_cancel_requested());
+        });
+    }
+}

@@ -2,6 +2,8 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::sync::Arc;
 
+use asupersync::sync::OwnedMutexGuard;
+
 use crate::model::{ContentBlock, UserContent};
 use crate::session::{Session, SessionEntry, SessionMessage};
 use crate::theme::TuiStyles;
@@ -231,13 +233,80 @@ pub(super) fn resolve_tree_selector_initial_id(session: &Session, args: &str) ->
     None
 }
 
+/// A user message `/fork` can branch from. Shared with the FTUI stack.
 #[derive(Debug, Clone)]
-struct ForkCandidate {
-    id: String,
-    summary: String,
+pub struct ForkCandidate {
+    pub id: String,
+    pub summary: String,
 }
 
-fn fork_candidates(session: &Session) -> Vec<ForkCandidate> {
+/// `/fork list`: the numbered candidates, as both stacks print them.
+pub fn format_fork_candidates(candidates: &[ForkCandidate]) -> String {
+    let list = candidates
+        .iter()
+        .enumerate()
+        .map(|(i, c)| format!("  {}. {} - {}", i + 1, c.id, c.summary))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("Forkable user messages (use /fork <id|index>):\n{list}")
+}
+
+/// Resolve `/fork [args]` against the candidates: empty picks the latest user
+/// message, a number is a 1-based index, anything else is an id or unique id
+/// prefix. The error is the message to show.
+pub fn select_fork_candidate(
+    candidates: &[ForkCandidate],
+    args: &str,
+) -> Result<ForkCandidate, String> {
+    let Some(last) = candidates.last() else {
+        return Err("No user messages to fork from".to_string());
+    };
+    if args.is_empty() {
+        return Ok(last.clone());
+    }
+    select_by_index_or_id(candidates, args, |c| &c.id, "user message")
+}
+
+/// A number is a 1-based index; anything else is an id or unique id prefix.
+fn select_by_index_or_id<T: Clone>(
+    items: &[T],
+    args: &str,
+    id: impl Fn(&T) -> &str,
+    noun: &str,
+) -> Result<T, String> {
+    if let Ok(index) = args.parse::<usize>() {
+        return index
+            .checked_sub(1)
+            .and_then(|position| items.get(position))
+            .cloned()
+            .ok_or_else(|| format!("Invalid index: {index} (1-{})", items.len()));
+    }
+    let matches = items
+        .iter()
+        .filter(|item| id(item).starts_with(args))
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [] => Err(format!("No {noun} id matches \"{args}\"")),
+        [only] => Ok((*only).clone()),
+        many => Err(format!("Ambiguous id \"{args}\" (matches {})", many.len())),
+    }
+}
+
+fn user_summary(content: &UserContent) -> String {
+    let text = user_content_to_text(content);
+    let first_line = text
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("")
+        .trim();
+    if first_line.is_empty() {
+        "(empty)".to_string()
+    } else {
+        super::truncate(first_line, 80)
+    }
+}
+
+pub fn fork_candidates(session: &Session) -> Vec<ForkCandidate> {
     let mut out = Vec::new();
 
     for entry in session.entries_for_current_path() {
@@ -253,32 +322,95 @@ fn fork_candidates(session: &Session) -> Vec<ForkCandidate> {
             continue;
         };
 
-        let text = user_content_to_text(content);
-        let first_line = text
-            .lines()
-            .find(|line| !line.trim().is_empty())
-            .unwrap_or("")
-            .trim();
-        let summary = if first_line.is_empty() {
-            "(empty)".to_string()
-        } else {
-            super::truncate(first_line, 80)
-        };
-
         out.push(ForkCandidate {
             id: id.clone(),
-            summary,
+            summary: user_summary(content),
         });
     }
 
     out
 }
 
+/// The tip of one session branch, for the FTUI `/tree` (the classic stack
+/// has the interactive selector instead).
+#[derive(Debug, Clone)]
+pub struct BranchCandidate {
+    pub leaf_id: String,
+    /// First line of the branch's latest user message.
+    pub summary: String,
+    /// This tip is the current leaf.
+    pub current: bool,
+}
+
+/// Every branch tip, oldest first.
+pub fn branch_candidates(session: &Session) -> Vec<BranchCandidate> {
+    let current = session.leaf_id();
+    session
+        .list_leaves()
+        .into_iter()
+        .map(|leaf_id| {
+            let summary = session
+                .get_path_to_entry(&leaf_id)
+                .iter()
+                .rev()
+                .find_map(|id| match session.get_entry(id)? {
+                    SessionEntry::Message(entry) => match &entry.message {
+                        SessionMessage::User { content, .. } => Some(user_summary(content)),
+                        _ => None,
+                    },
+                    _ => None,
+                })
+                .unwrap_or_else(|| "(no user message)".to_string());
+            BranchCandidate {
+                current: current == Some(leaf_id.as_str()),
+                leaf_id,
+                summary,
+            }
+        })
+        .collect()
+}
+
+/// FTUI `/tree`: the numbered branches and how to switch.
+pub fn format_branch_candidates(candidates: &[BranchCandidate], entry_count: usize) -> String {
+    if candidates.is_empty() {
+        return format!("Session tree: no branches, {entry_count} entries");
+    }
+    let list = candidates
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            let marker = if c.current { "  <- current" } else { "" };
+            format!("  {}. {} - {}{marker}", i + 1, c.leaf_id, c.summary)
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let position = if candidates.iter().any(|c| c.current) {
+        ""
+    } else {
+        "\nYou are partway along a branch (after a rewind); new messages start a new one."
+    };
+    format!(
+        "Session tree: {} branch(es), {entry_count} entries. Switch with /tree <index|id>:\n{list}{position}",
+        candidates.len()
+    )
+}
+
+/// Resolve `/tree <args>`: a 1-based index, or a leaf id or unique prefix.
+pub fn select_branch_candidate(
+    candidates: &[BranchCandidate],
+    args: &str,
+) -> Result<BranchCandidate, String> {
+    if candidates.is_empty() {
+        return Err("This session has no branches yet".to_string());
+    }
+    select_by_index_or_id(candidates, args, |c| &c.leaf_id, "branch")
+}
+
 impl PiApp {
     #[allow(clippy::too_many_lines)]
     pub(super) fn handle_slash_fork(&mut self, args: &str) -> Option<Cmd> {
-        if self.agent_state != AgentState::Idle {
-            self.status_message = Some("Cannot fork while processing a request".to_string());
+        if let Some(reason) = self.session_transition_blocker() {
+            self.status_message = Some(reason.to_string());
             return None;
         }
 
@@ -295,15 +427,9 @@ impl PiApp {
         }
 
         if args.eq_ignore_ascii_case("list") || args.eq_ignore_ascii_case("ls") {
-            let list = candidates
-                .iter()
-                .enumerate()
-                .map(|(i, c)| format!("  {}. {} - {}", i + 1, c.id, c.summary))
-                .collect::<Vec<_>>()
-                .join("\n");
             self.messages.push(ConversationMessage {
                 role: MessageRole::System,
-                content: format!("Forkable user messages (use /fork <id|index>):\n{list}"),
+                content: format_fork_candidates(&candidates),
                 thinking: None,
                 collapsed: false,
             });
@@ -311,39 +437,20 @@ impl PiApp {
             return None;
         }
 
-        let selection = if args.is_empty() {
-            candidates.last().expect("candidates is non-empty").clone()
-        } else if let Ok(index) = args.parse::<usize>() {
-            if index == 0 || index > candidates.len() {
-                self.status_message =
-                    Some(format!("Invalid index: {index} (1-{})", candidates.len()));
+        let selection = match select_fork_candidate(&candidates, args) {
+            Ok(selection) => selection,
+            Err(message) => {
+                self.status_message = Some(message);
                 return None;
             }
-            candidates[index - 1].clone()
-        } else {
-            let matches = candidates
-                .iter()
-                .filter(|c| c.id == args || c.id.starts_with(args))
-                .cloned()
-                .collect::<Vec<_>>();
-            if matches.is_empty() {
-                self.status_message = Some(format!("No user message id matches \"{args}\""));
-                return None;
-            }
-            if matches.len() > 1 {
-                self.status_message = Some(format!(
-                    "Ambiguous id \"{args}\" (matches {})",
-                    matches.len()
-                ));
-                return None;
-            }
-            matches[0].clone()
         };
 
         let event_tx = self.event_tx.clone();
         let session = Arc::clone(&self.session);
         let agent = Arc::clone(&self.agent);
+        let admission = self.session_action_admission.clone();
         let extensions = self.extensions.clone();
+        let runtime_cwd = self.cwd.clone();
         let model_provider = self.model_entry.model.provider.clone();
         let model_id = self.model_entry.model.id.clone();
         let (thinking_level, session_id) = if let Ok(guard) = self.session.try_lock() {
@@ -383,8 +490,8 @@ impl PiApp {
                 }
             }
 
-            let (fork_plan, parent_path, session_dir) = {
-                let guard = match session.lock(&cx).await {
+            let (fork_plan, session_dir) = {
+                let guard = match OwnedMutexGuard::lock(Arc::clone(&session), &cx).await {
                     Ok(guard) => guard,
                     Err(err) => {
                         let _ = crate::interactive::enqueue_pi_event(
@@ -408,10 +515,9 @@ impl PiApp {
                         return;
                     }
                 };
-                let parent_path = guard.path.as_ref().map(|p| p.display().to_string());
                 let session_dir = guard.session_dir.clone();
                 drop(guard);
-                (fork_plan, parent_path, session_dir)
+                (fork_plan, session_dir)
             };
 
             let selected_text = fork_plan.selected_text.clone();
@@ -420,12 +526,45 @@ impl PiApp {
             new_session.header.provider = Some(model_provider);
             new_session.header.model_id = Some(model_id);
             new_session.header.thinking_level = thinking_level;
-            if let Some(parent_path) = parent_path {
-                new_session.set_branched_from(Some(parent_path));
-            }
             new_session.init_from_fork_plan(fork_plan);
+            if let Err(err) =
+                crate::session_workdir::check_session_workdir(&new_session, &runtime_cwd)
+            {
+                let _ = crate::interactive::enqueue_pi_event(
+                    &event_tx,
+                    &cx,
+                    PiMsg::AgentError(format!("Failed to fork session: {err}")),
+                )
+                .await;
+                return;
+            }
             let new_session_id = new_session.header.id.clone();
 
+            // A fork retains all prior spend, including sibling and side
+            // requests absent from the selected transcript branch.
+            let (fork_budget, agent_busy) = agent
+                .try_lock()
+                .map_or((None, true), |agent| (agent.cost_budget().cloned(), false));
+            if agent_busy {
+                let _ = crate::interactive::enqueue_pi_event(
+                    &event_tx,
+                    &cx,
+                    PiMsg::AgentError("Agent busy; fork was not saved".to_string()),
+                )
+                .await;
+                return;
+            }
+            if let Some(budget) = &fork_budget
+                && let Err(error) = budget.checkpoint(&mut new_session)
+            {
+                let _ = crate::interactive::enqueue_pi_event(
+                    &event_tx,
+                    &cx,
+                    PiMsg::AgentError(format!("Failed to retain fork model spend: {error}")),
+                )
+                .await;
+                return;
+            }
             if let Err(err) = new_session.save().await {
                 let _ = crate::interactive::enqueue_pi_event(
                     &event_tx,
@@ -437,58 +576,32 @@ impl PiApp {
             }
 
             let messages_for_agent = new_session.to_messages_for_current_path();
+            let (messages, usage) = conversation_from_session(&new_session);
+            if let Err(err) = Self::try_install_session(
+                &session,
+                &agent,
+                &admission,
+                new_session,
+                messages_for_agent,
+                None,
+                true,
+            )
+            .await
             {
-                let mut agent_guard = match agent.lock(&cx).await {
-                    Ok(guard) => guard,
-                    Err(err) => {
-                        let _ = crate::interactive::enqueue_pi_event(
-                            &event_tx,
-                            &cx,
-                            PiMsg::AgentError(format!("Failed to lock agent: {err}")),
-                        )
-                        .await;
-                        return;
-                    }
-                };
-                agent_guard.replace_messages(messages_for_agent);
+                let _ = crate::interactive::enqueue_pi_event(
+                    &event_tx,
+                    &cx,
+                    PiMsg::AgentError(err.to_string()),
+                )
+                .await;
+                return;
             }
-
-            {
-                let mut guard = match session.lock(&cx).await {
-                    Ok(guard) => guard,
-                    Err(err) => {
-                        let _ = crate::interactive::enqueue_pi_event(
-                            &event_tx,
-                            &cx,
-                            PiMsg::AgentError(format!("Failed to lock session: {err}")),
-                        )
-                        .await;
-                        return;
-                    }
-                };
-                *guard = new_session;
-            }
-
-            let (messages, usage) = {
-                let guard = match session.lock(&cx).await {
-                    Ok(guard) => guard,
-                    Err(err) => {
-                        let _ = crate::interactive::enqueue_pi_event(
-                            &event_tx,
-                            &cx,
-                            PiMsg::AgentError(format!("Failed to lock session: {err}")),
-                        )
-                        .await;
-                        return;
-                    }
-                };
-                conversation_from_session(&guard)
-            };
 
             let _ = crate::interactive::enqueue_pi_event(
                 &event_tx,
                 &asupersync::Cx::current().unwrap_or_else(asupersync::Cx::for_request),
                 PiMsg::ConversationReset {
+                    session_id: new_session_id.clone(),
                     messages,
                     usage,
                     status: Some(format!("Forked new session from {}", selection.summary)),
@@ -499,7 +612,10 @@ impl PiApp {
             let _ = crate::interactive::enqueue_pi_event(
                 &event_tx,
                 &asupersync::Cx::current().unwrap_or_else(asupersync::Cx::for_request),
-                PiMsg::SetEditorText(selected_text),
+                PiMsg::SetEditorText {
+                    owner_session_id: new_session_id.clone(),
+                    text: selected_text,
+                },
             )
             .await;
 
@@ -1007,4 +1123,58 @@ fn view_tree_custom_prompt(state: &TreeCustomPromptState, styles: &TuiStyles) ->
     };
     let _ = writeln!(out, "  {}", styles.accent.render(&shown));
     out
+}
+
+#[cfg(test)]
+mod fork_selection_tests {
+    use super::{ForkCandidate, select_fork_candidate};
+
+    fn candidates() -> Vec<ForkCandidate> {
+        ["abc123", "abd456", "zzz789"]
+            .into_iter()
+            .map(|id| ForkCandidate {
+                id: id.to_string(),
+                summary: format!("message {id}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn empty_args_pick_the_latest_and_indices_are_one_based() {
+        let candidates = candidates();
+        assert_eq!(select_fork_candidate(&candidates, "").unwrap().id, "zzz789");
+        assert_eq!(
+            select_fork_candidate(&candidates, "1").unwrap().id,
+            "abc123"
+        );
+        assert_eq!(
+            select_fork_candidate(&candidates, "0").unwrap_err(),
+            "Invalid index: 0 (1-3)"
+        );
+        assert_eq!(
+            select_fork_candidate(&candidates, "4").unwrap_err(),
+            "Invalid index: 4 (1-3)"
+        );
+    }
+
+    #[test]
+    fn id_prefixes_must_be_unique() {
+        let candidates = candidates();
+        assert_eq!(
+            select_fork_candidate(&candidates, "abd").unwrap().id,
+            "abd456"
+        );
+        assert_eq!(
+            select_fork_candidate(&candidates, "ab").unwrap_err(),
+            "Ambiguous id \"ab\" (matches 2)"
+        );
+        assert_eq!(
+            select_fork_candidate(&candidates, "nope").unwrap_err(),
+            "No user message id matches \"nope\""
+        );
+        assert_eq!(
+            select_fork_candidate(&[], "").unwrap_err(),
+            "No user messages to fork from"
+        );
+    }
 }

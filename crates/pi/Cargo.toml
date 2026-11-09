@@ -1,12 +1,9 @@
-# [R1 接线] crates/pi 现为 uClaw 主 workspace 正式 member。pi 跑 stateless
-# (sqlite-sessions off → 无 sqlmodel-sqlite → 不与 uClaw rusqlite 的 libsqlite3-sys 冲突)。
-
 [package]
 name = "pi_agent_rust"
-version = "0.1.16"
+version = "0.8.0"
 edition = "2024"
-rust-version = "1.85"
-description = "High-performance AI coding agent CLI - Rust port of Pi Agent"
+rust-version = "1.95"
+description = "Native AI coding agent CLI - Rust port of Pi Agent"
 authors = ["Jeffrey Emanuel"]
 license-file = "LICENSE"
 repository = "https://github.com/Dicklesworthstone/pi_agent_rust"
@@ -16,36 +13,62 @@ readme = "README.md"
 keywords = ["ai", "cli", "coding-agent", "llm", "anthropic"]
 categories = ["command-line-utilities", "development-tools"]
 autobins = false
-autobenches = false  # [vendored] benches/ dropped
-autotests = false    # [vendored] tests/ dropped
 # Binary organization per bd-uuwgi.1/bd-uuwgi.2 classification:
 # - SHIPPING: src/main.rs (pi) - main CLI binary
-# - RETIRABLE: src/bin/pi_legacy_capture.rs (pending RULE 1 approval)
-# - DEV-ONLY: moved to examples/ (21 files: ext_*, test_*, debug utilities)
+# - INTERNAL/OPT-IN: src/bin/pi_legacy_capture.rs (pending RULE 1 approval)
+# - DEV-ONLY: moved to examples/ (23 files: ext_*, test_*, debug utilities)
 include = [
-    "docs/extension-artifact-provenance.json",
-    "docs/wit/extension.wit",
-    "docs/provider-upstream-model-ids-snapshot.json",
-    "docs/schema/extension_protocol.json",
-    "legacy_pi_mono_code/pi-mono/packages/ai/src/models.generated.ts",
-    "Cargo.toml",
-    "LICENSE",
-    "README.md",
-    # Pulled in by `include_str!("../../CHANGELOG.md")` in
-    # src/interactive/commands.rs and src/interactive.rs — without it the
-    # `cargo publish --dry-run` verify step fails to build the packaged tarball.
-    "CHANGELOG.md",
-    "build.rs",
-    "src/**",
+    "/docs/extension-artifact-provenance.json",
+    # Compile-time unit-test evidence referenced by src/tools.rs. Keeping it in
+    # the source package lets `cargo test` compile after crates.io extraction.
+    "/docs/evidence/tool-output-context-cache.jsonl",
+    "/docs/wit/extension.wit",
+    "/docs/provider-upstream-model-ids-snapshot.json",
+    "/docs/schema/extension_protocol.json",
+    "/legacy_pi_mono_code/pi-mono/packages/ai/src/models.generated.ts",
+    # Compile-time unit-test fixture referenced by src/doctor.rs.
+    "/tests/fixtures/agent_mail/schema_corrupt_health.json",
+    "/Cargo.toml",
+    "/LICENSE",
+    "/README.md",
+    # Compressed by build.rs and embedded by src/embedded_assets.rs; without it
+    # the `cargo publish --dry-run` verify step cannot build the packaged tarball.
+    "/CHANGELOG.md",
+    "/build.rs",
+    "/src/**",
 ]
 
 [lib]
 name = "pi"
 path = "src/lib.rs"
 
-# [vendored into uclaw-pi as crates/pi] bins stripped — uClaw consumes only the
-# `pi` lib. src/main.rs + src/bin/ stay on disk but unbuilt (autobins = false,
-# no [[bin]] stanzas). Re-add a [[bin]] here if you want pi's CLI in-tree.
+[[bin]]
+name = "pi"
+path = "src/main.rs"
+# The `pi` binary is the interactive terminal front-end; it requires the full
+# TUI stack (crossterm + charmed_rust). `tui` is in the default feature set, so
+# `cargo build` still produces `pi` with no extra flags. A `--no-default-features`
+# build correctly skips the binary while the library still compiles for SDK
+# consumers that do not want the terminal stack.
+required-features = ["tui"]
+
+# RETIRABLE internal conformance utility (pending RULE 1 approval). Keeping it
+# behind a non-default feature prevents an ordinary `cargo install
+# pi_agent_rust` from installing this unsupported executable. Repository gates
+# that exercise it explicitly enable `internal-legacy-capture`; the matching
+# integration test is gated below so CARGO_BIN_EXE_pi_legacy_capture is defined
+# whenever that test is compiled.
+[[bin]]
+name = "pi_legacy_capture"
+path = "src/bin/pi_legacy_capture.rs"
+required-features = ["internal-legacy-capture"]
+
+# DEV-ONLY MCP fixture server (bd-cv653.6.1): speaks the MCP stdio handshake
+# with canned tools for the mcp e2e lanes. Never shipped to end users.
+[[bin]]
+name = "pi_mcp_fixture"
+path = "src/bin/pi_mcp_fixture.rs"
+required-features = ["internal-mcp-fixture"]
 
 # Examples (moved from src/bin/ to examples/)
 # These binaries are accessible via: cargo run --example <name>
@@ -53,6 +76,10 @@ path = "src/lib.rs"
 [[example]]
 name = "basic_sdk"
 path = "examples/basic_sdk.rs"
+
+[[example]]
+name = "dialect_bench"
+path = "examples/dialect_bench.rs"
 
 [[example]]
 name = "ext_artifact_manifest"
@@ -119,12 +146,53 @@ name = "ext_workloads"
 path = "examples/ext_workloads.rs"
 
 [[example]]
+name = "ftui_preview"
+path = "examples/ftui_preview.rs"
+required-features = ["ftui"]
+
+[[example]]
 name = "pi_debug"
 path = "examples/pi_debug.rs"
 
+# Deliberately also declared as a [[bench]] below. Cargo warns on every
+# invocation that this path "is present in multiple build targets"; the warning
+# is expected and neither half is removable. `scripts/bench_extension_workloads.sh`
+# builds it with `--example pijs_workload` and times the binary at
+# `$profile/examples/pijs_workload` with hyperfine, while `tests/bench_schema.rs`
+# asserts the criterion regression gate invokes `cargo bench --bench
+# pijs_workload --profile perf`. Deleting either declaration to silence the
+# warning breaks one of those.
 [[example]]
 name = "pijs_workload"
 path = "examples/pijs_workload.rs"
+
+[[example]]
+name = "nrun_evidence_evaluator"
+path = "examples/nrun_evidence_evaluator.rs"
+
+[[example]]
+name = "release_evidence_ledger"
+path = "examples/release_evidence_ledger.rs"
+
+[[example]]
+name = "sequential_budget_gate"
+path = "examples/sequential_budget_gate.rs"
+
+[[example]]
+name = "perf_drift_watch"
+path = "examples/perf_drift_watch.rs"
+
+[[example]]
+name = "conformal_budget_calibration"
+path = "examples/conformal_budget_calibration.rs"
+
+[[example]]
+name = "startup_benchmark_runner"
+path = "examples/startup_benchmark_runner.rs"
+
+[[example]]
+name = "variance_gate"
+path = "examples/variance_gate.rs"
 
 [[example]]
 name = "session_workload_bench"
@@ -148,9 +216,19 @@ clap = { version = "4.5.60", features = ["derive", "env", "string"] }
 clap_complete = "4.5.66"
 
 # Async runtime
-asupersync = { version = "=0.3.2", default-features = false, features = ["tls-native-roots", "test-internals"] }
+asupersync = { version = "0.5.0", default-features = false, features = ["tls-webpki-roots", "tls-native-roots", "test-internals"] }
 futures = "0.3"
 async-trait = "0.1"
+
+# URL reads (bd-cv653.2.2): HTML reader-mode conversion + PDF text extraction
+# htmd is lean and always on; pdf-extract adds ~6 MiB so it is opt-in
+# (release binary size budget, 22 MiB). `full` includes it.
+htmd = "0.5.5"
+pdf-extract = { version = "0.12", optional = true }
+# Native archive/document reads. Reuse the existing flate2 backend without
+# enabling ZIP encryption, additional codecs, or the write-only zopfli backend.
+zip = { version = "=9.0.5", default-features = false, features = ["deflate-flate2"] }
+quick-xml = { version = "=0.42.0", default-features = false, features = ["escape-html"] }
 
 # URL parsing/building
 url = "2"
@@ -158,41 +236,107 @@ url = "2"
 # Signals
 ctrlc = "3.5.2"
 
+# PTY allocation for isatty-requiring bash commands (bd-cv653.1.7)
+portable-pty = "0.9"
+
 # Serialization
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = { version = "1", features = ["raw_value"] }
 json5 = "1.3.1"
 
+# Native jq-compatible Read filters run in resource-bounded Pi workers.
+jaq-core = "=3.1.1"
+jaq-std = "=3.0.3"
+jaq-json = "=2.0.3"
+jaq-fmts = { version = "=0.1.1", default-features = false, features = ["tabular"] }
+
 # Error handling
-anyhow = "1.0.102"
+anyhow = "1.0.104"
 thiserror = "2"
 
-# Terminal output (rich_rust for beautiful TUI)
-rich_rust = { version = "0.2.0", features = ["markdown"] }
-crossterm = "0.29"
-enable-ansi-support = "0.2"
+# Terminal output (rich_rust for beautiful TUI).
+# rich_rust is shared by non-TUI code paths (plain styled stdout/markdown
+# rendering in src/tui.rs and elsewhere), so it stays unconditional.
+rich_rust = { version = "0.2.3", features = ["markdown"] }
+# crossterm is the low-level terminal driver used exclusively by the
+# interactive front-end, so it is gated behind the `tui` feature.
+crossterm = { version = "0.29", optional = true }
+enable-ansi-support = "0.3"
 
-# Interactive TUI (charmed_rust - bubbletea/lipgloss/bubbles/glamour)
-bubbletea = { package = "charmed-bubbletea", version = "0.2.0" }
-lipgloss = { package = "charmed-lipgloss", version = "0.2.0" }
-bubbles = { package = "charmed-bubbles", version = "0.2.0" }
-glamour = { package = "charmed-glamour", version = "0.2.0" }
-unicode-width = "0.2"
-textwrap = "0.16"
+# Interactive TUI (charmed_rust - bubbletea/lipgloss/bubbles/glamour).
+# These are used exclusively by the interactive terminal front-end and are
+# gated behind the `tui` feature so SDK/library consumers can build the lib
+# with `--no-default-features` without pulling in the terminal stack.
+# bubbletea and bubbles are pinned to exactly 0.2.0. The 0.2.1..0.2.4 renderer
+# diffs only changed rows and overwrites the soft-wrapped tail of a line longer
+# than the terminal width, which hides the end of long classic-TUI status
+# lines (bd-charmed-bubbletea-024-wrapped-tail-drtao; pinned by
+# e2e_tui_share_rejects_public_argument_without_invoking_gh). A caret
+# requirement let a lockfile refresh move them to 0.2.4 once already
+# (bada02307). Lift the pin when a charmed_rust release fixes the renderer.
+bubbletea = { package = "charmed-bubbletea", version = "=0.2.0", optional = true }
+lipgloss = { package = "charmed-lipgloss", version = "0.2.0", optional = true }
+bubbles = { package = "charmed-bubbles", version = "=0.2.0", optional = true }
+# 0.2.4 is the first release that re-pads table cells truncated at a
+# wide-char boundary (charmed_rust 4150912, GH #195).
+glamour = { package = "charmed-glamour", version = "0.2.4", optional = true }
+# unicode-width / textwrap are TUI-layout helpers consumed only by the
+# interactive render code, so they are gated with the rest of the TUI stack.
+unicode-width = { version = "0.2", optional = true }
+textwrap = { version = "0.16", optional = true }
 arboard = { version = "3.6.1", optional = true }
 
+# Default FrankenTUI stack (bd-cv653.9.1); --classic selects charmed_rust.
+# 0.9.0 includes the styled WordChar progress fix needed by GH #255:
+# a wide grapheme that cannot fit the remainder of a nonempty row must
+# flush that row before retrying, or live thinking and session replay hang.
+# Keep the crossterm backend and existing feature set; this is not a switch
+# to the native backend or an opt-in to the facade's heavier defaults.
+ftui = { version = "0.9.0", default-features = false, features = ["runtime", "crossterm"], optional = true }
+# Markdown rendering for the ftui conversation view. Direct dep because the
+# facade's `extras` feature enables no ftui-extras features (markdown stays
+# off); default-features off keeps the heavy extras (charts, doom, ...) out.
+ftui-extras = { version = "0.9.0", default-features = false, features = ["markdown"], optional = true }
+
 # Filesystem
-dirs = "6"
+dirs = "7"
 tempfile = "3.25.0"
-fs4 = "0.13"
+fs4 = "1.1"
 glob = "0.3"
 ignore = "0.4"
+globset = "0.4"
+grep-regex = "0.1"
+grep-searcher = "0.1"
+# Typed subagent results (bd-cv653.5.1): validate child yields against
+# per-task output schemas.
+jsonschema = { version = "0.58.4", default-features = false }
+rustix = { version = "1.1.4", features = ["fs", "process"] }
 crossbeam-queue = "0.3"
-# uclaw-patch(P0§4): sqlmodel-sqlite REMOVED — its libsqlite3-sys 0.37 conflicts with
-# uClaw rusqlite's (cargo `links` uniqueness is graph-wide, incl. disabled optional deps).
-# pi runs stateless in uClaw (sqlite-sessions off). Re-add this dep to use the SQLite
-# session backend standalone. All sqlite code is cfg(feature="sqlite-sessions")-gated.
-sqlmodel-core = { version = "0.2.2" }
+# default-features off: pi's session storage needs only the core engine.
+# Effective since fsqlite 0.3.5 (frankensqlite#356): `native` no longer
+# force-enables the extension vtabs, and serde_json's `preserve_order` no
+# longer leaks into pi's dependency graph (bd-nhm45). Size note: the vtab
+# decoupling reclaimed ~nothing (lto=true had already dead-stripped them);
+# the 26 MiB budget (src/perf_build.rs BINARY_SIZE_RELEASE_BUDGET_MB) stands
+# with darwin-arm64 release at 24.59 MiB (bd-2ohw2).
+# MOVED 0.3.5 -> 0.3.13 -> 0.3.14 on 2026-09-01: 0.3.12/0.3.13 carry the
+# fsqlite GH#399 cross-process WAL corruption-fix wave (reader-slot
+# registration, checkpoint horizon gating, generation-boundary pool drop)
+# plus the 0.3.6-0.3.11 correctness train; 0.3.14 adds the FTS5 stock-compat
+# writer fix (GH#404 — pi uses the fts5 feature), the GH#402 checkpoint
+# backfill watermark (super-linear autocommit cost with schema size), and
+# PRAGMA wal_checkpoint cumulative-nBackfill stock parity.
+# MOVED 0.3.14 (locked 0.3.18) -> 0.4.10 on 2026-10-12: pi's use of the API
+# (Connection, Row, SqliteValue, FrankenError) compiles unchanged. 0.4 is
+# built on asupersync 0.5, the version pi itself uses, so the second copy of
+# asupersync (0.4.11) and its franken-kernel/decision/evidence 0.4.11
+# companions leave the dependency graph.
+fsqlite = { version = "0.4.10", default-features = false, features = ["native", "fts5"] }
+# The pinned engine's prepare API excludes DDL and transaction statements.
+# Use its own parser/AST for side-effect-free validation of Bun statements and
+# structural sandbox admission; both crates are already engine dependencies.
+fsqlite-ast = "=0.4.10"
+fsqlite-parser = "=0.4.10"
 
 # Time
 chrono = { version = "0.4", features = ["serde"] }
@@ -204,62 +348,124 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Utilities
 uuid = { version = "1.21.0", features = ["v4"] }
 memchr = "2.8.0"
-base64 = "0.22"
+signal-hook = "0.4.4"
+base64 = "0.23"
 flate2 = "1.1.9"
-sha2 = "0.10"
-sha1 = "0.10"
-md-5 = "0.10"
-hmac = "0.12"
-pbkdf2 = { version = "0.12.2", features = ["hmac"] }
-scrypt = { version = "0.11.0", default-features = false }
+toml = "1.0.3"
+sha2 = "0.11"
+sha1 = "0.11"
+md-5 = "0.11"
+hmac = "0.13"
+pbkdf2 = { version = "0.13.0", features = ["hmac"] }
+scrypt = { version = "0.12.0", default-features = false }
 getrandom = "0.4.1"
 regex = "1.12.3"
 ring = "0.17.14"
 semver = "1.0.27"
 crc32c = "0.6"
-ast-grep-core = "0.40"
-ast-grep-language = { version = "0.40", default-features = false, features = [
+ast-grep-core = "0.45"
+ast-grep-language = { version = "0.45", default-features = false, features = [
     "tree-sitter-bash",
     "tree-sitter-python",
     "tree-sitter-javascript",
     "tree-sitter-typescript",
     "tree-sitter-ruby",
+    "tree-sitter-rust",
+    "tree-sitter-go",
 ] }
 unicode-normalization = "0.1"
+# PiJS grapheme boundaries use the same Unicode tables already locked for the TUI.
+unicode-segmentation = "=1.13.3"
 xxhash-rust = { version = "0.8", features = ["xxh32"] }
-similar = "2"
-sysinfo = "0.38.2"
-rquickjs = { version = "0.11", features = ["futures", "loader"] }
-swc_common = "18.0.1"
-swc_ecma_codegen = "23.0.0"
-swc_ecma_ast = "20.0.1"
-swc_ecma_parser = "34.0.0"
-swc_ecma_transforms_base = "37.0.0"
-swc_ecma_transforms_typescript = "41.0.0"
-swc_ecma_visit = "20.0.0"
-wasmtime = { version = "41.0.3", features = ["component-model"], optional = true }
+similar = "3"
+sysinfo = "0.39.6"
+# BPE token counting tables (bd-cv653.7.2.1); enabled via the `bpe-tokens`
+# feature.
+tiktoken-rs = { version = "0.12.0", optional = true }
+rquickjs = { version = "0.12.2", features = ["futures", "loader"] }
+# Sampling profiler (bd-cv653.7.12.1); opt-in via the `profiler` feature —
+# internal signal handling is wrapped by the crate, keeping this crate's
+# forbid(unsafe_code) intact.
+pprof = { version = "0.14", optional = true, features = ["flamegraph"] }
+swc_common = "26.0.0"
+swc_ecma_codegen = "32.0.0"
+swc_ecma_ast = "29.0.0"
+swc_ecma_parser = "45.0.0"
+swc_ecma_transforms_base = "49.0.0"
+swc_ecma_transforms_typescript = "55.0.0"
+swc_ecma_visit = "29.0.0"
+wasmtime = { version = "47.0.3", features = ["component-model"], optional = true }
+filetime = "0.2.27"
 
-# Image processing (optional)
-image = { version = "0.25", optional = true }
+# Image processing (optional). Formats limited to what the read tool
+# actually decodes (jpg/png/gif/webp — see its schema docs) plus rayon for
+# decode parallelism: the default-formats set would pull avif → ravif →
+# rav1e → paste, adding two RUSTSEC inventory warnings (unmaintained
+# `paste`, bd-kytip) and megabytes of AV1 encoder against the size budget.
+image = { version = "0.25", optional = true, default-features = false, features = [
+    "jpeg",
+    "png",
+    "gif",
+    "webp",
+    "rayon",
+] }
 
 [build-dependencies]
-vergen-gix = { version = "9.1.0", features = ["build", "cargo", "rustc"] }
+crc32c = "0.6.8"
+flate2 = "1.1.9"
+vergen-gix = { version = "10.0.1", features = ["build", "cargo", "rustc"] }
 
 [dev-dependencies]
 arbitrary = { version = "1", features = ["derive"] }
 pretty_assertions = "1"
 insta = { version = "1", features = ["filters"] }
 tempfile = "3.25.0"
-asupersync = { version = "=0.3.2", default-features = false, features = ["test-internals"] }
-filetime = "0.2.27"
+asupersync = { version = "0.5.0", default-features = false, features = ["test-internals"] }
 criterion = { version = "0.8.2", features = ["html_reports"] }
-jsonschema = { version = "0.42.0", default-features = false }
+jsonschema = { version = "0.58.4", default-features = false }
 proptest = "1.10.0"
-wat = "1.245.1"
+wat = "1.255.0"
 toml = "1.0.3"
-loom = "0.7.2"
+# Pinned to the reviewed upstream root-stack configurability change from
+# tokio-rs/loom#412. Loom 0.7.2 hard-codes the model root coroutine to 4 KiB,
+# which overflows before these hostcall models can begin exploring. The exact
+# revision is immutable and remains test-only until upstream publishes it.
+loom = { version = "0.7.2", git = "https://github.com/ongardie-atomix/loom", rev = "2b7c402034cc041b5e325384c67bb43bff93c048" }
 
-# [vendored] benches/ dropped — [[bench]] stanzas removed.
+[[bench]]
+name = "tools"
+harness = false
+
+[[bench]]
+name = "extensions"
+harness = false
+
+[[bench]]
+name = "extension_budget_inputs"
+harness = false
+
+[[bench]]
+name = "semantic_context"
+harness = false
+
+# The other half of the deliberate duplication; see the [[example]] entry for
+# this same path above before removing either.
+[[bench]]
+name = "pijs_workload"
+path = "examples/pijs_workload.rs"
+harness = false
+
+[[bench]]
+name = "system"
+harness = false
+
+[[bench]]
+name = "tui_perf"
+harness = false
+
+[[bench]]
+name = "search_backends"
+harness = false
 
 # Gap H: jemalloc for 10-20% allocation-heavy path improvement.
 # Keep the global jemalloc override to targets where tikv-jemallocator is a
@@ -271,7 +477,7 @@ tikv-jemallocator = { version = "0.6", optional = true }
 # ship pre-generated bindings for this target, so regenerate at build time
 # via the `bindgen` feature (uses /usr/bin/clang from the base system).
 [target.'cfg(target_os = "freebsd")'.dependencies]
-rquickjs = { version = "0.11", features = ["futures", "loader", "bindgen"] }
+rquickjs = { version = "0.12.2", features = ["futures", "loader", "bindgen"] }
 
 # Android (including Termux on-device): rquickjs-sys 0.11 ships pre-generated
 # bindings for aarch64-linux-android only for some Cargo versions and not
@@ -280,26 +486,79 @@ rquickjs = { version = "0.11", features = ["futures", "loader", "bindgen"] }
 # upstream crate. Termux ships clang under $PREFIX/bin which bindgen picks
 # up automatically.
 [target.'cfg(target_os = "android")'.dependencies]
-rquickjs = { version = "0.11", features = ["futures", "loader", "bindgen"] }
+rquickjs = { version = "0.12.2", features = ["futures", "loader", "bindgen"] }
+
+# Windows child-tree kill discipline (bd-9jgrt item 1): Job objects close the
+# snapshot-vs-kill race that the parent-chain walk cannot. win32job keeps our
+# crate unsafe-free while encapsulating the Win32 FFI.
+[target.'cfg(windows)'.dependencies]
+win32job = "2.0.3"
+# Nonblocking job-pipe readers; one process-wide reactor owns IOCP completions.
+mio = { version = "1.2.4", features = ["os-ext"] }
+# `GetFileInformationByHandle` without `unsafe`: std's own accessors for the
+# volume serial number and file index are behind the unstable
+# `windows_by_handle` feature, which this crate cannot use because it also has
+# to build on stable. See `src/file_identity.rs`.
+winapi-util = "0.1.11"
 
 [features]
-# uclaw-patch(P0§4): default OFF — pi runs stateless in uClaw (no sqlmodel-sqlite).
-default = []
+default = ["sqlite-sessions", "tui", "bpe-tokens", "ftui"]
 full = [
     "image-resize",
     "jemalloc",
     "clipboard",
     "wasm-host",
+    "sqlite-sessions",
     "syntax-highlighting",
+    "tui",
+    "url-pdf",
+    "bpe-tokens",
     "rich_rust/full",
 ]
+# BPE token counting (bd-cv653.7.2.1): real O200k/Cl100k tables replace the
+# chars/4 heuristic; default-on, disable for size-critical minimal builds.
+bpe-tokens = ["dep:tiktoken-rs"]
+# PDF extraction for URL reads (bd-cv653.2.2) — opt-in to keep the default
+# release binary inside the 22 MiB size budget.
+url-pdf = ["dep:pdf-extract"]
+# Sampling profiler (bd-cv653.7.12.1) — opt-in; adds pprof + inferno deps.
+profiler = ["dep:pprof"]
+
+# Interactive terminal front-end (crossterm + charmed_rust stack). Enabled by
+# default so CLI users get an identical `pi` binary with no action required.
+# Disabling it (`--no-default-features`) lets SDK/library consumers compile the
+# `pi` library without the terminal UI dependencies.
+tui = [
+    "dep:crossterm",
+    "dep:bubbletea",
+    "dep:lipgloss",
+    "dep:bubbles",
+    "dep:glamour",
+    "dep:unicode-width",
+    "dep:textwrap",
+]
+# Default FrankenTUI stack. Requires `tui` because the bridge reuses PiMsg
+# and shared interactive helpers while --classic remains available.
+ftui = ["dep:ftui", "dep:ftui-extras", "tui"]
 image-resize = ["image"]
 clipboard = ["dep:arboard"]
 wasm-host = ["dep:wasmtime"]
-sqlite-sessions = []  # uclaw-patch(P0§4): sqlmodel-sqlite dep removed; re-add it to enable
+sqlite-sessions = []
 syntax-highlighting = ["rich_rust/syntax"]
 ext-conformance = []
 fuzzing = []
+# Internal-only legacy capture utility. This is deliberately non-default so
+# end-user `cargo install` installs only the supported `pi` executable. The
+# single integration test that executes it is gated at the test-function level
+# so the rest of that target remains in ordinary test runs.
+internal-legacy-capture = []
+# Enables deterministic persistence checkpoints used only by causal fault-injection
+# integration tests. Normal builds ignore the corresponding environment variable.
+internal-persistence-fault-injection = []
+# Internal-only MCP fixture server (bd-cv653.6.1): a tiny stdio JSON-RPC
+# binary used by the MCP client e2e lanes. Non-default so end-user installs
+# only get `pi`.
+internal-mcp-fixture = []
 # Opt-in loom model-checking lane. These tests are excluded from default
 # all-target gates because loom explores scheduler interleavings aggressively.
 loom-tests = []
@@ -309,7 +568,10 @@ loom-tests = []
 manual-timing-tests = []
 jemalloc = ["dep:tikv-jemallocator"]
 
-# [vendored] tests/ dropped — [[test]] stanza removed.
+[[test]]
+name = "hostcall_queue_loom"
+path = "tests/hostcall_queue_loom.rs"
+required-features = ["loom-tests"]
 
 [profile.release]
 opt-level = "z"
@@ -318,9 +580,38 @@ codegen-units = 1
 panic = "abort"
 strip = true
 
+# Shipped release binaries: dsr builds `--profile dist`. Same LTO, codegen,
+# panic and strip settings as `release`, optimised for speed instead of size.
+# `release` stays the size-budgeted profile that scripts/perf measures.
+[profile.dist]
+inherits = "release"
+opt-level = 3
+
 [profile.dev]
 opt-level = 0
 debug = true
+
+# RPC get_state reports contextTokens, a BPE count over the whole active branch
+# on every call. Unoptimized, the tokenizer and its regex engines take seconds
+# on a large session, which buries the RPC latency budgets under debug-build
+# noise. `test` inherits these overrides.
+[profile.dev.package.tiktoken-rs]
+opt-level = 3
+
+[profile.dev.package.fancy-regex]
+opt-level = 3
+
+[profile.dev.package.regex]
+opt-level = 3
+
+[profile.dev.package.regex-automata]
+opt-level = 3
+
+[profile.dev.package.regex-syntax]
+opt-level = 3
+
+[profile.dev.package.bstr]
+opt-level = 3
 
 [profile.test]
 # Full-suite RCH workers have limited artifact storage; keep test binaries
@@ -328,11 +619,12 @@ debug = true
 debug = "line-tables-only"
 incremental = false
 
-# Performance benchmarking profile: opt-level=3, with debug info.
+# Performance benchmarking profile: optimized with bounded remote-build latency.
 [profile.perf]
 inherits = "release"
 opt-level = 3
 lto = "thin"
+codegen-units = 8
 debug = 1
 strip = false
 
@@ -347,23 +639,139 @@ missing_errors_doc = "allow"
 missing_panics_doc = "allow"
 module_name_repetitions = "allow"
 
+# Both of the following arrived with the nightly-2026-08-31 pin (e403485b3),
+# which was a fleet-wide housekeeping change that touched no source and, as
+# rust-toolchain.toml's own comment warns can happen, strengthened the
+# pedantic/nursery groups underneath us. Between them they were 294 of the 296
+# errors blocking `cargo clippy -- -D warnings`, i.e. the entire quality gate.
+# Decided deliberately rather than reverted (bd-39x9z).
+#
+# One deviation from bd-39x9z's acceptance, recorded rather than glossed: that
+# bead asked for per-module suppression rather than crate-wide if this route was
+# taken. The owner chose the allow directly, and per-module would mean an inner
+# attribute in each of the ~78 affected files, which scatters the reasoning
+# across the tree instead of stating it once where the lint policy lives. One
+# documented place is easier to revisit than 78 undocumented ones.
+
+# 288 hits, essentially all in test assertions. The lint wants
+#   assert_eq!(plan_tool_effect_batches(&effect_plan(&cases)), [] as [agent::ToolEffectBatch; 0])
+# in place of
+#   assert!(plan_tool_effect_batches(&effect_plan(&cases)).is_empty())
+# which needs the element type spelled out at every site, is longer, and reads
+# worse. Its real argument — that assert_eq! shows the value on failure — is
+# fair, but not worth 288 rewrites of that shape. Prefer assert_eq! in NEW
+# assertions where the value is cheap to render.
+assert_is_empty = "allow"
+
+# 6 hits. The lint wants f64::mul_add, which is a FUSED multiply-add with no
+# intermediate rounding, so applying it changes results bit-for-bit. The sites
+# are bandit loss/regret accumulation (src/extensions.rs) and risk calibration
+# (src/resource_governor.rs, src/provider.rs), with tests pinning values
+# downstream. Changing risk arithmetic to satisfy a micro-optimisation lint is
+# the wrong trade; a sibling project on the same build fleet allows it too.
+suboptimal_flops = "allow"
+
+# Lint debt allowed for the 0.9.0 release (a release decision; see `bd-jdf1u`). Work since the
+# nightly-2026-08-31 validation run (7b6a53cc0) added clippy warnings that `-D warnings`
+# turns into errors. The kinds below are style or design lints with no correctness
+# impact, so they are allowed here, in one place, as bd-39x9z did, instead of being
+# rewritten under release pressure. Counts are from `cargo clippy --all-targets` with
+# CI's features at efdcaeaf9d; `bd-jdf1u` lists them for burn-down. Correctness-relevant
+# kinds were fixed per site, and machine-applicable ones applied, in the same release.
+# large_futures stays on: clippy.toml raises its size threshold to 64 KiB instead.
+# 55 sites. Narrowing each guard's scope reorders releases; each site needs review.
+significant_drop_tightening = "allow"
+# 31 sites. Splitting long functions is a refactor, not a lint fix.
+too_many_lines = "allow"
+# 17 sites. Changing these parameters to borrows changes signatures.
+needless_pass_by_value = "allow"
+# 1 site. Changing these parameters to shared borrows changes signatures.
+needless_pass_by_ref_mut = "allow"
+# 1 site. Passing these small Copy values by value changes signatures.
+trivially_copy_pass_by_ref = "allow"
+# 11 sites. Making a public fn const is an API commitment, decided per fn.
+missing_const_for_fn = "allow"
+# 14 sites. Making these futures Send is a design change.
+future_not_send = "allow"
+# 9 sites. Returning &'static str changes signatures.
+unnecessary_literal_bound = "allow"
+# 1 site. Unwrapping these return types changes signatures.
+unnecessary_wraps = "allow"
+# 14 sites. Rewording these doc summaries is documentation work.
+too_long_first_doc_paragraph = "allow"
+# 4 sites. Boxing a variant changes the type's layout and its constructors.
+large_enum_variant = "allow"
+# 3 sites. Replacing these bools with enums changes the type.
+struct_excessive_bools = "allow"
+# 1 site. Replacing these bool parameters changes signatures.
+fn_params_excessive_bools = "allow"
+# 1 site. Renaming these fields changes the type.
+struct_field_names = "allow"
+# 2 sites. Naming these types is a refactor, not a lint fix.
+type_complexity = "allow"
+# 2 sites. Replacing Option<Option<T>> changes the type.
+option_option = "allow"
+# 1 site. Rewriting these joins with fmt::Write is a refactor.
+format_collect = "allow"
+# 1 site. Uninhabited enums used as marker types are intended.
+empty_enums = "allow"
+# 10 sites. Rewriting these if-let/else blocks as map_or_else is a style refactor.
+option_if_let_else = "allow"
+# 9 sites. Naming the type in place of Default::default() is style only.
+default_trait_access = "allow"
+# 6 sites. Adding digit separators to these literals is style only.
+unreadable_literal = "allow"
+# 4 sites. Moving these local items above the statements is style only.
+items_after_statements = "allow"
+# 4 sites. Rewriting these early returns with `?` is a style refactor.
+question_mark = "allow"
+# 3 sites. Making these default values lazy is a per-site style change.
+or_fun_call = "allow"
+# 3 sites. Rewriting these matches as let-else is a style refactor.
+manual_let_else = "allow"
+# 3 sites. Switching these assignments to clone_from is a per-site refactor.
+assigning_clones = "allow"
+# 2 sites. Folding these let-then-if sequences is a style refactor.
+useless_let_if_seq = "allow"
+# 2 sites. Naming the variant changes how a new variant would match.
+match_wildcard_for_single_variants = "allow"
+# 1 site. Dropping the redundant #[must_use] is style only.
+double_must_use = "allow"
+# 1 site. Using From for this tuple/array conversion is style only.
+tuple_array_conversions = "allow"
+# 1 site. Rewriting format!-then-push_str with write! is a style refactor.
+format_push_string = "allow"
+# 1 site. Dropping this collect changes when the iterator runs; decided per site.
+needless_collect = "allow"
+# 1 site. Folding this field assignment into the literal is style only.
+field_reassign_with_default = "allow"
+
+[patch.crates-io]
+# rquickjs-sys 0.12.2 with one quickjs-ng fix: JS_FreeContext freed every
+# module definition while the reactions of an unsettled top-level-await
+# evaluation still referenced it, so a timed-out `await import()` corrupted
+# the heap (malloc abort) when its realm was retired. The two hunks are marked
+# "pi_agent_rust patch" in vendor/rquickjs-sys/quickjs/quickjs.c; the vendored
+# copy keeps only the files its build script compiles.
+rquickjs-sys = { path = "vendor/rquickjs-sys" }
+
 # ---------------------------------------------------------------------------
 # Local development with sibling crates
 # ---------------------------------------------------------------------------
 # This project depends on published crates.io versions of asupersync,
-# rich_rust, charmed-*, and sqlmodel-*. CI builds verify this (no sibling
+# rich_rust, charmed-*, and fsqlite. CI builds verify this (no sibling
 # repos are checked out).
 #
-# To develop against LOCAL checkouts of these crates, uncomment the
-# [patch.crates-io] section below. Cargo will use the local paths when they
-# satisfy the version requirement and fall back to crates.io otherwise.
+# To develop against LOCAL checkouts of these crates, uncomment the entries
+# below; they extend the [patch.crates-io] table above. Cargo will use the
+# local paths when they satisfy the version requirement and fall back to
+# crates.io otherwise.
 #
-# IMPORTANT: Do NOT commit this section. To prevent accidental commits:
+# IMPORTANT: Do NOT commit these entries. To prevent accidental commits:
 #   git update-index --skip-worktree Cargo.toml
 # To re-enable tracking:
 #   git update-index --no-skip-worktree Cargo.toml
 #
-# [patch.crates-io]
 # asupersync = { path = "../asupersync" }
 # rich_rust = { path = "../rich_rust" }
 # charmed-bubbletea = { path = "../charmed_rust/crates/bubbletea" }
@@ -372,5 +780,4 @@ module_name_repetitions = "allow"
 # charmed-bubbles = { path = "../charmed_rust/crates/bubbles" }
 # charmed-glamour = { path = "../charmed_rust/crates/glamour" }
 # charmed-harmonica = { path = "../charmed_rust/crates/harmonica" }
-# sqlmodel-core = { path = "../sqlmodel_rust/crates/sqlmodel-core" }
-# sqlmodel-sqlite = { path = "../sqlmodel_rust/crates/sqlmodel-sqlite" }
+# fsqlite = { path = "../frankensqlite/crates/fsqlite" }

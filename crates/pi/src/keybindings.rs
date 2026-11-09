@@ -36,7 +36,7 @@ pub struct KeyBindingsLoadResult {
 impl KeyBindingsLoadResult {
     /// Check if there were any warnings.
     #[must_use]
-    pub fn has_warnings(&self) -> bool {
+    pub const fn has_warnings(&self) -> bool {
         !self.warnings.is_empty()
     }
 
@@ -672,6 +672,12 @@ impl KeyBinding {
     ///
     /// Returns `None` for paste events or multi-character input that
     /// cannot map to a single key binding.
+    ///
+    /// Only available with the `tui` feature: it bridges the interactive
+    /// front-end's bubbletea key events into the binding catalog. The rest of
+    /// the keybinding catalog (pure serde data + string parsing) stays
+    /// available to library consumers without the terminal stack.
+    #[cfg(feature = "tui")]
     #[allow(clippy::too_many_lines)]
     #[must_use]
     pub fn from_bubbletea_key(key: &bubbletea::KeyMsg) -> Option<Self> {
@@ -813,6 +819,81 @@ impl KeyBinding {
         Some(Self {
             key: key_name.to_string(),
             modifiers,
+        })
+    }
+
+    /// Convert an ftui key event to a `KeyBinding` (FrankenTUI migration,
+    /// bd-cv653.9.1). Mirrors [`Self::from_bubbletea_key`]'s catalog naming
+    /// exactly — same lowercase key names, same char-lowercasing with shift
+    /// dropped on plain characters — so a user's keybinding config resolves
+    /// identically on both stacks during coexistence.
+    #[cfg(feature = "ftui")]
+    #[must_use]
+    pub fn from_ftui_key(key: &ftui::KeyEvent) -> Option<Self> {
+        use ftui::KeyCode as F;
+
+        let mods = key.modifiers;
+        let base = KeyModifiers {
+            ctrl: mods.contains(ftui::Modifiers::CTRL),
+            alt: mods.contains(ftui::Modifiers::ALT),
+            shift: mods.contains(ftui::Modifiers::SHIFT),
+        };
+
+        let key_name: String = match key.code {
+            F::Char(' ') => "space".to_string(),
+            F::Char(c) => {
+                // Match the bubbletea Runes path: chars are lowercased and a
+                // plain shift is not reported as a separate modifier (shift+p
+                // is just typing "P"). With ctrl or alt held, a reported
+                // shift is a deliberate chord: keep it, or ctrl+shift+p (the
+                // default for cycling models backward) collapses into ctrl+p.
+                return Some(Self {
+                    key: c.to_lowercase().to_string(),
+                    modifiers: KeyModifiers {
+                        shift: base.shift && (base.ctrl || base.alt),
+                        ..base
+                    },
+                });
+            }
+            F::Enter => "enter".to_string(),
+            F::Escape => "escape".to_string(),
+            F::Backspace => "backspace".to_string(),
+            F::Tab => "tab".to_string(),
+            F::BackTab => {
+                // bubbletea reports back-tab as shift+tab.
+                return Some(Self {
+                    key: "tab".to_string(),
+                    modifiers: KeyModifiers {
+                        shift: true,
+                        ..base
+                    },
+                });
+            }
+            F::Delete => "delete".to_string(),
+            F::Insert => "insert".to_string(),
+            F::Home => "home".to_string(),
+            F::End => "end".to_string(),
+            F::PageUp => "pageup".to_string(),
+            F::PageDown => "pagedown".to_string(),
+            F::Up => "up".to_string(),
+            F::Down => "down".to_string(),
+            F::Left => "left".to_string(),
+            F::Right => "right".to_string(),
+            F::F(n) => format!("f{n}"),
+            F::Null => {
+                // Ctrl+Space / Ctrl+@ maps to ctrl+@ like bubbletea's Null.
+                return Some(Self {
+                    key: "@".to_string(),
+                    modifiers: KeyModifiers { ctrl: true, ..base },
+                });
+            }
+            // Media/IME/other keys have no catalog entries.
+            _ => return None,
+        };
+
+        Some(Self {
+            key: key_name,
+            modifiers: base,
         })
     }
 }
@@ -1065,6 +1146,106 @@ impl<'de> Deserialize<'de> for KeyBinding {
 // Key Bindings Map
 // ============================================================================
 
+/// Render the `/hotkeys` listing for a catalog.
+///
+/// A free function rather than a method on either UI model because both stacks
+/// need it and they are behind different features: `interactive` is `tui`,
+/// `interactive_ftui` is `ftui`, and a build can have either. The body only
+/// ever read the catalog, so nothing is lost by moving it here.
+#[must_use]
+pub fn format_hotkeys(keybindings: &KeyBindings) -> String {
+    format_hotkeys_filtered(keybindings, |_| true)
+}
+
+/// Formats keybindings for display in `/hotkeys`, optionally filtering actions.
+#[must_use]
+pub fn format_hotkeys_filtered<F>(keybindings: &KeyBindings, mut filter: F) -> String
+where
+    F: FnMut(AppAction) -> bool,
+{
+    use std::fmt::Write;
+
+    let mut output = String::new();
+    let _ = writeln!(output, "Keyboard Shortcuts");
+    let _ = writeln!(output, "==================");
+    let _ = writeln!(output);
+    let _ = writeln!(
+        output,
+        "Config: {}",
+        KeyBindings::user_config_path().display()
+    );
+    let _ = writeln!(output);
+
+    for category in ActionCategory::all() {
+        let actions: Vec<_> = keybindings
+            .iter_category(*category)
+            .filter(|(action, _)| filter(*action))
+            .collect();
+
+        // Skip empty categories
+        if actions.iter().all(|(_, bindings)| bindings.is_empty()) {
+            continue;
+        }
+
+        let _ = writeln!(output, "## {}", category.display_name());
+        let _ = writeln!(output);
+
+        for (action, bindings) in actions {
+            if bindings.is_empty() {
+                continue;
+            }
+
+            // Format bindings as comma-separated list
+            let keys: Vec<_> = bindings
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect();
+            let keys_str = keys.join(", ");
+
+            let _ = writeln!(output, "  {:20} {}", keys_str, action.display_name());
+        }
+        let _ = writeln!(output);
+    }
+
+    output
+}
+
+/// Formats keybindings for display on the FrankenTUI stack, omitting actions
+/// that are currently unrouted/inert on FTUI.
+#[must_use]
+pub fn format_hotkeys_for_ftui(keybindings: &KeyBindings) -> String {
+    format_hotkeys_filtered(keybindings, |action| !is_inert_on_ftui(action))
+}
+
+/// Checks whether an action is currently unrouted/inert on the FTUI interactive stack.
+///
+/// The session and session-picker actions belong to the classic stack's
+/// picker and branch navigation. FTUI's `/resume` is a plain filtered list
+/// and it has no sibling-branch keys (nor does OMP), so `/hotkeys` there
+/// advertised ctrl+shift+left/right and the picker's ctrl+p/s/n/d to no
+/// effect.
+#[must_use]
+pub const fn is_inert_on_ftui(action: AppAction) -> bool {
+    matches!(
+        action,
+        AppAction::Copy
+            | AppAction::Yank
+            | AppAction::YankPop
+            | AppAction::NewSession
+            | AppAction::Tree
+            | AppAction::Fork
+            | AppAction::BranchPicker
+            | AppAction::BranchNextSibling
+            | AppAction::BranchPrevSibling
+            | AppAction::ToggleSessionPath
+            | AppAction::ToggleSessionSort
+            | AppAction::ToggleSessionNamedFilter
+            | AppAction::RenameSession
+            | AppAction::DeleteSession
+            | AppAction::DeleteSessionNoninvasive
+    )
+}
+
 /// Complete keybindings configuration.
 #[derive(Debug, Clone)]
 pub struct KeyBindings {
@@ -1302,6 +1483,28 @@ impl KeyBindings {
             .collect()
     }
 
+    /// Whether configuration removed this chord from any of its default actions.
+    ///
+    /// Hosts should dispatch configured actions first, then use this to prevent
+    /// a widget's native keymap from reviving a removed default. The chord can
+    /// still belong to another action, such as `up` remaining a picker binding
+    /// after cursor movement is disabled, or `ctrl+enter` being reassigned to submit.
+    /// Native shortcuts absent from the default catalog are unaffected.
+    #[must_use]
+    pub fn is_removed_default_binding(&self, binding: &KeyBinding) -> bool {
+        static DEFAULTS: std::sync::LazyLock<KeyBindings> =
+            std::sync::LazyLock::new(KeyBindings::new);
+
+        // Ordinary typing and native-only shortcuts need no per-action scan.
+        if DEFAULTS.lookup(binding).is_none() {
+            return false;
+        }
+        AppAction::all().iter().copied().any(|action| {
+            DEFAULTS.get_bindings(action).contains(binding)
+                && !self.get_bindings(action).contains(binding)
+        })
+    }
+
     /// Get all key bindings for an action.
     #[must_use]
     pub fn get_bindings(&self, action: AppAction) -> &[KeyBinding] {
@@ -1423,8 +1626,10 @@ impl KeyBindings {
         m.insert(AppAction::Tab, vec![KeyBinding::plain("tab")]);
 
         // Kill Ring
-        m.insert(AppAction::Yank, vec![KeyBinding::ctrl("y")]);
-        m.insert(AppAction::YankPop, vec![KeyBinding::alt("y")]);
+        // Yank and YankPop have no underlying kill ring implementation, so no default
+        // bindings are advertised; explicit bindings via keybindings.json remain valid.
+        m.insert(AppAction::Yank, vec![]);
+        m.insert(AppAction::YankPop, vec![]);
         m.insert(AppAction::Undo, vec![KeyBinding::ctrl("-")]);
 
         // Clipboard
@@ -1489,18 +1694,20 @@ impl KeyBindings {
         );
 
         // Session Picker
+        // Unimplemented actions have no default bindings so `/hotkeys` does not
+        // falsely advertise them; explicit bindings via keybindings.json remain valid.
+        // Session-picker controls. Scoped: `browse::action` resolves a key
+        // only against PICKER_ACTIONS, so these coexist with the same chords
+        // elsewhere the way DeleteSession=ctrl+d already coexists with Exit.
         m.insert(AppAction::ToggleSessionPath, vec![KeyBinding::ctrl("p")]);
         m.insert(AppAction::ToggleSessionSort, vec![KeyBinding::ctrl("s")]);
         m.insert(
             AppAction::ToggleSessionNamedFilter,
             vec![KeyBinding::ctrl("n")],
         );
-        m.insert(AppAction::RenameSession, vec![KeyBinding::ctrl("r")]);
+        m.insert(AppAction::RenameSession, vec![]);
         m.insert(AppAction::DeleteSession, vec![KeyBinding::ctrl("d")]);
-        m.insert(
-            AppAction::DeleteSessionNoninvasive,
-            vec![KeyBinding::ctrl("backspace")],
-        );
+        m.insert(AppAction::DeleteSessionNoninvasive, vec![]);
 
         m
     }
@@ -2193,6 +2400,118 @@ mod tests {
     }
 
     #[test]
+    fn removed_defaults_are_detected_after_either_config_loader() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("keybindings.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "newLine": ["ctrl+j"],
+                "submit": ["ctrl+enter"],
+                "cursorUp": [],
+                "cursorLineStart": [],
+                "cursorWordLeft": [],
+                "deleteToLineEnd": [],
+                "followUp": []
+            }"#,
+        )
+        .expect("write bindings");
+        let strict = KeyBindings::load(&path).expect("strict bindings");
+        let diagnostic = KeyBindings::load_from_path_with_diagnostics(&path);
+        assert!(!diagnostic.has_warnings());
+
+        for bindings in [strict, diagnostic.bindings] {
+            for binding in [
+                KeyBinding::plain("enter"),
+                KeyBinding::shift("enter"),
+                KeyBinding::ctrl("enter"),
+                KeyBinding::plain("up"),
+                KeyBinding::plain("home"),
+                KeyBinding::ctrl("a"),
+                KeyBinding::alt("b"),
+                KeyBinding::ctrl("k"),
+                KeyBinding::alt("enter"),
+            ] {
+                assert!(bindings.is_removed_default_binding(&binding), "{binding}");
+            }
+            // Sharing a chord does not hide removal from another context.
+            assert_eq!(
+                bindings.lookup(&KeyBinding::plain("up")),
+                Some(AppAction::SelectUp)
+            );
+            // The host must still execute this reassignment before its guard.
+            assert_eq!(
+                bindings.lookup(&KeyBinding::ctrl("enter")),
+                Some(AppAction::Submit)
+            );
+            assert_eq!(
+                bindings.lookup(&KeyBinding::ctrl("j")),
+                Some(AppAction::NewLine)
+            );
+            for binding in [
+                KeyBinding::ctrl("j"),
+                KeyBinding::plain("right"),
+                KeyBinding::ctrl("y"),
+                KeyBinding::shift("left"),
+                KeyBinding::ctrl_shift("left"),
+                KeyBinding::plain("x"),
+            ] {
+                assert!(!bindings.is_removed_default_binding(&binding), "{binding}");
+            }
+        }
+    }
+
+    #[test]
+    fn default_and_retained_aliases_are_not_removed() {
+        let defaults = KeyBindings::new();
+        for binding in [
+            KeyBinding::plain("enter"),
+            KeyBinding::shift("enter"),
+            KeyBinding::ctrl("enter"),
+            KeyBinding::alt("enter"),
+            KeyBinding::plain("up"),
+            KeyBinding::ctrl("a"),
+        ] {
+            assert!(!defaults.is_removed_default_binding(&binding), "{binding}");
+        }
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("keybindings.json");
+        std::fs::write(&path, r#"{"newLine": ["shift+enter", "ctrl+j"]}"#).expect("write bindings");
+        let bindings = KeyBindings::load(&path).expect("bindings");
+        assert!(!bindings.is_removed_default_binding(&KeyBinding::shift("enter")));
+        assert!(bindings.is_removed_default_binding(&KeyBinding::ctrl("enter")));
+        assert!(!bindings.is_removed_default_binding(&KeyBinding::ctrl("j")));
+    }
+
+    #[test]
+    fn invalid_overrides_do_not_mark_retained_defaults_as_removed() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("keybindings.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "newLine": ["invalidkey123"],
+                "submit": 42,
+                "cursorUp": [false]
+            }"#,
+        )
+        .expect("write bindings");
+        assert!(KeyBindings::load(&path).is_err());
+        let diagnostic = KeyBindings::load_from_path_with_diagnostics(&path);
+        assert!(diagnostic.has_warnings());
+        for (binding, action) in [
+            (KeyBinding::shift("enter"), AppAction::NewLine),
+            (KeyBinding::ctrl("enter"), AppAction::NewLine),
+            (KeyBinding::plain("enter"), AppAction::Submit),
+            (KeyBinding::plain("up"), AppAction::CursorUp),
+        ] {
+            assert_eq!(diagnostic.bindings.lookup(&binding), Some(action));
+            assert!(!diagnostic.bindings.is_removed_default_binding(&binding));
+        }
+    }
+
+    #[test]
     fn test_load_warns_on_invalid_json() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("keybindings.json");
@@ -2255,175 +2574,188 @@ mod tests {
     // ============================================================================
     // KeyMsg → KeyBinding Conversion (bd-gze)
     // ============================================================================
+    //
+    // These cover `KeyBinding::from_bubbletea_key`, which only exists with the
+    // `tui` feature, so the whole block is gated to keep the lib-only
+    // (`--no-default-features`) build clean.
+    #[cfg(feature = "tui")]
+    mod bubbletea_conversion {
+        use super::*;
 
-    #[test]
-    fn test_from_bubbletea_key_ctrl_keys() {
-        use bubbletea::{KeyMsg, KeyType};
+        #[test]
+        fn test_from_bubbletea_key_ctrl_keys() {
+            use bubbletea::{KeyMsg, KeyType};
 
-        // Test Ctrl+C
-        let key = KeyMsg::from_type(KeyType::CtrlC);
-        let binding = KeyBinding::from_bubbletea_key(&key).unwrap();
-        assert_eq!(binding.key, "c");
-        assert!(binding.modifiers.ctrl);
-        assert!(!binding.modifiers.alt);
+            // Test Ctrl+C
+            let key = KeyMsg::from_type(KeyType::CtrlC);
+            let binding = KeyBinding::from_bubbletea_key(&key).unwrap();
+            assert_eq!(binding.key, "c");
+            assert!(binding.modifiers.ctrl);
+            assert!(!binding.modifiers.alt);
 
-        // Test Ctrl+P
-        let key = KeyMsg::from_type(KeyType::CtrlP);
-        let binding = KeyBinding::from_bubbletea_key(&key).unwrap();
-        assert_eq!(binding.key, "p");
-        assert!(binding.modifiers.ctrl);
-    }
+            // Test Ctrl+P
+            let key = KeyMsg::from_type(KeyType::CtrlP);
+            let binding = KeyBinding::from_bubbletea_key(&key).unwrap();
+            assert_eq!(binding.key, "p");
+            assert!(binding.modifiers.ctrl);
+        }
 
-    #[test]
-    fn test_from_bubbletea_key_special_keys() {
-        use bubbletea::{KeyMsg, KeyType};
+        #[test]
+        fn test_from_bubbletea_key_special_keys() {
+            use bubbletea::{KeyMsg, KeyType};
 
-        // Enter
-        let binding = KeyBinding::from_bubbletea_key(&KeyMsg::from_type(KeyType::Enter)).unwrap();
-        assert_eq!(binding.key, "enter");
-        assert_eq!(binding.modifiers, KeyModifiers::NONE);
+            // Enter
+            let binding =
+                KeyBinding::from_bubbletea_key(&KeyMsg::from_type(KeyType::Enter)).unwrap();
+            assert_eq!(binding.key, "enter");
+            assert_eq!(binding.modifiers, KeyModifiers::NONE);
 
-        // Escape
-        let binding = KeyBinding::from_bubbletea_key(&KeyMsg::from_type(KeyType::Esc)).unwrap();
-        assert_eq!(binding.key, "escape");
+            // Escape
+            let binding = KeyBinding::from_bubbletea_key(&KeyMsg::from_type(KeyType::Esc)).unwrap();
+            assert_eq!(binding.key, "escape");
 
-        // Tab
-        let binding = KeyBinding::from_bubbletea_key(&KeyMsg::from_type(KeyType::Tab)).unwrap();
-        assert_eq!(binding.key, "tab");
+            // Tab
+            let binding = KeyBinding::from_bubbletea_key(&KeyMsg::from_type(KeyType::Tab)).unwrap();
+            assert_eq!(binding.key, "tab");
 
-        // Backspace
-        let binding =
-            KeyBinding::from_bubbletea_key(&KeyMsg::from_type(KeyType::Backspace)).unwrap();
-        assert_eq!(binding.key, "backspace");
-    }
+            // Backspace
+            let binding =
+                KeyBinding::from_bubbletea_key(&KeyMsg::from_type(KeyType::Backspace)).unwrap();
+            assert_eq!(binding.key, "backspace");
+        }
 
-    #[test]
-    fn test_from_bubbletea_key_arrow_keys() {
-        use bubbletea::{KeyMsg, KeyType};
+        #[test]
+        fn test_from_bubbletea_key_arrow_keys() {
+            use bubbletea::{KeyMsg, KeyType};
 
-        // Plain arrows
-        let binding = KeyBinding::from_bubbletea_key(&KeyMsg::from_type(KeyType::Up)).unwrap();
-        assert_eq!(binding.key, "up");
-        assert_eq!(binding.modifiers, KeyModifiers::NONE);
+            // Plain arrows
+            let binding = KeyBinding::from_bubbletea_key(&KeyMsg::from_type(KeyType::Up)).unwrap();
+            assert_eq!(binding.key, "up");
+            assert_eq!(binding.modifiers, KeyModifiers::NONE);
 
-        // Shift+arrows
-        let binding = KeyBinding::from_bubbletea_key(&KeyMsg::from_type(KeyType::ShiftUp)).unwrap();
-        assert_eq!(binding.key, "up");
-        assert!(binding.modifiers.shift);
+            // Shift+arrows
+            let binding =
+                KeyBinding::from_bubbletea_key(&KeyMsg::from_type(KeyType::ShiftUp)).unwrap();
+            assert_eq!(binding.key, "up");
+            assert!(binding.modifiers.shift);
 
-        // Ctrl+arrows
-        let binding =
-            KeyBinding::from_bubbletea_key(&KeyMsg::from_type(KeyType::CtrlLeft)).unwrap();
-        assert_eq!(binding.key, "left");
-        assert!(binding.modifiers.ctrl);
+            // Ctrl+arrows
+            let binding =
+                KeyBinding::from_bubbletea_key(&KeyMsg::from_type(KeyType::CtrlLeft)).unwrap();
+            assert_eq!(binding.key, "left");
+            assert!(binding.modifiers.ctrl);
 
-        // Ctrl+Shift+arrows
-        let binding =
-            KeyBinding::from_bubbletea_key(&KeyMsg::from_type(KeyType::CtrlShiftDown)).unwrap();
-        assert_eq!(binding.key, "down");
-        assert!(binding.modifiers.ctrl);
-        assert!(binding.modifiers.shift);
-    }
+            // Ctrl+Shift+arrows
+            let binding =
+                KeyBinding::from_bubbletea_key(&KeyMsg::from_type(KeyType::CtrlShiftDown)).unwrap();
+            assert_eq!(binding.key, "down");
+            assert!(binding.modifiers.ctrl);
+            assert!(binding.modifiers.shift);
+        }
 
-    #[test]
-    fn test_from_bubbletea_key_with_alt() {
-        use bubbletea::{KeyMsg, KeyType};
+        #[test]
+        fn test_from_bubbletea_key_with_alt() {
+            use bubbletea::{KeyMsg, KeyType};
 
-        // Alt+arrow
-        let key = KeyMsg::from_type(KeyType::Up).with_alt();
-        let binding = KeyBinding::from_bubbletea_key(&key).unwrap();
-        assert_eq!(binding.key, "up");
-        assert!(binding.modifiers.alt);
-        assert!(!binding.modifiers.ctrl);
+            // Alt+arrow
+            let key = KeyMsg::from_type(KeyType::Up).with_alt();
+            let binding = KeyBinding::from_bubbletea_key(&key).unwrap();
+            assert_eq!(binding.key, "up");
+            assert!(binding.modifiers.alt);
+            assert!(!binding.modifiers.ctrl);
 
-        // Alt+letter (via Runes)
-        let key = KeyMsg::from_char('f').with_alt();
-        let binding = KeyBinding::from_bubbletea_key(&key).unwrap();
-        assert_eq!(binding.key, "f");
-        assert!(binding.modifiers.alt);
-    }
+            // Alt+letter (via Runes)
+            let key = KeyMsg::from_char('f').with_alt();
+            let binding = KeyBinding::from_bubbletea_key(&key).unwrap();
+            assert_eq!(binding.key, "f");
+            assert!(binding.modifiers.alt);
+        }
 
-    #[test]
-    fn test_from_bubbletea_key_runes() {
-        use bubbletea::KeyMsg;
+        #[test]
+        fn test_from_bubbletea_key_runes() {
+            use bubbletea::KeyMsg;
 
-        // Single character
-        let key = KeyMsg::from_char('a');
-        let binding = KeyBinding::from_bubbletea_key(&key).unwrap();
-        assert_eq!(binding.key, "a");
-        assert_eq!(binding.modifiers, KeyModifiers::NONE);
+            // Single character
+            let key = KeyMsg::from_char('a');
+            let binding = KeyBinding::from_bubbletea_key(&key).unwrap();
+            assert_eq!(binding.key, "a");
+            assert_eq!(binding.modifiers, KeyModifiers::NONE);
 
-        // Uppercase becomes lowercase
-        let key = KeyMsg::from_char('A');
-        let binding = KeyBinding::from_bubbletea_key(&key).unwrap();
-        assert_eq!(binding.key, "a");
-    }
+            // Uppercase becomes lowercase
+            let key = KeyMsg::from_char('A');
+            let binding = KeyBinding::from_bubbletea_key(&key).unwrap();
+            assert_eq!(binding.key, "a");
+        }
 
-    #[test]
-    fn test_from_bubbletea_key_multi_char_returns_none() {
-        use bubbletea::KeyMsg;
+        #[test]
+        fn test_from_bubbletea_key_multi_char_returns_none() {
+            use bubbletea::KeyMsg;
 
-        // Multi-character input (e.g., IME) cannot be a keybinding
-        let key = KeyMsg::from_runes(vec!['a', 'b']);
-        assert!(KeyBinding::from_bubbletea_key(&key).is_none());
-    }
+            // Multi-character input (e.g., IME) cannot be a keybinding
+            let key = KeyMsg::from_runes(vec!['a', 'b']);
+            assert!(KeyBinding::from_bubbletea_key(&key).is_none());
+        }
 
-    #[test]
-    fn test_from_bubbletea_key_paste_returns_none() {
-        use bubbletea::KeyMsg;
+        #[test]
+        fn test_from_bubbletea_key_paste_returns_none() {
+            use bubbletea::KeyMsg;
 
-        // Paste events should not be keybindings
-        let key = KeyMsg::from_char('a').with_paste();
-        assert!(KeyBinding::from_bubbletea_key(&key).is_none());
-    }
+            // Paste events should not be keybindings
+            let key = KeyMsg::from_char('a').with_paste();
+            assert!(KeyBinding::from_bubbletea_key(&key).is_none());
+        }
 
-    #[test]
-    fn test_from_bubbletea_key_function_keys() {
-        use bubbletea::{KeyMsg, KeyType};
+        #[test]
+        fn test_from_bubbletea_key_function_keys() {
+            use bubbletea::{KeyMsg, KeyType};
 
-        let binding = KeyBinding::from_bubbletea_key(&KeyMsg::from_type(KeyType::F1)).unwrap();
-        assert_eq!(binding.key, "f1");
+            let binding = KeyBinding::from_bubbletea_key(&KeyMsg::from_type(KeyType::F1)).unwrap();
+            assert_eq!(binding.key, "f1");
 
-        let binding = KeyBinding::from_bubbletea_key(&KeyMsg::from_type(KeyType::F12)).unwrap();
-        assert_eq!(binding.key, "f12");
-    }
+            let binding = KeyBinding::from_bubbletea_key(&KeyMsg::from_type(KeyType::F12)).unwrap();
+            assert_eq!(binding.key, "f12");
+        }
 
-    #[test]
-    fn test_from_bubbletea_key_navigation() {
-        use bubbletea::{KeyMsg, KeyType};
+        #[test]
+        fn test_from_bubbletea_key_navigation() {
+            use bubbletea::{KeyMsg, KeyType};
 
-        let binding = KeyBinding::from_bubbletea_key(&KeyMsg::from_type(KeyType::Home)).unwrap();
-        assert_eq!(binding.key, "home");
+            let binding =
+                KeyBinding::from_bubbletea_key(&KeyMsg::from_type(KeyType::Home)).unwrap();
+            assert_eq!(binding.key, "home");
 
-        let binding = KeyBinding::from_bubbletea_key(&KeyMsg::from_type(KeyType::PgUp)).unwrap();
-        assert_eq!(binding.key, "pageup");
+            let binding =
+                KeyBinding::from_bubbletea_key(&KeyMsg::from_type(KeyType::PgUp)).unwrap();
+            assert_eq!(binding.key, "pageup");
 
-        let binding = KeyBinding::from_bubbletea_key(&KeyMsg::from_type(KeyType::Delete)).unwrap();
-        assert_eq!(binding.key, "delete");
-    }
+            let binding =
+                KeyBinding::from_bubbletea_key(&KeyMsg::from_type(KeyType::Delete)).unwrap();
+            assert_eq!(binding.key, "delete");
+        }
 
-    #[test]
-    fn test_keybinding_lookup_via_conversion() {
-        use bubbletea::{KeyMsg, KeyType};
+        #[test]
+        fn test_keybinding_lookup_via_conversion() {
+            use bubbletea::{KeyMsg, KeyType};
 
-        let bindings = KeyBindings::new();
+            let bindings = KeyBindings::new();
 
-        // Ctrl+C should map to an action (Copy or Clear depending on context)
-        let key = KeyMsg::from_type(KeyType::CtrlC);
-        let binding = KeyBinding::from_bubbletea_key(&key).unwrap();
-        assert!(bindings.lookup(&binding).is_some());
+            // Ctrl+C should map to an action (Copy or Clear depending on context)
+            let key = KeyMsg::from_type(KeyType::CtrlC);
+            let binding = KeyBinding::from_bubbletea_key(&key).unwrap();
+            assert!(bindings.lookup(&binding).is_some());
 
-        // PageUp should map to PageUp action
-        let key = KeyMsg::from_type(KeyType::PgUp);
-        let binding = KeyBinding::from_bubbletea_key(&key).unwrap();
-        let action = bindings.lookup(&binding);
-        assert_eq!(action, Some(AppAction::PageUp));
+            // PageUp should map to PageUp action
+            let key = KeyMsg::from_type(KeyType::PgUp);
+            let binding = KeyBinding::from_bubbletea_key(&key).unwrap();
+            let action = bindings.lookup(&binding);
+            assert_eq!(action, Some(AppAction::PageUp));
 
-        // Enter should map to Submit
-        let key = KeyMsg::from_type(KeyType::Enter);
-        let binding = KeyBinding::from_bubbletea_key(&key).unwrap();
-        let action = bindings.lookup(&binding);
-        assert_eq!(action, Some(AppAction::Submit));
+            // Enter should map to Submit
+            let key = KeyMsg::from_type(KeyType::Enter);
+            let binding = KeyBinding::from_bubbletea_key(&key).unwrap();
+            let action = bindings.lookup(&binding);
+            assert_eq!(action, Some(AppAction::Submit));
+        }
     }
 
     // ── Property tests ──────────────────────────────────────────────────
@@ -2666,6 +2998,337 @@ mod tests {
                     "function key '{key}' should be invalid"
                 );
             }
+        }
+    }
+
+    // ========================================================================
+    // ftui KeyEvent → KeyBinding conversion (bd-cv653.9.1)
+    // ========================================================================
+    //
+    // Parity cases against `from_bubbletea_key`: both converters must resolve
+    // the same catalog entries for the same physical chords.
+    #[cfg(feature = "ftui")]
+    mod ftui_conversion {
+        use super::*;
+
+        fn fkey(code: ftui::KeyCode, modifiers: ftui::Modifiers) -> ftui::KeyEvent {
+            ftui::KeyEvent {
+                code,
+                modifiers,
+                kind: ftui::KeyEventKind::Press,
+            }
+        }
+
+        #[test]
+        fn chars_lowercase_and_drop_shift() {
+            let b =
+                KeyBinding::from_ftui_key(&fkey(ftui::KeyCode::Char('A'), ftui::Modifiers::SHIFT))
+                    .unwrap();
+            assert_eq!(b.key, "a");
+            assert_eq!(b.modifiers, KeyModifiers::NONE);
+        }
+
+        #[test]
+        fn ctrl_shift_char_keeps_shift_so_it_is_not_plain_ctrl() {
+            let b = KeyBinding::from_ftui_key(&fkey(
+                ftui::KeyCode::Char('P'),
+                ftui::Modifiers::CTRL | ftui::Modifiers::SHIFT,
+            ))
+            .unwrap();
+            assert_eq!(b, KeyBinding::ctrl_shift("p"));
+            assert_ne!(b, KeyBinding::ctrl("p"));
+        }
+
+        #[test]
+        fn ctrl_char_and_named_keys() {
+            let b =
+                KeyBinding::from_ftui_key(&fkey(ftui::KeyCode::Char('r'), ftui::Modifiers::CTRL))
+                    .unwrap();
+            assert_eq!((b.key.as_str(), b.modifiers), ("r", KeyModifiers::CTRL));
+
+            let b =
+                KeyBinding::from_ftui_key(&fkey(ftui::KeyCode::Enter, ftui::Modifiers::empty()))
+                    .unwrap();
+            assert_eq!(b.key, "enter");
+
+            let b =
+                KeyBinding::from_ftui_key(&fkey(ftui::KeyCode::Escape, ftui::Modifiers::empty()))
+                    .unwrap();
+            assert_eq!(b.key, "escape");
+
+            let b = KeyBinding::from_ftui_key(&fkey(
+                ftui::KeyCode::Char(' '),
+                ftui::Modifiers::empty(),
+            ))
+            .unwrap();
+            assert_eq!(b.key, "space");
+        }
+
+        #[test]
+        fn shifted_navigation_and_backtab() {
+            let b = KeyBinding::from_ftui_key(&fkey(ftui::KeyCode::Up, ftui::Modifiers::SHIFT))
+                .unwrap();
+            assert_eq!((b.key.as_str(), b.modifiers), ("up", KeyModifiers::SHIFT));
+
+            let b =
+                KeyBinding::from_ftui_key(&fkey(ftui::KeyCode::BackTab, ftui::Modifiers::empty()))
+                    .unwrap();
+            assert_eq!((b.key.as_str(), b.modifiers), ("tab", KeyModifiers::SHIFT));
+        }
+
+        #[test]
+        fn function_keys_and_default_catalog_resolution() {
+            let b = KeyBinding::from_ftui_key(&fkey(ftui::KeyCode::F(5), ftui::Modifiers::empty()))
+                .unwrap();
+            assert_eq!(b.key, "f5");
+
+            // End-to-end: default catalog resolves the same actions the
+            // bubbletea stack sees for these chords.
+            let bindings = KeyBindings::default();
+            let submit =
+                KeyBinding::from_ftui_key(&fkey(ftui::KeyCode::Enter, ftui::Modifiers::empty()))
+                    .unwrap();
+            assert_eq!(bindings.lookup(&submit), Some(AppAction::Submit));
+            let newline =
+                KeyBinding::from_ftui_key(&fkey(ftui::KeyCode::Enter, ftui::Modifiers::SHIFT))
+                    .unwrap();
+            assert_eq!(bindings.lookup(&newline), Some(AppAction::NewLine));
+            let page_up =
+                KeyBinding::from_ftui_key(&fkey(ftui::KeyCode::Up, ftui::Modifiers::SHIFT))
+                    .unwrap();
+            assert_eq!(bindings.lookup(&page_up), Some(AppAction::PageUp));
+        }
+
+        #[cfg(not(target_arch = "wasm32"))]
+        #[test]
+        fn terminal_enter_normalization_preserves_newline_chords_and_event_kinds() {
+            use crossterm::event as ct;
+
+            let bindings = KeyBindings::default();
+            let chords = [
+                (ct::KeyModifiers::NONE, "enter", Some(AppAction::Submit)),
+                (
+                    ct::KeyModifiers::SHIFT,
+                    "shift+enter",
+                    Some(AppAction::NewLine),
+                ),
+                (
+                    ct::KeyModifiers::CONTROL,
+                    "ctrl+enter",
+                    Some(AppAction::NewLine),
+                ),
+                (
+                    ct::KeyModifiers::ALT,
+                    "alt+enter",
+                    Some(AppAction::FollowUp),
+                ),
+                (
+                    ct::KeyModifiers::CONTROL | ct::KeyModifiers::SHIFT,
+                    "ctrl+shift+enter",
+                    None,
+                ),
+                (
+                    ct::KeyModifiers::ALT | ct::KeyModifiers::SHIFT,
+                    "alt+shift+enter",
+                    None,
+                ),
+                (
+                    ct::KeyModifiers::CONTROL | ct::KeyModifiers::ALT,
+                    "ctrl+alt+enter",
+                    None,
+                ),
+            ];
+            for (kind, expected_kind) in [
+                (ct::KeyEventKind::Press, ftui::KeyEventKind::Press),
+                (ct::KeyEventKind::Repeat, ftui::KeyEventKind::Repeat),
+                (ct::KeyEventKind::Release, ftui::KeyEventKind::Release),
+            ] {
+                for (modifiers, chord, expected_action) in chords {
+                    // Exercise the same backend boundary as TerminalSession,
+                    // rather than synthesizing an already-normalized FTUI key.
+                    let terminal = ct::Event::Key(ct::KeyEvent::new_with_kind(
+                        ct::KeyCode::Enter,
+                        modifiers,
+                        kind,
+                    ));
+                    let Some(ftui::Event::Key(key)) = ftui::Event::from_crossterm(terminal) else {
+                        panic!("terminal Enter event was dropped: {chord} {kind:?}"); // ubs:ignore test assertion: normalization must preserve this known key event.
+                    };
+                    assert_eq!(key.code, ftui::KeyCode::Enter);
+                    // The model must still be able to discard releases without
+                    // suppressing auto-repeat on multiline input.
+                    assert_eq!(key.kind, expected_kind);
+                    let binding = KeyBinding::from_ftui_key(&key).expect("Enter binding");
+                    assert_eq!(binding, chord.parse::<KeyBinding>().unwrap());
+                    assert_eq!(bindings.lookup(&binding), expected_action, "{chord}");
+                }
+            }
+        }
+
+        #[cfg(not(target_arch = "wasm32"))]
+        #[test]
+        fn terminal_newline_actions_respect_user_config() {
+            use crossterm::event as ct;
+
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("keybindings.json");
+            std::fs::write(
+                &path,
+                r#"{"newLine": ["ctrl+j"], "submit": ["ctrl+enter"]}"#,
+            )
+            .unwrap();
+            let loaded = KeyBindings::load_from_path_with_diagnostics(&path);
+            assert!(!loaded.has_warnings());
+
+            for (code, modifiers, newline, submit) in [
+                // Raw-mode LF is a Ctrl+J event, distinct from Enter. Users
+                // can bind it without an unconditional newline alias.
+                (
+                    ct::KeyCode::Char('j'),
+                    ct::KeyModifiers::CONTROL,
+                    true,
+                    false,
+                ),
+                (ct::KeyCode::Enter, ct::KeyModifiers::CONTROL, false, true),
+                (ct::KeyCode::Enter, ct::KeyModifiers::SHIFT, false, false),
+                (ct::KeyCode::Enter, ct::KeyModifiers::NONE, false, false),
+            ] {
+                let terminal = ct::Event::Key(ct::KeyEvent::new(code, modifiers));
+                let Some(ftui::Event::Key(key)) = ftui::Event::from_crossterm(terminal) else {
+                    panic!("configured terminal chord was dropped: {code:?} {modifiers:?}"); // ubs:ignore test assertion: normalization must preserve this known key event.
+                };
+                let binding = KeyBinding::from_ftui_key(&key).expect("configured binding");
+                let actions = loaded.bindings.matching_actions(&binding);
+                assert_eq!(actions.contains(&AppAction::NewLine), newline, "{binding}");
+                assert_eq!(actions.contains(&AppAction::Submit), submit, "{binding}");
+            }
+        }
+
+        #[test]
+        fn session_picker_default_bindings_and_hotkeys() {
+            let bindings = KeyBindings::default();
+            // The rule here is "unimplemented actions stay unbound, so
+            // /hotkeys never advertises a dead key". The three browse controls
+            // were unimplemented when that rule was written and are not any
+            // more: 1f2a2e7aa added `apply_browser_control` and the arms in
+            // `handle_browse_key` that reach it. Binding them is the same rule
+            // applied to the new facts, not an exception to it.
+            assert_eq!(
+                bindings.get_bindings(AppAction::ToggleSessionPath),
+                &[KeyBinding::ctrl("p")]
+            );
+            assert_eq!(
+                bindings.get_bindings(AppAction::ToggleSessionSort),
+                &[KeyBinding::ctrl("s")]
+            );
+            assert_eq!(
+                bindings.get_bindings(AppAction::ToggleSessionNamedFilter),
+                &[KeyBinding::ctrl("n")]
+            );
+            // Still genuinely unimplemented, so still unbound.
+            assert!(bindings.get_bindings(AppAction::RenameSession).is_empty());
+            assert!(
+                bindings
+                    .get_bindings(AppAction::DeleteSessionNoninvasive)
+                    .is_empty()
+            );
+
+            // DeleteSession is implemented and retains ctrl+d
+            assert_eq!(
+                bindings.get_bindings(AppAction::DeleteSession),
+                &[KeyBinding::ctrl("d")]
+            );
+
+            // Selection actions retain defaults
+            assert_eq!(
+                bindings.get_bindings(AppAction::SelectUp),
+                &[KeyBinding::plain("up")]
+            );
+            assert_eq!(
+                bindings.get_bindings(AppAction::SelectDown),
+                &[KeyBinding::plain("down")]
+            );
+            assert_eq!(
+                bindings.get_bindings(AppAction::SelectPageUp),
+                &[KeyBinding::plain("pageup")]
+            );
+            assert_eq!(
+                bindings.get_bindings(AppAction::SelectPageDown),
+                &[KeyBinding::plain("pagedown")]
+            );
+            assert_eq!(
+                bindings.get_bindings(AppAction::SelectConfirm),
+                &[KeyBinding::plain("enter")]
+            );
+            assert_eq!(
+                bindings.get_bindings(AppAction::SelectCancel),
+                &[KeyBinding::plain("escape"), KeyBinding::ctrl("c")]
+            );
+
+            // /hotkeys lists what works and nothing else: the three browse
+            // controls now appear because they now do something, while the
+            // two that remain unimplemented stay off the list.
+            let hotkeys = format_hotkeys(&bindings);
+            assert!(hotkeys.contains("## Session Picker"));
+            assert!(hotkeys.contains("Delete session"));
+            assert!(hotkeys.contains("Toggle path display"));
+            assert!(hotkeys.contains("Toggle sort mode"));
+            assert!(hotkeys.contains("Toggle named-only filter"));
+            assert!(!hotkeys.contains("Rename session"));
+            assert!(!hotkeys.contains("Delete session (when query empty)"));
+        }
+
+        #[test]
+        fn kill_ring_yank_and_yank_pop_are_unbound_by_default() {
+            let bindings = KeyBindings::default();
+            // Yank and YankPop are currently unimplemented across both stacks,
+            // so they must have empty defaults and not be advertised in /hotkeys.
+            assert!(bindings.get_bindings(AppAction::Yank).is_empty());
+            assert!(bindings.get_bindings(AppAction::YankPop).is_empty());
+            // Undo is implemented on FTUI and retains ctrl+-
+            assert_eq!(
+                bindings.get_bindings(AppAction::Undo),
+                &[KeyBinding::ctrl("-")]
+            );
+
+            let hotkeys = format_hotkeys(&bindings);
+            assert!(!hotkeys.contains("Paste most recently deleted text"));
+            assert!(!hotkeys.contains("Cycle through deleted text"));
+        }
+
+        #[test]
+        fn ftui_hotkeys_filter_omits_inert_actions() {
+            let bindings = KeyBindings::default();
+            let ftui_hotkeys = format_hotkeys_for_ftui(&bindings);
+
+            // Supported actions appear:
+            assert!(ftui_hotkeys.contains("Open model selector"));
+            assert!(ftui_hotkeys.contains("Show help"));
+            assert!(ftui_hotkeys.contains("Cycle thinking level"));
+            assert!(ftui_hotkeys.contains("Submit input"));
+            assert!(ftui_hotkeys.contains("Insert new line"));
+            // Routed on FTUI since ctrl+p model cycling was wired in.
+            assert!(ftui_hotkeys.contains("Cycle to next model"));
+            assert!(ftui_hotkeys.contains("Cycle to previous model"));
+            // Routed since mid-turn input goes through session_control.
+            assert!(ftui_hotkeys.contains("Queue follow-up message"));
+            assert!(ftui_hotkeys.contains("Restore queued messages to editor"));
+            // Routed with ctrl+o/ctrl+t/ctrl+g and OMP's ctrl+c clear.
+            assert!(ftui_hotkeys.contains("Collapse/expand tool output"));
+            assert!(ftui_hotkeys.contains("Collapse/expand thinking blocks"));
+            assert!(ftui_hotkeys.contains("Open in external editor"));
+            assert!(ftui_hotkeys.contains("Clear editor"));
+
+            assert!(ftui_hotkeys.contains("Open settings"));
+            // Inert actions on FTUI are omitted:
+            assert!(!ftui_hotkeys.contains("Copy selection"));
+            assert!(!ftui_hotkeys.contains("Switch to next sibling branch"));
+            assert!(!ftui_hotkeys.contains("Switch to previous sibling branch"));
+            assert!(!ftui_hotkeys.contains("Session Picker"));
+            // The classic list still has them.
+            assert!(format_hotkeys(&bindings).contains("Switch to next sibling branch"));
+            // Routed: the pasted image becomes an `@file` attachment.
+            assert!(ftui_hotkeys.contains("Paste image from clipboard"));
         }
     }
 }

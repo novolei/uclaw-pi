@@ -60,7 +60,7 @@ pub(super) fn normalize_raw_terminal_newlines(input: String) -> String {
 ///
 /// We do explicit wrapping here instead of relying on terminal auto-wrap so the
 /// renderer's logical rows stay aligned with physical rows in alt-screen mode.
-fn wrapped_line_segments(line: &str, max_width: usize) -> Vec<&str> {
+pub(super) fn wrapped_line_segments(line: &str, max_width: usize) -> Vec<&str> {
     if max_width == 0 || line.is_empty() {
         return vec![line];
     }
@@ -84,13 +84,13 @@ fn wrapped_line_segments(line: &str, max_width: usize) -> Vec<&str> {
 }
 
 #[inline]
-fn starts_with_unordered_list_marker(trimmed: &str) -> bool {
+const fn starts_with_unordered_list_marker(trimmed: &str) -> bool {
     let bytes = trimmed.as_bytes();
     bytes.len() >= 2 && matches!(bytes[0], b'-' | b'+' | b'*') && bytes[1].is_ascii_whitespace()
 }
 
 #[inline]
-fn starts_with_ordered_list_marker(trimmed: &str) -> bool {
+const fn starts_with_ordered_list_marker(trimmed: &str) -> bool {
     let bytes = trimmed.as_bytes();
     let mut idx = 0usize;
     while idx < bytes.len() && bytes[idx].is_ascii_digit() {
@@ -334,15 +334,27 @@ impl PiApp {
         let mut output = String::new();
         let plain_width = self.term_width.saturating_sub(4).max(1);
 
-        if !self.startup_welcome.trim().is_empty() {
-            for line in self.startup_welcome.lines() {
-                if line.trim().is_empty() {
-                    output.push('\n');
-                    continue;
-                }
-                for segment in wrapped_line_segments(line, plain_width) {
-                    let _ = writeln!(output, "{}", self.styles.muted_italic.render(segment));
-                }
+        if self.startup_welcome.trim().is_empty() {
+            if self.config.quiet_startup.unwrap_or(false) {
+                return output;
+            }
+            let welcome = crate::overlay_system::WelcomeScreen::default();
+            let _ = writeln!(output, "  {}", self.styles.title.render(&welcome.greeting));
+            let _ = writeln!(
+                output,
+                "\n  {}",
+                self.styles.muted_italic.render(welcome.current_tip())
+            );
+            return output;
+        }
+
+        for line in self.startup_welcome.lines() {
+            if line.trim().is_empty() {
+                output.push('\n');
+                continue;
+            }
+            for segment in wrapped_line_segments(line, plain_width) {
+                let _ = writeln!(output, "{}", self.styles.muted_italic.render(segment));
             }
         }
 
@@ -499,11 +511,29 @@ impl PiApp {
                 }
                 format!(" ({})", parts.join(" \u{2022} "))
             });
+            // Show what the tool was asked to do (bash command line, file
+            // path, ...) truncated to the terminal width.
+            let invocation_str = self
+                .current_tool_id
+                .as_ref()
+                .and_then(|tool_id| self.current_tool_summary.get(tool_id))
+                .map_or_else(String::new, |summary| {
+                    let budget = self
+                        .term_width
+                        .saturating_sub(16 + tool.len() + progress_str.len())
+                        .max(12);
+                    let mut clipped: String = summary.chars().take(budget).collect();
+                    if summary.chars().count() > budget {
+                        clipped.push('…');
+                    }
+                    format!(": {clipped}")
+                });
             let _ = write!(
                 output,
-                "\n  {} {}{} ...\n",
+                "\n  {} {}{}{} ...\n",
                 self.spinner.view(),
                 self.styles.warning_bold.render(&format!("Running {tool}")),
+                self.styles.muted.render(&invocation_str),
                 self.styles.muted.render(&progress_str),
             );
         }
@@ -512,6 +542,17 @@ impl PiApp {
         if let Some(status) = &self.status_message {
             let status_style = self.styles.accent.clone().italic();
             let _ = write!(output, "\n  {}\n", status_style.render(status));
+        }
+
+        // Todo footer (bd-cv653.3.9): compact `settled/total · current task`
+        // line, state-driven from the todo tool's todo_list.v1 details.
+        if let Some(todo) = &self.todo_summary {
+            let _ = write!(
+                output,
+                "\n  {} {}\n",
+                self.styles.muted.render("todo"),
+                self.styles.accent.render(todo),
+            );
         }
 
         // Session picker overlay (if open)
@@ -530,10 +571,11 @@ impl PiApp {
         }
 
         // Capability prompt overlay (if open)
-        if let Some(ref prompt) = self.capability_prompt {
-            output.push_str(&self.render_capability_prompt(prompt));
+        if let Some(prompt) = &self.capability_prompt {
+            output.push_str(
+                &self.render_capability_prompt(prompt, self.capability_prompt_queue.len()),
+            );
         }
-
         // Extension custom overlay (if open)
         if let Some(ref overlay) = self.extension_custom_overlay {
             output.push_str(&self.render_extension_custom_overlay(overlay));
@@ -599,7 +641,7 @@ impl PiApp {
     /// PERF-7: Render the header directly into `output`, avoiding an
     /// intermediate `String` allocation on the hot path.
     fn render_header_into(&self, output: &mut String) {
-        let model_label = format!("({})", self.model);
+        let model_label = format!("({})", model_display_label(&self.model_entry));
 
         // Branch indicator: show "Branch N/M" when session has multiple leaves.
         let branch_indicator = self
@@ -647,6 +689,31 @@ impl PiApp {
             max_width,
         );
 
+        let activity = match self.agent_state {
+            AgentState::Idle => "ready",
+            AgentState::Processing => "processing",
+            AgentState::ToolRunning => "tool",
+        };
+        // Issue #200: a `/name`d (or resumed named) session titles the
+        // terminal tab after itself; unnamed sessions keep the model label.
+        // The header re-renders every frame, so both `/name` and resume are
+        // covered without extra hooks.
+        let session_name = self
+            .session
+            .try_lock()
+            .ok()
+            .and_then(|session| session.get_name());
+        let terminal_title = session_name.map_or_else(
+            || {
+                format!(
+                    "Pi · {} · {activity}",
+                    model_display_label(&self.model_entry)
+                )
+            },
+            |name| format!("Pi · {name} · {activity}"),
+        );
+        output.push_str(&crate::delight::format_terminal_title(&terminal_title));
+
         let _ = write!(
             output,
             "  {} {}{}\n  {}\n  {}\n",
@@ -665,22 +732,43 @@ impl PiApp {
         buf
     }
 
+    /// Thinking level for the input-frame badge.
+    ///
+    /// Issue #197: only re-resolve when the session header is actually
+    /// readable. Under lock contention (agent mid-turn) the old code
+    /// silently fell back to the config default, flipping the badge between
+    /// the session's real level and the default; reuse the last successfully
+    /// read level instead.
+    fn thinking_badge_level(&self) -> ThinkingLevel {
+        self.session.try_lock().ok().map_or_else(
+            || {
+                self.thinking_badge_cache
+                    .get()
+                    .unwrap_or(ThinkingLevel::Off)
+            },
+            |guard| {
+                let level = guard
+                    .header
+                    .thinking_level
+                    .as_deref()
+                    .and_then(|level| level.parse::<ThinkingLevel>().ok())
+                    .or_else(|| {
+                        self.config
+                            .default_thinking_level
+                            .as_deref()
+                            .and_then(|level| level.parse::<ThinkingLevel>().ok())
+                    })
+                    .unwrap_or(ThinkingLevel::Off);
+                self.thinking_badge_cache.set(Some(level));
+                level
+            },
+        )
+    }
+
     pub(super) fn render_input(&self) -> String {
         let mut output = String::new();
 
-        let thinking_level = self
-            .session
-            .try_lock()
-            .ok()
-            .and_then(|guard| guard.header.thinking_level.clone())
-            .and_then(|level| level.parse::<ThinkingLevel>().ok())
-            .or_else(|| {
-                self.config
-                    .default_thinking_level
-                    .as_deref()
-                    .and_then(|level| level.parse::<ThinkingLevel>().ok())
-            })
-            .unwrap_or(ThinkingLevel::Off);
+        let thinking_level = self.thinking_badge_level();
 
         let input_text = self.input.value();
         let is_bash_mode = parse_bash_command(&input_text).is_some();
@@ -713,6 +801,11 @@ impl PiApp {
             ),
             ThinkingLevel::XHigh => (
                 "xhigh",
+                self.styles.error_bold.clone(),
+                self.styles.error_bold.clone(),
+            ),
+            ThinkingLevel::Max => (
+                "max",
                 self.styles.error_bold.clone(),
                 self.styles.error_bold.clone(),
             ),
@@ -793,15 +886,28 @@ impl PiApp {
             .vcs_info
             .as_ref()
             .map_or_else(String::new, |b| format!("  |  {b}"));
+        let approval_str = self
+            .agent
+            .try_lock()
+            .ok()
+            .and_then(|g| g.approval_state())
+            .map_or_else(String::new, |s| {
+                let m = s.mode();
+                if m == crate::approval::ApprovalMode::AlwaysAsk {
+                    String::new()
+                } else {
+                    format!("  |  Approval: {}", m.as_str())
+                }
+            });
         let mode_hint = match self.input_mode {
             InputMode::SingleLine => "Shift+Enter: newline  |  Alt+Enter: multi-line",
             InputMode::MultiLine => "Enter: newline  |  Alt+Enter: send  |  Esc: single-line",
         };
         let footer_long = format!(
-            "Tokens: {input} in / {output_tokens} out{cost_str}{branch_str}  |  {persistence_str}  |  {mode_hint}  |  /help  |  Ctrl+C: quit"
+            "Tokens: {input} in / {output_tokens} out{cost_str}{branch_str}{approval_str}  |  {persistence_str}  |  {mode_hint}  |  /help  |  Ctrl+C: quit"
         );
         let footer_short = format!(
-            "Tokens: {input} in / {output_tokens} out{cost_str}{branch_str}  |  {persistence_str}  |  /help  |  Ctrl+C: quit"
+            "Tokens: {input} in / {output_tokens} out{cost_str}{branch_str}{approval_str}  |  {persistence_str}  |  /help  |  Ctrl+C: quit"
         );
         let max_width = self.term_width.saturating_sub(2);
         let mut footer = if footer_long.chars().count() <= max_width {
@@ -812,20 +918,83 @@ impl PiApp {
         if footer.chars().count() > max_width {
             footer = truncate(&footer, max_width);
         }
-        let _ = write!(output, "\n  {}\n", self.styles.muted.render(&footer));
+        let (thinking_level, session_name) = self.session.try_lock().ok().map_or_else(
+            || (None, String::new()),
+            |session| {
+                (
+                    session.header.thinking_level.clone(),
+                    session
+                        .get_name()
+                        .unwrap_or_else(|| session.header.id.clone()),
+                )
+            },
+        );
+        let mode = self.agent.try_lock().ok().map_or("act", |agent| {
+            let plan_mode = agent.plan_state().mode();
+            if plan_mode == crate::plan::PlanMode::Off {
+                "act"
+            } else {
+                plan_mode.as_str()
+            }
+        });
+        let cwd = self.cwd.to_string_lossy();
+        // gh #214: the same display label the default stack's powerline uses.
+        let model_label = self.model_entry.model.status_label();
+        let status_ctx = crate::status_line::StatusContext {
+            model: model_label.as_str(),
+            thinking_level: thinking_level.as_deref(),
+            mode,
+            cwd: cwd.as_ref(),
+            git_branch: self.vcs_info.as_deref(),
+            git_dirty: false,
+            context_pct: 0,
+            cost_usd: total_cost,
+            tokens_used: input.saturating_add(output_tokens),
+            subagent_count: 0,
+            session_name: &session_name,
+            timestamp_str: "",
+        };
+        let powerline = crate::status_line::PowerlineStatusLine::with_preset(
+            crate::status_line::StatusLinePreset::Compact,
+        )
+        .render(&status_ctx, max_width);
+
+        output.push('\n');
+        if !powerline.is_empty() {
+            let _ = writeln!(output, "  {}", self.styles.muted.render(&powerline));
+        }
+        let _ = writeln!(output, "  {}", self.styles.muted.render(&footer));
     }
 
     /// Render a single conversation message to a string (uncached path).
+    #[allow(clippy::too_many_lines)]
     fn render_single_message(&self, msg: &ConversationMessage) -> String {
         let mut output = String::new();
         match msg.role {
             MessageRole::User => {
-                let _ = write!(
-                    output,
-                    "\n  {} {}\n",
-                    self.styles.accent_bold.render("You:"),
-                    msg.content
-                );
+                // Hard-wrap so logical rows match physical rows (the frame
+                // height clamp counts newlines; verbatim long lines overflow
+                // and make the scroll percentage lie — bd-06s4y).
+                let wrap_width = self.term_width.saturating_sub(9).max(20);
+                output.push('\n');
+                let mut first = true;
+                for line in msg.content.lines() {
+                    for segment in wrapped_line_segments(line, wrap_width) {
+                        if first {
+                            first = false;
+                            let _ = writeln!(
+                                output,
+                                "  {} {segment}",
+                                self.styles.accent_bold.render("You:")
+                            );
+                        } else {
+                            let _ = writeln!(output, "       {segment}");
+                        }
+                    }
+                }
+                if first {
+                    let _ = writeln!(output, "  {}", self.styles.accent_bold.render("You:"));
+                }
             }
             MessageRole::Assistant => {
                 let _ = write!(
@@ -835,24 +1004,25 @@ impl PiApp {
                 );
 
                 // Render thinking if present
-                if self.thinking_visible {
-                    if let Some(thinking) = &msg.thinking {
-                        let truncated = truncate(thinking, 100);
-                        let _ = writeln!(
-                            output,
-                            "  {}",
-                            self.styles
-                                .muted_italic
-                                .render(&format!("Thinking: {truncated}"))
-                        );
-                    }
+                if self.thinking_visible
+                    && let Some(thinking) = &msg.thinking
+                {
+                    let truncated = truncate(thinking, 100);
+                    let _ = writeln!(
+                        output,
+                        "  {}",
+                        self.styles
+                            .muted_italic
+                            .render(&format!("Thinking: {truncated}"))
+                    );
                 }
 
-                // Render markdown content
+                // Render markdown content with rich enhancements
+                let enriched_content = crate::markdown_rich::enrich_markdown(&msg.content);
                 let rendered = glamour::Renderer::new()
                     .with_style_config(self.markdown_style.clone())
                     .with_word_wrap(self.term_width.saturating_sub(6).max(40))
-                    .render(&msg.content);
+                    .render(&enriched_content);
                 for line in rendered.lines() {
                     let _ = writeln!(output, "  {line}");
                 }
@@ -860,8 +1030,9 @@ impl PiApp {
             MessageRole::Tool => {
                 // Per-message collapse: global toggle overrides, then per-message.
                 let show_expanded = self.tools_expanded && !msg.collapsed;
+                let wrap_width = self.term_width.saturating_sub(4).max(20);
                 if show_expanded {
-                    let rendered = render_tool_message(&msg.content, &self.styles);
+                    let rendered = render_tool_message(&msg.content, &self.styles, wrap_width);
                     let _ = write!(output, "\n  {rendered}\n");
                 } else {
                     let header = msg.content.lines().next().unwrap_or("Tool output");
@@ -891,17 +1062,27 @@ impl PiApp {
                                 );
                                 break;
                             }
-                            let _ = writeln!(
-                                output,
-                                "  {}",
-                                self.styles.muted.render(&format!("  {line}"))
-                            );
+                            for segment in
+                                wrapped_line_segments(line, wrap_width.saturating_sub(2).max(10))
+                            {
+                                let _ = writeln!(
+                                    output,
+                                    "  {}",
+                                    self.styles.muted.render(&format!("  {segment}"))
+                                );
+                            }
                         }
                     }
                 }
             }
             MessageRole::System => {
-                let _ = write!(output, "\n  {}\n", self.styles.warning.render(&msg.content));
+                let wrap_width = self.term_width.saturating_sub(4).max(20);
+                output.push('\n');
+                for line in msg.content.lines() {
+                    for segment in wrapped_line_segments(line, wrap_width) {
+                        let _ = writeln!(output, "  {}", self.styles.warning.render(segment));
+                    }
+                }
             }
         }
         output
@@ -1065,7 +1246,6 @@ impl PiApp {
     pub(super) fn render_autocomplete_dropdown(&self) -> String {
         let mut output = String::new();
 
-        let offset = self.autocomplete.scroll_offset();
         // Constrain visible items to available terminal space.
         // Dropdown chrome uses ~5 rows (borders, help, pagination, description).
         let max_dropdown_rows = self.term_height.saturating_sub(
@@ -1078,6 +1258,9 @@ impl PiApp {
             .max_visible
             .min(self.autocomplete.items.len())
             .min(max_dropdown_rows.max(1));
+        // Scroll relative to the clamped window so the highlighted item is
+        // always inside the rendered rows, even on short terminals.
+        let offset = self.autocomplete.scroll_offset(visible_count);
         let end = (offset + visible_count).min(self.autocomplete.items.len());
 
         // Styles
@@ -1086,8 +1269,10 @@ impl PiApp {
         let kind_style = &self.styles.warning;
         let desc_style = &self.styles.muted_italic;
 
-        // Top border
-        let width = 60;
+        // Top border. Clamp to the terminal width so dropdown rows never
+        // soft-wrap on narrow terminals (wrapping breaks the newline-based
+        // frame height accounting and pushes the footer off screen).
+        let width = 60usize.min(self.term_width.saturating_sub(4)).max(20);
         let _ = write!(
             output,
             "\n  {}",
@@ -1152,49 +1337,47 @@ impl PiApp {
                 border_style.render("│")
             );
 
-            if is_selected {
-                if let Some(desc) = &item.description {
-                    let max_desc_len = width.saturating_sub(4);
-                    let desc_width = desc.width();
-                    let truncated_desc = if desc_width > max_desc_len {
-                        let mut out = String::with_capacity(max_desc_len);
-                        let mut current_width = 0;
-                        for c in desc.chars() {
-                            let c = if c == '\n' { ' ' } else { c };
-                            let w = c.width().unwrap_or(0);
-                            if current_width + w > max_desc_len {
-                                while current_width > max_desc_len.saturating_sub(1) {
-                                    if let Some(last) = out.pop() {
-                                        current_width -= last.width().unwrap_or(0);
-                                    } else {
-                                        break;
-                                    }
+            if is_selected && let Some(desc) = &item.description {
+                let max_desc_len = width.saturating_sub(4);
+                let desc_width = desc.width();
+                let truncated_desc = if desc_width > max_desc_len {
+                    let mut out = String::with_capacity(max_desc_len);
+                    let mut current_width = 0;
+                    for c in desc.chars() {
+                        let c = if c == '\n' { ' ' } else { c };
+                        let w = c.width().unwrap_or(0);
+                        if current_width + w > max_desc_len {
+                            while current_width > max_desc_len.saturating_sub(1) {
+                                if let Some(last) = out.pop() {
+                                    current_width -= last.width().unwrap_or(0);
+                                } else {
+                                    break;
                                 }
-                                out.push('…');
-                                break;
                             }
-                            out.push(c);
-                            current_width += w;
+                            out.push('…');
+                            break;
                         }
-                        out
-                    } else {
-                        desc.replace('\n', " ")
-                    };
+                        out.push(c);
+                        current_width += w;
+                    }
+                    out
+                } else {
+                    desc.replace('\n', " ")
+                };
 
-                    let _ = write!(
-                        output,
-                        "\n  {}  {}{}",
-                        border_style.render("│"),
-                        desc_style.render(&truncated_desc),
-                        border_style.render(&format!(
-                            "{:>pad$}│",
-                            "",
-                            pad = width
-                                .saturating_sub(2)
-                                .saturating_sub(truncated_desc.width())
-                        ))
-                    );
-                }
+                let _ = write!(
+                    output,
+                    "\n  {}  {}{}",
+                    border_style.render("│"),
+                    desc_style.render(&truncated_desc),
+                    border_style.render(&format!(
+                        "{:>pad$}│",
+                        "",
+                        pad = width
+                            .saturating_sub(2)
+                            .saturating_sub(truncated_desc.width())
+                    ))
+                );
             }
         }
 
@@ -1377,6 +1560,46 @@ impl PiApp {
                         "followUpMode: {}",
                         self.config.follow_up_queue_mode().as_str()
                     ),
+                    SettingsUiEntry::EnableEval => format!(
+                        "tools.enableEval: {} (new session)",
+                        bool_label(
+                            self.config
+                                .tools
+                                .as_ref()
+                                .and_then(|tools| tools.enable_eval)
+                                .unwrap_or(false)
+                        )
+                    ),
+                    SettingsUiEntry::EnableGithub => format!(
+                        "tools.enableGithub: {} (new session)",
+                        bool_label(
+                            self.config
+                                .tools
+                                .as_ref()
+                                .and_then(|tools| tools.enable_github)
+                                .unwrap_or(false)
+                        )
+                    ),
+                    SettingsUiEntry::EnableSecurityScan => format!(
+                        "tools.enableSecurityScan: {} (new session)",
+                        bool_label(
+                            self.config
+                                .tools
+                                .as_ref()
+                                .and_then(|tools| tools.enable_security_scan)
+                                .unwrap_or(false)
+                        )
+                    ),
+                    SettingsUiEntry::EnableSubagent => format!(
+                        "tools.enableSubagent: {} (new session)",
+                        bool_label(
+                            self.config
+                                .tools
+                                .as_ref()
+                                .and_then(|tools| tools.enable_subagent)
+                                .unwrap_or(false)
+                        )
+                    ),
                     SettingsUiEntry::DefaultPermissive => format!(
                         "extensionPolicy.defaultPermissive: {}{}",
                         bool_label(self.effective_default_permissive()),
@@ -1517,7 +1740,20 @@ impl PiApp {
         output
     }
 
-    pub(super) fn render_capability_prompt(&self, prompt: &CapabilityPromptOverlay) -> String {
+    pub(super) fn render_capability_prompt(
+        &self,
+        prompt: &CapabilityPromptOverlay,
+        queued_count: usize,
+    ) -> String {
+        self.render_capability_prompt_at(prompt, queued_count, std::time::Instant::now())
+    }
+
+    pub(super) fn render_capability_prompt_at(
+        &self,
+        prompt: &CapabilityPromptOverlay,
+        queued_count: usize,
+        now: std::time::Instant,
+    ) -> String {
         let mut output = String::new();
 
         // Title line.
@@ -1559,8 +1795,10 @@ impl PiApp {
         }
         output.push('\n');
 
-        // Auto-deny timer.
-        if let Some(secs) = prompt.auto_deny_secs {
+        // Auto-deny countdown derived LIVE from the authoritative deadline
+        // captured on arrival (bd-yllbn); it decays in wall-clock time and
+        // expiry resolves the overlay fail-closed.
+        if let Some(secs) = prompt.remaining_secs(now) {
             let _ = writeln!(
                 output,
                 "  {}",
@@ -1570,14 +1808,13 @@ impl PiApp {
             );
         }
 
-        // Help text.
-        let _ = writeln!(
-            output,
-            "  {}",
-            self.styles
-                .muted_italic
-                .render("←/→/Tab: navigate  Enter: confirm  Esc: deny")
-        );
+        // Help text; surface FIFO depth so users see waiting prompts.
+        let help = if queued_count > 0 {
+            format!("←/→/Tab: navigate  Enter: confirm  Esc: deny  ({queued_count} queued)")
+        } else {
+            "←/→/Tab: navigate  Enter: confirm  Esc: deny".to_string()
+        };
+        let _ = writeln!(output, "  {}", self.styles.muted_italic.render(&help));
 
         output
     }

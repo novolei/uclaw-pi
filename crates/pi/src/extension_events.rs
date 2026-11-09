@@ -52,7 +52,7 @@ pub enum ExtensionEvent {
     TurnEnd {
         session_id: String,
         turn_index: usize,
-        message: AssistantMessage,
+        message: Box<AssistantMessage>,
         tool_results: Vec<ToolResultMessage>,
     },
 
@@ -398,10 +398,10 @@ pub fn apply_before_agent_start_response(
         return outcome;
     }
 
-    if let Some(message_value) = obj.get("message") {
-        if let Some(msg) = parse_custom_message(message_value, timestamp) {
-            outcome.messages.push(msg);
-        }
+    if let Some(message_value) = obj.get("message")
+        && let Some(msg) = parse_custom_message(message_value, timestamp)
+    {
+        outcome.messages.push(msg);
     }
 
     outcome
@@ -552,6 +552,7 @@ mod tests {
                 model: "test".to_string(),
                 usage: crate::model::Usage::default(),
                 stop_reason: crate::model::StopReason::Stop,
+                stop_details: None,
                 error_message: None,
                 timestamp: 0,
             }
@@ -608,7 +609,7 @@ mod tests {
                 ExtensionEvent::TurnEnd {
                     session_id: "s".to_string(),
                     turn_index: 0,
-                    message: sample_assistant_message(),
+                    message: Box::new(sample_assistant_message()),
                     tool_results: vec![sample_tool_result()],
                 },
                 "turn_end",

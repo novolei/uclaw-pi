@@ -355,20 +355,20 @@ fn format_trace_line(payload: &LogPayload) -> String {
             out.push_str(" pid=");
             out.push_str(&pid.to_string());
         }
-        if let Some(host) = source.host.as_deref() {
-            if !host.trim().is_empty() {
-                out.push_str(" host=");
-                out.push_str(host);
-            }
+        if let Some(host) = source.host.as_deref()
+            && !host.trim().is_empty()
+        {
+            out.push_str(" host=");
+            out.push_str(host);
         }
     }
 
-    if let Some(data) = &payload.data {
-        if let Ok(text) = serde_json::to_string(data) {
-            let truncated = truncate_chars(&text, 200);
-            out.push_str(" data=");
-            out.push_str(&truncated);
-        }
+    if let Some(data) = &payload.data
+        && let Ok(text) = serde_json::to_string(data)
+    {
+        let truncated = truncate_chars(&text, 200);
+        out.push_str(" data=");
+        out.push_str(&truncated);
     }
 
     out
@@ -1396,14 +1396,17 @@ fn rpc_handle_ui_request(
     let Some(method) = value.get("method").and_then(Value::as_str) else {
         return Ok(());
     };
+    let Some(request_generation) = value.get("requestGeneration").and_then(Value::as_u64) else {
+        return Ok(());
+    };
 
     match method {
         "select" => {
             let response = rpc_ui_response_value(scenario, "select")
                 .and_then(Value::as_str)
                 .map_or_else(
-                    || json!({"type":"extension_ui_response","id": id, "cancelled": true}),
-                    |choice| json!({"type":"extension_ui_response","id": id, "value": choice}),
+                    || json!({"type":"extension_ui_response","id": id, "requestGeneration": request_generation, "cancelled": true}),
+                    |choice| json!({"type":"extension_ui_response","id": id, "requestGeneration": request_generation, "value": choice}),
                 );
             rpc_write_command(stdin, &response)?;
         }
@@ -1411,9 +1414,9 @@ fn rpc_handle_ui_request(
             let response = rpc_ui_response_value(scenario, "confirm")
                 .and_then(Value::as_bool)
                 .map_or_else(
-                    || json!({"type":"extension_ui_response","id": id, "cancelled": true}),
+                    || json!({"type":"extension_ui_response","id": id, "requestGeneration": request_generation, "cancelled": true}),
                     |confirmed| {
-                        json!({"type":"extension_ui_response","id": id, "confirmed": confirmed})
+                        json!({"type":"extension_ui_response","id": id, "requestGeneration": request_generation, "confirmed": confirmed})
                     },
                 );
             rpc_write_command(stdin, &response)?;
@@ -1422,8 +1425,8 @@ fn rpc_handle_ui_request(
             let response = rpc_ui_response_value(scenario, "input")
                 .and_then(Value::as_str)
                 .map_or_else(
-                    || json!({"type":"extension_ui_response","id": id, "cancelled": true}),
-                    |text| json!({"type":"extension_ui_response","id": id, "value": text}),
+                    || json!({"type":"extension_ui_response","id": id, "requestGeneration": request_generation, "cancelled": true}),
+                    |text| json!({"type":"extension_ui_response","id": id, "requestGeneration": request_generation, "value": text}),
                 );
             rpc_write_command(stdin, &response)?;
         }
@@ -1431,8 +1434,8 @@ fn rpc_handle_ui_request(
             let response = rpc_ui_response_value(scenario, "editor")
                 .and_then(Value::as_str)
                 .map_or_else(
-                    || json!({"type":"extension_ui_response","id": id, "cancelled": true}),
-                    |text| json!({"type":"extension_ui_response","id": id, "value": text}),
+                    || json!({"type":"extension_ui_response","id": id, "requestGeneration": request_generation, "cancelled": true}),
+                    |text| json!({"type":"extension_ui_response","id": id, "requestGeneration": request_generation, "value": text}),
                 );
             rpc_write_command(stdin, &response)?;
         }
@@ -1689,13 +1692,13 @@ fn normalize_jsonl_file(input: &Path, output: &Path, ctx: &NormalizationContext)
     let mut out = File::create(output).with_context(|| format!("create {}", output.display()))?;
     for line in reader.lines() {
         let line = line.with_context(|| format!("read {}", input.display()))?;
-        if line.trim_start().starts_with('{') {
-            if let Ok(mut value) = serde_json::from_str::<Value>(&line) {
-                normalize_json_value(&mut value, None, ctx);
-                let normalized = serde_json::to_string(&value)?;
-                writeln!(out, "{normalized}")?;
-                continue;
-            }
+        if line.trim_start().starts_with('{')
+            && let Ok(mut value) = serde_json::from_str::<Value>(&line)
+        {
+            normalize_json_value(&mut value, None, ctx);
+            let normalized = serde_json::to_string(&value)?;
+            writeln!(out, "{normalized}")?;
+            continue;
         }
         writeln!(out, "{}", normalize_text_line(&line, ctx))?;
     }

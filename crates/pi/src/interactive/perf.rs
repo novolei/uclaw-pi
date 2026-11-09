@@ -1,10 +1,268 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 
+use asupersync::Cx;
+use asupersync::sync::{Mutex, OwnedMutexGuard};
 use serde_json::{Value, json};
 
-use super::{AgentState, Cmd, EXTENSION_EVENT_TIMEOUT_MS, PiApp, PiMsg, conversation_from_session};
+use super::{
+    AgentState, Cmd, ConversationMessage, EXTENSION_EVENT_TIMEOUT_MS, PiApp, PiMsg,
+    conversation_from_session,
+};
+use crate::checkpoint::RetryPlan;
 use crate::extension_events::{SessionBeforeCompactOutcome, apply_session_before_compact_response};
+use crate::extensions::ExtensionEventName;
+use crate::model::{Message, Usage};
+use crate::session::{CompactionEntry, Session, SessionEntry};
+
+async fn deliver_compaction_terminal_event(
+    event_tx: &asupersync::channel::mpsc::Sender<PiMsg>,
+    cx: &Cx,
+    message: PiMsg,
+) -> bool {
+    let delivered = crate::interactive::enqueue_pi_event(event_tx, cx, message).await;
+    if !delivered {
+        tracing::error!("terminal compaction event was not delivered before runtime shutdown");
+    }
+    delivered
+}
+
+fn spawn_compaction_terminal_event(
+    runtime_handle: &asupersync::runtime::RuntimeHandle,
+    event_tx: asupersync::channel::mpsc::Sender<PiMsg>,
+    message: PiMsg,
+) {
+    if let Err(err) = runtime_handle.try_spawn_with_cx(move |completion_cx| async move {
+        deliver_compaction_terminal_event(&event_tx, &completion_cx, message).await;
+    }) {
+        tracing::error!(
+            error = %err,
+            "terminal compaction event could not be admitted by the runtime"
+        );
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompactionPersistenceOutcome {
+    Confirmed,
+    Disabled,
+    ReconciledButUnconfirmed,
+}
+
+impl CompactionPersistenceOutcome {
+    const fn may_emit_success_event(self) -> bool {
+        matches!(self, Self::Confirmed | Self::Disabled)
+    }
+}
+
+#[derive(Debug)]
+struct CompactionSessionCommit {
+    messages_for_agent: Vec<Message>,
+    messages_for_ui: Vec<ConversationMessage>,
+    usage: Usage,
+    compaction_entry: CompactionEntry,
+    persistence: CompactionPersistenceOutcome,
+}
+
+async fn confirm_exact_compaction_after_save_error(
+    candidate: &Session,
+    entry_id: &str,
+    expected_entry: &[u8],
+) -> Option<()> {
+    let path = candidate.path.as_ref()?;
+    let (reopened, diagnostics) = Session::open_with_diagnostics(path.to_string_lossy().as_ref())
+        .await
+        .ok()?;
+    if !diagnostics.skipped_entries.is_empty() || !diagnostics.orphaned_parent_links.is_empty() {
+        return None;
+    }
+    if reopened.header.id != candidate.header.id || reopened.leaf_id() != Some(entry_id) {
+        return None;
+    }
+    if serde_json::to_vec(&reopened.header).ok()? != serde_json::to_vec(&candidate.header).ok()?
+        || serde_json::to_vec(&reopened.entries).ok()?
+            != serde_json::to_vec(&candidate.entries).ok()?
+    {
+        return None;
+    }
+    let reopened_entry = reopened.get_entry(entry_id)?;
+    if serde_json::to_vec(reopened_entry).ok()?.as_slice() != expected_entry {
+        return None;
+    }
+    Some(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn stage_and_commit_compaction_session(
+    session: Arc<Mutex<Session>>,
+    expected_session_id: &str,
+    expected_leaf_id: Option<&str>,
+    summary: String,
+    first_kept_entry_id: String,
+    tokens_before: u64,
+    details: Option<Value>,
+    from_hook: Option<bool>,
+    save_enabled: bool,
+    cx: &Cx,
+) -> crate::error::Result<CompactionSessionCommit> {
+    let mut live = OwnedMutexGuard::lock(session, cx)
+        .await
+        .map_err(|err| crate::error::Error::session(err.to_string()))?;
+    if live.header.id != expected_session_id || live.leaf_id() != expected_leaf_id {
+        return Err(crate::error::Error::session(
+            "Session changed while compaction was running; compaction was not applied".to_string(),
+        ));
+    }
+
+    let mut candidate = live.clone();
+    let entry_id = candidate.append_compaction(
+        summary,
+        first_kept_entry_id,
+        tokens_before,
+        details,
+        from_hook,
+    );
+    let compaction_entry = candidate
+        .get_entry(&entry_id)
+        .and_then(|entry| match entry {
+            SessionEntry::Compaction(compaction) => Some(compaction.clone()),
+            _ => None,
+        })
+        .ok_or_else(|| {
+            crate::error::Error::session(
+                "Staged compaction entry disappeared before commit".to_string(),
+            )
+        })?;
+    let expected_entry = serde_json::to_vec(&SessionEntry::Compaction(compaction_entry.clone()))?;
+    let persistence = if !save_enabled {
+        CompactionPersistenceOutcome::Disabled
+    } else if let Err(err) = candidate.save().await {
+        tracing::error!(
+            error = %err,
+            entry_id,
+            "compaction save failed; reconciling the exact operation against current disk state"
+        );
+        if confirm_exact_compaction_after_save_error(&candidate, &entry_id, &expected_entry)
+            .await
+            .is_none()
+        {
+            return Err(crate::error::Error::session(
+                    "Compaction persistence was not confirmed, current disk state could not be reconciled, and the active in-memory session was left unchanged"
+                        .to_string(),
+                ));
+        }
+        CompactionPersistenceOutcome::ReconciledButUnconfirmed
+    } else {
+        CompactionPersistenceOutcome::Confirmed
+    };
+
+    let messages_for_agent = candidate.to_messages_for_current_path();
+    let (messages_for_ui, usage) = conversation_from_session(&candidate);
+
+    *live = candidate;
+    Ok(CompactionSessionCommit {
+        messages_for_agent,
+        messages_for_ui,
+        usage,
+        compaction_entry,
+        persistence,
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetryPersistenceOutcome {
+    Confirmed,
+    Disabled,
+    ReconciledButUnconfirmed,
+}
+
+#[derive(Debug)]
+struct RetrySessionCommit {
+    messages_for_agent: Vec<Message>,
+    messages_for_ui: Vec<ConversationMessage>,
+    usage: Usage,
+    plan: RetryPlan,
+    persistence: RetryPersistenceOutcome,
+}
+
+async fn confirm_exact_retry_after_save_error(
+    candidate: &Session,
+    expected_leaf_id: Option<&str>,
+) -> Option<()> {
+    let path = candidate.path.as_ref()?;
+    let (reopened, diagnostics) = Session::open_with_diagnostics(path.to_string_lossy().as_ref())
+        .await
+        .ok()?;
+    if !diagnostics.skipped_entries.is_empty() || !diagnostics.orphaned_parent_links.is_empty() {
+        return None;
+    }
+    if reopened.header.id != candidate.header.id || reopened.leaf_id() != expected_leaf_id {
+        return None;
+    }
+    if serde_json::to_vec(&reopened.header).ok()? != serde_json::to_vec(&candidate.header).ok()?
+        || serde_json::to_vec(&reopened.entries).ok()?
+            != serde_json::to_vec(&candidate.entries).ok()?
+    {
+        return None;
+    }
+    Some(())
+}
+
+async fn stage_and_commit_retry(
+    session: Arc<Mutex<Session>>,
+    expected_session_id: &str,
+    expected_leaf_id: Option<&str>,
+    save_enabled: bool,
+    cx: &Cx,
+) -> crate::error::Result<RetrySessionCommit> {
+    let mut live = OwnedMutexGuard::lock(session, cx)
+        .await
+        .map_err(|err| crate::error::Error::session(err.to_string()))?;
+    if live.header.id != expected_session_id || live.leaf_id() != expected_leaf_id {
+        return Err(crate::error::Error::session(
+            "Session changed while retry was preparing; retry was not applied".to_string(),
+        ));
+    }
+    let plan = crate::checkpoint::plan_retry(&live)
+        .ok_or_else(|| crate::error::Error::session("No user turn to retry".to_string()))?;
+    let mut candidate = live.clone();
+    crate::checkpoint::apply_retry_plan(&mut candidate, &plan).map_err(|err| {
+        crate::error::Error::session(format!("Retry plan could not be applied: {err}"))
+    })?;
+
+    let new_leaf_id = candidate.leaf_id().map(str::to_string);
+    let persistence = if !save_enabled {
+        RetryPersistenceOutcome::Disabled
+    } else if let Err(err) = candidate.save().await {
+        tracing::error!(
+            error = %err,
+            ?new_leaf_id,
+            "retry save failed; reconciling the exact operation against current disk state"
+        );
+        if confirm_exact_retry_after_save_error(&candidate, new_leaf_id.as_deref())
+            .await
+            .is_none()
+        {
+            return Err(crate::error::Error::session(format!(
+                "Retry persistence was not confirmed ({err}), current disk state could not be reconciled, and the active in-memory session was left unchanged"
+            )));
+        }
+        RetryPersistenceOutcome::ReconciledButUnconfirmed
+    } else {
+        RetryPersistenceOutcome::Confirmed
+    };
+
+    let messages_for_agent = candidate.to_messages_for_current_path();
+    let (messages_for_ui, usage) = conversation_from_session(&candidate);
+    *live = candidate;
+    Ok(RetrySessionCommit {
+        messages_for_agent,
+        messages_for_ui,
+        usage,
+        plan,
+        persistence,
+    })
+}
 
 /// Safely convert `Duration::as_micros()` (u128) to u64 with saturation.
 #[inline]
@@ -72,7 +330,7 @@ impl FrameTimingStats {
             self.budget_exceeded_count
                 .set(self.budget_exceeded_count.get() + 1);
         }
-        if total % FRAME_TIMING_WINDOW as u64 == 0 {
+        if total.is_multiple_of(FRAME_TIMING_WINDOW as u64) {
             drop(times);
             self.emit_stats();
         }
@@ -435,7 +693,16 @@ impl RssReader for ProcSelfRssReader {
         }
         #[cfg(not(target_os = "linux"))]
         {
-            None
+            // macOS (and other non-Linux) has no /proc; ask sysinfo for our
+            // own RSS. Without this the memory tiers never sample and the
+            // progressive-degradation path is inert off Linux (bd-1h9dp).
+            // Sampling is interval-gated by MemoryMonitor, so the refresh
+            // cost stays off the hot path.
+            let pid = sysinfo::Pid::from_u32(std::process::id());
+            let mut system = sysinfo::System::new();
+            system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
+            let rss = system.process(pid)?.memory();
+            usize::try_from(rss).ok()
         }
     }
 }
@@ -574,6 +841,478 @@ impl MemoryMonitor {
 }
 
 impl PiApp {
+    /// `/checkpoint [name] [note...]` (bd-cv653.3.7): cheap restore-point
+    /// marker on the current leaf.
+    #[allow(clippy::too_many_lines)]
+    pub(super) fn handle_slash_checkpoint(&mut self, args: &str) -> Option<Cmd> {
+        let Ok(agent_guard) = self.agent.try_lock() else {
+            self.status_message = Some("Agent busy; try again".to_string());
+            return None;
+        };
+        let messages: Vec<crate::model::Message> = agent_guard.messages().to_vec();
+        drop(agent_guard);
+
+        let (name, note) = args
+            .split_once(char::is_whitespace)
+            .map_or((args, ""), |(name, note)| (name, note));
+        let cx = asupersync::Cx::for_request();
+        let session = Arc::clone(&self.session);
+        let note_owned = note.trim().to_string();
+        let name_owned = name.trim().to_string();
+        let event_tx = self.event_tx.clone();
+        self.runtime_handle.spawn(async move {
+            let Ok(mut guard) = OwnedMutexGuard::lock(session, &cx).await else {
+                let _ = crate::interactive::enqueue_pi_event(
+                    &event_tx,
+                    &cx,
+                    PiMsg::AgentError("Failed to lock session".to_string()),
+                )
+                .await;
+                return;
+            };
+            let checkpoint = crate::checkpoint::mark_checkpoint(
+                &mut guard,
+                &name_owned,
+                if note_owned.is_empty() {
+                    None
+                } else {
+                    Some(note_owned.as_str())
+                },
+                &messages,
+            );
+            let _ = crate::interactive::enqueue_pi_event(
+                &event_tx,
+                &cx,
+                PiMsg::System(format!(
+                    "Checkpoint '{}' marked ({} messages, ~{} tokens). Rewind with /rewind{}.",
+                    checkpoint.name,
+                    checkpoint.message_count,
+                    checkpoint.token_estimate,
+                    if checkpoint.name == "checkpoint" {
+                        String::new()
+                    } else {
+                        format!(" {}", checkpoint.name)
+                    }
+                )),
+            )
+            .await;
+        });
+        None
+    }
+
+    /// `/rewind [name]` (bd-cv653.3.7): collapse the span from a checkpoint
+    /// to now into a concise report (tree keeps everything).
+    #[allow(clippy::too_many_lines)]
+    pub(super) fn handle_slash_rewind(&mut self, args: &str) -> Option<Cmd> {
+        if self.agent_state != AgentState::Idle {
+            self.status_message = Some("Cannot rewind while processing".to_string());
+            return None;
+        }
+        let Ok(agent_guard) = self.agent.try_lock() else {
+            self.status_message = Some("Agent busy; try again".to_string());
+            return None;
+        };
+        let provider = agent_guard.provider();
+        let stream_options = agent_guard.stream_options().clone();
+        let privacy = agent_guard.compaction_privacy();
+        drop(agent_guard);
+
+        let name = args.trim().to_string();
+        let session = Arc::clone(&self.session);
+        let agent = Arc::clone(&self.agent);
+        let event_tx = self.event_tx.clone();
+        let runtime_handle = self.runtime_handle.clone();
+        self.agent_state = AgentState::Processing;
+        self.status_message = Some("Rewinding...".to_string());
+        runtime_handle.spawn(async move {
+            let cx = asupersync::Cx::for_request();
+            let checkpoint = {
+                let Ok(guard) = OwnedMutexGuard::lock(Arc::clone(&session), &cx).await else {
+                    let _ = crate::interactive::enqueue_pi_event(
+                        &event_tx,
+                        &cx,
+                        PiMsg::AgentError("Failed to lock session".to_string()),
+                    )
+                    .await;
+                    return;
+                };
+                crate::checkpoint::find_checkpoint(
+                    &guard,
+                    if name.is_empty() {
+                        None
+                    } else {
+                        Some(name.as_str())
+                    },
+                )
+            };
+            let Some(checkpoint) = checkpoint else {
+                let _ = crate::interactive::enqueue_pi_event(
+                    &event_tx,
+                    &cx,
+                    PiMsg::System(if name.is_empty() {
+                        "No checkpoints yet — mark one with /checkpoint".to_string()
+                    } else {
+                        format!("No checkpoint named '{name}'")
+                    }),
+                )
+                .await;
+                return;
+            };
+
+            let span: Vec<crate::model::Message> = {
+                let Ok(agent_guard) = OwnedMutexGuard::lock(Arc::clone(&agent), &cx).await else {
+                    let _ = crate::interactive::enqueue_pi_event(
+                        &event_tx,
+                        &cx,
+                        PiMsg::AgentError("Failed to lock agent".to_string()),
+                    )
+                    .await;
+                    return;
+                };
+                agent_guard.messages()
+                    [checkpoint.message_count.min(agent_guard.messages().len())..]
+                    .to_vec()
+            };
+            if span.is_empty() {
+                let _ = crate::interactive::enqueue_pi_event(
+                    &event_tx,
+                    &cx,
+                    PiMsg::System(format!(
+                        "Nothing to rewind — the active context is already at '{}'.",
+                        checkpoint.name
+                    )),
+                )
+                .await;
+                return;
+            }
+
+            let settings = crate::compaction::ResolvedCompactionSettings {
+                enabled: true,
+                ..Default::default()
+            };
+            let summary = crate::checkpoint::summarize_span(
+                &span,
+                provider,
+                &stream_options,
+                &settings,
+                &privacy,
+            )
+            .await
+            .unwrap_or_else(|err| {
+                format!("(summarization failed: {err}; the span was collapsed without a report)")
+            });
+
+            let outcome = {
+                let Ok(mut agent_guard) = OwnedMutexGuard::lock(Arc::clone(&agent), &cx).await
+                else {
+                    let _ = crate::interactive::enqueue_pi_event(
+                        &event_tx,
+                        &cx,
+                        PiMsg::AgentError("Failed to lock agent".to_string()),
+                    )
+                    .await;
+                    return;
+                };
+                crate::checkpoint::apply_rewind_to_active(&mut agent_guard, &checkpoint, summary)
+            };
+            {
+                let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&session), &cx).await else {
+                    let _ = crate::interactive::enqueue_pi_event(
+                        &event_tx,
+                        &cx,
+                        PiMsg::AgentError("Failed to lock session".to_string()),
+                    )
+                    .await;
+                    return;
+                };
+                guard.append_custom_entry(
+                    "rewind".to_string(),
+                    Some(serde_json::to_value(&outcome).unwrap_or_default()),
+                );
+            }
+            let _ = crate::interactive::enqueue_pi_event(
+                &event_tx,
+                &cx,
+                PiMsg::System(format!(
+                    "Rewound to '{}': {} messages collapsed into a report (~{} tokens). The tree kept everything.",
+                    outcome.checkpoint, outcome.collapsed_messages, outcome.summary_tokens_estimate
+                )),
+            )
+            .await;
+        });
+        None
+    }
+
+    /// `/undo [n] [force]` (bd-cv653.3.13): roll back the last n tool-path
+    /// file mutations. `force` overrides the external-change guard.
+    pub(super) fn handle_slash_undo(&mut self, args: &str) -> Option<Cmd> {
+        self.apply_undo_redo(args, false)
+    }
+
+    /// `/redo [n] [force]` (bd-cv653.3.13): re-apply undone file mutations.
+    pub(super) fn handle_slash_redo(&mut self, args: &str) -> Option<Cmd> {
+        self.apply_undo_redo(args, true)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn apply_undo_redo(&mut self, args: &str, redo: bool) -> Option<Cmd> {
+        let verb = if redo { "redo" } else { "undo" };
+        if self.agent_state != AgentState::Idle {
+            self.status_message = Some(format!("Cannot {verb} while processing"));
+            return None;
+        }
+        let Ok(agent_guard) = self.agent.try_lock() else {
+            self.status_message = Some("Agent busy; try again".to_string());
+            return None;
+        };
+        let recorder = agent_guard.mutation_recorder();
+        drop(agent_guard);
+        let Some(recorder) = recorder else {
+            self.status_message = Some(format!(
+                "/{verb} unavailable: no mutation recorder in this session"
+            ));
+            return None;
+        };
+
+        let mut count = 1_usize;
+        let mut force = false;
+        for token in args.split_whitespace() {
+            if token.eq_ignore_ascii_case("force") {
+                force = true;
+            } else if let Ok(n) = token.parse::<usize>() {
+                count = n.max(1);
+            } else {
+                self.status_message = Some(format!("Usage: /{verb} [n] [force]"));
+                return None;
+            }
+        }
+
+        let outcome = if redo {
+            recorder.redo(count, force)
+        } else {
+            recorder.undo(count, force)
+        };
+
+        let message = crate::undo::render_outcome_text(&outcome, redo, count);
+
+        // Audit trail: record the applied operation as a session Custom entry
+        // (mirrors checkpoint/rewind), then surface the report.
+        let record = serde_json::json!({
+            "schema": crate::undo::UNDO_SCHEMA,
+            "action": verb,
+            "outcome": outcome,
+        });
+        let applied_any = !outcome.applied.is_empty();
+        let cx = asupersync::Cx::for_request();
+        let session = Arc::clone(&self.session);
+        let event_tx = self.event_tx.clone();
+        self.runtime_handle.spawn(async move {
+            if applied_any && let Ok(mut guard) = OwnedMutexGuard::lock(session, &cx).await {
+                guard.append_custom_entry("undo".to_string(), Some(record));
+            }
+            let _ =
+                crate::interactive::enqueue_pi_event(&event_tx, &cx, PiMsg::System(message)).await;
+        });
+        None
+    }
+
+    /// `/usage [refresh]` (bd-cv653.7.4): provider quota/credit table.
+    pub(super) fn handle_slash_usage(&mut self, args: &str) -> Option<Cmd> {
+        let refresh = args.trim().eq_ignore_ascii_case("refresh");
+        let cx = asupersync::Cx::for_request();
+        let cwd = self.cwd.clone();
+        let event_tx = self.event_tx.clone();
+        self.status_message = Some("Fetching provider usage...".to_string());
+        self.runtime_handle.spawn(async move {
+            let message = match super::commands::load_runtime_auth(&cwd) {
+                Ok(auth) => {
+                    let rows = crate::usage::gather_usage(&auth, refresh).await;
+                    crate::usage::render_usage_text(&rows)
+                }
+                Err(err) => format!("Failed to load credentials: {err}"),
+            };
+            let _ =
+                crate::interactive::enqueue_pi_event(&event_tx, &cx, PiMsg::System(message)).await;
+        });
+        None
+    }
+
+    /// `/fresh` (bd-cv653.3.7): reset provider stream state; transcript
+    /// untouched.
+    pub(super) fn handle_slash_fresh(&mut self) -> Option<Cmd> {
+        let Ok(mut agent_guard) = self.agent.try_lock() else {
+            self.status_message = Some("Agent busy; try again".to_string());
+            return None;
+        };
+        // Agent-side reset is synchronous; only the session log spawns.
+        // uuid suffix: a bare millisecond stamp can collide across rapid
+        // calls, defeating the cache-reset purpose.
+        let new_id = format!(
+            "fresh-{}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_millis()),
+            uuid::Uuid::new_v4().simple()
+        );
+        crate::app::rebind_stream_options_session(agent_guard.stream_options_mut(), &new_id);
+        let messages_len = agent_guard.messages().len();
+        drop(agent_guard);
+
+        let cx = asupersync::Cx::for_request();
+        let session = Arc::clone(&self.session);
+        let event_tx = self.event_tx.clone();
+        self.runtime_handle.spawn(async move {
+            {
+                let Ok(mut guard) = OwnedMutexGuard::lock(session, &cx).await else {
+                    return;
+                };
+                guard.append_custom_entry(
+                    "fresh".to_string(),
+                    Some(serde_json::json!({
+                        "schema": "pi.fresh.v1",
+                        "newSessionId": new_id,
+                        "reason": "operator /fresh: provider cache + stream bookkeeping reset",
+                    })),
+                );
+            }
+            let _ = crate::interactive::enqueue_pi_event(
+                &event_tx,
+                &cx,
+                PiMsg::System(format!(
+                    "Fresh stream state (session id {new_id}); transcript untouched ({messages_len} messages)."
+                )),
+            )
+            .await;
+        });
+        None
+    }
+
+    /// `/retry` (bd-cv653.3.7, durable branching bd-r7icz): re-issue the last
+    /// user turn as a SIBLING branch. Staging clones the Session, persists the
+    /// rewound leaf, then swaps Session/Agent only after that save. The prompt
+    /// is emitted as one `RetryCommitted` event so slash-command reparse cannot
+    /// steal the sibling parent.
+    #[allow(clippy::too_many_lines)]
+    pub(super) fn handle_slash_retry(&mut self) -> Option<Cmd> {
+        if self.agent_state != AgentState::Idle {
+            self.status_message = Some("Cannot retry while processing".to_string());
+            return None;
+        }
+        if !self.pending_inputs.is_empty() {
+            self.status_message = Some(
+                "Queued input is still pending; finish or restore it before retrying".to_string(),
+            );
+            return None;
+        }
+        let (session_id, expected_leaf_id) = {
+            let Ok(session_guard) = self.session.try_lock() else {
+                self.status_message = Some("Session busy; try again".to_string());
+                return None;
+            };
+            if crate::checkpoint::plan_retry(&session_guard).is_none() {
+                self.status_message = Some("No user turn to retry".to_string());
+                return None;
+            }
+            (
+                session_guard.header.id.clone(),
+                session_guard.leaf_id().map(str::to_string),
+            )
+        };
+
+        self.agent_state = AgentState::Processing;
+        self.status_message = Some("Retrying last turn...".to_string());
+
+        let session = Arc::clone(&self.session);
+        let agent = Arc::clone(&self.agent);
+        let event_tx = self.event_tx.clone();
+        let extensions = self.extensions.clone();
+        let save_enabled = self.save_enabled;
+        let runtime_handle = self.runtime_handle.clone();
+
+        runtime_handle.spawn_with_cx(move |cx| async move {
+            if let Some(manager) = extensions {
+                let cancelled = manager
+                    .dispatch_cancellable_event(
+                        ExtensionEventName::SessionBeforeSwitch,
+                        Some(json!({
+                            "reason": "retry",
+                            "sessionId": session_id,
+                        })),
+                        EXTENSION_EVENT_TIMEOUT_MS,
+                    )
+                    .await
+                    .unwrap_or(false);
+                if cancelled {
+                    let _ = crate::interactive::enqueue_pi_event(
+                        &event_tx,
+                        &cx,
+                        PiMsg::System("Retry cancelled by extension".to_string()),
+                    )
+                    .await;
+                    return;
+                }
+            }
+
+            let mut agent_guard = match OwnedMutexGuard::lock(Arc::clone(&agent), &cx).await {
+                Ok(guard) => guard,
+                Err(err) => {
+                    let _ = crate::interactive::enqueue_pi_event(
+                        &event_tx,
+                        &cx,
+                        PiMsg::AgentError(format!("Failed to lock agent: {err}")),
+                    )
+                    .await;
+                    return;
+                }
+            };
+            let commit = match stage_and_commit_retry(
+                Arc::clone(&session),
+                &session_id,
+                expected_leaf_id.as_deref(),
+                save_enabled,
+                &cx,
+            )
+            .await
+            {
+                Ok(commit) => commit,
+                Err(err) => {
+                    drop(agent_guard);
+                    let _ = crate::interactive::enqueue_pi_event(
+                        &event_tx,
+                        &cx,
+                        PiMsg::AgentError(format!("Retry could not be confirmed: {err}")),
+                    )
+                    .await;
+                    return;
+                }
+            };
+            agent_guard.replace_messages(commit.messages_for_agent);
+            drop(agent_guard);
+
+            let status = match commit.persistence {
+                RetryPersistenceOutcome::Confirmed | RetryPersistenceOutcome::Disabled => {
+                    Some("Retrying last turn".to_string())
+                }
+                RetryPersistenceOutcome::ReconciledButUnconfirmed => Some(
+                    "Persistence warning: retry branch is present in the current disk and active session state, but final durability was not confirmed".to_string(),
+                ),
+            };
+            let _ = crate::interactive::enqueue_pi_event(
+                &event_tx,
+                &cx,
+                PiMsg::RetryCommitted {
+                    session_id,
+                    messages: commit.messages_for_ui,
+                    usage: commit.usage,
+                    text: commit.plan.text,
+                    status,
+                },
+            )
+            .await;
+        });
+        None
+    }
+
     #[allow(clippy::too_many_lines)]
     pub(super) fn handle_slash_compact(&mut self, args: &str) -> Option<Cmd> {
         if self.agent_state != AgentState::Idle {
@@ -586,12 +1325,25 @@ impl PiApp {
             return None;
         };
         let provider = agent_guard.provider();
-        let api_key_opt = agent_guard.stream_options().api_key.clone();
+        let stream_options = agent_guard.stream_options().clone();
+        let privacy = agent_guard.compaction_privacy();
         drop(agent_guard);
 
-        let Some(api_key) = api_key_opt else {
-            self.status_message = Some("No API key configured; cannot run compaction".to_string());
-            return None;
+        // Mode selection (bd-cv653.3.18): a leading `shake` drops bulky tool
+        // results deterministically with zero LLM calls; `aggressive` runs the
+        // LLM summary with a halved keep-recent window. Remaining words stay
+        // custom instructions for the summarizer.
+        let trimmed_args = args.trim();
+        let first_token = trimmed_args.split_whitespace().next();
+        let shake_mode = matches!(first_token, Some("shake" | "--shake"));
+        let aggressive_mode = matches!(first_token, Some("aggressive" | "--aggressive"));
+        let rest = if shake_mode || aggressive_mode {
+            trimmed_args
+                .split_once(char::is_whitespace)
+                .map_or("", |(_, rest)| rest)
+                .trim()
+        } else {
+            trimmed_args
         };
 
         let event_tx = self.event_tx.clone();
@@ -599,13 +1351,18 @@ impl PiApp {
         let agent = Arc::clone(&self.agent);
         let extensions = self.extensions.clone();
         let runtime_handle = self.runtime_handle.clone();
+        let completion_runtime_handle = runtime_handle.clone();
         let reserve_tokens = self.config.compaction_reserve_tokens();
-        let keep_recent_tokens = self.config.compaction_keep_recent_tokens();
-        let custom_instructions = args.trim().to_string();
-        let custom_instructions = if custom_instructions.is_empty() {
+        let save_enabled = self.save_enabled;
+        let keep_recent_tokens = if aggressive_mode {
+            self.config.compaction_keep_recent_tokens() / 2
+        } else {
+            self.config.compaction_keep_recent_tokens()
+        };
+        let custom_instructions = if rest.is_empty() {
             None
         } else {
-            Some(custom_instructions)
+            Some(rest.to_string())
         };
         let is_compacting = Arc::clone(&self.extension_compacting);
 
@@ -614,29 +1371,30 @@ impl PiApp {
         self.extension_compacting
             .store(true, std::sync::atomic::Ordering::SeqCst);
 
-        runtime_handle.spawn(async move {
-            let cx = asupersync::Cx::for_request();
-
-            let path_entries = {
-                let mut guard = match session.lock(&cx).await {
+        runtime_handle.spawn_with_cx(move |cx| async move {
+            let (path_entries, expected_session_id, expected_leaf_id) = {
+                let mut guard = match OwnedMutexGuard::lock(Arc::clone(&session), &cx).await {
                     Ok(guard) => guard,
                     Err(err) => {
                         is_compacting.store(false, std::sync::atomic::Ordering::SeqCst);
-                        let _ = crate::interactive::enqueue_pi_event(
-                            &event_tx,
-                            &cx,
+                        spawn_compaction_terminal_event(
+                            &completion_runtime_handle,
+                            event_tx.clone(),
                             PiMsg::AgentError(format!("Failed to lock session: {err}")),
-                        )
-                        .await;
+                        );
                         return;
                     }
                 };
                 guard.ensure_entry_ids();
-                guard
-                    .entries_for_current_path()
-                    .into_iter()
-                    .cloned()
-                    .collect::<Vec<_>>()
+                (
+                    guard
+                        .entries_for_current_path()
+                        .into_iter()
+                        .cloned()
+                        .collect::<Vec<_>>(),
+                    guard.header.id.clone(),
+                    guard.leaf_id().map(str::to_string),
+                )
             };
 
             let settings = crate::compaction::ResolvedCompactionSettings {
@@ -645,16 +1403,16 @@ impl PiApp {
                 keep_recent_tokens,
                 ..Default::default()
             };
-            let Some(prep) = crate::compaction::prepare_compaction(&path_entries, settings) else {
+            let Some(prep) = crate::compaction::prepare_manual_compaction(&path_entries, settings)
+            else {
                 is_compacting.store(false, std::sync::atomic::Ordering::SeqCst);
-                let _ = crate::interactive::enqueue_pi_event(
-                    &event_tx,
-                    &asupersync::Cx::current().unwrap_or_else(asupersync::Cx::for_request),
+                spawn_compaction_terminal_event(
+                    &completion_runtime_handle,
+                    event_tx.clone(),
                     PiMsg::System(
                         "Nothing to compact (already compacted or too little history)".to_string(),
                     ),
-                )
-                .await;
+                );
                 return;
             };
 
@@ -687,12 +1445,11 @@ impl PiApp {
 
             if before_outcome.cancel {
                 is_compacting.store(false, std::sync::atomic::Ordering::SeqCst);
-                let _ = crate::interactive::enqueue_pi_event(
-                    &event_tx,
-                    &asupersync::Cx::current().unwrap_or_else(asupersync::Cx::for_request),
+                spawn_compaction_terminal_event(
+                    &completion_runtime_handle,
+                    event_tx.clone(),
                     PiMsg::System("Compaction cancelled by extension".to_string()),
-                )
-                .await;
+                );
                 return;
             }
 
@@ -706,23 +1463,27 @@ impl PiApp {
                         true,
                     )
                 } else {
-                    let result = match crate::compaction::compact(
-                        prep,
-                        Arc::clone(&provider),
-                        &api_key,
-                        custom_instructions.as_deref(),
-                    )
-                    .await
-                    {
+                    let compact_outcome = if shake_mode {
+                        Ok(crate::compaction::compact_shake(prep, &privacy))
+                    } else {
+                        crate::compaction::compact(
+                            prep,
+                            Arc::clone(&provider),
+                            &stream_options,
+                            custom_instructions.as_deref(),
+                            &privacy,
+                        )
+                        .await
+                    };
+                    let result = match compact_outcome {
                         Ok(result) => result,
                         Err(err) => {
                             is_compacting.store(false, std::sync::atomic::Ordering::SeqCst);
-                            let _ = crate::interactive::enqueue_pi_event(
-                                &event_tx,
-                                &cx,
+                            spawn_compaction_terminal_event(
+                                &completion_runtime_handle,
+                                event_tx.clone(),
                                 PiMsg::AgentError(format!("Compaction failed: {err}")),
-                            )
-                            .await;
+                            );
                             return;
                         }
                     };
@@ -738,97 +1499,139 @@ impl PiApp {
                     )
                 };
 
-            let (messages_for_agent, compaction_entry) = {
-                let mut guard = match session.lock(&cx).await {
-                    Ok(guard) => guard,
-                    Err(err) => {
-                        is_compacting.store(false, std::sync::atomic::Ordering::SeqCst);
-                        let _ = crate::interactive::enqueue_pi_event(
-                            &event_tx,
-                            &cx,
-                            PiMsg::AgentError(format!("Failed to lock session: {err}")),
-                        )
-                        .await;
-                        return;
-                    }
-                };
-                let from_hook = if from_extension { Some(true) } else { None };
-                let entry_id = guard.append_compaction(
-                    summary,
-                    first_kept_entry_id,
-                    tokens_before,
-                    details,
-                    from_hook,
-                );
-                let _ = guard.save().await;
-                let compaction_entry = guard.get_entry(&entry_id).and_then(|entry| {
-                    if let crate::session::SessionEntry::Compaction(compaction) = entry {
-                        Some(compaction.clone())
+            let summary_tokens_after = crate::compaction::estimate_text_tokens(&summary);
+            // Provider/extension work can consume or cancel the original task
+            // context. Commit and terminal delivery therefore run in a fresh
+            // runtime child so already-incurred work still resolves to exactly
+            // one coherent Session/Agent/UI outcome.
+            let completion_is_compacting = Arc::clone(&is_compacting);
+            let fallback_event_tx = event_tx.clone();
+            let completion_spawn = completion_runtime_handle.try_spawn_with_cx(
+                move |completion_cx| async move {
+                    // Acquire every fallible live-state lock before persistence.
+                    // The staged helper either confirms/reconciles the exact
+                    // operation or leaves the active Session untouched;
+                    // installing the matching Agent transcript is then infallible.
+                    let mut agent_guard = match OwnedMutexGuard::lock(
+                        Arc::clone(&agent),
+                        &completion_cx,
+                    )
+                    .await
+                    {
+                        Ok(guard) => guard,
+                        Err(err) => {
+                            completion_is_compacting
+                                .store(false, std::sync::atomic::Ordering::SeqCst);
+                            deliver_compaction_terminal_event(
+                                &event_tx,
+                                &completion_cx,
+                                PiMsg::AgentError(format!("Failed to lock agent: {err}")),
+                            )
+                            .await;
+                            return;
+                        }
+                    };
+                    let from_hook = if from_extension { Some(true) } else { None };
+                    let commit = match stage_and_commit_compaction_session(
+                        Arc::clone(&session),
+                        &expected_session_id,
+                        expected_leaf_id.as_deref(),
+                        summary,
+                        first_kept_entry_id,
+                        tokens_before,
+                        details,
+                        from_hook,
+                        save_enabled,
+                        &completion_cx,
+                    )
+                    .await
+                    {
+                        Ok(commit) => commit,
+                        Err(err) => {
+                            drop(agent_guard);
+                            completion_is_compacting
+                                .store(false, std::sync::atomic::Ordering::SeqCst);
+                            deliver_compaction_terminal_event(
+                                &event_tx,
+                                &completion_cx,
+                                PiMsg::AgentError(format!(
+                                    "Compaction could not be confirmed: {err}"
+                                )),
+                            )
+                            .await;
+                            return;
+                        }
+                    };
+                    let CompactionSessionCommit {
+                        messages_for_agent,
+                        messages_for_ui: messages,
+                        usage,
+                        compaction_entry,
+                        persistence,
+                    } = commit;
+                    agent_guard.replace_messages(messages_for_agent);
+                    drop(agent_guard);
+
+                    completion_is_compacting
+                        .store(false, std::sync::atomic::Ordering::SeqCst);
+                    let label = if shake_mode {
+                        "shake"
+                    } else if aggressive_mode {
+                        "aggressive"
                     } else {
-                        None
-                    }
-                });
-                (guard.to_messages_for_current_path(), compaction_entry)
-            };
+                        "summary"
+                    };
+                    let status = match persistence {
+                        CompactionPersistenceOutcome::Confirmed
+                        | CompactionPersistenceOutcome::Disabled => format!(
+                            "Compaction complete ({label}: {tokens_before} → ~{summary_tokens_after} tokens in compacted span)"
+                        ),
+                        CompactionPersistenceOutcome::ReconciledButUnconfirmed => format!(
+                            "Persistence warning: compaction is present in the current disk and active session state, but final durability was not confirmed ({label}: {tokens_before} → ~{summary_tokens_after} tokens)"
+                        ),
+                    };
+                    let delivered = deliver_compaction_terminal_event(
+                        &event_tx,
+                        &completion_cx,
+                        PiMsg::ConversationReset {
+                            session_id: expected_session_id.clone(),
+                            messages,
+                            usage,
+                            status: Some(status),
+                        },
+                    )
+                    .await;
 
-            {
-                let mut agent_guard = match agent.lock(&cx).await {
-                    Ok(guard) => guard,
-                    Err(err) => {
-                        is_compacting.store(false, std::sync::atomic::Ordering::SeqCst);
-                        let _ = crate::interactive::enqueue_pi_event(
-                            &event_tx,
-                            &cx,
-                            PiMsg::AgentError(format!("Failed to lock agent: {err}")),
-                        )
-                        .await;
-                        return;
+                    if delivered
+                        && persistence.may_emit_success_event()
+                        && let Some(manager) = extensions
+                    {
+                        let _ = manager
+                            .dispatch_event(
+                                crate::extensions::ExtensionEventName::SessionCompact,
+                                Some(json!({
+                                    "compactionEntry": compaction_entry,
+                                    "fromExtension": from_extension,
+                                })),
+                            )
+                            .await;
                     }
-                };
-                agent_guard.replace_messages(messages_for_agent);
-            }
-
-            let (messages, usage) = {
-                let guard = match session.lock(&cx).await {
-                    Ok(guard) => guard,
-                    Err(err) => {
-                        is_compacting.store(false, std::sync::atomic::Ordering::SeqCst);
-                        let _ = crate::interactive::enqueue_pi_event(
-                            &event_tx,
-                            &cx,
-                            PiMsg::AgentError(format!("Failed to lock session: {err}")),
-                        )
-                        .await;
-                        return;
-                    }
-                };
-                conversation_from_session(&guard)
-            };
-
-            is_compacting.store(false, std::sync::atomic::Ordering::SeqCst);
-            let _ = crate::interactive::enqueue_pi_event(
-                &event_tx,
-                &asupersync::Cx::current().unwrap_or_else(asupersync::Cx::for_request),
-                PiMsg::ConversationReset {
-                    messages,
-                    usage,
-                    status: Some("Compaction complete".to_string()),
                 },
-            )
-            .await;
-
-            if let Some(manager) = extensions {
-                if let Some(compaction_entry) = compaction_entry {
-                    let _ = manager
-                        .dispatch_event(
-                            crate::extensions::ExtensionEventName::SessionCompact,
-                            Some(json!({
-                                "compactionEntry": compaction_entry,
-                                "fromExtension": from_extension,
-                            })),
-                        )
-                        .await;
-                }
+            );
+            if let Err(err) = completion_spawn {
+                is_compacting.store(false, std::sync::atomic::Ordering::SeqCst);
+                tracing::error!(
+                    error = %err,
+                    "compaction completion could not be admitted by the runtime"
+                );
+                deliver_compaction_terminal_event(
+                    &fallback_event_tx,
+                    &cx,
+                    PiMsg::AgentError(
+                        "Compaction completion could not be admitted by the runtime".to_string(),
+                    ),
+                )
+                .await;
             }
         });
         None
@@ -983,10 +1786,8 @@ impl MessageRenderCache {
         use std::hash::{Hash, Hasher};
         let mut hasher = std::hash::DefaultHasher::new();
         msg.content.hash(&mut hasher);
-        if thinking_visible {
-            if let Some(thinking) = &msg.thinking {
-                thinking.hash(&mut hasher);
-            }
+        if thinking_visible && let Some(thinking) = &msg.thinking {
+            thinking.hash(&mut hasher);
         }
         // Include tools_expanded in hash for tool messages since it affects rendering
         if msg.role == MessageRole::Tool {
@@ -1006,7 +1807,7 @@ impl MessageRenderCache {
     /// - The message count changed (messages added/removed)
     /// - The render-cache generation advanced (theme/resize/toggle)
     /// - The prefix is empty and there are messages to render
-    pub(super) fn prefix_valid(&self, message_count: usize) -> bool {
+    pub(super) const fn prefix_valid(&self, message_count: usize) -> bool {
         message_count > 0
             && self.prefix_message_count.get() == message_count
             && self.prefix_generation.get() == self.generation.get()
@@ -1113,7 +1914,7 @@ impl RenderBuffers {
     }
 
     /// Get the capacity hint for the next frame's view assembly.
-    pub(super) fn view_capacity_hint(&self) -> usize {
+    pub(super) const fn view_capacity_hint(&self) -> usize {
         self.view_capacity_hint.get()
     }
 
@@ -1126,10 +1927,494 @@ impl RenderBuffers {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::interactive::state::{ConversationMessage, MessageRole};
+    use crate::interactive::state::MessageRole;
+    use asupersync::runtime::RuntimeBuilder;
     use std::collections::VecDeque;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, OnceLock};
+    use tempfile::TempDir;
+
+    fn runtime() -> &'static asupersync::runtime::Runtime {
+        static RT: OnceLock<asupersync::runtime::Runtime> = OnceLock::new();
+        RT.get_or_init(|| {
+            RuntimeBuilder::multi_thread()
+                .blocking_threads(1, 4)
+                .build()
+                .expect("build runtime")
+        })
+    }
+
+    #[test]
+    fn compaction_terminal_event_waits_for_capacity_instead_of_being_dropped() {
+        let (event_tx, mut event_rx) = asupersync::channel::mpsc::channel(1);
+        event_tx
+            .try_send(PiMsg::System("occupy channel".to_string()))
+            .expect("fill event channel");
+        let runtime_handle = runtime().handle();
+        spawn_compaction_terminal_event(
+            &runtime_handle,
+            event_tx,
+            PiMsg::System("terminal compaction result".to_string()),
+        );
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(PiMsg::System(message)) if message == "occupy channel"
+        ));
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            match event_rx.try_recv() {
+                Ok(PiMsg::System(message)) if message == "terminal compaction result" => break,
+                Ok(other) => {
+                    panic!("unexpected event while awaiting compaction result: {other:?}")
+                }
+                Err(_) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(err) => {
+                    panic!("compaction result was not delivered after capacity freed: {err}")
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn staged_compaction_save_failure_leaves_live_session_exact() {
+        let temp = TempDir::new().expect("tempdir");
+        let blocked_path = temp.path().join("blocked.jsonl");
+        std::fs::create_dir(&blocked_path).expect("create directory at session path");
+
+        let mut raw_session = Session::create_with_dir(Some(temp.path().join("sessions")));
+        raw_session.path = Some(blocked_path);
+        let expected_session_id = raw_session.header.id.clone();
+        let expected_leaf_id = raw_session.leaf_id().map(str::to_string);
+        let expected_entries =
+            serde_json::to_value(&raw_session.entries).expect("serialize entries");
+        let session = Arc::new(Mutex::new(raw_session));
+        let cx = Cx::for_testing();
+
+        let error = runtime()
+            .block_on(stage_and_commit_compaction_session(
+                Arc::clone(&session),
+                &expected_session_id,
+                expected_leaf_id.as_deref(),
+                "staged summary".to_string(),
+                "first-kept".to_string(),
+                42,
+                None,
+                None,
+                true,
+                &cx,
+            ))
+            .expect_err("directory session path must reject compaction save");
+        assert!(!error.to_string().is_empty());
+
+        runtime().block_on(async {
+            let guard = OwnedMutexGuard::lock(Arc::clone(&session), &cx)
+                .await
+                .expect("lock unchanged session");
+            assert_eq!(guard.header.id, expected_session_id);
+            assert_eq!(guard.leaf_id(), expected_leaf_id.as_deref());
+            assert_eq!(
+                serde_json::to_value(&guard.entries).expect("serialize live entries"),
+                expected_entries
+            );
+            assert_eq!(guard.autosave_metrics().pending_mutations, 0);
+        });
+    }
+
+    #[test]
+    fn staged_compaction_rejects_stale_session_identity_before_mutation() {
+        let session = Arc::new(Mutex::new(Session::in_memory()));
+        let cx = Cx::for_testing();
+        let error = runtime()
+            .block_on(stage_and_commit_compaction_session(
+                Arc::clone(&session),
+                "replaced-session-id",
+                None,
+                "stale summary".to_string(),
+                "first-kept".to_string(),
+                1,
+                None,
+                None,
+                false,
+                &cx,
+            ))
+            .expect_err("stale compaction must fail closed");
+        assert!(error.to_string().contains("Session changed"));
+
+        runtime().block_on(async {
+            let guard = OwnedMutexGuard::lock(Arc::clone(&session), &cx)
+                .await
+                .expect("lock rejected session");
+            assert!(guard.entries.is_empty());
+            assert!(guard.leaf_id().is_none());
+            assert_eq!(guard.autosave_metrics().pending_mutations, 0);
+        });
+    }
+
+    #[test]
+    fn staged_compaction_rejects_stale_leaf_before_mutation() {
+        let mut raw_session = Session::in_memory();
+        let session_id = raw_session.header.id.clone();
+        let live_leaf = raw_session.append_message(crate::session::SessionMessage::User {
+            content: crate::model::UserContent::Text("new live turn".to_string()),
+            timestamp: Some(0),
+        });
+        let expected_entries =
+            serde_json::to_value(&raw_session.entries).expect("serialize entries");
+        let session = Arc::new(Mutex::new(raw_session));
+        let cx = Cx::for_testing();
+
+        let error = runtime()
+            .block_on(stage_and_commit_compaction_session(
+                Arc::clone(&session),
+                &session_id,
+                None,
+                "stale summary".to_string(),
+                "first-kept".to_string(),
+                1,
+                None,
+                None,
+                false,
+                &cx,
+            ))
+            .expect_err("stale leaf must fail closed");
+        assert!(error.to_string().contains("Session changed"));
+
+        runtime().block_on(async {
+            let guard = OwnedMutexGuard::lock(Arc::clone(&session), &cx)
+                .await
+                .expect("lock rejected session");
+            assert_eq!(guard.leaf_id(), Some(live_leaf.as_str()));
+            assert_eq!(
+                serde_json::to_value(&guard.entries).expect("serialize live entries"),
+                expected_entries
+            );
+            assert_eq!(guard.autosave_metrics().pending_mutations, 1);
+        });
+    }
+
+    #[test]
+    fn staged_compaction_with_saving_disabled_commits_only_in_memory() {
+        let temp = TempDir::new().expect("tempdir");
+        let session_dir = temp.path().join("sessions");
+        let raw_session = Session::create_with_dir(Some(session_dir.clone()));
+        let expected_session_id = raw_session.header.id.clone();
+        let session = Arc::new(Mutex::new(raw_session));
+        let cx = Cx::for_testing();
+
+        let commit = runtime()
+            .block_on(stage_and_commit_compaction_session(
+                Arc::clone(&session),
+                &expected_session_id,
+                None,
+                "memory-only summary".to_string(),
+                "first-kept".to_string(),
+                7,
+                None,
+                Some(true),
+                false,
+                &cx,
+            ))
+            .expect("memory-only compaction");
+        assert_eq!(commit.compaction_entry.summary, "memory-only summary");
+        assert_eq!(commit.persistence, CompactionPersistenceOutcome::Disabled);
+
+        runtime().block_on(async {
+            let guard = OwnedMutexGuard::lock(Arc::clone(&session), &cx)
+                .await
+                .expect("lock memory-only session");
+            assert!(guard.path.is_none());
+            assert!(matches!(
+                guard.entries.as_slice(),
+                [SessionEntry::Compaction(entry)] if entry.summary == "memory-only summary"
+            ));
+            assert_eq!(guard.autosave_metrics().pending_mutations, 1);
+        });
+        assert!(
+            !session_dir.exists(),
+            "--no-session compaction must not create durable state"
+        );
+    }
+
+    #[test]
+    fn staged_compaction_success_reopens_committed_entry() {
+        let temp = TempDir::new().expect("tempdir");
+        let session = Arc::new(Mutex::new(Session::create_with_dir(Some(
+            temp.path().join("sessions"),
+        ))));
+        let cx = Cx::for_testing();
+        let expected_session_id = runtime().block_on(async {
+            OwnedMutexGuard::lock(Arc::clone(&session), &cx)
+                .await
+                .expect("lock new session")
+                .header
+                .id
+                .clone()
+        });
+
+        let persisted_path = runtime().block_on(async {
+            let commit = stage_and_commit_compaction_session(
+                Arc::clone(&session),
+                &expected_session_id,
+                None,
+                "durable summary".to_string(),
+                "first-kept".to_string(),
+                99,
+                None,
+                None,
+                true,
+                &cx,
+            )
+            .await
+            .expect("durable compaction");
+            assert_eq!(commit.persistence, CompactionPersistenceOutcome::Confirmed);
+            OwnedMutexGuard::lock(Arc::clone(&session), &cx)
+                .await
+                .expect("lock saved session")
+                .path
+                .clone()
+                .expect("saved path")
+        });
+
+        let reopened = runtime()
+            .block_on(Session::open(persisted_path.to_string_lossy().as_ref()))
+            .expect("reopen compacted session");
+        assert!(matches!(
+            reopened.entries.as_slice(),
+            [SessionEntry::Compaction(entry)] if entry.summary == "durable summary"
+        ));
+    }
+
+    #[test]
+    fn post_error_reconciliation_requires_exact_compaction_identity() {
+        let temp = TempDir::new().expect("tempdir");
+        let mut candidate = Session::create_with_dir(Some(temp.path().join("sessions")));
+        runtime()
+            .block_on(candidate.save())
+            .expect("persist baseline session");
+
+        let entry_id = candidate.append_compaction(
+            "durable despite terminal error".to_string(),
+            "first-kept".to_string(),
+            11,
+            None,
+            None,
+        );
+        let expected_entry = serde_json::to_vec(
+            candidate
+                .get_entry(&entry_id)
+                .expect("staged compaction entry"),
+        )
+        .expect("serialize compaction entry");
+        runtime()
+            .block_on(candidate.save())
+            .expect("persist simulated post-write state");
+
+        assert!(
+            runtime()
+                .block_on(confirm_exact_compaction_after_save_error(
+                    &candidate,
+                    &entry_id,
+                    &expected_entry,
+                ))
+                .is_some(),
+            "exact durable operation should reconcile"
+        );
+
+        let mut wrong_surrounding_state = candidate.clone();
+        wrong_surrounding_state.header.cwd.push_str("-different");
+        assert!(
+            runtime()
+                .block_on(confirm_exact_compaction_after_save_error(
+                    &wrong_surrounding_state,
+                    &entry_id,
+                    &expected_entry,
+                ))
+                .is_none(),
+            "reconciliation must reject a matching operation on mismatched session state"
+        );
+
+        let mut wrong_entry = expected_entry;
+        wrong_entry.push(b' ');
+        assert!(
+            runtime()
+                .block_on(confirm_exact_compaction_after_save_error(
+                    &candidate,
+                    &entry_id,
+                    &wrong_entry,
+                ))
+                .is_none(),
+            "reconciliation must reject a mismatched operation payload"
+        );
+    }
+
+    fn session_user(text: &str) -> crate::session::SessionMessage {
+        crate::session::SessionMessage::User {
+            content: crate::model::UserContent::Text(text.to_string()),
+            timestamp: Some(0),
+        }
+    }
+
+    fn session_assistant(text: &str) -> crate::session::SessionMessage {
+        crate::session::SessionMessage::from(crate::model::Message::Assistant(std::sync::Arc::new(
+            crate::model::AssistantMessage {
+                content: vec![crate::model::ContentBlock::Text(
+                    crate::model::TextContent::new(text),
+                )],
+                ..Default::default()
+            },
+        )))
+    }
+
+    fn linear_retry_session(session_dir: Option<std::path::PathBuf>) -> (Session, String, String) {
+        let mut session = session_dir.map_or_else(Session::in_memory, |dir| {
+            Session::create_with_dir(Some(dir))
+        });
+        session.append_message(session_user("first question"));
+        let first_answer = session.append_message(session_assistant("first answer"));
+        let abandoned = session.append_message(session_user("second question"));
+        session.append_message(session_assistant("second answer"));
+        (session, first_answer, abandoned)
+    }
+
+    #[test]
+    fn staged_retry_save_failure_leaves_live_session_exact() {
+        let temp = TempDir::new().expect("tempdir");
+        let blocked_path = temp.path().join("blocked.jsonl");
+        std::fs::create_dir(&blocked_path).expect("create directory at session path");
+        let (mut raw_session, _parent, _abandoned) =
+            linear_retry_session(Some(temp.path().join("sessions")));
+        raw_session.path = Some(blocked_path);
+        let expected_session_id = raw_session.header.id.clone();
+        let expected_leaf_id = raw_session.leaf_id().map(str::to_string);
+        let expected_entries =
+            serde_json::to_value(&raw_session.entries).expect("serialize entries");
+        let session = Arc::new(Mutex::new(raw_session));
+        let cx = Cx::for_testing();
+
+        let error = runtime()
+            .block_on(stage_and_commit_retry(
+                Arc::clone(&session),
+                &expected_session_id,
+                expected_leaf_id.as_deref(),
+                true,
+                &cx,
+            ))
+            .expect_err("directory session path must reject retry save");
+        assert!(
+            !error.to_string().is_empty(),
+            "retry save failure must be observable"
+        );
+
+        runtime().block_on(async {
+            let guard = OwnedMutexGuard::lock(Arc::clone(&session), &cx)
+                .await
+                .expect("lock unchanged session");
+            assert_eq!(guard.header.id, expected_session_id);
+            assert_eq!(guard.leaf_id(), expected_leaf_id.as_deref());
+            assert_eq!(
+                serde_json::to_value(&guard.entries).expect("serialize live entries"),
+                expected_entries
+            );
+        });
+    }
+
+    #[test]
+    fn staged_retry_with_saving_disabled_commits_sibling_parent_in_memory() {
+        let (raw_session, first_answer, abandoned) = linear_retry_session(None);
+        let expected_session_id = raw_session.header.id.clone();
+        let expected_leaf_id = raw_session.leaf_id().map(str::to_string);
+        let session = Arc::new(Mutex::new(raw_session));
+        let cx = Cx::for_testing();
+
+        let commit = runtime()
+            .block_on(stage_and_commit_retry(
+                Arc::clone(&session),
+                &expected_session_id,
+                expected_leaf_id.as_deref(),
+                false,
+                &cx,
+            ))
+            .expect("memory-only retry");
+        assert_eq!(commit.plan.abandoned_entry_id, abandoned);
+        assert_eq!(commit.plan.text, "second question");
+        assert_eq!(commit.persistence, RetryPersistenceOutcome::Disabled);
+        assert_eq!(
+            commit.plan.expected_parent_id.as_deref(),
+            Some(first_answer.as_str())
+        );
+
+        runtime().block_on(async {
+            let guard = OwnedMutexGuard::lock(Arc::clone(&session), &cx)
+                .await
+                .expect("lock retried session");
+            assert_eq!(guard.leaf_id(), Some(first_answer.as_str()));
+            let abandoned_on_path = guard
+                .entries_for_current_path()
+                .iter()
+                .any(|entry| entry.base().id.as_ref() == Some(&abandoned));
+            assert!(!abandoned_on_path);
+            assert!(guard.get_entry(&abandoned).is_some());
+        });
+    }
+
+    #[test]
+    fn staged_retry_save_reopen_keeps_sibling_parent_topology() {
+        let temp = tempfile::Builder::new()
+            .prefix("pi-r7icz-")
+            .tempdir_in("/tmp")
+            .unwrap_or_else(|_| TempDir::new().expect("tempdir"));
+        let session_dir = temp.path().join("sessions");
+        let (mut raw_session, first_answer, abandoned) = linear_retry_session(Some(session_dir));
+        raw_session.path = Some(temp.path().join("session.jsonl"));
+        let expected_session_id = raw_session.header.id.clone();
+        let expected_leaf_id = raw_session.leaf_id().map(str::to_string);
+        let cx = Cx::for_testing();
+        runtime()
+            .block_on(raw_session.save())
+            .expect("pin baseline retry session");
+        let session = Arc::new(Mutex::new(raw_session));
+
+        let commit = runtime()
+            .block_on(stage_and_commit_retry(
+                Arc::clone(&session),
+                &expected_session_id,
+                expected_leaf_id.as_deref(),
+                true,
+                &cx,
+            ))
+            .expect("durable retry");
+        assert_eq!(commit.persistence, RetryPersistenceOutcome::Confirmed);
+
+        let persisted_path = runtime().block_on(async {
+            OwnedMutexGuard::lock(Arc::clone(&session), &cx)
+                .await
+                .expect("lock saved session")
+                .path
+                .clone()
+                .expect("saved path")
+        });
+        let reopened = runtime()
+            .block_on(Session::open(persisted_path.to_string_lossy().as_ref()))
+            .expect("reopen retried session");
+        assert_eq!(reopened.leaf_id(), Some(first_answer.as_str()));
+        let abandoned_on_path = reopened
+            .entries_for_current_path()
+            .iter()
+            .any(|entry| entry.base().id.as_ref() == Some(&abandoned));
+        assert!(!abandoned_on_path);
+        assert!(reopened.get_entry(&abandoned).is_some());
+        let mut live = reopened;
+        let retried = live.append_message(session_user("second question"));
+        let retried_parent = live
+            .get_entry(&retried)
+            .and_then(|entry| entry.base().parent_id.clone());
+        assert_eq!(retried_parent.as_deref(), Some(first_answer.as_str()));
+    }
 
     // ========================================================================
     // FrameTimingStats unit tests (PERF-3)
@@ -1452,6 +2737,17 @@ mod tests {
         assert!(summary.contains("Warning"));
     }
 
+    /// bd-1h9dp: the RSS reading must be plausible for the test process
+    /// (Linux via /proc, macOS/others via sysinfo).
+    #[test]
+    fn proc_self_rss_reader_reports_plausible_rss() {
+        let rss = ProcSelfRssReader.read_rss_bytes();
+        assert!(
+            rss.is_some_and(|bytes| bytes > 1_000_000),
+            "expected a plausible RSS reading for the test process, got {rss:?}"
+        );
+    }
+
     #[test]
     fn memory_monitor_should_force_degraded_only_at_critical() {
         let (mut monitor, shared) = make_memory_monitor(10_000_000);
@@ -1628,13 +2924,12 @@ mod tests {
     }
 
     #[test]
-    fn proc_self_rss_reader_returns_some_on_linux() {
+    fn proc_self_rss_reader_returns_some_on_all_platforms() {
+        // bd-1h9dp: non-Linux used to return None, leaving the entire
+        // memory-pressure degradation path silently inert off Linux.
         let reader = ProcSelfRssReader;
         let result = reader.read_rss_bytes();
-        #[cfg(target_os = "linux")]
         assert!(result.is_some());
-        #[cfg(not(target_os = "linux"))]
-        assert!(result.is_none());
     }
 
     // --- MessageRenderCache tests (PERF-1) ---

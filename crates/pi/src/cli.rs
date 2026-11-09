@@ -3,6 +3,7 @@
 use clap::error::ErrorKind;
 use clap::{Parser, Subcommand};
 use std::collections::HashSet;
+use std::path::PathBuf;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExtensionCliFlag {
@@ -43,6 +44,24 @@ const ROOT_SUBCOMMANDS: &[&str] = &[
     "config",
     "doctor",
     "migrate",
+    "usage",
+    "gc",
+    "review",
+    "rules",
+    "handoff",
+    "commit",
+    "worktree",
+    "completions",
+    "__complete",
+    "token",
+    "stats",
+    "profile",
+    "import",
+    "recover",
+    "grievances",
+    "self-update",
+    "web",
+    "gallery",
 ];
 
 fn known_long_option(name: &str) -> Option<LongOptionSpec> {
@@ -58,27 +77,65 @@ fn known_long_option(name: &str) -> Option<LongOptionSpec> {
         | "acp"
         | "verbose"
         | "no-tools"
+        | "no-implicit-tools"
+        | "no-mcp"
         | "no-extensions"
+        | "plan-mode"
+        | "plan-yolo"
+        | "prewalk"
+        | "no-prewalk"
+        | "yolo"
+        | "auto-approve"
         | "explain-extension-policy"
         | "explain-repair-policy"
         | "no-skills"
+        | "no-context-files"
+        // bd-cv653.3.12 / bd-cv653.7.12 / bd-cv653.7.12.1: the pre-parser
+        // must pass these through to clap — any top-level long missing from
+        // this match gets silently diverted to extension-flag extraction.
+        | "crash-test"
+        | "profile"
         | "no-prompt-templates"
         | "no-themes"
         | "list-providers"
+        | "refresh-models"
+        | "persist-models"
+        | "trust"
+        // ftui migration flags (bd-cv653.9.1). Listed unconditionally: on
+        // non-ftui builds clap still rejects them with a proper error instead
+        // of the pre-parser silently diverting them to extension flags.
+        | "ftui"
+        | "classic"
+        | "classic-tui"
+        | "charmed"
+        | "bubbletea"
+        | "inline"
         | "hide-cwd-in-prompt" => (false, false),
         "provider"
         | "model"
         | "api-key"
         | "models"
+        | "smol"
+        | "slow"
+        | "plan"
+        | "advisor"
+        | "warn-cost"
+        | "max-cost"
+        | "prewalk-into"
+        | "subagent-fallback-policy"
+        | "approval-mode"
         | "thinking"
         | "system-prompt"
         | "append-system-prompt"
         | "session"
+        | "session-workdir"
         | "session-dir"
+        | "add-dir"
         | "session-durability"
         | "mode"
         | "tools"
         | "extension"
+        | "mcp-config"
         | "extension-policy"
         | "repair-policy"
         | "skill"
@@ -86,7 +143,10 @@ fn known_long_option(name: &str) -> Option<LongOptionSpec> {
         | "theme"
         | "theme-path"
         | "max-tool-iterations"
-        | "export" => (true, false),
+        | "max-time"
+        | "request-timeout"
+        | "export"
+        | "fetch-models" => (true, false),
         "list-models" => (true, true),
         _ => return None,
     };
@@ -123,6 +183,16 @@ fn is_negative_numeric_token(token: &str) -> bool {
         return false;
     }
     token.parse::<i64>().is_ok() || token.parse::<f64>().is_ok_and(f64::is_finite)
+}
+
+fn recovery_entry_id(value: &str) -> Result<String, String> {
+    if value.trim().is_empty() || value.len() > 1024 {
+        return Err(
+            "branch ID must be nonempty and at most 1024 UTF-8 bytes; use --root for a new path"
+                .to_string(),
+        );
+    }
+    Ok(value.to_string())
 }
 
 #[allow(clippy::too_many_lines)] // Argument normalization needs single-pass stateful parsing.
@@ -184,15 +254,12 @@ fn preprocess_extension_flags(raw_args: &[String]) -> (Vec<String>, Vec<Extensio
             let mut value = inline_value;
             if value.is_none() {
                 let next = raw_args.get(index + 1);
-                if let Some(next) = next {
-                    if next.ne("--")
-                        && (!next.starts_with('-')
-                            || next.eq("-")
-                            || is_negative_numeric_token(next))
-                    {
-                        value = Some(next.clone());
-                        index += 1;
-                    }
+                if let Some(next) = next
+                    && next.ne("--")
+                    && (!next.starts_with('-') || next.eq("-") || is_negative_numeric_token(next))
+                {
+                    value = Some(next.clone());
+                    index += 1;
                 }
             }
             extracted.push(ExtensionCliFlag {
@@ -306,6 +373,56 @@ pub struct Cli {
     #[arg(long)]
     pub models: Option<String>,
 
+    /// Model spec for the `smol` role (cheap/fast work, e.g. subagent fan-out).
+    /// Format: provider/model with optional :thinking suffix (bd-cv653.3.1).
+    #[arg(long, value_name = "PROVIDER/MODEL")]
+    pub smol: Option<String>,
+
+    /// Model spec for the `slow` role (deep reasoning).
+    #[arg(long, value_name = "PROVIDER/MODEL")]
+    pub slow: Option<String>,
+
+    /// Model spec for the `plan` role (plan mode).
+    #[arg(long, value_name = "PROVIDER/MODEL")]
+    pub plan: Option<String>,
+
+    /// Model spec for the `advisor` role (turn-review second model).
+    #[arg(long, value_name = "PROVIDER/MODEL")]
+    pub advisor: Option<String>,
+
+    /// Frozen host routing policy for an admitted native child process.
+    #[arg(long, hide = true)]
+    pub subagent_fallback_policy: Option<crate::failover::ChildFallbackPolicy>,
+
+    /// Plan with the initial model, then hand off to prewalk.into (default @smol).
+    #[arg(long, conflicts_with = "no_prewalk")]
+    pub prewalk: bool,
+
+    /// Override prewalk.into: provider/model[:thinking] or an explicit @role.
+    #[arg(long, value_name = "MODEL_OR_ROLE", conflicts_with = "no_prewalk")]
+    pub prewalk_into: Option<String>,
+
+    /// Disable prewalk for this launch, overriding prewalk.enabled in settings.
+    #[arg(long, conflicts_with_all = ["prewalk", "prewalk_into"])]
+    pub no_prewalk: bool,
+
+    /// Start in plan mode: read-only planning until a plan is approved
+    /// (bd-cv653.3.5).
+    #[arg(long)]
+    pub plan_mode: bool,
+
+    /// Auto-approve submitted plans without review (unattended runs).
+    #[arg(long)]
+    pub plan_yolo: bool,
+
+    /// Tool approval mode: always-ask (default), write, or yolo (bd-cv653.3.19).
+    #[arg(long, value_parser = ["always-ask", "write", "yolo"])]
+    pub approval_mode: Option<String>,
+
+    /// Shorthand alias for --approval-mode yolo (bd-cv653.3.19).
+    #[arg(long, alias = "auto-approve")]
+    pub yolo: bool,
+
     /// HTTP request timeout in seconds for provider API calls.
     ///
     /// Bounds connect + request + first-response-header latency for each
@@ -322,7 +439,7 @@ pub struct Cli {
 
     // === Thinking/Reasoning ===
     /// Extended thinking level
-    #[arg(long, value_parser = ["off", "minimal", "low", "medium", "high", "xhigh"])]
+    #[arg(long, value_parser = ["off", "minimal", "low", "medium", "high", "xhigh", "max"])]
     pub thinking: Option<String>,
 
     // === System Prompt ===
@@ -347,6 +464,18 @@ pub struct Cli {
     #[arg(long)]
     pub session: Option<String>,
 
+    /// Explicitly attach an existing --session to this workspace before resuming
+    #[arg(
+        long,
+        value_name = "PATH",
+        requires = "session",
+        conflicts_with_all = [
+            "no_session", "export", "acp", "list_models", "list_providers",
+            "fetch_models", "explain_extension_policy", "explain_repair_policy"
+        ]
+    )]
+    pub session_workdir: Option<PathBuf>,
+
     /// Directory for session storage/lookup
     #[arg(long)]
     pub session_dir: Option<String>,
@@ -354,6 +483,26 @@ pub struct Cli {
     /// Don't save session (ephemeral)
     #[arg(long)]
     pub no_session: bool,
+
+    /// Launch the FrankenTUI interactive stack (default when built with `ftui`).
+    ///
+    /// Conflicts with `--classic`: the two select opposite stacks, and until
+    /// this conflict was declared, nothing read this flag at all — `--ftui`
+    /// appeared to work only because it names the default, and
+    /// `pi --classic --ftui` silently gave you classic.
+    #[cfg(feature = "ftui")]
+    #[arg(long, conflicts_with = "classic")]
+    pub ftui: bool,
+
+    /// Force the classic charmed_rust TUI stack instead of the default ftui stack.
+    #[arg(long, aliases = ["classic-tui", "charmed", "bubbletea"])]
+    pub classic: bool,
+
+    /// With ftui: run inline (UI at the bottom, shell scrollback
+    /// preserved) instead of the alternate screen.
+    #[cfg(feature = "ftui")]
+    #[arg(long)]
+    pub inline: bool,
 
     /// Session durability mode: strict, balanced, or throughput
     #[arg(
@@ -395,6 +544,11 @@ pub struct Cli {
     #[arg(short = 'p', long)]
     pub print: bool,
 
+    /// In print mode, wait for background jobs and let the agent handle their results.
+    /// --max-time also bounds idle waiting and subsequent completion turns.
+    #[arg(long, conflicts_with_all = ["rpc", "acp"])]
+    pub wait_async: bool,
+
     /// Start in RPC mode (alias for --mode rpc)
     #[arg(long, conflicts_with_all = ["mode", "print"])]
     pub rpc: bool,
@@ -413,21 +567,42 @@ pub struct Cli {
     #[arg(long)]
     pub no_tools: bool,
 
-    /// Specific tools to enable (comma-separated: read,write,edit,bash,grep,find,ls,hashline_edit)
-    #[arg(
-        long,
-        default_value = "read,bash,edit,write,grep,find,ls,hashline_edit"
-    )]
-    pub tools: String,
+    /// Specific tools to enable (comma-separated), overriding optional-tool
+    /// activation in settings. When omitted, use the default tool set plus
+    /// configured opt-ins (`tools.enableEval`, `enableGithub`,
+    /// `enableSecurityScan`, `enableSubagent`).
+    #[arg(long, value_name = "TOOLS")]
+    pub tools: Option<String>,
+
+    /// Keep the explicit built-in tool list as the native child's ceiling.
+    #[arg(long, hide = true, requires = "tools")]
+    pub no_implicit_tools: bool,
 
     // === Extensions ===
     /// Load extension file (can use multiple times)
     #[arg(short = 'e', long, action = clap::ArgAction::Append)]
     pub extension: Vec<String>,
 
+    /// Extra MCP server config file (can be repeated; highest precedence
+    /// over .pi/mcp.json, .agents/mcp.json, ~/.pi/agent/mcp.json, and
+    /// discovered foreign configs)
+    #[arg(long, value_name = "PATH", action = clap::ArgAction::Append)]
+    pub mcp_config: Vec<PathBuf>,
+
+    /// Disable MCP discovery, server startup and tool mounting for this run.
+    /// ACP clients cannot attach MCP servers while this flag is set.
+    #[arg(long)]
+    pub no_mcp: bool,
+
     /// Disable extension discovery
     #[arg(long)]
     pub no_extensions: bool,
+
+    /// Trust this workspace: allow project-local .pi/settings.json packages
+    /// and .pi/extensions to load and execute (persisted for the current
+    /// content digest; content changes re-prompt)
+    #[arg(long)]
+    pub trust: bool,
 
     /// Extension capability policy: safe, balanced, or permissive (legacy alias: standard)
     #[arg(long, value_name = "PROFILE")]
@@ -450,9 +625,18 @@ pub struct Cli {
     #[arg(long, action = clap::ArgAction::Append)]
     pub skill: Vec<String>,
 
-    /// Disable skill discovery
+    /// Disable skill discovery and configured skills (explicit --skill paths still load)
     #[arg(long)]
     pub no_skills: bool,
+
+    // === Context files ===
+    /// Disable AGENTS.md / CLAUDE.md discovery and loading (the global
+    /// agent-dir file, the cwd, and every ancestor directory), plus the
+    /// foreign-format workspace rules import. Use it when a host composes the
+    /// whole system prompt itself (`--system-prompt`) and must not pick up
+    /// ambient project instructions. Separate from `--no-skills` (gh #216).
+    #[arg(long, env = "PI_NO_CONTEXT_FILES")]
+    pub no_context_files: bool,
 
     // === Prompt Templates ===
     /// Load prompt template file/directory (can use multiple times)
@@ -498,6 +682,42 @@ pub struct Cli {
     #[arg(long, value_name = "N")]
     pub max_tool_iterations: Option<usize>,
 
+    /// Wall-clock cap for a run in seconds (bd-cv653.3.7): the agent pauses
+    /// politely at the NEXT TURN BOUNDARY with a 'time cap reached' marker
+    /// (never mid-tool-call), flushes session state, and exits 0 in print
+    /// mode. Distinct from --request-timeout (per-request) and
+    /// --max-tool-iterations (per-turn count).
+    #[arg(long, value_name = "SECONDS")]
+    pub max_time: Option<u64>,
+
+    /// Warn once when recorded session-tree model spend reaches this USD amount.
+    #[arg(long, value_name = "USD", value_parser = crate::cost::parse_threshold)]
+    pub warn_cost: Option<f64>,
+
+    /// Refuse further model requests after recorded session-tree spend reaches
+    /// this USD amount. In-flight requests may exceed the cap.
+    #[arg(long, value_name = "USD", value_parser = crate::cost::parse_threshold)]
+    pub max_cost: Option<f64>,
+
+    /// Additional workspace roots (bd-cv653.3.12): grant the agent access to
+    /// extra directories beyond the primary cwd. Repeatable. Tools and the
+    /// extension filesystem connector can then touch paths under ANY root;
+    /// paths outside all roots stay fail-closed.
+    #[arg(long = "add-dir", value_name = "DIR")]
+    pub add_dir: Vec<std::path::PathBuf>,
+    // === Export & Listing ===
+    /// Export session file to HTML
+
+    /// Inject an intentional panic to verify the crash-bundle pipeline
+    /// (bd-cv653.7.12). Hidden smoke hook.
+    #[arg(long, hide = true)]
+    pub crash_test: bool,
+    /// Start the sampling profiler for this run and write folded stacks
+    /// under <agent-dir>/profiles/ (bd-cv653.7.12.1). Requires the
+    /// `profiler` feature.
+    #[arg(long)]
+    pub profile: bool,
+
     // === Export & Listing ===
     /// Export session file to HTML
     #[arg(long)]
@@ -515,15 +735,22 @@ pub struct Cli {
 
     /// Fetch the live model catalog from a provider's `/v1/models` endpoint
     /// (OpenAI-compatible providers only). Falls back to the static registry
-    /// when the live call fails. Results are cached in-memory for 5 minutes;
-    /// set `PI_DISABLE_MODEL_CACHE=1` to bypass.
+    /// when the live call fails. Long-lived library callers reuse successful
+    /// results in-process for 5 minutes; separate CLI invocations do not share
+    /// that cache. Set `PI_DISABLE_MODEL_CACHE=1` to bypass it.
     #[arg(long, value_name = "PROVIDER")]
     pub fetch_models: Option<String>,
 
-    /// When used with `--fetch-models`, ignore any cached entry and force a
-    /// fresh network call (still falls back to the static registry on error).
+    /// When used with `--fetch-models`, ignore any cached entry and require a
+    /// successful fresh network call. Live-refresh failures are reported
+    /// instead of being disguised as static-registry results.
     #[arg(long, requires = "fetch_models")]
     pub refresh_models: bool,
+
+    /// Persist a verified live or same-process cached `--fetch-models` catalog
+    /// to `models.fetched.json`. Static fallback results are never persisted.
+    #[arg(long, requires = "fetch_models")]
+    pub persist_models: bool,
 
     // === Subcommands ===
     #[command(subcommand)]
@@ -537,8 +764,12 @@ pub struct Cli {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Commands, ROOT_SUBCOMMANDS, parse_with_extension_flags};
-    use clap::{CommandFactory, Parser};
+    use super::{
+        Cli, Commands, ExtensionCliFlag, ROOT_SUBCOMMANDS, known_long_option,
+        parse_with_extension_flags, preprocess_extension_flags,
+    };
+    use clap::{CommandFactory, Parser, error::ErrorKind};
+    use std::path::PathBuf;
 
     // ── 1. Basic flag parsing ────────────────────────────────────────
 
@@ -601,9 +832,119 @@ mod tests {
     }
 
     #[test]
+    fn session_workdir_is_explicit_and_survives_extension_flag_parsing() {
+        let parsed = parse_with_extension_flags(
+            [
+                "pi",
+                "--session",
+                "saved.jsonl",
+                "--session-workdir",
+                "../moved project",
+                "--custom-feature",
+                "enabled",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+        )
+        .expect("parse explicit attachment with an extension flag");
+        assert_eq!(parsed.cli.session.as_deref(), Some("saved.jsonl"));
+        assert_eq!(
+            parsed.cli.session_workdir.as_deref(),
+            Some(std::path::Path::new("../moved project"))
+        );
+        assert_eq!(parsed.extension_flags.len(), 1);
+        assert_eq!(parsed.extension_flags[0].name, "custom-feature");
+        assert!(Cli::try_parse_from(["pi", "--session-workdir", "/new/project"]).is_err());
+        for conflicting in ["--no-session", "--acp"] {
+            assert!(
+                Cli::try_parse_from([
+                    "pi",
+                    "--session",
+                    "saved.jsonl",
+                    "--session-workdir",
+                    "/new/project",
+                    conflicting,
+                ])
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
     fn parse_session_dir() {
         let cli = Cli::parse_from(["pi", "--session-dir", "/tmp/sessions"]);
         assert_eq!(cli.session_dir.as_deref(), Some("/tmp/sessions"));
+    }
+
+    /// bd-print-session-path-persists-nothing: the exact print-mode argv, since
+    /// `parse_session_path` above proves only the two-token form.
+    ///
+    /// `args` is `trailing_var_arg`, so everything from the first positional on
+    /// is a message — including things that look like flags. This pins that
+    /// `--session` placed BEFORE the message still binds, and that the message
+    /// does not end up in `session`.
+    /// `--ftui` and `--classic` pick opposite stacks, so asking for both is a
+    /// mistake worth reporting rather than resolving silently. Before this,
+    /// `pi --classic --ftui` ran classic and said nothing.
+    #[cfg(feature = "ftui")]
+    #[test]
+    fn ftui_and_classic_cannot_both_be_requested() {
+        let cli = Cli::parse_from(["pi", "--ftui"]);
+        assert!(cli.ftui);
+        assert!(!cli.classic);
+
+        let cli = Cli::parse_from(["pi", "--classic"]);
+        assert!(!cli.ftui);
+        assert!(cli.classic);
+
+        assert!(
+            Cli::try_parse_from(["pi", "--classic", "--ftui"]).is_err(),
+            "two stack selectors at once must be refused, not silently ordered"
+        );
+        assert!(
+            Cli::try_parse_from(["pi", "--ftui", "--classic"]).is_err(),
+            "and in the other order too"
+        );
+        // The documented aliases for --classic conflict as well.
+        assert!(Cli::try_parse_from(["pi", "--ftui", "--classic-tui"]).is_err());
+    }
+
+    #[test]
+    fn parse_session_path_in_a_full_print_mode_argv() {
+        let cli = Cli::parse_from([
+            "pi",
+            "--print",
+            "--mode",
+            "json",
+            "--session",
+            "/tmp/session.jsonl",
+            "--provider",
+            "e2eprimary",
+            "--model",
+            "primary-model",
+            "hello",
+        ]);
+        assert_eq!(cli.session.as_deref(), Some("/tmp/session.jsonl"));
+        assert!(cli.print);
+        assert_eq!(cli.mode.as_deref(), Some("json"));
+        assert_eq!(cli.message_args(), vec!["hello".to_string()]);
+    }
+
+    /// The same argv without the trailing message, which is the shape that
+    /// showed `--session` having no effect at runtime.
+    #[test]
+    fn parse_session_path_without_a_message() {
+        let cli = Cli::parse_from([
+            "pi",
+            "--print",
+            "--mode",
+            "json",
+            "--session",
+            "/tmp/s.jsonl",
+        ]);
+        assert_eq!(cli.session.as_deref(), Some("/tmp/s.jsonl"));
+        assert!(cli.message_args().is_empty());
     }
 
     #[test]
@@ -653,6 +994,36 @@ mod tests {
     fn parse_model_flag() {
         let cli = Cli::parse_from(["pi", "--model", "claude-opus-4"]);
         assert_eq!(cli.model.as_deref(), Some("claude-opus-4"));
+    }
+
+    /// bd-cv653.3.1: role model flags parse independently and together.
+    #[test]
+    fn parse_role_model_flags() {
+        let cli = Cli::parse_from(["pi", "--smol", "openai/gpt-5-mini"]);
+        assert_eq!(cli.smol.as_deref(), Some("openai/gpt-5-mini"));
+        assert!(cli.slow.is_none());
+        assert!(cli.plan.is_none());
+
+        let cli = Cli::parse_from([
+            "pi",
+            "--smol",
+            "openai/gpt-5-mini",
+            "--slow",
+            "anthropic/claude-opus-4-7:max",
+            "--plan",
+            "google/gemini-3-pro",
+        ]);
+        assert_eq!(cli.smol.as_deref(), Some("openai/gpt-5-mini"));
+        assert_eq!(cli.slow.as_deref(), Some("anthropic/claude-opus-4-7:max"));
+        assert_eq!(cli.plan.as_deref(), Some("google/gemini-3-pro"));
+    }
+
+    /// bd-cv653.3.1: role flags compose with the classic model flags.
+    #[test]
+    fn parse_role_flags_compose_with_model_flag() {
+        let cli = Cli::parse_from(["pi", "--model", "gpt-5.5", "--smol", "openai/gpt-5-mini"]);
+        assert_eq!(cli.model.as_deref(), Some("gpt-5.5"));
+        assert_eq!(cli.smol.as_deref(), Some("openai/gpt-5-mini"));
     }
 
     #[test]
@@ -715,7 +1086,7 @@ mod tests {
 
     #[test]
     fn parse_all_thinking_levels() {
-        for level in &["off", "minimal", "low", "medium", "high", "xhigh"] {
+        for level in &["off", "minimal", "low", "medium", "high", "xhigh", "max"] {
             let cli = Cli::parse_from(["pi", "--thinking", level]);
             assert_eq!(cli.thinking.as_deref(), Some(*level));
         }
@@ -976,6 +1347,94 @@ mod tests {
     }
 
     #[test]
+    fn parse_recover_inspection_and_session_copy_modes() -> Result<(), String> {
+        let cli = Cli::parse_from(["pi", "recover", "saved.jsonl", "--active"]);
+        let Some(Commands::Recover {
+            source,
+            output,
+            session_output,
+            json,
+            active,
+            branch,
+            root,
+        }) = cli.command
+        else {
+            return Err(format!("unexpected command: {:?}", cli.command));
+        };
+        assert_eq!(source, PathBuf::from("saved.jsonl"));
+        assert!(output.is_none() && session_output.is_none() && !json && active);
+        assert!(branch.is_none() && !root);
+
+        let cli = Cli::parse_from([
+            "pi",
+            "recover",
+            "saved.jsonl",
+            "--session-output",
+            "copy.jsonl",
+            "--branch",
+            "answer",
+        ]);
+        let Some(Commands::Recover {
+            session_output,
+            branch,
+            ..
+        }) = cli.command
+        else {
+            return Err(format!("unexpected command: {:?}", cli.command));
+        };
+        assert_eq!(session_output, Some(PathBuf::from("copy.jsonl")));
+        assert_eq!(branch.as_deref(), Some("answer"));
+        Ok(())
+    }
+
+    #[test]
+    fn recover_rejects_ambiguous_or_destructive_mode_combinations() {
+        for argv in [
+            vec!["pi", "recover", "saved.jsonl", "--root"],
+            vec!["pi", "recover", "saved.jsonl", "--branch", ""],
+            vec!["pi", "recover", "saved.jsonl", "--active", "--branch", "id"],
+            vec!["pi", "recover", "saved.jsonl", "--json", "--branch", "id"],
+            vec![
+                "pi",
+                "recover",
+                "saved.jsonl",
+                "--session-output",
+                "copy.jsonl",
+                "--output",
+                "report.txt",
+            ],
+            vec![
+                "pi",
+                "recover",
+                "saved.jsonl",
+                "--session-output",
+                "copy.jsonl",
+                "--root",
+                "--branch",
+                "id",
+            ],
+        ] {
+            assert!(Cli::try_parse_from(argv).is_err());
+        }
+    }
+
+    #[test]
+    fn recover_is_not_misclassified_as_an_extension_flag() {
+        let parsed = parse_with_extension_flags(
+            ["pi", "recover", "saved.jsonl", "--json"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+        )
+        .expect("recover subcommand");
+        assert!(matches!(
+            parsed.cli.command,
+            Some(Commands::Recover { json: true, .. })
+        ));
+        assert!(parsed.extension_flags.is_empty());
+    }
+
+    #[test]
     fn no_subcommand_when_only_message() {
         let cli = Cli::parse_from(["pi", "hello"]);
         assert!(cli.command.is_none());
@@ -1006,6 +1465,149 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn wait_async_survives_extension_flag_preprocessing() {
+        let parsed = parse_with_extension_flags(
+            ["pi", "-p", "--wait-async", "--max-time", "37", "run tests"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+        )
+        .expect("parse background completion mode");
+        assert!(parsed.cli.print);
+        assert!(parsed.cli.wait_async);
+        assert_eq!(parsed.cli.max_time, Some(37));
+        assert_eq!(parsed.cli.message_args(), vec!["run tests"]);
+        assert!(parsed.extension_flags.is_empty());
+        assert!(!Cli::parse_from(["pi", "-p", "hello"]).wait_async);
+        assert!(Cli::try_parse_from(["pi", "--rpc", "--wait-async"]).is_err());
+        assert!(Cli::try_parse_from(["pi", "--acp", "--wait-async"]).is_err());
+    }
+
+    #[test]
+    fn fetch_models_flags_survive_extension_flag_preprocessing() {
+        let parsed = parse_with_extension_flags(
+            [
+                "pi",
+                "--fetch-models",
+                "openrouter",
+                "--refresh-models",
+                "--persist-models",
+                "--request-timeout",
+                "17",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+        )
+        .expect("parse fetch-models flags");
+
+        assert_eq!(parsed.cli.fetch_models.as_deref(), Some("openrouter"));
+        assert!(parsed.cli.refresh_models);
+        assert!(parsed.cli.persist_models);
+        assert_eq!(parsed.cli.request_timeout, Some(17));
+        assert!(
+            parsed.extension_flags.is_empty(),
+            "built-in model flags must not be reclassified as extension flags"
+        );
+    }
+
+    #[test]
+    fn formerly_omitted_builtin_flags_survive_production_preprocessing() {
+        let parsed = parse_with_extension_flags(
+            [
+                "pi",
+                "--smol",
+                "openai/smol",
+                "--slow",
+                "anthropic/slow",
+                "--plan",
+                "openai/plan",
+                "--advisor",
+                "openai/advisor",
+                "--plan-mode",
+                "--plan-yolo",
+                "--approval-mode",
+                "write",
+                "--yolo",
+                "--mcp-config",
+                "project.mcp.json",
+                "--max-time",
+                "37",
+                "hello",
+                "--extension-answer",
+                "ship-it",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+        )
+        .expect("parse built-in and extension flags through the production pre-parser");
+
+        assert_eq!(parsed.cli.message_args(), vec!["hello"]);
+        assert_eq!(parsed.cli.smol.as_deref(), Some("openai/smol"));
+        assert_eq!(parsed.cli.slow.as_deref(), Some("anthropic/slow"));
+        assert_eq!(parsed.cli.plan.as_deref(), Some("openai/plan"));
+        assert_eq!(parsed.cli.advisor.as_deref(), Some("openai/advisor"));
+        assert!(parsed.cli.plan_mode);
+        assert!(parsed.cli.plan_yolo);
+        assert_eq!(parsed.cli.approval_mode.as_deref(), Some("write"));
+        assert!(parsed.cli.yolo);
+        assert_eq!(
+            parsed.cli.mcp_config,
+            vec![PathBuf::from("project.mcp.json")]
+        );
+        assert_eq!(parsed.cli.max_time, Some(37));
+        assert_eq!(
+            parsed.extension_flags,
+            vec![ExtensionCliFlag {
+                name: "extension-answer".to_string(),
+                value: Some("ship-it".to_string()),
+            }]
+        );
+
+        let alias = parse_with_extension_flags(
+            ["pi", "--auto-approve"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+        )
+        .expect("parse yolo alias through the production pre-parser");
+        assert!(alias.cli.yolo);
+        assert!(alias.extension_flags.is_empty());
+    }
+
+    #[test]
+    fn extension_preparser_classifies_every_top_level_clap_long_option_and_alias() {
+        let mut missing = Vec::new();
+        for arg in Cli::command().get_arguments() {
+            let mut names = arg.get_long().into_iter().collect::<Vec<_>>();
+            if let Some(aliases) = arg.get_all_aliases() {
+                names.extend(aliases);
+            }
+            for name in names {
+                // Clap's generated help flag is handled by the early DisplayHelp
+                // return in parse_with_extension_flags, before preprocessing.
+                if name != "help" && known_long_option(name).is_none() {
+                    missing.push(name.to_string());
+                }
+            }
+        }
+        missing.sort();
+        missing.dedup();
+        assert!(
+            missing.is_empty(),
+            "top-level Clap options missing from extension pre-parser: {missing:?}"
+        );
+    }
+
+    #[test]
+    fn persist_models_requires_fetch_models() {
+        let error = Cli::try_parse_from(["pi", "--persist-models"])
+            .expect_err("persist-models without fetch-models must be rejected");
+        assert_eq!(error.kind(), ErrorKind::MissingRequiredArgument);
+    }
+
     // ── 5b. --list-providers (bool) ────────────────────────────────────
 
     #[test]
@@ -1026,7 +1628,7 @@ mod tests {
     fn default_tools() {
         let cli = Cli::parse_from(["pi"]);
         assert_eq!(
-            cli.enabled_tools(),
+            cli.enabled_tools(&crate::config::Config::default()),
             vec![
                 "read",
                 "bash",
@@ -1036,6 +1638,17 @@ mod tests {
                 "find",
                 "ls",
                 "hashline_edit",
+                "web_search",
+                "ast_grep",
+                "ast_edit",
+                "lsp",
+                "debug",
+                "ask",
+                "todo",
+                "submit_plan",
+                "jobs",
+                "hub",
+                "current_time",
             ]
         );
     }
@@ -1043,25 +1656,374 @@ mod tests {
     #[test]
     fn custom_tools_list() {
         let cli = Cli::parse_from(["pi", "--tools", "read,grep,find,ls"]);
-        assert_eq!(cli.enabled_tools(), vec!["read", "grep", "find", "ls"]);
+        assert_eq!(
+            cli.enabled_tools(&crate::config::Config::default()),
+            vec!["read", "grep", "find", "ls"]
+        );
     }
 
     #[test]
     fn no_tools_flag_returns_empty() {
         let cli = Cli::parse_from(["pi", "--no-tools"]);
-        assert!(cli.enabled_tools().is_empty());
+        assert!(
+            cli.enabled_tools(&crate::config::Config::default())
+                .is_empty()
+        );
     }
 
     #[test]
     fn tools_with_spaces_trimmed() {
         let cli = Cli::parse_from(["pi", "--tools", "read, bash, edit"]);
-        assert_eq!(cli.enabled_tools(), vec!["read", "bash", "edit"]);
+        assert_eq!(
+            cli.enabled_tools(&crate::config::Config::default()),
+            vec!["read", "bash", "edit"]
+        );
     }
 
     #[test]
     fn tools_ignore_empty_entries_and_duplicates() {
         let cli = Cli::parse_from(["pi", "--tools", "read,, bash,read, ,grep,bash"]);
-        assert_eq!(cli.enabled_tools(), vec!["read", "bash", "grep"]);
+        assert_eq!(
+            cli.enabled_tools(&crate::config::Config::default()),
+            vec!["read", "bash", "grep"]
+        );
+    }
+
+    const OPTIONAL_TOOL_SETTINGS: [(&str, &str); 4] = [
+        ("enableEval", "eval"),
+        ("enableGithub", "github"),
+        ("enableSecurityScan", "security_scan"),
+        ("enableSubagent", "subagent"),
+    ];
+
+    fn optional_tool_config(enabled: bool) -> crate::config::Config {
+        crate::config::Config {
+            tools: Some(crate::config::ToolSettings {
+                enable_eval: Some(enabled),
+                enable_github: Some(enabled),
+                enable_security_scan: Some(enabled),
+                enable_subagent: Some(enabled),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn optional_tools_remain_disabled_unless_configured() {
+        let cli = Cli::parse_from(["pi"]);
+        for config in [
+            crate::config::Config::default(),
+            optional_tool_config(false),
+        ] {
+            assert_eq!(
+                cli.enabled_tools(&config),
+                crate::xdev::default_enabled_tools()
+            );
+        }
+    }
+
+    #[test]
+    fn each_optional_tool_can_be_enabled_independently() {
+        let cli = Cli::parse_from(["pi"]);
+        for (setting, name) in OPTIONAL_TOOL_SETTINGS {
+            let config = serde_json::from_value(serde_json::json!({
+                "tools": { (setting): true }
+            }))
+            .expect("optional tool config");
+            let mut expected = crate::xdev::default_enabled_tools();
+            expected.push(name);
+            assert_eq!(cli.enabled_tools(&config), expected, "{setting}");
+        }
+    }
+
+    #[test]
+    fn explicit_tools_override_configured_opt_ins_even_when_equal_to_defaults() {
+        let config = optional_tool_config(true);
+        let defaults = crate::xdev::default_enabled_tools().join(",");
+        let cli = Cli::parse_from(["pi", "--tools", defaults.as_str()]);
+        assert!(cli.tools.is_some());
+        assert_eq!(
+            cli.enabled_tools(&config),
+            crate::xdev::default_enabled_tools()
+        );
+
+        for args in [vec!["pi", "--tools", "read"], vec!["pi", "--tools=read"]] {
+            let cli = Cli::parse_from(args);
+            assert_eq!(cli.enabled_tools(&config), ["read"]);
+        }
+    }
+
+    #[test]
+    fn explicit_optional_tools_override_disabled_settings_and_are_deduplicated() {
+        let config = optional_tool_config(false);
+        let cli = Cli::parse_from([
+            "pi",
+            "--tools",
+            "eval, github,security_scan,subagent,eval, ,github",
+        ]);
+        assert_eq!(
+            cli.enabled_tools(&config),
+            ["eval", "github", "security_scan", "subagent"]
+        );
+    }
+
+    #[test]
+    fn empty_and_disabled_cli_selections_suppress_configured_opt_ins() {
+        let config = optional_tool_config(true);
+        for args in [
+            vec!["pi", "--tools", ""],
+            vec!["pi", "--tools=,"],
+            vec!["pi", "--no-tools"],
+            vec![
+                "pi",
+                "--no-tools",
+                "--tools",
+                "eval,github,security_scan,subagent",
+            ],
+        ] {
+            let cli = Cli::parse_from(args);
+            assert!(cli.enabled_tools(&config).is_empty());
+        }
+    }
+
+    #[test]
+    fn extension_flag_preprocessing_preserves_explicit_tool_selection() {
+        let config = optional_tool_config(true);
+        let defaults = crate::xdev::default_enabled_tools().join(",");
+        let parsed = parse_with_extension_flags(vec![
+            "pi".to_string(),
+            "--custom-extension-flag".to_string(),
+            format!("--tools={defaults}"),
+        ])
+        .expect("parse explicit selection with extension flag");
+        assert_eq!(parsed.extension_flags.len(), 1);
+        assert_eq!(
+            parsed.cli.enabled_tools(&config),
+            crate::xdev::default_enabled_tools()
+        );
+    }
+
+    #[test]
+    fn configured_optional_tools_reach_the_existing_registry_once() {
+        let cwd = tempfile::tempdir().expect("tempdir");
+        let config = optional_tool_config(true);
+        let cli = Cli::parse_from(["pi"]);
+        let registry =
+            crate::tools::ToolRegistry::new(&cli.enabled_tools(&config), cwd.path(), Some(&config));
+
+        for (_, name) in OPTIONAL_TOOL_SETTINGS {
+            assert!(registry.get(name).is_some(), "{name} must be registered");
+            assert_eq!(
+                registry
+                    .tools()
+                    .iter()
+                    .filter(|tool| tool.name() == name)
+                    .count(),
+                1,
+                "{name} must be registered once"
+            );
+        }
+        for name in ["eval", "github", "security_scan"] {
+            assert!(registry.is_discoverable(name), "{name}");
+        }
+
+        // The registry must not independently add configured tools to an
+        // explicit restricted selection (SDKs and native children use this).
+        let cli = Cli::parse_from(["pi", "--tools", "read"]);
+        let registry =
+            crate::tools::ToolRegistry::new(&cli.enabled_tools(&config), cwd.path(), Some(&config));
+        for (_, name) in OPTIONAL_TOOL_SETTINGS {
+            assert!(registry.get(name).is_none(), "{name} must remain excluded");
+        }
+    }
+
+    #[test]
+    fn load_modes_do_not_grant_optional_tool_activation() {
+        let cwd = tempfile::tempdir().expect("tempdir");
+        let cli = Cli::parse_from(["pi"]);
+        for (setting, name) in OPTIONAL_TOOL_SETTINGS {
+            for tools in [
+                serde_json::json!({ "loadMode": { (name): "essential" } }),
+                serde_json::json!({ (setting): false, "loadMode": { (name): "essential" } }),
+            ] {
+                let config = serde_json::from_value(serde_json::json!({ "tools": tools }))
+                    .expect("load mode config");
+                let enabled = cli.enabled_tools(&config);
+                assert!(!enabled.contains(&name), "{setting}");
+                let registry = crate::tools::ToolRegistry::new(&enabled, cwd.path(), Some(&config));
+                assert!(registry.get(name).is_none(), "{name}");
+            }
+        }
+    }
+
+    #[test]
+    fn native_tool_ceiling_requires_and_preserves_explicit_selection() {
+        let error = Cli::try_parse_from(["pi", "--no-implicit-tools"])
+            .expect_err("a child tool ceiling requires a selected list");
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
+        assert!(error.to_string().contains("--tools"));
+        assert!(!Cli::parse_from(["pi"]).no_implicit_tools);
+
+        let config = optional_tool_config(true);
+        for tools in ["read", "eval,github", "", " , , "] {
+            let cli = Cli::parse_from(["pi", "--no-implicit-tools", "--tools", tools]);
+            assert!(cli.no_implicit_tools);
+            let ordinary = Cli::parse_from(["pi", "--tools", tools]);
+            assert_eq!(cli.enabled_tools(&config), ordinary.enabled_tools(&config));
+        }
+        let cli = Cli::parse_from([
+            "pi",
+            "--no-implicit-tools",
+            "--tools",
+            "read,eval",
+            "--no-tools",
+        ]);
+        assert!(cli.builtin_tools_disabled());
+        assert!(cli.enabled_tools(&config).is_empty());
+    }
+
+    #[test]
+    fn native_tool_ceiling_survives_extension_flag_preprocessing() {
+        for extension in [None, Some("--fixture-mode=fast")] {
+            let mut args = vec!["pi", "--tools", "read", "--no-implicit-tools"];
+            if let Some(flag) = extension {
+                args.push(flag);
+            }
+            args.push("inspect");
+            let parsed = parse_with_extension_flags(args.into_iter().map(str::to_string).collect())
+                .expect("native tool policy must survive the real parser");
+            assert!(parsed.cli.no_implicit_tools);
+            assert_eq!(parsed.cli.tools.as_deref(), Some("read"));
+            assert_eq!(parsed.cli.message_args(), ["inspect"]);
+            let expected = extension.map(|_| ExtensionCliFlag {
+                name: "fixture-mode".to_string(),
+                value: Some("fast".to_string()),
+            });
+            assert_eq!(
+                parsed.extension_flags,
+                expected.into_iter().collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_builtin_disable_policy_normalizes_empty_lists() {
+        let config = optional_tool_config(true);
+        for (args, disabled) in [
+            (vec!["pi"], false),
+            (vec!["pi", "--tools", "read, ,"], false),
+            (vec!["pi", "--tools", "unknown-tool"], false),
+            (vec!["pi", "--tools", ""], true),
+            (vec!["pi", "--tools", " ,\t,\n "], true),
+            (vec!["pi", "--tools=, ,"], true),
+            (vec!["pi", "--no-tools", "--tools", "read"], true),
+        ] {
+            let cli = Cli::parse_from(args);
+            assert_eq!(cli.builtin_tools_disabled(), disabled);
+            if disabled {
+                assert!(cli.enabled_tools(&config).is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn configured_off_removes_default_tools_unless_cli_selects_them() {
+        let cwd = tempfile::tempdir().expect("tempdir");
+        let config = serde_json::from_value(serde_json::json!({
+            "tools": { "loadMode": { "bash": "off" } }
+        }))
+        .expect("load mode config");
+        let cli = Cli::parse_from(["pi"]);
+        let enabled = cli.enabled_tools(&config);
+        assert!(!enabled.contains(&"bash"));
+        let registry = crate::tools::ToolRegistry::new(&enabled, cwd.path(), Some(&config));
+        assert!(registry.get("bash").is_none());
+
+        let defaults = crate::xdev::default_enabled_tools().join(",");
+        for explicit in ["bash", defaults.as_str()] {
+            let cli = Cli::parse_from(["pi", "--tools", explicit]);
+            let enabled = cli.enabled_tools(&config);
+            assert!(enabled.contains(&"bash"));
+            let registry = crate::tools::ToolRegistry::new(&enabled, cwd.path(), Some(&config));
+            assert!(registry.get("bash").is_some());
+            if explicit == defaults.as_str() {
+                assert_eq!(enabled, crate::xdev::default_enabled_tools());
+            }
+        }
+    }
+
+    #[test]
+    fn configured_off_optional_tools_are_unavailable_unless_cli_selects_them() {
+        let cwd = tempfile::tempdir().expect("tempdir");
+        for (setting, name) in OPTIONAL_TOOL_SETTINGS {
+            let config = serde_json::from_value(serde_json::json!({
+                "tools": { (setting): true, "loadMode": { (name): " OFF " } }
+            }))
+            .expect("optional tool off config");
+            let cli = Cli::parse_from(["pi"]);
+            let enabled = cli.enabled_tools(&config);
+            assert!(!enabled.contains(&name), "{name}");
+            let registry = crate::tools::ToolRegistry::new(&enabled, cwd.path(), Some(&config));
+            assert!(registry.get(name).is_none(), "{name}");
+            assert!(!registry.tools().iter().any(|tool| tool.name() == name));
+            assert!(
+                !registry
+                    .discoverable_index()
+                    .iter()
+                    .any(|(tool, _)| tool == name)
+            );
+
+            let explicit = format!("read,{name}");
+            let cli = Cli::parse_from(["pi", "--tools", explicit.as_str()]);
+            assert_eq!(cli.enabled_tools(&config), ["read", name]);
+            let registry = crate::tools::ToolRegistry::new(
+                &cli.enabled_tools(&config),
+                cwd.path(),
+                Some(&config),
+            );
+            assert!(registry.get(name).is_some(), "explicit {name}");
+        }
+    }
+
+    #[test]
+    fn absent_and_unknown_load_modes_do_not_cancel_opt_in_activation() {
+        let cli = Cli::parse_from(["pi"]);
+        let mut config = optional_tool_config(true);
+        let expected = cli.enabled_tools(&config);
+        assert!(
+            expected.contains(&"subagent"),
+            "default Off is not a settings veto"
+        );
+        config.tools.as_mut().expect("tool settings").load_mode = Some(
+            ["bash", "eval", "github", "security_scan", "subagent"]
+                .into_iter()
+                .map(|name| (name.to_string(), "not-a-load-mode".to_string()))
+                .collect(),
+        );
+        assert_eq!(cli.enabled_tools(&config), expected);
+    }
+
+    #[test]
+    fn implicit_off_modes_are_distinct_from_disabling_all_builtins() {
+        let cli = Cli::parse_from(["pi"]);
+        let config = crate::config::Config {
+            tools: Some(crate::config::ToolSettings {
+                load_mode: Some(
+                    crate::xdev::default_enabled_tools()
+                        .into_iter()
+                        .map(|name| (name.to_string(), "off".to_string()))
+                        .collect(),
+                ),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(cli.enabled_tools(&config).is_empty());
+        assert!(!cli.builtin_tools_disabled());
     }
 
     // ── 7. Invalid inputs ────────────────────────────────────────────
@@ -1100,7 +2062,7 @@ mod tests {
     fn extension_flags_are_extracted_in_second_pass_parse() {
         let parsed = parse_with_extension_flags(vec![
             "pi".to_string(),
-            "--plan".to_string(),
+            "--extension-plan".to_string(),
             "ship it".to_string(),
             "--model".to_string(),
             "gpt-4o".to_string(),
@@ -1109,7 +2071,7 @@ mod tests {
 
         assert_eq!(parsed.cli.model.as_deref(), Some("gpt-4o"));
         assert_eq!(parsed.extension_flags.len(), 1);
-        assert_eq!(parsed.extension_flags[0].name, "plan");
+        assert_eq!(parsed.extension_flags[0].name, "extension-plan");
         assert_eq!(parsed.extension_flags[0].value.as_deref(), Some("ship it"));
     }
 
@@ -1180,11 +2142,33 @@ mod tests {
     }
 
     #[test]
+    fn cost_limits_are_validated_builtin_flags_and_preserve_the_prompt() {
+        let parsed = parse_with_extension_flags(vec![
+            "pi".to_string(),
+            "--warn-cost".to_string(),
+            "0.25".to_string(),
+            "--max-cost=2.50".to_string(),
+            "--print".to_string(),
+            "hello".to_string(),
+        ])
+        .expect("cost flags");
+        assert_eq!(parsed.cli.warn_cost, Some(0.25));
+        assert_eq!(parsed.cli.max_cost, Some(2.5));
+        assert_eq!(parsed.cli.message_args(), vec!["hello"]);
+        assert!(parsed.extension_flags.is_empty());
+        for flag in ["--warn-cost", "--max-cost"] {
+            for amount in ["0", "-1", "NaN", "inf", "1e999", "money"] {
+                assert!(Cli::try_parse_from(["pi", &format!("{flag}={amount}")]).is_err());
+            }
+        }
+    }
+
+    #[test]
     fn parse_with_extension_flags_recognizes_no_mouse_capture_as_builtin() {
         let parsed = parse_with_extension_flags(vec![
             "pi".to_string(),
             "--no-mouse-capture".to_string(),
-            "--plan".to_string(),
+            "--extension-plan".to_string(),
             "ship-it".to_string(),
             "--print".to_string(),
             "hello".to_string(),
@@ -1195,7 +2179,7 @@ mod tests {
         assert!(parsed.cli.print);
         assert_eq!(parsed.cli.message_args(), vec!["hello"]);
         assert_eq!(parsed.extension_flags.len(), 1);
-        assert_eq!(parsed.extension_flags[0].name, "plan");
+        assert_eq!(parsed.extension_flags[0].name, "extension-plan");
         assert_eq!(parsed.extension_flags[0].value.as_deref(), Some("ship-it"));
     }
 
@@ -1216,7 +2200,7 @@ mod tests {
             "pi".to_string(),
             "-pe".to_string(),
             "ext.js".to_string(),
-            "--plan".to_string(),
+            "--extension-plan".to_string(),
             "ship-it".to_string(),
             "hello".to_string(),
         ])
@@ -1226,7 +2210,7 @@ mod tests {
         assert_eq!(parsed.cli.extension, vec!["ext.js".to_string()]);
         assert_eq!(parsed.cli.message_args(), vec!["hello"]);
         assert_eq!(parsed.extension_flags.len(), 1);
-        assert_eq!(parsed.extension_flags[0].name, "plan");
+        assert_eq!(parsed.extension_flags[0].name, "extension-plan");
         assert_eq!(parsed.extension_flags[0].value.as_deref(), Some("ship-it"));
     }
 
@@ -1235,14 +2219,14 @@ mod tests {
         let parsed = parse_with_extension_flags(vec![
             "pi".to_string(),
             "hello".to_string(),
-            "--plan".to_string(),
+            "--extension-plan".to_string(),
             "ship-it".to_string(),
         ])
         .expect("parse extension flag after message");
 
         assert_eq!(parsed.cli.message_args(), vec!["hello"]);
         assert_eq!(parsed.extension_flags.len(), 1);
-        assert_eq!(parsed.extension_flags[0].name, "plan");
+        assert_eq!(parsed.extension_flags[0].name, "extension-plan");
         assert_eq!(parsed.extension_flags[0].value.as_deref(), Some("ship-it"));
     }
 
@@ -1250,7 +2234,7 @@ mod tests {
     fn extension_flag_inline_value_matches_separate_value() {
         let separate = parse_with_extension_flags(vec![
             "pi".to_string(),
-            "--plan".to_string(),
+            "--extension-plan".to_string(),
             "ship-it".to_string(),
             "--print".to_string(),
             "hello".to_string(),
@@ -1259,7 +2243,7 @@ mod tests {
 
         let inline = parse_with_extension_flags(vec![
             "pi".to_string(),
-            "--plan=ship-it".to_string(),
+            "--extension-plan=ship-it".to_string(),
             "--print".to_string(),
             "hello".to_string(),
         ])
@@ -1342,9 +2326,92 @@ mod tests {
     }
 
     #[test]
+    fn no_mcp_survives_preprocessing_and_keeps_other_tools_enabled() {
+        let parsed = parse_with_extension_flags(vec![
+            "pi".to_string(),
+            "--no-mcp".to_string(),
+            "--mcp-config".to_string(),
+            "ignored.json".to_string(),
+            "-p".to_string(),
+            "hello".to_string(),
+        ])
+        .expect("parse --no-mcp");
+        assert!(parsed.cli.no_mcp);
+        assert!(!parsed.cli.no_tools);
+        assert!(!parsed.cli.no_extensions);
+        assert!(parsed.extension_flags.is_empty());
+        assert!(!Cli::parse_from(["pi"]).no_mcp);
+    }
+
+    #[test]
+    fn native_child_fallback_policy_survives_extension_flag_preprocessing() {
+        let policy = crate::failover::ChildFallbackPolicy::capture(
+            &crate::config::Config::default(),
+            crate::models::ModelRole::Task,
+            &[],
+        )
+        .to_cli_arg()
+        .unwrap();
+        let parsed = parse_with_extension_flags(vec![
+            "pi".to_string(),
+            "--subagent-fallback-policy".to_string(),
+            policy,
+            "--mode".to_string(),
+            "json".to_string(),
+            "--print".to_string(),
+            "Task: finish delegated work".to_string(),
+        ])
+        .unwrap();
+        assert!(parsed.extension_flags.is_empty());
+        assert!(parsed.cli.subagent_fallback_policy.is_some());
+        assert!(Cli::try_parse_from(["pi", "--subagent-fallback-policy", "{}"]).is_err());
+    }
+
+    #[test]
+    fn trust_flag() {
+        let cli = Cli::parse_from(["pi", "--trust"]);
+        assert!(cli.trust);
+        let cli = Cli::parse_from(["pi"]);
+        assert!(!cli.trust);
+    }
+
+    #[test]
+    fn trust_flag_is_builtin_not_extension_flag() {
+        let parsed = parse_with_extension_flags(vec![
+            "pi".to_string(),
+            "--trust".to_string(),
+            "-p".to_string(),
+            "hello".to_string(),
+        ])
+        .expect("parse --trust with print mode");
+        assert!(parsed.cli.trust, "--trust must survive preprocessing");
+        assert!(
+            parsed.extension_flags.is_empty(),
+            "--trust must not be extracted as an extension flag"
+        );
+    }
+
+    #[test]
     fn no_skills_flag() {
         let cli = Cli::parse_from(["pi", "--no-skills"]);
         assert!(cli.no_skills);
+        // gh #216: skills and context files are independent switches.
+        assert!(!cli.no_context_files);
+    }
+
+    #[test]
+    fn no_context_files_flag() {
+        let cli = Cli::parse_from(["pi", "--no-context-files"]);
+        assert!(cli.no_context_files);
+        assert!(!cli.no_skills);
+    }
+
+    #[test]
+    fn no_context_files_flag_is_not_diverted_to_extension_flags() {
+        let args: Vec<String> = vec!["pi".to_string(), "--no-context-files".to_string()];
+        let (kept, extracted) = preprocess_extension_flags(&args);
+        assert!(extracted.is_empty());
+        assert_eq!(kept, args);
     }
 
     #[test]
@@ -1368,6 +2435,7 @@ mod tests {
         assert!(!cli.no_tools);
         assert!(!cli.no_extensions);
         assert!(!cli.no_skills);
+        assert!(!cli.no_context_files);
         assert!(!cli.no_prompt_templates);
         assert!(!cli.no_themes);
         assert!(cli.provider.is_none());
@@ -1383,7 +2451,13 @@ mod tests {
         assert!(cli.list_models.is_none());
         assert!(cli.command.is_none());
         assert!(cli.args.is_empty());
-        assert_eq!(cli.tools, "read,bash,edit,write,grep,find,ls,hashline_edit");
+        // The bare-invocation default must stay in lockstep with the
+        // canonical default-enabled tool list.
+        assert!(cli.tools.is_none());
+        assert_eq!(
+            cli.enabled_tools(&crate::config::Config::default()),
+            crate::xdev::default_enabled_tools()
+        );
     }
 
     // ── 11. Combined flags ───────────────────────────────────────────
@@ -1530,7 +2604,7 @@ mod tests {
         assert!(cli.print);
         assert!(cli.verbose);
         assert!(cli.no_tools);
-        assert_eq!(cli.tools, "read,bash");
+        assert_eq!(cli.tools.as_deref(), Some("read,bash"));
         assert_eq!(cli.thinking.as_deref(), Some("high"));
         assert_eq!(cli.extension, vec!["ext.js"]);
         assert!(cli.no_extensions);
@@ -1727,7 +2801,8 @@ mod tests {
             fn preprocess_known_flags_never_extracted(
                 flag in prop::sample::select(vec![
                     "--version", "--verbose", "--print", "--no-tools",
-                    "--no-extensions", "--no-skills", "--no-prompt-templates",
+                    "--no-extensions", "--no-skills", "--no-context-files",
+                    "--no-prompt-templates",
                     "--no-mouse-capture", "--rpc", "--list-providers",
                 ]),
             ) {
@@ -1855,6 +2930,249 @@ pub enum Commands {
     #[command(name = "update-index")]
     UpdateIndex,
 
+    /// Manage pi-iso agent worktrees (bd-cv653.5.2)
+    #[command(name = "worktree")]
+    Worktree {
+        /// `list` live agent worktrees or `clean` stale ones
+        #[arg(value_parser = ["list", "clean"])]
+        action: String,
+        /// Reap worktrees older than this many days (clean only, default 1)
+        #[arg(long, default_value = "1")]
+        older_than_days: u64,
+    },
+
+    /// Print shell completion script from the live CLI graph (bd-cv653.7.2)
+    #[command(name = "completions")]
+    Completions {
+        /// bash | zsh | fish
+        #[arg(value_parser = ["bash", "zsh", "fish"])]
+        shell: String,
+    },
+
+    /// Dynamic completion protocol (bd-cv653.7.2): answer candidates for a
+    /// value-taking flag from the live registry/session index.
+    #[command(name = "__complete", hide = true)]
+    Complete {
+        /// The flag being completed (`--model`, `--session`, ...). Hyphen
+        /// values are allowed because the completed token IS a flag.
+        #[arg(allow_hyphen_values = true)]
+        flag: String,
+        /// Prefix typed so far (may be empty)
+        #[arg(default_value = "", allow_hyphen_values = true)]
+        prefix: String,
+    },
+
+    /// Count tokens in text (or @file) against the active counter
+    /// (bd-cv653.7.1) — price a prompt before sending it.
+    #[command(name = "token")]
+    Token {
+        /// Text to count, or @file to read from disk
+        input: String,
+    },
+
+    /// Render folded profiler stacks (bd-cv653.7.12.1): top functions by
+    /// inclusive samples from a `.folded` snapshot.
+    #[command(name = "profile")]
+    Profile {
+        /// Path to a `.folded` snapshot (defaults to the newest under
+        /// <agent-dir>/profiles/)
+        #[arg(long)]
+        input: Option<PathBuf>,
+        /// How many top rows to print
+        #[arg(long, default_value_t = 25)]
+        top: usize,
+    },
+
+    /// Aggregate local session usage: tokens/cost by provider, model, day;
+    /// tool-call frequency; compactions (bd-cv653.7.7). All local — no
+    /// network.
+    #[command(name = "stats")]
+    Stats {
+        /// Only entries at/after this RFC 3339 timestamp (day prefixes work)
+        #[arg(long)]
+        since: Option<String>,
+        /// Only entries at/before this RFC 3339 timestamp (day prefixes work)
+        #[arg(long)]
+        until: Option<String>,
+        /// Only sessions under project dirs whose name contains this text
+        #[arg(long)]
+        project: Option<String>,
+        /// Only assistant messages from this provider
+        #[arg(long)]
+        provider: Option<String>,
+        /// Only assistant messages from this model
+        #[arg(long)]
+        model: Option<String>,
+        /// Output format: text | json | markdown
+        #[arg(long, default_value = "text")]
+        format: String,
+    },
+
+    /// Import a foreign session into a native continuable pi session
+    /// (bd-cv653.6.4): Claude Code or Codex JSONL.
+    #[command(name = "import")]
+    Import {
+        /// Import from Claude Code (~/.claude/projects/**/*.jsonl)
+        #[arg(long, conflicts_with = "from_codex")]
+        from_claude: Option<String>,
+        /// Import from Codex (~/.codex/sessions/**/*.jsonl)
+        #[arg(long, conflicts_with = "from_claude")]
+        from_codex: Option<String>,
+    },
+
+    /// Recover readable text from a v3 JSONL session without opening media sidecars.
+    ///
+    /// Inspection is read-only by default. --session-output explicitly creates a
+    /// separate text-only native session with a new identity; it never repairs or
+    /// overwrites the source.
+    #[command(name = "recover")]
+    Recover {
+        /// Authoritative version-3 JSONL source.
+        source: PathBuf,
+        /// Create a new report file. Existing destinations are never replaced.
+        #[arg(long, conflicts_with = "session_output")]
+        output: Option<PathBuf>,
+        /// Create a NEW resumable text-only .jsonl session. Existing files and sidecars are refused.
+        #[arg(long, conflicts_with_all = ["output", "json"])]
+        session_output: Option<PathBuf>,
+        /// Emit the complete machine-readable recovery report.
+        #[arg(long, conflicts_with_all = ["active", "branch", "root", "session_output"])]
+        json: bool,
+        /// Inspect only the source's saved active path. Default inspection shows all records.
+        #[arg(long, conflicts_with_all = ["branch", "root", "session_output"])]
+        active: bool,
+        /// Inspect this exact root-to-entry path, or select it in a new session copy.
+        #[arg(long, conflicts_with = "root", value_parser = recovery_entry_id)]
+        branch: Option<String>,
+        /// Start a new session copy at the root while preserving source history off-path.
+        #[arg(
+            long,
+            requires = "session_output",
+            conflicts_with_all = ["active", "branch", "json"]
+        )]
+        root: bool,
+    },
+
+    /// Generate structured cross-session/cross-agent handoff brief (bd-cv653.3.17)
+    #[command(name = "handoff")]
+    Handoff {
+        /// Delivery target: human | bead:<id> | agent:<thread_id>
+        #[arg(long, default_value = "human")]
+        to: String,
+        /// Output file path for markdown brief (sidecar .json written alongside)
+        #[arg(short, long)]
+        out: Option<PathBuf>,
+        /// Session ID or session file path (defaults to latest active session)
+        #[arg(short, long)]
+        session: Option<String>,
+        /// Print generated handoff markdown directly to stdout
+        #[arg(long)]
+        print: bool,
+    },
+
+    /// Manage time-traveling stream rules (TTSR) (bd-cv653.3.4)
+    #[command(name = "rules")]
+    Rules {
+        #[command(subcommand)]
+        command: RulesCommands,
+    },
+
+    /// Manage per-project grievances ledger (bd-cv653.3.4)
+    #[command(name = "grievances")]
+    Grievances {
+        #[command(subcommand)]
+        command: GrievancesCommands,
+    },
+
+    /// Create dependency-ordered atomic commits from working tree changes (bd-cv653.3.14)
+    #[command(name = "commit")]
+    Commit {
+        /// Dry-run mode: plan and preview atomic commits without writing to git
+        #[arg(short = 'n', long)]
+        dry_run: bool,
+        /// Include lockfiles (Cargo.lock, etc.) in commit planning (excluded by default)
+        #[arg(long)]
+        include_lockfiles: bool,
+        /// Automatically stage all untracked files
+        #[arg(short = 'a', long)]
+        all: bool,
+        /// Optional bead / issue reference to annotate conventional commit messages
+        #[arg(short = 'b', long)]
+        bead: Option<String>,
+        /// Optional custom commit message prefix
+        #[arg(short = 'm', long)]
+        message: Option<String>,
+    },
+
+    /// Verified in-place self-updater for Pi binary (bd-cv653.7.10)
+    #[command(name = "self-update")]
+    SelfUpdate {
+        /// Target version to update to (e.g. v0.2.0 or 0.2.0; defaults to latest release)
+        #[arg(long)]
+        version: Option<String>,
+        /// Check for available updates without applying any binary changes
+        #[arg(long)]
+        check: bool,
+    },
+
+    /// Parallel model code review with prioritized findings and a ship verdict
+    #[command(name = "review")]
+    Review {
+        /// Optional checkout, then a Git target / PR / MR, then review focus. Hosted targets accept HTTPS URLs, OWNER/REPO#N, or #N / !N in a checkout
+        #[arg(value_name = "CHECKOUT_TARGET_FOCUS")]
+        target: Vec<String>,
+        /// Additional review instructions (model review only)
+        #[arg(long, value_name = "TEXT", allow_hyphen_values = true)]
+        focus: Option<String>,
+        /// Run only local heuristics; do not send code to a model
+        #[arg(long)]
+        offline: bool,
+        /// Fail with non-zero exit code if findings meet or exceed severity (P0, P1, P2)
+        #[arg(long, value_name = "SEVERITY")]
+        fail_on: Option<String>,
+        /// Output format: text (default), json, or markdown
+        #[arg(long, default_value = "text", value_parser = ["text", "json", "markdown"])]
+        format: String,
+        /// Minimum confidence threshold for findings (0.0 to 1.0)
+        #[arg(long, default_value_t = 0.70)]
+        confidence_threshold: f64,
+        /// Maximum number of findings to report
+        #[arg(long, default_value_t = 50)]
+        max_findings: usize,
+        /// Optional path to write output report to
+        #[arg(short, long)]
+        out: Option<PathBuf>,
+    },
+
+    /// Prune stale sessions, artifacts, and caches per retention policy (bd-cv653.7.11)
+    #[command(name = "gc")]
+    Gc {
+        /// Retention window (e.g. 30d, 7d, 24h, or integer days; default: 30d)
+        #[arg(long, default_value = "30d")]
+        older_than: String,
+        /// Number of most recent prunable sessions to preserve per project; named/pinned sessions are always kept and do not consume a slot (default: 5)
+        #[arg(long, default_value_t = 5)]
+        keep_last: usize,
+        /// Include extension transpile caches and temporary runtime caches
+        #[arg(long, default_value_t = true)]
+        caches: bool,
+        /// Perform dry run: analyze and print the reclamation plan without modifying disk (default: true)
+        #[arg(long)]
+        dry_run: bool,
+        /// Confirm destructive sweep and move pruned items to trash
+        #[arg(long, short = 'y')]
+        yes: bool,
+        /// Empty the trash directory permanently
+        #[arg(long)]
+        empty_trash: bool,
+        /// Restore a previously trashed session by filename or ID
+        #[arg(long)]
+        restore: Option<String>,
+        /// Output format: text (default) or json
+        #[arg(long, default_value = "text", value_parser = ["text", "json"])]
+        format: String,
+    },
+
     /// Preview the semantic context bundle Pi would use for a task
     #[command(name = "context-preview")]
     ContextPreview {
@@ -1970,7 +3288,7 @@ pub enum Commands {
 
     /// Diagnose environment health and extension compatibility
     Doctor {
-        /// Extension path to check (omit to run all environment checks)
+        /// Extension path to check (omit to check ordinary installation health)
         path: Option<String>,
         /// Output format: text (default), json, markdown
         #[arg(long, default_value = "text")]
@@ -1981,12 +3299,45 @@ pub enum Commands {
         /// Automatically fix safe issues (missing dirs, permissions)
         #[arg(long)]
         fix: bool,
-        /// Run specific categories: config,dirs,auth,shell,sessions,swarm,extensions
+        /// Run specific categories: config,dirs,auth,shell,sessions,swarm,extensions (swarm is opt-in)
         #[arg(long)]
         only: Option<String>,
     },
 
     /// Migrate session files from JSONL v1 to v2 segment format
+    /// Show provider usage/quota state (bd-cv653.7.4)
+    Usage {
+        /// Output format: text (default) or json
+        #[arg(long, default_value = "text", value_parser = ["text", "json"])]
+        format: String,
+        /// Force live reads (skip the 60s cache)
+        #[arg(long)]
+        refresh: bool,
+    },
+
+    /// Web remote access (not available yet: this build has no web remote server)
+    Web {
+        /// Port to bind web server (default: 8080)
+        #[arg(long, default_value_t = 8080)]
+        port: u16,
+        /// Network interface binding mode: loopback (default), tailscale, lan
+        #[arg(long, default_value = "loopback", value_parser = ["loopback", "tailscale", "lan"])]
+        bind: String,
+        /// Connect in view-only mode (disallows input from web clients)
+        #[arg(long)]
+        view_only: bool,
+        /// Maximum concurrent connected web viewers (default: 4)
+        #[arg(long, default_value_t = 4)]
+        max_viewers: usize,
+    },
+
+    /// Visual component gallery harness (bd-cv653.9.10)
+    Gallery {
+        /// Output format: text (default) or json
+        #[arg(long, default_value = "text", value_parser = ["text", "json"])]
+        format: String,
+    },
+
     Migrate {
         /// Path to specific session JSONL file (or directory to migrate all)
         path: String,
@@ -2127,6 +3478,75 @@ pub enum ValidationBrokerCommand {
     },
 }
 
+#[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
+pub enum RulesCommands {
+    /// List configured stream rules
+    List {
+        /// Show global rules in addition to project rules
+        #[arg(long)]
+        global: bool,
+    },
+    /// Add a new stream rule
+    Add {
+        /// Rule identifier (e.g. no-box-leak)
+        #[arg(short, long)]
+        id: String,
+        /// Rule display name
+        #[arg(short, long)]
+        name: String,
+        /// Matching regex pattern
+        #[arg(short, long)]
+        pattern: String,
+        /// Reminder directive body injected on match
+        #[arg(short, long)]
+        body: String,
+        /// Save to global settings (~/.pi/agent/stream-rules.json) instead of project
+        #[arg(long)]
+        global: bool,
+        /// Optional turn cooldown in turns
+        #[arg(long)]
+        cooldown: Option<usize>,
+    },
+    /// Remove a stream rule by ID
+    Remove {
+        /// Rule ID
+        id: String,
+    },
+    /// Test a regex pattern or existing rule against sample text
+    Test {
+        /// Regex pattern or rule ID
+        pattern: String,
+        /// Sample text to test against
+        sample: String,
+    },
+    /// Export stream rules as JSON
+    Export,
+    /// Import stream rules from JSON file or stdin
+    Import {
+        /// File path or "-" for stdin
+        path: String,
+        /// Import to global rules
+        #[arg(long)]
+        global: bool,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
+pub enum GrievancesCommands {
+    /// List recorded grievances
+    List,
+    /// Record a user complaint / grievance
+    Add {
+        /// Complaint description
+        complaint: String,
+    },
+    /// Forge a stream rule from a grievance
+    ForgeRule {
+        /// Grievance ID
+        id: String,
+    },
+}
+
 impl Cli {
     /// Get file arguments (prefixed with @)
     pub fn file_args(&self) -> Vec<&str> {
@@ -2146,18 +3566,58 @@ impl Cli {
             .collect()
     }
 
-    /// Get enabled tools as a list
-    pub fn enabled_tools(&self) -> Vec<&str> {
-        if self.no_tools {
-            vec![]
-        } else {
+    /// Whether the invocation explicitly disables all built-in tools.
+    ///
+    /// An explicit list containing only commas and whitespace is empty after
+    /// normalization, just like `--tools ""`. Host construction must use this
+    /// policy as well as selection so implicit built-ins cannot reappear.
+    #[must_use]
+    pub fn builtin_tools_disabled(&self) -> bool {
+        self.no_tools
+            || self
+                .tools
+                .as_deref()
+                .is_some_and(|tools| tools.split(',').all(|name| name.trim().is_empty()))
+    }
+
+    /// Resolve the enabled tool names from CLI selection and effective settings.
+    ///
+    /// Callers must supply configuration loaded with the workspace-trust
+    /// decision. An explicit `--tools` list (including an empty list or the
+    /// default list) is authoritative: configured opt-ins must not expand a
+    /// restricted SDK session or native child agent's tool access. Without an
+    /// explicit list, configured `loadMode: "off"` entries disable both default
+    /// tools and configured opt-ins before the registry is constructed.
+    pub fn enabled_tools(&self, config: &crate::config::Config) -> Vec<&str> {
+        if self.builtin_tools_disabled() {
+            return Vec::new();
+        }
+        if let Some(tools) = &self.tools {
             let mut seen = HashSet::new();
-            self.tools
+            return tools
                 .split(',')
                 .map(str::trim)
                 .filter(|name| !name.is_empty())
                 .filter(|name| seen.insert(*name))
-                .collect()
+                .collect();
         }
+
+        let mut enabled = crate::xdev::default_enabled_tools();
+        if let Some(settings) = &config.tools {
+            for (name, opt_in) in [
+                ("eval", settings.enable_eval),
+                ("github", settings.enable_github),
+                ("security_scan", settings.enable_security_scan),
+                ("subagent", settings.enable_subagent),
+            ] {
+                if opt_in == Some(true) && !enabled.contains(&name) {
+                    enabled.push(name);
+                }
+            }
+        }
+        enabled.retain(|name| {
+            crate::xdev::configured_tier(name, Some(config)) != Some(crate::xdev::LoadMode::Off)
+        });
+        enabled
     }
 }

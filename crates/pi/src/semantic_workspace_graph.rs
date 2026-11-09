@@ -7,25 +7,124 @@
 #![allow(clippy::missing_const_for_fn, clippy::too_many_lines)]
 
 use chrono::{DateTime, Duration, Utc};
-use serde::{Deserialize, Serialize};
+use serde::de::{MapAccess, SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
+use sha1::Sha1;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error as StdError;
-use std::fmt;
+use std::fmt::{self, Write as _};
 use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
+use std::process::Command;
 use std::time::UNIX_EPOCH;
 
 pub const SEMANTIC_WORKSPACE_GRAPH_SCHEMA: &str = "pi.semantic_workspace_graph.v1";
 pub const GRAPH_BUILDER_SCHEMA: &str = "pi.semantic_workspace_graph.builder_trace.v1";
 pub const SEMANTIC_CONTEXT_BUNDLE_SCHEMA: &str = "pi.semantic_context_bundle.v1";
 
-const DEFAULT_STALE_AFTER_DAYS: i64 = 90;
+const DEFAULT_STALE_AFTER_DAYS: i64 = 1;
+const RELEASE_FACING_EVIDENCE_STALE_AFTER_DAYS: i64 = 14;
 const DEFAULT_CACHE_TTL_SECONDS: u64 = 6 * 60 * 60;
 const DEFAULT_CONTEXT_CACHE_TTL_SECONDS: u64 = 15 * 60;
 const CONTEXT_PRIVACY_POLICY_VERSION: &str = "pi.context_privacy.v1";
+
+struct DuplicateRejectingJsonValue(Value);
+
+impl<'de> Deserialize<'de> for DuplicateRejectingJsonValue {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_any(DuplicateRejectingJsonVisitor)
+    }
+}
+
+struct DuplicateRejectingJsonVisitor;
+
+impl<'de> Visitor<'de> for DuplicateRejectingJsonVisitor {
+    type Value = DuplicateRejectingJsonValue;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a JSON value without duplicate object keys")
+    }
+
+    fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E> {
+        Ok(DuplicateRejectingJsonValue(Value::Bool(value)))
+    }
+
+    fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E> {
+        Ok(DuplicateRejectingJsonValue(Value::Number(value.into())))
+    }
+
+    fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
+        Ok(DuplicateRejectingJsonValue(Value::Number(value.into())))
+    }
+
+    fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        serde_json::Number::from_f64(value)
+            .map(Value::Number)
+            .map(DuplicateRejectingJsonValue)
+            .ok_or_else(|| E::custom("JSON number must be finite"))
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E> {
+        Ok(DuplicateRejectingJsonValue(Value::String(
+            value.to_string(),
+        )))
+    }
+
+    fn visit_string<E>(self, value: String) -> Result<Self::Value, E> {
+        Ok(DuplicateRejectingJsonValue(Value::String(value)))
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E> {
+        Ok(DuplicateRejectingJsonValue(Value::Null))
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(DuplicateRejectingJsonValue(Value::Null))
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut values = Vec::new();
+        while let Some(value) = sequence.next_element::<DuplicateRejectingJsonValue>()? {
+            values.push(value.0);
+        }
+        Ok(DuplicateRejectingJsonValue(Value::Array(values)))
+    }
+
+    fn visit_map<A>(self, mut entries: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut object = serde_json::Map::new();
+        while let Some(key) = entries.next_key::<String>()? {
+            let value = entries.next_value::<DuplicateRejectingJsonValue>()?;
+            if object.insert(key, value.0).is_some() {
+                return Err(<A::Error as serde::de::Error>::custom(
+                    "duplicate JSON object key",
+                ));
+            }
+        }
+        Ok(DuplicateRejectingJsonValue(Value::Object(object)))
+    }
+}
+
+pub(crate) fn parse_json_rejecting_duplicate_keys(content: &str) -> serde_json::Result<Value> {
+    let mut deserializer = serde_json::Deserializer::from_str(content);
+    let value = DuplicateRejectingJsonValue::deserialize(&mut deserializer)?.0;
+    deserializer.end()?;
+    Ok(value)
+}
 
 #[derive(Debug, Clone)]
 pub struct SemanticWorkspaceGraphBuilder {
@@ -252,21 +351,33 @@ impl SemanticWorkspaceGraphBuilder {
             cache_status,
         });
 
-        let content = String::from_utf8_lossy(&bytes);
         match input.surface {
             SourceSurface::RustCodeModules | SourceSurface::IntegrationAndContractTests => {
+                let content = String::from_utf8_lossy(&bytes);
                 Self::ingest_rust_file(input, &content, &content_sha256, size_bytes, state);
             }
             SourceSurface::ReadmeAndDocs => {
+                let content = String::from_utf8_lossy(&bytes);
                 Self::ingest_markdown_file(input, &content, &content_sha256, size_bytes, state);
             }
-            SourceSurface::EvidenceArtifacts => {
-                self.ingest_evidence_file(input, &content, &content_sha256, size_bytes, state);
-            }
+            SourceSurface::EvidenceArtifacts => match std::str::from_utf8(&bytes) {
+                Ok(content) => {
+                    self.ingest_evidence_file(input, content, &content_sha256, size_bytes, state);
+                }
+                Err(_) => Self::ingest_invalid_utf8_evidence_file(
+                    input,
+                    &bytes,
+                    &content_sha256,
+                    size_bytes,
+                    state,
+                ),
+            },
             SourceSurface::BeadsIssueGraph => {
+                let content = String::from_utf8_lossy(&bytes);
                 self.ingest_beads_jsonl(input, &content, &content_sha256, size_bytes, state);
             }
             SourceSurface::RuntimeArtifacts => {
+                let content = String::from_utf8_lossy(&bytes);
                 Self::ingest_runtime_artifact(input, &content, &content_sha256, size_bytes, state);
             }
             SourceSurface::Unknown => {}
@@ -467,14 +578,16 @@ impl SemanticWorkspaceGraphBuilder {
         let file_node_id = file_node.id.clone();
         state.push_node(file_node);
 
-        match serde_json::from_str::<Value>(content) {
+        match parse_json_rejecting_duplicate_keys(content) {
             Ok(value) => {
                 let redaction = assess_redaction(&input.source_path, content, Some(&value));
                 let mut evidence_node = evidence_artifact_node(
                     &input.source_path,
                     &value,
+                    content.as_bytes(),
                     content_sha256,
                     &self.options,
+                    &self.root,
                 );
                 apply_redaction_metadata(&mut evidence_node, &redaction);
                 state.push_edge(edge(
@@ -519,6 +632,57 @@ impl SemanticWorkspaceGraphBuilder {
                 ));
             }
         }
+    }
+
+    fn ingest_invalid_utf8_evidence_file(
+        input: &DiscoveredInput,
+        bytes: &[u8],
+        content_sha256: &str,
+        size_bytes: u64,
+        state: &mut GraphBuildState,
+    ) {
+        let line_count = if bytes.is_empty() {
+            0
+        } else {
+            bytes.split(|byte| *byte == b'\n').count()
+        };
+        let mut file_node = file_region_node(
+            &input.source_path,
+            content_sha256,
+            size_bytes,
+            1,
+            line_count,
+            input.surface.as_str(),
+        );
+        file_node.redaction_status = file_node
+            .redaction_status
+            .max(RedactionStatus::SensitiveOmitted);
+        let file_node_id = file_node.id.clone();
+        state.push_node(file_node);
+
+        let mut node = missing_or_unreadable_evidence_node(
+            &input.source_path,
+            EvidenceFreshnessStatus::Malformed,
+            "invalid_utf8",
+        );
+        node.content_sha256 = Some(content_sha256.to_string());
+        node.redaction_status = node.redaction_status.max(RedactionStatus::SensitiveOmitted);
+        state.push_edge(edge(
+            SemanticEdgeType::Tracks,
+            &file_node_id,
+            &node.id,
+            "invalid_utf8_evidence",
+        ));
+        state.register_evidence_node(&input.source_path, &node.id);
+        state.push_node(node);
+        state.push_trace(GraphBuildTraceEvent::new(
+            input.surface.as_str(),
+            input.source_path.clone(),
+            GraphInputStatus::Malformed,
+            "invalid_utf8",
+            1,
+            1,
+        ));
     }
 
     fn ingest_beads_jsonl(
@@ -1008,6 +1172,7 @@ impl<'a> SemanticContextBundlePlanner<'a> {
         let mut selected_items = Vec::new();
         let mut excluded_items = Vec::new();
         let mut stale_evidence_suppressions = Vec::new();
+        let mut stale_evidence_suppression_keys = BTreeSet::new();
         let mut suggested_validation_commands = BTreeSet::new();
         let mut estimated_bytes = 0_u64;
 
@@ -1020,7 +1185,10 @@ impl<'a> SemanticContextBundlePlanner<'a> {
                     suppression_reason
                 };
                 let exclusion = candidate.to_exclusion(exclusion_reason);
-                if suppression_reason == "suppressed_stale_or_unsafe_evidence" {
+                if suppression_reason == "suppressed_stale_or_unsafe_evidence"
+                    && stale_evidence_suppression_keys
+                        .insert((exclusion.source_path.clone(), exclusion.reason.clone()))
+                {
                     stale_evidence_suppressions.push(exclusion.clone());
                 }
                 excluded_items.push(exclusion);
@@ -1036,15 +1204,14 @@ impl<'a> SemanticContextBundlePlanner<'a> {
             }
 
             estimated_bytes = estimated_bytes.saturating_add(candidate.estimated_bytes);
-            if candidate.node.node_type == SemanticNodeType::ValidationCommand {
-                if let Some(command) = candidate
+            if candidate.node.node_type == SemanticNodeType::ValidationCommand
+                && let Some(command) = candidate
                     .node
                     .metadata
                     .get("command")
                     .and_then(Value::as_str)
-                {
-                    suggested_validation_commands.insert(command.to_string());
-                }
+            {
+                suggested_validation_commands.insert(command.to_string());
             }
             selected_items.push(candidate.to_item());
         }
@@ -1882,10 +2049,3191 @@ fn classify_in_progress_bead(
     }
 }
 
+const PERF_BUDGET_SUMMARY_SCHEMA: &str = "pi.perf.budget_summary.v2";
+const PERF_BUDGET_SUMMARY_PATH: &str = "tests/perf/reports/budget_summary.json";
+const DROPIN_CERTIFICATION_CONTRACT_PATH: &str =
+    "docs/contracts/dropin-certification-contract.json";
+const DROPIN_CERTIFICATION_CONTRACT_SCHEMA: &str = "pi.dropin.certification_contract.v1";
+const DROPIN_CERTIFICATION_VERDICT_PATH: &str = "docs/evidence/dropin-certification-verdict.json";
+const DROPIN_CERTIFICATION_VERDICT_SCHEMA: &str = "pi.dropin.certification_verdict.v1";
+const DROPIN_CERTIFICATION_LANE_PATH: &str = "tests/full_suite_gate/certification_verdict.json";
+const DROPIN_CERTIFICATION_LANE_SCHEMA: &str = "pi.ci.certification_lane.v1";
+const DROPIN_MAX_EVIDENCE_AGE_HOURS: i64 = 168;
+const DROPIN_CERTIFICATION_LANE_POLICY: &str = "Full certification: all blocking gates must pass for release. Waived gates are tracked but do not block. Expired waivers fail the waiver_lifecycle gate.";
+const DROPIN_LANE_TOP_LEVEL_FIELDS: &[&str] = &[
+    "schema",
+    "lane",
+    "generated_at",
+    "verdict",
+    "policy",
+    "gates",
+    "waiver_audit",
+    "waivers_applied",
+    "summary",
+    "promotion_rules",
+    "rerun_guidance",
+];
+#[derive(Clone, Copy)]
+struct DropinLaneGateIdentity {
+    id: &'static str,
+    name: &'static str,
+    bead: &'static str,
+    blocking: bool,
+    artifact_path: &'static str,
+    reproduce_command: Option<&'static str>,
+}
+
+const DROPIN_FULL_LANE_GATES: &[DropinLaneGateIdentity] = &[
+    DropinLaneGateIdentity {
+        id: "non_mock_unit",
+        name: "Non-mock unit compliance",
+        bead: "bd-1f42.2.6",
+        blocking: true,
+        artifact_path: "docs/non-mock-rubric.json",
+        reproduce_command: Some("cargo test --test non_mock_compliance_gate -- --nocapture"),
+    },
+    DropinLaneGateIdentity {
+        id: "e2e_log_contract",
+        name: "E2E log contract and transcripts",
+        bead: "bd-1f42.3.6",
+        blocking: false,
+        artifact_path: "tests/e2e_results",
+        reproduce_command: None,
+    },
+    DropinLaneGateIdentity {
+        id: "ext_must_pass",
+        name: "Extension must-pass gate",
+        bead: "bd-1f42.4.4",
+        blocking: true,
+        artifact_path: "tests/ext_conformance/reports/gate/must_pass_gate_verdict.json",
+        reproduce_command: Some(
+            "cargo test --test ext_conformance_generated --features ext-conformance -- conformance_must_pass_gate --nocapture --exact",
+        ),
+    },
+    DropinLaneGateIdentity {
+        id: "ext_provider_compat",
+        name: "Extension provider compatibility matrix",
+        bead: "bd-1f42.4.6",
+        blocking: false,
+        artifact_path: "tests/ext_conformance/reports/provider_compat/provider_compat_report.json",
+        reproduce_command: Some(
+            "cargo test --test ext_conformance_generated --features ext-conformance -- conformance_provider_compat_matrix --nocapture --exact",
+        ),
+    },
+    DropinLaneGateIdentity {
+        id: "evidence_bundle",
+        name: "Unified evidence bundle",
+        bead: "bd-1f42.6.8",
+        blocking: false,
+        artifact_path: "tests/evidence_bundle/index.json",
+        reproduce_command: Some(
+            "cargo test --test ci_evidence_bundle -- build_evidence_bundle --nocapture --exact",
+        ),
+    },
+    DropinLaneGateIdentity {
+        id: "cross_platform",
+        name: "Cross-platform matrix validation",
+        bead: "bd-1f42.6.7",
+        blocking: true,
+        artifact_path: "tests/cross_platform_reports/linux/platform_report.json",
+        reproduce_command: Some(
+            "cargo test --test ci_cross_platform_matrix -- cross_platform_matrix --nocapture --exact",
+        ),
+    },
+    DropinLaneGateIdentity {
+        id: "conformance_regression",
+        name: "Conformance regression gate",
+        bead: "bd-1f42.4",
+        blocking: true,
+        artifact_path: "tests/ext_conformance/reports/regression_verdict.json",
+        reproduce_command: Some("cargo test --test conformance_regression_gate -- --nocapture"),
+    },
+    DropinLaneGateIdentity {
+        id: "conformance_pass_rate",
+        name: "Conformance pass rate >= 80%",
+        bead: "bd-1f42.4",
+        blocking: true,
+        artifact_path: "tests/ext_conformance/reports/conformance_summary.json",
+        reproduce_command: Some("cargo test --test conformance_report -- --nocapture"),
+    },
+    DropinLaneGateIdentity {
+        id: "suite_classification",
+        name: "Suite classification guard",
+        bead: "bd-1f42.6.1",
+        blocking: true,
+        artifact_path: "tests/suite_classification.toml",
+        reproduce_command: None,
+    },
+    DropinLaneGateIdentity {
+        id: "traceability_matrix",
+        name: "Requirement traceability matrix",
+        bead: "bd-1f42.6.4",
+        blocking: false,
+        artifact_path: "docs/traceability_matrix.json",
+        reproduce_command: None,
+    },
+    DropinLaneGateIdentity {
+        id: "e2e_scenario_matrix",
+        name: "Canonical E2E scenario matrix",
+        bead: "bd-1f42.8.5.1",
+        blocking: false,
+        artifact_path: "docs/e2e_scenario_matrix.json",
+        reproduce_command: Some("python3 scripts/check_traceability_matrix.py"),
+    },
+    DropinLaneGateIdentity {
+        id: "provider_gap_matrix",
+        name: "Provider gap test matrix coverage",
+        bead: "bd-3uqg.11.11.5",
+        blocking: false,
+        artifact_path: "docs/provider-gaps-test-matrix.json",
+        reproduce_command: Some(
+            "cargo test --test provider_native_contract --test e2e_provider_scenarios -- --nocapture",
+        ),
+    },
+    DropinLaneGateIdentity {
+        id: "sec_conformance",
+        name: "SEC-6.4 security compatibility conformance",
+        bead: "bd-1a2cu",
+        blocking: true,
+        artifact_path: "tests/full_suite_gate/sec_conformance_verdict.json",
+        reproduce_command: Some("cargo test --test sec_compatibility_conformance -- --nocapture"),
+    },
+    DropinLaneGateIdentity {
+        id: "perf3x_bead_coverage",
+        name: "PERF-3X bead-to-artifact coverage audit",
+        bead: "bd-3ar8v.6.11",
+        blocking: true,
+        artifact_path: "tests/full_suite_gate/perf3x_bead_coverage_audit.json",
+        reproduce_command: Some(
+            "cargo test --test ci_full_suite_gate -- perf3x_bead_coverage_contract_is_well_formed --nocapture --exact",
+        ),
+    },
+    DropinLaneGateIdentity {
+        id: "practical_finish_checkpoint",
+        name: "Practical-finish checkpoint (docs-only residual filter)",
+        bead: "bd-3ar8v.6.9",
+        blocking: true,
+        artifact_path: "tests/full_suite_gate/practical_finish_checkpoint.json",
+        reproduce_command: Some(
+            "cargo test --test ci_full_suite_gate -- practical_finish_report_fails_when_technical_open_issues_remain --nocapture --exact",
+        ),
+    },
+    DropinLaneGateIdentity {
+        id: "extension_remediation_backlog",
+        name: "Extension remediation backlog artifact integrity",
+        bead: "bd-3ar8v.6.8",
+        blocking: true,
+        artifact_path: "tests/full_suite_gate/extension_remediation_backlog.json",
+        reproduce_command: Some(
+            "cargo test --test qa_certification_dossier -- certification_dossier --nocapture --exact",
+        ),
+    },
+    DropinLaneGateIdentity {
+        id: "opportunity_matrix_integrity",
+        name: "Opportunity matrix artifact integrity",
+        bead: "bd-3ar8v.6.1",
+        blocking: true,
+        artifact_path: "tests/perf/reports/opportunity_matrix.json",
+        reproduce_command: Some(
+            "cargo test --test release_evidence_gate -- phase1_weighted_attribution_contract_links_phase5_consumers --nocapture --exact",
+        ),
+    },
+    DropinLaneGateIdentity {
+        id: "parameter_sweeps_integrity",
+        name: "Parameter sweeps artifact integrity",
+        bead: "bd-3ar8v.6.2",
+        blocking: true,
+        artifact_path: "tests/perf/reports/parameter_sweeps.json",
+        reproduce_command: Some(
+            "cargo test --test release_evidence_gate -- parameter_sweeps_contract_links_phase1_matrix_and_readiness --nocapture --exact",
+        ),
+    },
+    DropinLaneGateIdentity {
+        id: "conformance_stress_lineage",
+        name: "Conformance+stress lineage coherence",
+        bead: "bd-3ar8v.6.3",
+        blocking: true,
+        artifact_path: "tests/ext_conformance/reports/conformance_summary.json",
+        reproduce_command: Some(
+            "cargo test --test ci_full_suite_gate -- conformance_stress_lineage_passes_with_valid_artifacts --nocapture --exact",
+        ),
+    },
+    DropinLaneGateIdentity {
+        id: "waiver_lifecycle",
+        name: "Waiver lifecycle compliance",
+        bead: "bd-1f42.8.8.1",
+        blocking: true,
+        artifact_path: "tests/full_suite_gate/waiver_audit.json",
+        reproduce_command: Some(
+            "cargo test --test ci_full_suite_gate -- waiver_lifecycle_audit --nocapture --exact",
+        ),
+    },
+];
+const DROPIN_VERDICT_REQUIRED_FIELDS: &[&str] = &[
+    "git_commit",
+    "generated_at_utc",
+    "overall_verdict",
+    "hard_gate_results",
+    "blocking_reasons",
+    "evidence_index",
+];
+/// The inventory hash the canonical budget producer must emit.
+///
+/// THE definition, not a copy. `tests/release_readiness.rs` and
+/// `tests/release_evidence_gate.rs` each carried their own identical literal,
+/// and three hand-maintained copies of one number is the shape of the problem
+/// they exist to catch: commit 0f44a3fb0 amended the `ext_cold_load_simple_p95`
+/// budget and updated all three, but not the checked-in artifact they are
+/// compared against, and the disagreement surfaced as 41 test failures across
+/// four binaries (bd-649i1). Reducing three to one does not fix that
+/// disagreement — the artifact still has to be regenerated by the producer, and
+/// that is an owner decision because it flips a CI-enforced budget from FAIL to
+/// PASS — but it removes the copies that could have drifted from each other on
+/// top of it.
+///
+/// Deliberately still a hand-written constant rather than derived from the
+/// budget table: the tripwire property is the point. A derived hash cannot
+/// disagree with the table, which also means it cannot notice someone editing
+/// the table carelessly.
+pub const PERF_CANONICAL_BUDGET_INVENTORY_SHA256: &str =
+    "85ea5705c7472c3e7b85b6e31552ee57f245406e5b8c636b6555f3bbda7f6cc6";
+const PERF_TOP_LEVEL_FIELDS: &[&str] = &[
+    "schema",
+    "generated_at",
+    "source_commit",
+    "run_id",
+    "correlation_id",
+    "strict_mode",
+    "total_budgets",
+    "ci_enforced",
+    "ci_with_data",
+    "ci_fail",
+    "ci_no_data",
+    "pass",
+    "fail",
+    "no_data",
+    "data_contract_failures_count",
+    "failing_data_contracts",
+    "budgets",
+    "budget_results",
+    "claim_readiness",
+];
+const PERF_BUDGET_FIELDS: &[&str] = &[
+    "name",
+    "category",
+    "metric",
+    "unit",
+    "threshold",
+    "comparison",
+    "methodology",
+    "ci_enforced",
+];
+const PERF_RESULT_REQUIRED_FIELDS: &[&str] = &[
+    "budget_name",
+    "category",
+    "threshold",
+    "comparison",
+    "unit",
+    "actual",
+    "status",
+    "source",
+    "ci_enforced",
+];
+const PERF_FAILURE_REQUIRED_FIELDS: &[&str] = &["contract_id", "detail", "remediation"];
+const PERF_CLAIM_READINESS_FIELDS: &[&str] = &[
+    "status",
+    "performance_claims_authorized",
+    "blocking_reason_codes",
+];
+
+#[derive(Debug)]
+struct ValidatedPerformanceBudgetClaim {
+    source_commit: Option<String>,
+    claim_ready: bool,
+}
+
+#[derive(Debug)]
+struct PerformanceBudgetDefinition {
+    category: String,
+    unit: String,
+    threshold: f64,
+    comparison: String,
+    ci_enforced: bool,
+}
+
+fn performance_exact_object<'a>(
+    value: &'a Value,
+    required: &[&str],
+    optional: &[&str],
+    label: &str,
+) -> Result<&'a serde_json::Map<String, Value>, String> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| format!("{label} must be an object"))?;
+    let missing = required
+        .iter()
+        .filter(|field| !object.contains_key(**field))
+        .copied()
+        .collect::<Vec<_>>();
+    let unexpected = object
+        .keys()
+        .filter(|field| !required.contains(&field.as_str()) && !optional.contains(&field.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    if missing.is_empty() && unexpected.is_empty() {
+        Ok(object)
+    } else {
+        Err(format!(
+            "{label} fields are not exact (missing={missing:?}, unexpected={unexpected:?})"
+        ))
+    }
+}
+
+fn performance_nonempty_string<'a>(value: &'a Value, label: &str) -> Result<&'a str, String> {
+    let raw = value
+        .as_str()
+        .ok_or_else(|| format!("{label} must be a string"))?;
+    if raw.is_empty() || raw.trim() != raw {
+        Err(format!(
+            "{label} must be non-empty and free of surrounding whitespace"
+        ))
+    } else {
+        Ok(raw)
+    }
+}
+
+fn performance_uint(value: &Value, label: &str) -> Result<u64, String> {
+    value
+        .as_u64()
+        .filter(|number| *number <= i64::MAX.unsigned_abs())
+        .ok_or_else(|| format!("{label} must be a non-negative signed 64-bit integer"))
+}
+
+fn performance_finite_number(value: &Value, label: &str, positive: bool) -> Result<f64, String> {
+    let number = value
+        .as_f64()
+        .filter(|number| number.is_finite())
+        .ok_or_else(|| format!("{label} must be a finite number"))?;
+    if positive && number <= 0.0 {
+        Err(format!("{label} must be a positive finite number"))
+    } else {
+        Ok(number)
+    }
+}
+
+fn performance_nullable_lineage(value: &Value, label: &str) -> Result<Option<String>, String> {
+    if value.is_null() {
+        return Ok(None);
+    }
+    let raw = performance_nonempty_string(value, label)?;
+    let mut chars = raw.chars();
+    let valid_start = chars.next().is_some_and(|ch| ch.is_ascii_alphanumeric());
+    let valid_rest =
+        chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | ':' | '/' | '-'));
+    if valid_start && valid_rest && raw.len() <= 256 {
+        Ok(Some(raw.to_string()))
+    } else {
+        Err(format!("{label} must be a canonical lineage identifier"))
+    }
+}
+
+fn performance_source_commit(value: &Value) -> Result<Option<String>, String> {
+    if value.is_null() {
+        return Ok(None);
+    }
+    let raw = performance_nonempty_string(value, "source_commit")?;
+    if matches!(raw.len(), 40 | 64)
+        && raw
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        Ok(Some(raw.to_string()))
+    } else {
+        Err("source_commit must be null or a canonical full lowercase Git object ID".to_string())
+    }
+}
+
+fn performance_generated_at(value: &Value) -> Result<DateTime<Utc>, String> {
+    let raw = performance_nonempty_string(value, "generated_at")?;
+    let bytes = raw.as_bytes();
+    let millisecond_utc_shape = bytes.len() == 24
+        && bytes[4] == b'-'
+        && bytes[7] == b'-'
+        && bytes[10] == b'T'
+        && bytes[13] == b':'
+        && bytes[16] == b':'
+        && bytes[19] == b'.'
+        && bytes[23] == b'Z'
+        && bytes.iter().enumerate().all(|(index, byte)| {
+            matches!(index, 4 | 7 | 10 | 13 | 16 | 19 | 23) || byte.is_ascii_digit()
+        });
+    if !millisecond_utc_shape {
+        return Err(
+            "generated_at must use canonical millisecond-precision UTC RFC3339".to_string(),
+        );
+    }
+    let parsed = DateTime::parse_from_rfc3339(raw)
+        .map_err(|error| format!("generated_at is not valid RFC3339: {error}"))?;
+    if parsed.offset().local_minus_utc() != 0
+        || parsed.to_rfc3339_opts(chrono::SecondsFormat::Millis, true) != raw
+    {
+        return Err(
+            "generated_at must use canonical millisecond-precision UTC RFC3339".to_string(),
+        );
+    }
+    Ok(parsed.with_timezone(&Utc))
+}
+
+fn performance_budget_inventory_sha256(budgets: &[Value]) -> Result<String, String> {
+    let mut canonical = String::from("[");
+    for (index, budget) in budgets.iter().enumerate() {
+        let label = format!("budgets[{index}]");
+        let object = budget
+            .as_object()
+            .ok_or_else(|| format!("{label} must be an object"))?;
+        if index != 0 {
+            canonical.push(',');
+        }
+        let name = serde_json::to_string(performance_nonempty_string(
+            &object["name"],
+            &format!("{label}.name"),
+        )?)
+        .map_err(|error| format!("failed to serialize {label}.name: {error}"))?;
+        let category = serde_json::to_string(performance_nonempty_string(
+            &object["category"],
+            &format!("{label}.category"),
+        )?)
+        .map_err(|error| format!("failed to serialize {label}.category: {error}"))?;
+        let metric = serde_json::to_string(performance_nonempty_string(
+            &object["metric"],
+            &format!("{label}.metric"),
+        )?)
+        .map_err(|error| format!("failed to serialize {label}.metric: {error}"))?;
+        let unit = serde_json::to_string(performance_nonempty_string(
+            &object["unit"],
+            &format!("{label}.unit"),
+        )?)
+        .map_err(|error| format!("failed to serialize {label}.unit: {error}"))?;
+        let threshold =
+            performance_finite_number(&object["threshold"], &format!("{label}.threshold"), true)?;
+        let rounded_threshold = (threshold * 1_000_000.0).round() / 1_000_000.0;
+        if threshold.total_cmp(&rounded_threshold).is_ne() {
+            return Err(format!(
+                "{label}.threshold exceeds canonical six-decimal precision"
+            ));
+        }
+        let comparison = serde_json::to_string(performance_nonempty_string(
+            &object["comparison"],
+            &format!("{label}.comparison"),
+        )?)
+        .map_err(|error| format!("failed to serialize {label}.comparison: {error}"))?;
+        let ci_enforced = object["ci_enforced"]
+            .as_bool()
+            .ok_or_else(|| format!("{label}.ci_enforced must be a boolean"))?;
+        let methodology = serde_json::to_string(performance_nonempty_string(
+            &object["methodology"],
+            &format!("{label}.methodology"),
+        )?)
+        .map_err(|error| format!("failed to serialize {label}.methodology: {error}"))?;
+        write!(
+            canonical,
+            "{{\"name\":{name},\"category\":{category},\"metric\":{metric},\"unit\":{unit},\"threshold\":{threshold:.6},\"comparison\":{comparison},\"ci_enforced\":{ci_enforced},\"methodology\":{methodology}}}"
+        )
+        .map_err(|error| format!("failed to serialize canonical budget inventory: {error}"))?;
+    }
+    canonical.push(']');
+    Ok(crate::package_manager::hex_encode(&Sha256::digest(
+        canonical.as_bytes(),
+    )))
+}
+
+fn validate_performance_budget_contract(
+    value: &Value,
+) -> Result<ValidatedPerformanceBudgetClaim, String> {
+    // `git_commit` is the harness's source-binding provenance (2026-08 rebind
+    // work); the Python checker treats it the same way. Every other unknown
+    // field still fails closed.
+    let top = performance_exact_object(
+        value,
+        PERF_TOP_LEVEL_FIELDS,
+        &["git_commit"],
+        "performance summary",
+    )?;
+    if top.get("schema").and_then(Value::as_str) != Some(PERF_BUDGET_SUMMARY_SCHEMA) {
+        return Err(format!(
+            "schema must be {PERF_BUDGET_SUMMARY_SCHEMA}, found {:?}",
+            top.get("schema")
+        ));
+    }
+    performance_generated_at(&top["generated_at"])?;
+    let source_commit = performance_source_commit(&top["source_commit"])?;
+    let run_id = performance_nullable_lineage(&top["run_id"], "run_id")?;
+    let correlation_id = performance_nullable_lineage(&top["correlation_id"], "correlation_id")?;
+    if run_id != correlation_id {
+        return Err("run_id and correlation_id must both be null or match".to_string());
+    }
+    let strict_mode = top["strict_mode"]
+        .as_bool()
+        .ok_or_else(|| "strict_mode must be a boolean".to_string())?;
+
+    let count_names = [
+        "total_budgets",
+        "ci_enforced",
+        "ci_with_data",
+        "ci_fail",
+        "ci_no_data",
+        "pass",
+        "fail",
+        "no_data",
+        "data_contract_failures_count",
+    ];
+    let mut counts = BTreeMap::new();
+    for name in count_names {
+        counts.insert(name, performance_uint(&top[name], name)?);
+    }
+
+    let budgets = top["budgets"]
+        .as_array()
+        .filter(|entries| !entries.is_empty())
+        .ok_or_else(|| "budgets must be a non-empty array".to_string())?;
+    let results = top["budget_results"]
+        .as_array()
+        .filter(|entries| !entries.is_empty())
+        .ok_or_else(|| "budget_results must be a non-empty array".to_string())?;
+    let failures = top["failing_data_contracts"]
+        .as_array()
+        .ok_or_else(|| "failing_data_contracts must be an array".to_string())?;
+
+    let mut definitions = BTreeMap::new();
+    let mut definition_order = Vec::with_capacity(budgets.len());
+    for (index, budget) in budgets.iter().enumerate() {
+        let label = format!("budgets[{index}]");
+        let object = performance_exact_object(budget, PERF_BUDGET_FIELDS, &[], &label)?;
+        let name = performance_nonempty_string(&object["name"], &format!("{label}.name"))?;
+        for field in ["category", "metric", "unit", "methodology"] {
+            performance_nonempty_string(&object[field], &format!("{label}.{field}"))?;
+        }
+        let comparison = match performance_nonempty_string(
+            &object["comparison"],
+            &format!("{label}.comparison"),
+        )? {
+            comparison @ ("maximum" | "minimum") => comparison,
+            comparison => {
+                return Err(format!(
+                    "{label}.comparison has unsupported value {comparison:?}"
+                ));
+            }
+        };
+        let definition = PerformanceBudgetDefinition {
+            category: performance_nonempty_string(
+                &object["category"],
+                &format!("{label}.category"),
+            )?
+            .to_string(),
+            unit: performance_nonempty_string(&object["unit"], &format!("{label}.unit"))?
+                .to_string(),
+            threshold: performance_finite_number(
+                &object["threshold"],
+                &format!("{label}.threshold"),
+                true,
+            )?,
+            comparison: comparison.to_string(),
+            ci_enforced: object["ci_enforced"]
+                .as_bool()
+                .ok_or_else(|| format!("{label}.ci_enforced must be a boolean"))?,
+        };
+        if definitions.insert(name.to_string(), definition).is_some() {
+            return Err(format!("duplicate budget name: {name}"));
+        }
+        definition_order.push(name.to_string());
+    }
+    let inventory_sha256 = performance_budget_inventory_sha256(budgets)?;
+    if inventory_sha256 != PERF_CANONICAL_BUDGET_INVENTORY_SHA256 {
+        return Err(format!(
+            "budget inventory does not match the canonical producer contract (observed_sha256={inventory_sha256}, expected_sha256={PERF_CANONICAL_BUDGET_INVENTORY_SHA256})"
+        ));
+    }
+
+    let mut result_names = BTreeSet::new();
+    let mut result_order = Vec::with_capacity(results.len());
+    let mut pass_count = 0usize;
+    let mut fail_count = 0usize;
+    let mut no_data_count = 0usize;
+    let mut ci_with_data = 0usize;
+    let mut ci_fail = 0usize;
+    let mut ci_no_data = 0usize;
+    for (index, result) in results.iter().enumerate() {
+        let label = format!("budget_results[{index}]");
+        let object = performance_exact_object(
+            result,
+            PERF_RESULT_REQUIRED_FIELDS,
+            &["failure_reason"],
+            &label,
+        )?;
+        let name =
+            performance_nonempty_string(&object["budget_name"], &format!("{label}.budget_name"))?;
+        if !result_names.insert(name.to_string()) {
+            return Err(format!("duplicate budget result: {name}"));
+        }
+        result_order.push(name.to_string());
+        let definition = definitions
+            .get(name)
+            .ok_or_else(|| format!("budget result has no matching definition: {name}"))?;
+        let category =
+            performance_nonempty_string(&object["category"], &format!("{label}.category"))?;
+        let unit = performance_nonempty_string(&object["unit"], &format!("{label}.unit"))?;
+        let comparison =
+            performance_nonempty_string(&object["comparison"], &format!("{label}.comparison"))?;
+        let threshold =
+            performance_finite_number(&object["threshold"], &format!("{label}.threshold"), true)?;
+        let ci_enforced = object["ci_enforced"]
+            .as_bool()
+            .ok_or_else(|| format!("{label}.ci_enforced must be a boolean"))?;
+        if category != definition.category
+            || unit != definition.unit
+            || comparison != definition.comparison
+            || threshold.total_cmp(&definition.threshold).is_ne()
+            || ci_enforced != definition.ci_enforced
+        {
+            return Err(format!(
+                "budget result {name} does not match its category/unit/threshold/CI definition"
+            ));
+        }
+        performance_nonempty_string(&object["source"], &format!("{label}.source"))?;
+
+        let status = object["status"]
+            .as_str()
+            .ok_or_else(|| format!("{label}.status must be a string"))?;
+        if !matches!(status, "PASS" | "FAIL" | "NO_DATA") {
+            return Err(format!(
+                "budget result {name} has unsupported status: {status}"
+            ));
+        }
+        let failure_reason = object.get("failure_reason");
+        if let Some(reason) = failure_reason {
+            performance_nonempty_string(reason, &format!("{label}.failure_reason"))?;
+        }
+        if object["actual"].is_null() {
+            if strict_mode && definition.ci_enforced {
+                if status != "FAIL"
+                    || failure_reason.and_then(Value::as_str) != Some("missing_measurement_data")
+                {
+                    return Err(format!(
+                        "strict CI budget {name} without data must be FAIL with failure_reason=missing_measurement_data"
+                    ));
+                }
+            } else if status != "NO_DATA" || failure_reason.is_some() {
+                return Err(format!(
+                    "budget {name} without data must be NO_DATA without a failure reason"
+                ));
+            }
+        } else {
+            let actual =
+                performance_finite_number(&object["actual"], &format!("{label}.actual"), false)?;
+            if actual < 0.0 {
+                return Err(format!("{label}.actual must be non-negative"));
+            }
+            let passes = if definition.comparison == "minimum" {
+                actual >= threshold
+            } else {
+                actual <= threshold
+            };
+            let expected_status = if passes { "PASS" } else { "FAIL" };
+            if status != expected_status || failure_reason.is_some() {
+                return Err(format!(
+                    "budget result {name} is inconsistent with actual={actual}, threshold={threshold}, and expected status={expected_status}"
+                ));
+            }
+        }
+
+        match status {
+            "PASS" => pass_count += 1,
+            "FAIL" => fail_count += 1,
+            "NO_DATA" => no_data_count += 1,
+            _ => unreachable!("performance status validated above"),
+        }
+        if definition.ci_enforced {
+            ci_with_data += usize::from(!object["actual"].is_null());
+            ci_fail += usize::from(status == "FAIL");
+            ci_no_data += usize::from(status == "NO_DATA");
+        }
+    }
+    let definition_names = definitions.keys().cloned().collect::<BTreeSet<_>>();
+    if result_names != definition_names || result_order != definition_order {
+        return Err(
+            "budget_results must match canonical budget declaration order and membership"
+                .to_string(),
+        );
+    }
+
+    let mut failure_fingerprints = BTreeSet::new();
+    for (index, failure) in failures.iter().enumerate() {
+        let label = format!("failing_data_contracts[{index}]");
+        let object = performance_exact_object(
+            failure,
+            PERF_FAILURE_REQUIRED_FIELDS,
+            &["budget_name"],
+            &label,
+        )?;
+        let contract_id =
+            performance_nonempty_string(&object["contract_id"], &format!("{label}.contract_id"))?;
+        let detail = performance_nonempty_string(&object["detail"], &format!("{label}.detail"))?;
+        let remediation =
+            performance_nonempty_string(&object["remediation"], &format!("{label}.remediation"))?;
+        let budget_name = match object.get("budget_name") {
+            None | Some(Value::Null) => None,
+            Some(value) => {
+                let name = performance_nonempty_string(value, &format!("{label}.budget_name"))?;
+                if !definitions.contains_key(name) {
+                    return Err(format!(
+                        "data-contract failure references unknown budget: {name}"
+                    ));
+                }
+                Some(name.to_string())
+            }
+        };
+        if !failure_fingerprints.insert((
+            contract_id.to_string(),
+            detail.to_string(),
+            remediation.to_string(),
+            budget_name,
+        )) {
+            return Err(format!("duplicate data-contract failure at index {index}"));
+        }
+    }
+
+    let ci_enforced_count = definitions
+        .values()
+        .filter(|definition| definition.ci_enforced)
+        .count();
+    let derived_counts = [
+        ("total_budgets", budgets.len()),
+        ("ci_enforced", ci_enforced_count),
+        ("ci_with_data", ci_with_data),
+        ("ci_fail", ci_fail),
+        ("ci_no_data", ci_no_data),
+        ("pass", pass_count),
+        ("fail", fail_count),
+        ("no_data", no_data_count),
+        ("data_contract_failures_count", failures.len()),
+    ];
+    for (name, expected) in derived_counts {
+        let expected = u64::try_from(expected)
+            .map_err(|_| format!("derived {name} exceeds the supported count range"))?;
+        if counts[name] != expected {
+            return Err(format!(
+                "{name}={} is inconsistent with derived value {expected}",
+                counts[name]
+            ));
+        }
+    }
+    if counts["pass"]
+        .checked_add(counts["fail"])
+        .and_then(|count| count.checked_add(counts["no_data"]))
+        != Some(counts["total_budgets"])
+    {
+        return Err("pass + fail + no_data must equal total_budgets".to_string());
+    }
+
+    let claim = performance_exact_object(
+        &top["claim_readiness"],
+        PERF_CLAIM_READINESS_FIELDS,
+        &[],
+        "claim_readiness",
+    )?;
+    let reasons = claim["blocking_reason_codes"]
+        .as_array()
+        .ok_or_else(|| "claim_readiness.blocking_reason_codes must be an array".to_string())?;
+    let reported_reasons = reasons
+        .iter()
+        .enumerate()
+        .map(|(index, reason)| {
+            performance_nonempty_string(
+                reason,
+                &format!("claim_readiness.blocking_reason_codes[{index}]"),
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if !reported_reasons.windows(2).all(|pair| pair[0] < pair[1]) {
+        return Err(
+            "claim_readiness.blocking_reason_codes must be sorted and duplicate-free".to_string(),
+        );
+    }
+
+    let mut expected_reasons = BTreeSet::new();
+    if counts["no_data"] != 0 {
+        expected_reasons.insert("budget_data_missing");
+    }
+    if counts["fail"] != 0 {
+        expected_reasons.insert("budget_failed");
+    }
+    if counts["ci_with_data"] != counts["ci_enforced"] || counts["ci_no_data"] != 0 {
+        expected_reasons.insert("ci_budget_data_missing");
+    }
+    if counts["ci_fail"] != 0 {
+        expected_reasons.insert("ci_budget_failed");
+    }
+    if correlation_id.is_none() {
+        expected_reasons.insert("correlation_id_missing");
+    }
+    if counts["data_contract_failures_count"] != 0 {
+        expected_reasons.insert("data_contract_failure");
+    }
+    if run_id.is_none() {
+        expected_reasons.insert("run_id_missing");
+    }
+    if source_commit.is_none() {
+        expected_reasons.insert("source_commit_unbound");
+    }
+    if !strict_mode {
+        expected_reasons.insert("strict_mode_disabled");
+    }
+    let expected_reasons = expected_reasons.into_iter().collect::<Vec<_>>();
+    if reported_reasons != expected_reasons {
+        return Err(format!(
+            "claim_readiness blockers disagree with derived blockers (reported={reported_reasons:?}, expected={expected_reasons:?})"
+        ));
+    }
+    let claim_ready = expected_reasons.is_empty();
+    let expected_status = if claim_ready {
+        "claim_ready"
+    } else {
+        "blocked"
+    };
+    if claim["status"].as_str() != Some(expected_status)
+        || claim["performance_claims_authorized"].as_bool() != Some(claim_ready)
+    {
+        return Err(
+            "claim_readiness status or authorization contradicts derived blockers".to_string(),
+        );
+    }
+
+    Ok(ValidatedPerformanceBudgetClaim {
+        source_commit,
+        claim_ready,
+    })
+}
+
+fn classify_performance_budget_claim(
+    value: &Value,
+    options: &SemanticWorkspaceGraphBuildOptions,
+    repository_root: Option<&Path>,
+    artifact_source_path: Option<&str>,
+    captured_artifact_bytes: Option<&[u8]>,
+    canonical_path: bool,
+) -> Option<(EvidenceFreshnessStatus, bool, String)> {
+    let schema = value.get("schema").and_then(Value::as_str);
+    if schema == Some("pi.perf.budget_summary.v1") {
+        return Some((
+            EvidenceFreshnessStatus::Malformed,
+            false,
+            "performance_budget_schema_not_current".to_string(),
+        ));
+    }
+    if schema != Some(PERF_BUDGET_SUMMARY_SCHEMA) {
+        return canonical_path.then(|| {
+            (
+                EvidenceFreshnessStatus::Malformed,
+                false,
+                "performance_budget_schema_not_current".to_string(),
+            )
+        });
+    }
+
+    let Some(Ok(generated_at)) = value.get("generated_at").map(performance_generated_at) else {
+        return Some((
+            EvidenceFreshnessStatus::Malformed,
+            false,
+            "performance_budget_claim_readiness_malformed".to_string(),
+        ));
+    };
+    if options.reference_time_utc.is_some_and(|reference| {
+        generated_at.signed_duration_since(reference) > Duration::minutes(5)
+    }) {
+        return Some((
+            EvidenceFreshnessStatus::Malformed,
+            false,
+            "performance_budget_generated_at_in_future".to_string(),
+        ));
+    }
+
+    let Ok(validated) = validate_performance_budget_contract(value) else {
+        return Some((
+            EvidenceFreshnessStatus::Malformed,
+            false,
+            "performance_budget_claim_readiness_malformed".to_string(),
+        ));
+    };
+    if options.reference_time_utc.is_some_and(|reference_time| {
+        evidence_age_exceeds_policy(
+            value,
+            options,
+            artifact_source_path,
+            generated_at,
+            reference_time,
+        )
+    }) {
+        return Some((
+            EvidenceFreshnessStatus::Stale,
+            false,
+            "generated_at_older_than_policy".to_string(),
+        ));
+    }
+    if !validated.claim_ready {
+        return Some((
+            EvidenceFreshnessStatus::Uncertified,
+            false,
+            "performance_claims_not_authorized".to_string(),
+        ));
+    }
+    let Some(source_commit) = validated.source_commit.as_deref() else {
+        return Some((
+            EvidenceFreshnessStatus::Malformed,
+            false,
+            "performance_budget_claim_readiness_malformed".to_string(),
+        ));
+    };
+    match performance_source_binding_failure(
+        repository_root,
+        artifact_source_path,
+        source_commit,
+        captured_artifact_bytes,
+    ) {
+        None => None,
+        Some(PerformanceSourceBindingFailure::Unavailable) => Some((
+            EvidenceFreshnessStatus::Uncertified,
+            false,
+            "performance_budget_source_binding_unavailable".to_string(),
+        )),
+        Some(PerformanceSourceBindingFailure::Invalid(reason)) => Some((
+            EvidenceFreshnessStatus::Malformed,
+            false,
+            reason.to_string(),
+        )),
+    }
+}
+
+fn evidence_age_exceeds_policy(
+    value: &Value,
+    options: &SemanticWorkspaceGraphBuildOptions,
+    artifact_source_path: Option<&str>,
+    generated_at: DateTime<Utc>,
+    reference_time: DateTime<Utc>,
+) -> bool {
+    let evidence_age = reference_time.signed_duration_since(generated_at);
+    if matches!(
+        artifact_source_path,
+        Some(DROPIN_CERTIFICATION_VERDICT_PATH | PERF_BUDGET_SUMMARY_PATH)
+    ) {
+        evidence_age > Duration::hours(DROPIN_MAX_EVIDENCE_AGE_HOURS)
+    } else if value.get("claim_surface").and_then(Value::as_str) == Some("release_facing") {
+        evidence_age > Duration::days(RELEASE_FACING_EVIDENCE_STALE_AFTER_DAYS)
+    } else {
+        Duration::try_days(options.stale_after_days)
+            .is_none_or(|stale_after| evidence_age > stale_after)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum PerformanceSourceBindingFailure {
+    Unavailable,
+    Invalid(&'static str),
+}
+
+#[derive(Debug)]
+struct RepositoryGitContext {
+    worktree: PathBuf,
+    git_dir: PathBuf,
+    git_executable: PathBuf,
+}
+
+#[cfg(unix)]
+fn trusted_git_executable() -> Option<PathBuf> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    let mut candidates = vec![
+        PathBuf::from("/usr/bin/git"),
+        PathBuf::from("/usr/local/bin/git"),
+    ];
+    if let Some(path) = std::env::var_os("PATH") {
+        candidates.extend(
+            std::env::split_paths(&path)
+                .filter(|directory| directory.is_absolute())
+                .map(|directory| directory.join("git")),
+        );
+    }
+
+    let mut seen = BTreeSet::new();
+    for candidate in candidates {
+        let Ok(canonical) = fs::canonicalize(candidate) else {
+            continue;
+        };
+        if !seen.insert(canonical.clone()) {
+            continue;
+        }
+        let Ok(metadata) = fs::symlink_metadata(&canonical) else {
+            continue;
+        };
+        if !metadata.is_file()
+            || metadata.file_type().is_symlink()
+            || metadata.uid() != 0
+            || metadata.permissions().mode() & 0o111 == 0
+            || metadata.permissions().mode() & 0o022 != 0
+        {
+            continue;
+        }
+        let trusted_ancestors = canonical.ancestors().skip(1).all(|ancestor| {
+            fs::symlink_metadata(ancestor).is_ok_and(|ancestor_metadata| {
+                ancestor_metadata.is_dir()
+                    && !ancestor_metadata.file_type().is_symlink()
+                    && ancestor_metadata.uid() == 0
+                    && ancestor_metadata.permissions().mode() & 0o022 == 0
+            })
+        });
+        if trusted_ancestors {
+            return Some(canonical);
+        }
+    }
+    None
+}
+
+#[cfg(windows)]
+fn trusted_git_executable() -> Option<PathBuf> {
+    [
+        r"C:\Program Files\Git\cmd\git.exe",
+        r"C:\Program Files\Git\bin\git.exe",
+    ]
+    .into_iter()
+    .find_map(|candidate| {
+        let canonical = fs::canonicalize(candidate).ok()?;
+        let metadata = fs::symlink_metadata(&canonical).ok()?;
+        (metadata.is_file() && !metadata.file_type().is_symlink()).then_some(canonical)
+    })
+}
+
+#[cfg(not(any(unix, windows)))]
+fn trusted_git_executable() -> Option<PathBuf> {
+    None
+}
+
+fn canonical_real_directory(path: &Path) -> Option<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().ok()?.join(path)
+    };
+    let mut lexical = PathBuf::new();
+    let mut pending = std::collections::VecDeque::new();
+    for component in absolute.components() {
+        match component {
+            Component::Prefix(prefix) => lexical.push(prefix.as_os_str()),
+            Component::RootDir => lexical.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => pending.push_back(std::ffi::OsString::from("..")),
+            Component::Normal(segment) => pending.push_back(segment.to_os_string()),
+        }
+    }
+    // Bounded trusted-symlink expansion, in the spirit of SYMLOOP_MAX.
+    let mut symlink_budget: u8 = 8;
+    while let Some(segment) = pending.pop_front() {
+        if segment == ".." {
+            // An absolute filesystem root is its own parent.
+            lexical.pop();
+            continue;
+        }
+        lexical.push(&segment);
+        let metadata = fs::symlink_metadata(&lexical).ok()?;
+        if metadata.file_type().is_symlink() {
+            // A symlink ancestor stays fail-closed against planting, except
+            // trusted system symlinks such as macOS `/var -> private/var`:
+            // root-owned while this process is not root, with a target that
+            // never climbs upward. Expand those lexically and keep walking.
+            let (components, absolute_target) = trusted_symlink_ancestor_target(&lexical)?;
+            symlink_budget = symlink_budget.checked_sub(1)?;
+            for part in components.into_iter().rev() {
+                pending.push_front(part);
+            }
+            lexical.pop();
+            if absolute_target {
+                lexical = PathBuf::from("/");
+            }
+            continue;
+        }
+        if !metadata.is_dir() {
+            return None;
+        }
+    }
+    fs::canonicalize(lexical).ok()
+}
+
+/// Path-based analogue of `crate::platform::read_trusted_symlink_component`
+/// for the lexical directory walk above: expand a root-owned symlink (while
+/// this process is not root) into its target components, refusing targets
+/// with parent or prefix components.
+#[cfg(unix)]
+fn trusted_symlink_ancestor_target(link: &Path) -> Option<(Vec<std::ffi::OsString>, bool)> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let metadata = fs::symlink_metadata(link).ok()?;
+    if !metadata.file_type().is_symlink()
+        || metadata.uid() != 0
+        || rustix::process::geteuid().is_root()
+    {
+        return None;
+    }
+    let target = fs::read_link(link).ok()?;
+    let absolute = target.is_absolute();
+    let mut components = Vec::new();
+    for component in target.components() {
+        match component {
+            Component::RootDir | Component::CurDir => {}
+            Component::Normal(part) => components.push(part.to_os_string()),
+            // A trusted symlink that climbs upward is outside this narrow
+            // allowance; keep the strict fail-closed behavior for it.
+            Component::ParentDir | Component::Prefix(_) => return None,
+        }
+    }
+    Some((components, absolute))
+}
+
+#[cfg(not(unix))]
+fn trusted_symlink_ancestor_target(_link: &Path) -> Option<(Vec<std::ffi::OsString>, bool)> {
+    None
+}
+
+fn repository_git_context(repository_root: &Path) -> Option<RepositoryGitContext> {
+    let worktree = canonical_real_directory(repository_root)?;
+    let git_executable = trusted_git_executable()?;
+    let git_marker = worktree.join(".git");
+    let marker_metadata = fs::symlink_metadata(&git_marker).ok()?;
+    if marker_metadata.file_type().is_symlink() {
+        return None;
+    }
+    let git_dir = if marker_metadata.is_dir() {
+        fs::canonicalize(&git_marker).ok()?
+    } else if marker_metadata.is_file() {
+        let marker = fs::read_to_string(&git_marker).ok()?;
+        let target = marker
+            .trim_end_matches(['\r', '\n'])
+            .strip_prefix("gitdir: ")?;
+        if target.is_empty() || target.contains('\0') || target.lines().count() != 1 {
+            return None;
+        }
+        let target = Path::new(target);
+        let candidate = if target.is_absolute() {
+            target.to_path_buf()
+        } else {
+            worktree.join(target)
+        };
+        let candidate_metadata = fs::symlink_metadata(&candidate).ok()?;
+        if candidate_metadata.file_type().is_symlink() || !candidate_metadata.is_dir() {
+            return None;
+        }
+        fs::canonicalize(candidate).ok()?
+    } else {
+        return None;
+    };
+    let git_dir_metadata = fs::symlink_metadata(&git_dir).ok()?;
+    let head_metadata = fs::symlink_metadata(git_dir.join("HEAD")).ok()?;
+    (git_dir_metadata.is_dir()
+        && !git_dir_metadata.file_type().is_symlink()
+        && head_metadata.is_file()
+        && !head_metadata.file_type().is_symlink())
+    .then_some(RepositoryGitContext {
+        worktree,
+        git_dir,
+        git_executable,
+    })
+}
+
+fn repository_git_command(context: &RepositoryGitContext) -> Command {
+    let mut command = Command::new(&context.git_executable);
+    command
+        .arg("--git-dir")
+        .arg(&context.git_dir)
+        .arg("--work-tree")
+        .arg(&context.worktree)
+        .args(["-c", "core.bare=false", "-c", "core.fsmonitor=false"])
+        .arg("-c")
+        .arg(format!("core.worktree={}", context.worktree.display()));
+    for (variable, _) in std::env::vars_os() {
+        if variable
+            .to_string_lossy()
+            .as_bytes()
+            .get(..4)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"GIT_"))
+        {
+            command.env_remove(variable);
+        }
+    }
+    command.env("GIT_LITERAL_PATHSPECS", "1");
+    command.env("GIT_NO_REPLACE_OBJECTS", "1");
+    command.env(
+        "GIT_CONFIG_GLOBAL",
+        if cfg!(windows) { "NUL" } else { "/dev/null" },
+    );
+    command.env("GIT_CONFIG_NOSYSTEM", "1");
+    command.env("GIT_OPTIONAL_LOCKS", "0");
+    command.env("GIT_TERMINAL_PROMPT", "0");
+    command
+}
+
+fn git_output(context: &RepositoryGitContext, args: &[&str]) -> Option<Vec<u8>> {
+    let output = repository_git_command(context).args(args).output().ok()?;
+    output.status.success().then_some(output.stdout)
+}
+
+fn git_stdout(context: &RepositoryGitContext, args: &[&str]) -> Option<String> {
+    String::from_utf8(git_output(context, args)?)
+        .ok()
+        .map(|stdout| stdout.trim().to_string())
+}
+
+type GitRecordFields<'a> = (&'a [u8], &'a [u8], &'a [u8], &'a [u8]);
+
+fn parse_canonical_git_record(record: &[u8]) -> Option<GitRecordFields<'_>> {
+    let tab = record.iter().position(|byte| *byte == b'\t')?;
+    let path = &record[tab + 1..];
+    if path.is_empty() {
+        return None;
+    }
+    let mut fields = record[..tab].split(|byte| *byte == b' ');
+    let first = fields.next().filter(|field| !field.is_empty())?;
+    let second = fields.next().filter(|field| !field.is_empty())?;
+    let third = fields.next().filter(|field| !field.is_empty())?;
+    fields
+        .next()
+        .is_none()
+        .then_some((first, second, third, path))
+}
+
+fn canonical_nul_records(output: &[u8]) -> Option<Vec<&[u8]>> {
+    if output.is_empty() {
+        return Some(Vec::new());
+    }
+    let body = output.strip_suffix(&[0])?;
+    if body.is_empty() {
+        return None;
+    }
+    let records = body.split(|byte| *byte == 0).collect::<Vec<_>>();
+    records
+        .iter()
+        .all(|record| !record.is_empty())
+        .then_some(records)
+}
+
+#[cfg(unix)]
+fn git_path_from_bytes(path: &[u8]) -> PathBuf {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt as _;
+
+    PathBuf::from(OsStr::from_bytes(path))
+}
+
+#[cfg(not(unix))]
+fn git_path_from_bytes(path: &[u8]) -> Option<PathBuf> {
+    std::str::from_utf8(path).ok().map(PathBuf::from)
+}
+
+#[cfg(unix)]
+fn symlink_target_bytes(path: &Path) -> Option<Vec<u8>> {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    fs::read_link(path)
+        .ok()
+        .map(|target| target.as_os_str().as_bytes().to_vec())
+}
+
+#[cfg(not(unix))]
+fn symlink_target_bytes(path: &Path) -> Option<Vec<u8>> {
+    fs::read_link(path)
+        .ok()?
+        .to_str()
+        .map(|target| target.as_bytes().to_vec())
+}
+
+fn git_blob_oid(object_format: &str, bytes: &[u8]) -> Option<String> {
+    let header = format!("blob {}\0", bytes.len());
+    match object_format {
+        "sha1" => {
+            let mut hasher = Sha1::new();
+            hasher.update(header.as_bytes());
+            hasher.update(bytes);
+            Some(crate::package_manager::hex_encode(&hasher.finalize()))
+        }
+        "sha256" => {
+            let mut hasher = Sha256::new();
+            hasher.update(header.as_bytes());
+            hasher.update(bytes);
+            Some(crate::package_manager::hex_encode(&hasher.finalize()))
+        }
+        _ => None,
+    }
+}
+
+fn tracked_worktree_blob(root: &Path, relative: &Path, expected_mode: &[u8]) -> Option<Vec<u8>> {
+    if relative.is_absolute()
+        || !relative
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
+    {
+        return None;
+    }
+    let components = relative.components().collect::<Vec<_>>();
+    let mut path = root.to_path_buf();
+    for (index, component) in components.iter().enumerate() {
+        let Component::Normal(name) = component else {
+            return None;
+        };
+        path.push(name);
+        let metadata = fs::symlink_metadata(&path).ok()?;
+        if index + 1 != components.len() {
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return None;
+            }
+            continue;
+        }
+        return match expected_mode {
+            b"120000" if metadata.file_type().is_symlink() => symlink_target_bytes(&path),
+            b"100644" | b"100755" if metadata.is_file() && !metadata.file_type().is_symlink() => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt as _;
+
+                    let executable = metadata.permissions().mode() & 0o111 != 0;
+                    if executable != (expected_mode == b"100755") {
+                        return None;
+                    }
+                }
+                fs::read(&path).ok()
+            }
+            _ => None,
+        };
+    }
+    None
+}
+
+fn performance_tracked_head_state_failure(
+    context: &RepositoryGitContext,
+    expected_head: &str,
+) -> Option<PerformanceSourceBindingFailure> {
+    let Some(object_format) = git_stdout(context, &["rev-parse", "--show-object-format"]) else {
+        return Some(PerformanceSourceBindingFailure::Unavailable);
+    };
+    if !matches!(object_format.as_str(), "sha1" | "sha256") {
+        return Some(PerformanceSourceBindingFailure::Unavailable);
+    }
+    let Some(index_output) = git_output(context, &["ls-files", "--stage", "-z"]) else {
+        return Some(PerformanceSourceBindingFailure::Unavailable);
+    };
+    let Some(index_records) = canonical_nul_records(&index_output) else {
+        return Some(PerformanceSourceBindingFailure::Unavailable);
+    };
+    let mut index_entries = BTreeMap::new();
+    for record in index_records {
+        let Some((mode, oid, stage, path)) = parse_canonical_git_record(record) else {
+            return Some(PerformanceSourceBindingFailure::Unavailable);
+        };
+        // The tracker database is exempt on both sides of the comparison so a
+        // staged or rewritten `.beads/` export cannot read as source drift, and
+        // so the worktree re-hash below never races the daemon.
+        if tracker_state_path(path) {
+            continue;
+        }
+        if stage != b"0"
+            || index_entries
+                .insert(path.to_vec(), (mode.to_vec(), oid.to_vec()))
+                .is_some()
+        {
+            return Some(PerformanceSourceBindingFailure::Invalid(
+                "performance_budget_repository_tracked_state_not_head",
+            ));
+        }
+    }
+
+    let Some(tree_output) = git_output(
+        context,
+        &["ls-tree", "-r", "-z", "--full-tree", expected_head],
+    ) else {
+        return Some(PerformanceSourceBindingFailure::Unavailable);
+    };
+    let Some(tree_records) = canonical_nul_records(&tree_output) else {
+        return Some(PerformanceSourceBindingFailure::Unavailable);
+    };
+    for record in tree_records {
+        let Some((mode, object_type, oid, path)) = parse_canonical_git_record(record) else {
+            return Some(PerformanceSourceBindingFailure::Unavailable);
+        };
+        if tracker_state_path(path) {
+            continue;
+        }
+        let Some((index_mode, index_oid)) = index_entries.remove(path) else {
+            return Some(PerformanceSourceBindingFailure::Invalid(
+                "performance_budget_repository_tracked_state_not_head",
+            ));
+        };
+        if object_type != b"blob" || index_mode != mode || index_oid != oid {
+            return Some(PerformanceSourceBindingFailure::Invalid(
+                "performance_budget_repository_tracked_state_not_head",
+            ));
+        }
+        #[cfg(unix)]
+        let relative = git_path_from_bytes(path);
+        #[cfg(not(unix))]
+        let Some(relative) = git_path_from_bytes(path) else {
+            return Some(PerformanceSourceBindingFailure::Unavailable);
+        };
+        let Some(bytes) = tracked_worktree_blob(&context.worktree, &relative, mode) else {
+            return Some(PerformanceSourceBindingFailure::Invalid(
+                "performance_budget_repository_tracked_state_not_head",
+            ));
+        };
+        if git_blob_oid(&object_format, &bytes).as_deref() != std::str::from_utf8(oid).ok() {
+            return Some(PerformanceSourceBindingFailure::Invalid(
+                "performance_budget_repository_tracked_state_not_head",
+            ));
+        }
+    }
+    (!index_entries.is_empty()).then_some(PerformanceSourceBindingFailure::Invalid(
+        "performance_budget_repository_tracked_state_not_head",
+    ))
+}
+
+/// Is this `git status --porcelain=v1 -z --no-renames` record a write to the
+/// issue-tracker database?
+///
+/// Every record is `XY<space>PATH`, so the path begins at byte 3. `.beads/*` is
+/// never product source, never packaged, and cannot affect a measurement, but
+/// the beads daemon exports it on every issue write and the auto-commit sweeper
+/// commits the result. Treating those writes as source drift made the
+/// performance and drop-in source bindings report "repository not clean" almost
+/// continuously — a provenance signal that was really reporting on issue
+/// tracking. The exemption is exactly this prefix; anything else still
+/// invalidates the binding.
+const TRACKER_STATE_PREFIX: &str = ".beads/";
+
+fn tracker_state_path(path: &[u8]) -> bool {
+    path.starts_with(TRACKER_STATE_PREFIX.as_bytes())
+}
+
+fn tracker_state_status_record(record: &[u8]) -> bool {
+    record.get(3..).is_some_and(tracker_state_path)
+}
+
+fn performance_repository_state_failure(
+    context: &RepositoryGitContext,
+    expected_head: &str,
+) -> Option<PerformanceSourceBindingFailure> {
+    let Some(top_level) = git_stdout(context, &["rev-parse", "--show-toplevel"]) else {
+        return Some(PerformanceSourceBindingFailure::Unavailable);
+    };
+    if fs::canonicalize(top_level).ok().as_deref() != Some(context.worktree.as_path()) {
+        return Some(PerformanceSourceBindingFailure::Unavailable);
+    }
+    let Some(index_entries) = git_output(context, &["ls-files", "-v", "-z"]) else {
+        return Some(PerformanceSourceBindingFailure::Unavailable);
+    };
+    let Some(index_entries) = canonical_nul_records(&index_entries) else {
+        return Some(PerformanceSourceBindingFailure::Unavailable);
+    };
+    if index_entries.iter().any(|entry| {
+        entry.len() < 3 || entry[1] != b' ' || entry[2..].is_empty() || entry[0] != b'H'
+    }) {
+        return Some(PerformanceSourceBindingFailure::Invalid(
+            "performance_budget_repository_index_flags_not_default",
+        ));
+    }
+    let Some(status) = git_output(
+        context,
+        &[
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+            "--ignore-submodules=none",
+            "--no-renames",
+        ],
+    ) else {
+        return Some(PerformanceSourceBindingFailure::Unavailable);
+    };
+    let Some(status_records) = canonical_nul_records(&status) else {
+        return Some(PerformanceSourceBindingFailure::Unavailable);
+    };
+    if status_records
+        .iter()
+        .any(|record| !tracker_state_status_record(record))
+    {
+        return Some(PerformanceSourceBindingFailure::Invalid(
+            "performance_budget_repository_not_clean",
+        ));
+    }
+    performance_tracked_head_state_failure(context, expected_head)
+}
+
+fn performance_repository_end_state_failure(
+    context: &RepositoryGitContext,
+    expected_head: &str,
+) -> Option<PerformanceSourceBindingFailure> {
+    let Some(current_head) = git_stdout(context, &["rev-parse", "--verify", "HEAD^{commit}"])
+    else {
+        return Some(PerformanceSourceBindingFailure::Unavailable);
+    };
+    if current_head != expected_head {
+        return Some(PerformanceSourceBindingFailure::Invalid(
+            "performance_budget_repository_head_changed",
+        ));
+    }
+    performance_repository_state_failure(context, expected_head)
+}
+
+fn performance_artifact_end_state_failure(
+    context: &RepositoryGitContext,
+    expected_head: &str,
+    artifact_path: &Path,
+    captured_artifact_bytes: &[u8],
+) -> Option<PerformanceSourceBindingFailure> {
+    if let Some(failure) = performance_repository_end_state_failure(context, expected_head) {
+        return Some(failure);
+    }
+    match fs::read(artifact_path) {
+        Ok(bytes) if bytes == captured_artifact_bytes => None,
+        Ok(_) => Some(PerformanceSourceBindingFailure::Invalid(
+            "performance_budget_artifact_changed_during_validation",
+        )),
+        Err(_) => Some(PerformanceSourceBindingFailure::Invalid(
+            "performance_budget_artifact_unreadable",
+        )),
+    }
+}
+
+fn performance_artifact_relative_path(source_path: &str) -> Option<&Path> {
+    let path = Path::new(source_path);
+    (!source_path.is_empty()
+        && !source_path.contains('\\')
+        && !source_path.contains('\0')
+        && !path.is_absolute()
+        && path
+            .components()
+            .all(|component| matches!(component, Component::Normal(_))))
+    .then_some(path)
+}
+
+fn toml_line_without_comment(line: &str) -> Option<&str> {
+    let mut quote = None;
+    let mut escaped = false;
+    for (index, byte) in line.bytes().enumerate() {
+        match quote {
+            Some(b'"') if escaped => escaped = false,
+            Some(b'"') if byte == b'\\' => escaped = true,
+            Some(delimiter) if byte == delimiter => quote = None,
+            None if matches!(byte, b'"' | b'\'') => quote = Some(byte),
+            None if byte == b'#' => return Some(&line[..index]),
+            Some(_) | None => {}
+        }
+    }
+    quote.is_none().then_some(line)
+}
+
+fn toml_string_array_is_complete(raw: &str) -> Option<bool> {
+    let mut quote = None;
+    let mut escaped = false;
+    let mut depth = 0usize;
+    let mut opened = false;
+    for byte in raw.bytes() {
+        match quote {
+            Some(b'"') if escaped => escaped = false,
+            Some(b'"') if byte == b'\\' => escaped = true,
+            Some(delimiter) if byte == delimiter => quote = None,
+            None if matches!(byte, b'"' | b'\'') => quote = Some(byte),
+            None if byte == b'[' => {
+                opened = true;
+                depth = depth.checked_add(1)?;
+            }
+            None if byte == b']' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(opened);
+                }
+            }
+            Some(_) | None => {}
+        }
+    }
+    (quote.is_none() && opened).then_some(false)
+}
+
+fn parse_toml_string_array(raw: &str) -> Option<Vec<String>> {
+    let bytes = raw.as_bytes();
+    let mut index = 0usize;
+    while bytes.get(index).is_some_and(u8::is_ascii_whitespace) {
+        index += 1;
+    }
+    if bytes.get(index) != Some(&b'[') {
+        return None;
+    }
+    index += 1;
+    let mut values = Vec::new();
+    loop {
+        while bytes.get(index).is_some_and(u8::is_ascii_whitespace) {
+            index += 1;
+        }
+        if bytes.get(index) == Some(&b']') {
+            index += 1;
+            return bytes[index..]
+                .iter()
+                .all(u8::is_ascii_whitespace)
+                .then_some(values);
+        }
+        let delimiter = *bytes.get(index)?;
+        if !matches!(delimiter, b'"' | b'\'') {
+            return None;
+        }
+        let start = index;
+        index += 1;
+        let content_start = index;
+        let mut escaped = false;
+        loop {
+            let byte = *bytes.get(index)?;
+            if delimiter == b'"' && escaped {
+                escaped = false;
+            } else if delimiter == b'"' && byte == b'\\' {
+                escaped = true;
+            } else if byte == delimiter {
+                break;
+            }
+            index += 1;
+        }
+        let value = if delimiter == b'"' {
+            serde_json::from_str::<String>(&raw[start..=index]).ok()?
+        } else {
+            raw[content_start..index].to_string()
+        };
+        values.push(value);
+        index += 1;
+        while bytes.get(index).is_some_and(u8::is_ascii_whitespace) {
+            index += 1;
+        }
+        match bytes.get(index) {
+            Some(b',') => index += 1,
+            Some(b']') => {}
+            _ => return None,
+        }
+    }
+}
+
+fn source_package_include_patterns(cargo_toml: &str) -> Option<Vec<String>> {
+    let mut in_package = false;
+    let mut include_value = None::<String>;
+    for raw_line in cargo_toml.lines() {
+        let line = toml_line_without_comment(raw_line)?;
+        let trimmed = line.trim();
+        if let Some(value) = include_value.as_mut() {
+            value.push('\n');
+            value.push_str(trimmed);
+            if toml_string_array_is_complete(value)? {
+                return parse_toml_string_array(value);
+            }
+            continue;
+        }
+        if trimmed.starts_with('[') {
+            in_package = trimmed == "[package]";
+            continue;
+        }
+        if !in_package || trimmed.is_empty() {
+            continue;
+        }
+        let Some((key, value)) = trimmed.split_once('=') else {
+            continue;
+        };
+        if key.trim() != "include" {
+            continue;
+        }
+        let value = value.trim();
+        if toml_string_array_is_complete(value)? {
+            return parse_toml_string_array(value);
+        }
+        include_value = Some(value.to_string());
+    }
+    // Cargo's default package policy is broad when `package.include` is
+    // absent. Treat docs/evidence as packaged rather than authorizing a
+    // post-measurement follow-up whose distribution status was never narrowed.
+    Some(vec!["/docs/evidence/**".to_string()])
+}
+
+fn performance_path_is_packaged(path: &str, package_patterns: &[String]) -> Option<bool> {
+    for raw_pattern in package_patterns {
+        if raw_pattern.is_empty() {
+            return None;
+        }
+        let normalized = raw_pattern.strip_prefix('/').unwrap_or(raw_pattern);
+        let pattern = glob::Pattern::new(normalized).ok()?;
+        if pattern.matches(path)
+            || normalized.strip_suffix("/**").is_some_and(|prefix| {
+                path.starts_with(&format!("{}/", prefix.trim_end_matches('/')))
+            })
+        {
+            return Some(true);
+        }
+    }
+    Some(false)
+}
+
+fn performance_source_binding_failure(
+    repository_root: Option<&Path>,
+    artifact_source_path: Option<&str>,
+    source_commit: &str,
+    captured_artifact_bytes: Option<&[u8]>,
+) -> Option<PerformanceSourceBindingFailure> {
+    let Some(repository_root) = repository_root else {
+        return Some(PerformanceSourceBindingFailure::Unavailable);
+    };
+    let Some(artifact_source_path) = artifact_source_path else {
+        return Some(PerformanceSourceBindingFailure::Unavailable);
+    };
+    let Some(captured_artifact_bytes) = captured_artifact_bytes else {
+        return Some(PerformanceSourceBindingFailure::Unavailable);
+    };
+    let Some(relative_artifact) = performance_artifact_relative_path(artifact_source_path) else {
+        return Some(PerformanceSourceBindingFailure::Invalid(
+            "performance_budget_artifact_path_invalid",
+        ));
+    };
+    let Some(git_context) = repository_git_context(repository_root) else {
+        return Some(PerformanceSourceBindingFailure::Unavailable);
+    };
+    let canonical_root = &git_context.worktree;
+    let Some(head) = git_stdout(&git_context, &["rev-parse", "--verify", "HEAD^{commit}"]) else {
+        return Some(PerformanceSourceBindingFailure::Unavailable);
+    };
+    let mut artifact_path = canonical_root.clone();
+    for component in relative_artifact.components() {
+        let Component::Normal(name) = component else {
+            return Some(PerformanceSourceBindingFailure::Invalid(
+                "performance_budget_artifact_path_invalid",
+            ));
+        };
+        artifact_path.push(name);
+        let Ok(metadata) = fs::symlink_metadata(&artifact_path) else {
+            return Some(PerformanceSourceBindingFailure::Invalid(
+                "performance_budget_artifact_unreadable",
+            ));
+        };
+        if metadata.file_type().is_symlink() {
+            return Some(PerformanceSourceBindingFailure::Invalid(
+                "performance_budget_artifact_symlink",
+            ));
+        }
+    }
+    if !artifact_path.is_file()
+        || fs::canonicalize(&artifact_path)
+            .ok()
+            .is_none_or(|canonical| !canonical.starts_with(canonical_root))
+    {
+        return Some(PerformanceSourceBindingFailure::Invalid(
+            "performance_budget_artifact_path_invalid",
+        ));
+    }
+
+    let Some(tree_entry) = git_output(
+        &git_context,
+        &[
+            "ls-tree",
+            "-z",
+            "--full-tree",
+            &head,
+            "--",
+            artifact_source_path,
+        ],
+    ) else {
+        return Some(PerformanceSourceBindingFailure::Unavailable);
+    };
+    let Some(entries) = canonical_nul_records(&tree_entry) else {
+        return Some(PerformanceSourceBindingFailure::Unavailable);
+    };
+    let Some(entry) = entries
+        .as_slice()
+        .first()
+        .copied()
+        .filter(|_| entries.len() == 1)
+    else {
+        return Some(PerformanceSourceBindingFailure::Invalid(
+            "performance_budget_artifact_not_tracked_at_head",
+        ));
+    };
+    let Some(tab) = entry.iter().position(|byte| *byte == b'\t') else {
+        return Some(PerformanceSourceBindingFailure::Unavailable);
+    };
+    if &entry[tab + 1..] != artifact_source_path.as_bytes() {
+        return Some(PerformanceSourceBindingFailure::Invalid(
+            "performance_budget_artifact_not_tracked_at_head",
+        ));
+    }
+    let Some((mode, object_type, oid, _)) = parse_canonical_git_record(entry) else {
+        return Some(PerformanceSourceBindingFailure::Unavailable);
+    };
+    if !matches!(mode, b"100644" | b"100755") || object_type != b"blob" {
+        return Some(PerformanceSourceBindingFailure::Invalid(
+            "performance_budget_artifact_not_regular_at_head",
+        ));
+    }
+    let Ok(blob_oid) = std::str::from_utf8(oid) else {
+        return Some(PerformanceSourceBindingFailure::Unavailable);
+    };
+    let Some(head_bytes) = git_output(&git_context, &["cat-file", "blob", blob_oid]) else {
+        return Some(PerformanceSourceBindingFailure::Unavailable);
+    };
+    let repository_state_failure = performance_repository_state_failure(&git_context, &head);
+    if matches!(
+        repository_state_failure,
+        Some(PerformanceSourceBindingFailure::Invalid(
+            "performance_budget_repository_tracked_state_not_head"
+        ))
+    ) {
+        return repository_state_failure;
+    }
+    if captured_artifact_bytes != head_bytes {
+        return Some(PerformanceSourceBindingFailure::Invalid(
+            "performance_budget_artifact_changed_since_ingestion",
+        ));
+    }
+    if let Some(failure) = repository_state_failure {
+        return Some(failure);
+    }
+    let Ok(worktree_bytes) = fs::read(&artifact_path) else {
+        return Some(PerformanceSourceBindingFailure::Invalid(
+            "performance_budget_artifact_unreadable",
+        ));
+    };
+    if worktree_bytes != head_bytes {
+        return Some(PerformanceSourceBindingFailure::Invalid(
+            "performance_budget_artifact_bytes_do_not_match_head",
+        ));
+    }
+
+    let source_expression = format!("{source_commit}^{{commit}}");
+    let Some(resolved_source) =
+        git_stdout(&git_context, &["rev-parse", "--verify", &source_expression])
+    else {
+        return Some(PerformanceSourceBindingFailure::Invalid(
+            "performance_budget_source_commit_unresolvable",
+        ));
+    };
+    if resolved_source != source_commit {
+        return Some(PerformanceSourceBindingFailure::Invalid(
+            "performance_budget_source_commit_not_exact",
+        ));
+    }
+    let Ok(ancestor) = repository_git_command(&git_context)
+        .args(["merge-base", "--is-ancestor", source_commit, &head])
+        .output()
+    else {
+        return Some(PerformanceSourceBindingFailure::Unavailable);
+    };
+    if !ancestor.status.success() {
+        return Some(if ancestor.status.code() == Some(1) {
+            PerformanceSourceBindingFailure::Invalid(
+                "performance_budget_source_commit_not_ancestor",
+            )
+        } else {
+            PerformanceSourceBindingFailure::Unavailable
+        });
+    }
+    if source_commit == head {
+        return performance_artifact_end_state_failure(
+            &git_context,
+            &head,
+            &artifact_path,
+            captured_artifact_bytes,
+        );
+    }
+
+    let Some(changed_paths) = git_output(
+        &git_context,
+        &[
+            "diff",
+            "--name-only",
+            "-z",
+            "--no-renames",
+            source_commit,
+            &head,
+        ],
+    ) else {
+        return Some(PerformanceSourceBindingFailure::Unavailable);
+    };
+    let Some(paths) = canonical_nul_records(&changed_paths) else {
+        return Some(PerformanceSourceBindingFailure::Unavailable);
+    };
+    if paths.is_empty() {
+        return Some(PerformanceSourceBindingFailure::Invalid(
+            "performance_budget_source_commit_not_release_bound",
+        ));
+    }
+    let Some(paths) = paths
+        .iter()
+        .map(|path| std::str::from_utf8(path).ok())
+        .collect::<Option<Vec<_>>>()
+    else {
+        return Some(PerformanceSourceBindingFailure::Unavailable);
+    };
+    let package_patterns = if paths.iter().any(|path| path.starts_with("docs/evidence/")) {
+        let cargo_expression = format!("{source_commit}:Cargo.toml");
+        let Some(cargo_toml) = git_output(&git_context, &["show", &cargo_expression])
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+        else {
+            return Some(PerformanceSourceBindingFailure::Unavailable);
+        };
+        let Some(patterns) = source_package_include_patterns(&cargo_toml) else {
+            return Some(PerformanceSourceBindingFailure::Unavailable);
+        };
+        patterns
+    } else {
+        Vec::new()
+    };
+    let evidence_only = paths.iter().all(|path| {
+        // Tracker-database churn is not source drift; see
+        // `tracker_state_status_record`.
+        if path.starts_with(TRACKER_STATE_PREFIX) {
+            return true;
+        }
+        let packaged_docs_evidence = path.starts_with("docs/evidence/")
+            && performance_path_is_packaged(path, &package_patterns) != Some(false);
+        performance_artifact_relative_path(path).is_some()
+            && !packaged_docs_evidence
+            && [
+                "tests/perf/reports/",
+                "tests/e2e_results/",
+                "tests/ext_conformance/reports/",
+                "tests/certification/",
+                "docs/evidence/",
+            ]
+            .iter()
+            .any(|prefix| path.starts_with(prefix))
+    });
+    if !evidence_only {
+        return Some(PerformanceSourceBindingFailure::Invalid(
+            "performance_budget_source_commit_not_release_bound",
+        ));
+    }
+    performance_artifact_end_state_failure(
+        &git_context,
+        &head,
+        &artifact_path,
+        captured_artifact_bytes,
+    )
+}
+
+#[derive(Debug)]
+struct DropinGateSpec {
+    gate_id: String,
+    blocking: bool,
+    owner_issue: String,
+    required_artifacts: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum DropinClaimFailure {
+    Unavailable(&'static str),
+    Invalid(&'static str),
+}
+
+fn dropin_canonical_repo_path(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    let invalid_prefix = path.is_empty()
+        || path.contains('\\')
+        || path.contains('\0')
+        || path.starts_with('/')
+        || bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':';
+    !invalid_prefix
+        && path
+            .split('/')
+            .all(|component| !component.is_empty() && !matches!(component, "." | ".."))
+}
+
+fn dropin_full_git_oid(value: &str) -> bool {
+    matches!(value.len(), 40 | 64)
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
+fn dropin_generated_at_is_canonical(value: &Value) -> bool {
+    let Some(raw) = value.as_str() else {
+        return false;
+    };
+    let bytes = raw.as_bytes();
+    let shape = bytes.len() >= 20
+        && bytes[4] == b'-'
+        && bytes[7] == b'-'
+        && bytes[10] == b'T'
+        && bytes[13] == b':'
+        && bytes[16] == b':'
+        && bytes.last() == Some(&b'Z')
+        && bytes.iter().enumerate().all(|(index, byte)| {
+            matches!(index, 4 | 7 | 10 | 13 | 16)
+                || index + 1 == bytes.len()
+                || (index == 19 && bytes.len() > 20 && *byte == b'.')
+                || byte.is_ascii_digit()
+        })
+        && (bytes.len() == 20 || bytes.len() > 21);
+    shape
+        && DateTime::parse_from_rfc3339(raw)
+            .is_ok_and(|parsed| parsed.offset().local_minus_utc() == 0)
+}
+
+fn dropin_gate_id_is_canonical(gate_id: &str, expected_number: usize) -> bool {
+    let expected_prefix = format!("G{expected_number:02}-");
+    let Some(suffix) = gate_id.strip_prefix(&expected_prefix) else {
+        return false;
+    };
+    !suffix.is_empty()
+        && suffix.split('-').all(|component| {
+            !component.is_empty()
+                && component
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || byte.is_ascii_lowercase())
+        })
+}
+
+fn dropin_contract_gate_specs(contract: &Value) -> Result<Vec<DropinGateSpec>, DropinClaimFailure> {
+    let object = contract.as_object().ok_or(DropinClaimFailure::Invalid(
+        "dropin_verdict_contract_invalid",
+    ))?;
+    if object.get("schema").and_then(Value::as_str) != Some(DROPIN_CERTIFICATION_CONTRACT_SCHEMA) {
+        return Err(DropinClaimFailure::Invalid(
+            "dropin_verdict_contract_invalid",
+        ));
+    }
+    let verdict_contract = object
+        .get("release_process_enforcement")
+        .and_then(Value::as_object)
+        .and_then(|enforcement| enforcement.get("verdict_artifact_contract"))
+        .and_then(Value::as_object)
+        .ok_or(DropinClaimFailure::Invalid(
+            "dropin_verdict_contract_invalid",
+        ))?;
+    if verdict_contract.get("path").and_then(Value::as_str)
+        != Some(DROPIN_CERTIFICATION_VERDICT_PATH)
+        || verdict_contract.get("schema").and_then(Value::as_str)
+            != Some(DROPIN_CERTIFICATION_VERDICT_SCHEMA)
+    {
+        return Err(DropinClaimFailure::Invalid(
+            "dropin_verdict_contract_invalid",
+        ));
+    }
+    let required_fields = verdict_contract
+        .get("required_fields")
+        .and_then(Value::as_array)
+        .and_then(|fields| fields.iter().map(Value::as_str).collect::<Option<Vec<_>>>())
+        .ok_or(DropinClaimFailure::Invalid(
+            "dropin_verdict_contract_invalid",
+        ))?;
+    let expected_fields = DROPIN_VERDICT_REQUIRED_FIELDS
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    if required_fields.len() != expected_fields.len()
+        || required_fields.iter().copied().collect::<BTreeSet<_>>() != expected_fields
+    {
+        return Err(DropinClaimFailure::Invalid(
+            "dropin_verdict_contract_invalid",
+        ));
+    }
+
+    let hard_gates = object
+        .get("hard_gates")
+        .and_then(Value::as_array)
+        .filter(|gates| gates.len() == 12)
+        .ok_or(DropinClaimFailure::Invalid(
+            "dropin_verdict_contract_invalid",
+        ))?;
+    hard_gates
+        .iter()
+        .enumerate()
+        .map(|(index, gate)| {
+            let gate = gate.as_object().ok_or(DropinClaimFailure::Invalid(
+                "dropin_verdict_contract_invalid",
+            ))?;
+            let gate_id = gate
+                .get("gate_id")
+                .and_then(Value::as_str)
+                .filter(|gate_id| dropin_gate_id_is_canonical(gate_id, index + 1))
+                .ok_or(DropinClaimFailure::Invalid(
+                    "dropin_verdict_contract_invalid",
+                ))?;
+            let blocking = gate.get("blocking").and_then(Value::as_bool).ok_or(
+                DropinClaimFailure::Invalid("dropin_verdict_contract_invalid"),
+            )?;
+            let owner_issue = gate
+                .get("owner_issue_primary")
+                .and_then(Value::as_str)
+                .filter(|owner| !owner.is_empty())
+                .ok_or(DropinClaimFailure::Invalid(
+                    "dropin_verdict_contract_invalid",
+                ))?;
+            let required_artifacts = gate
+                .get("required_artifacts")
+                .and_then(Value::as_array)
+                .filter(|artifacts| !artifacts.is_empty())
+                .and_then(|artifacts| {
+                    artifacts
+                        .iter()
+                        .map(Value::as_str)
+                        .map(|artifact| artifact.filter(|path| dropin_canonical_repo_path(path)))
+                        .collect::<Option<Vec<_>>>()
+                })
+                .ok_or(DropinClaimFailure::Invalid(
+                    "dropin_verdict_contract_invalid",
+                ))?;
+            if required_artifacts
+                .iter()
+                .copied()
+                .collect::<BTreeSet<_>>()
+                .len()
+                != required_artifacts.len()
+            {
+                return Err(DropinClaimFailure::Invalid(
+                    "dropin_verdict_contract_invalid",
+                ));
+            }
+            Ok(DropinGateSpec {
+                gate_id: gate_id.to_string(),
+                blocking,
+                owner_issue: owner_issue.to_string(),
+                required_artifacts: required_artifacts.into_iter().map(str::to_string).collect(),
+            })
+        })
+        .collect()
+}
+
+fn dropin_verdict_payload(
+    verdict: &Value,
+    gate_specs: &[DropinGateSpec],
+) -> Result<(String, Vec<String>), DropinClaimFailure> {
+    let object = verdict.as_object().ok_or(DropinClaimFailure::Invalid(
+        "dropin_verdict_contract_invalid",
+    ))?;
+    if DROPIN_VERDICT_REQUIRED_FIELDS
+        .iter()
+        .any(|field| !object.contains_key(*field))
+        || object.get("schema").and_then(Value::as_str) != Some(DROPIN_CERTIFICATION_VERDICT_SCHEMA)
+        || object.get("overall_verdict").and_then(Value::as_str) != Some("CERTIFIED")
+        || !object
+            .get("generated_at_utc")
+            .is_some_and(dropin_generated_at_is_canonical)
+    {
+        return Err(DropinClaimFailure::Invalid(
+            "dropin_verdict_contract_invalid",
+        ));
+    }
+
+    let source_commit = object
+        .get("git_commit")
+        .and_then(Value::as_str)
+        .filter(|commit| dropin_full_git_oid(commit))
+        .ok_or(DropinClaimFailure::Invalid(
+            "dropin_verdict_source_commit_invalid",
+        ))?;
+    let hard_gate_results = object
+        .get("hard_gate_results")
+        .and_then(Value::as_array)
+        .filter(|gates| gates.len() == gate_specs.len())
+        .ok_or(DropinClaimFailure::Invalid(
+            "dropin_verdict_hard_gates_invalid",
+        ))?;
+    for (gate, expected) in hard_gate_results.iter().zip(gate_specs) {
+        let Some(gate) = gate.as_object() else {
+            return Err(DropinClaimFailure::Invalid(
+                "dropin_verdict_hard_gates_invalid",
+            ));
+        };
+        let detail_valid = gate
+            .get("detail")
+            .is_none_or(|detail| detail.is_null() || detail.is_string());
+        let artifacts_match = gate
+            .get("artifact_paths")
+            .and_then(Value::as_array)
+            .and_then(|artifacts| {
+                artifacts
+                    .iter()
+                    .map(Value::as_str)
+                    .collect::<Option<Vec<_>>>()
+            })
+            .is_some_and(|artifacts| {
+                artifacts
+                    == expected
+                        .required_artifacts
+                        .iter()
+                        .map(String::as_str)
+                        .collect::<Vec<_>>()
+            });
+        if gate.get("gate_id").and_then(Value::as_str) != Some(expected.gate_id.as_str())
+            || gate.get("status").and_then(Value::as_str) != Some("pass")
+            || gate.get("blocking").and_then(Value::as_bool) != Some(expected.blocking)
+            || gate.get("bead").and_then(Value::as_str) != Some(expected.owner_issue.as_str())
+            || !detail_valid
+            || !artifacts_match
+        {
+            return Err(DropinClaimFailure::Invalid(
+                "dropin_verdict_hard_gates_invalid",
+            ));
+        }
+    }
+
+    if object
+        .get("blocking_reasons")
+        .and_then(Value::as_array)
+        .is_none_or(|reasons| !reasons.is_empty())
+    {
+        return Err(DropinClaimFailure::Invalid(
+            "dropin_verdict_blocking_reasons_invalid",
+        ));
+    }
+    let source =
+        object
+            .get("source")
+            .and_then(Value::as_object)
+            .ok_or(DropinClaimFailure::Invalid(
+                "dropin_verdict_source_lane_invalid",
+            ))?;
+    if source
+        .get("certification_lane_artifact")
+        .and_then(Value::as_str)
+        != Some(DROPIN_CERTIFICATION_LANE_PATH)
+        || source.get("lane_schema").and_then(Value::as_str)
+            != Some(DROPIN_CERTIFICATION_LANE_SCHEMA)
+        || source.get("lane_verdict").and_then(Value::as_str) != Some("pass")
+    {
+        return Err(DropinClaimFailure::Invalid(
+            "dropin_verdict_source_lane_invalid",
+        ));
+    }
+
+    let expected_evidence_paths = gate_specs
+        .iter()
+        .flat_map(|gate| gate.required_artifacts.iter())
+        .fold(Vec::<String>::new(), |mut paths, artifact| {
+            if !paths.contains(artifact) {
+                paths.push(artifact.clone());
+            }
+            paths
+        });
+    let evidence_index = object
+        .get("evidence_index")
+        .and_then(Value::as_array)
+        .filter(|index| !index.is_empty())
+        .ok_or(DropinClaimFailure::Invalid(
+            "dropin_verdict_evidence_index_invalid",
+        ))?;
+    let mut evidence_paths = Vec::with_capacity(evidence_index.len());
+    for entry in evidence_index {
+        let Some(entry) = entry.as_object() else {
+            return Err(DropinClaimFailure::Invalid(
+                "dropin_verdict_evidence_index_invalid",
+            ));
+        };
+        let Some(path) = entry
+            .get("path")
+            .and_then(Value::as_str)
+            .filter(|path| dropin_canonical_repo_path(path))
+        else {
+            return Err(DropinClaimFailure::Invalid(
+                "dropin_verdict_evidence_index_invalid",
+            ));
+        };
+        if entry.len() != 2
+            || !entry.contains_key("exists")
+            || entry.get("exists").and_then(Value::as_bool) != Some(true)
+        {
+            return Err(DropinClaimFailure::Invalid(
+                "dropin_verdict_evidence_index_invalid",
+            ));
+        }
+        evidence_paths.push(path.to_string());
+    }
+    if evidence_paths != expected_evidence_paths
+        || evidence_paths.iter().collect::<BTreeSet<_>>().len() != evidence_paths.len()
+    {
+        return Err(DropinClaimFailure::Invalid(
+            "dropin_verdict_evidence_index_invalid",
+        ));
+    }
+    Ok((source_commit.to_string(), evidence_paths))
+}
+
+#[derive(Debug)]
+struct DropinLaneWaiverAudit {
+    generated_at: DateTime<Utc>,
+    expired: u64,
+    invalid: u64,
+    eligible_gate_ids: BTreeSet<String>,
+}
+
+fn dropin_lane_time_is_current(
+    value: &Value,
+    reference_time: DateTime<Utc>,
+) -> Result<DateTime<Utc>, DropinClaimFailure> {
+    let generated_at = performance_generated_at(value)
+        .map_err(|_| DropinClaimFailure::Invalid("dropin_verdict_source_lane_invalid"))?;
+    if generated_at.signed_duration_since(reference_time) > Duration::minutes(5)
+        || reference_time.signed_duration_since(generated_at)
+            > Duration::hours(DROPIN_MAX_EVIDENCE_AGE_HOURS)
+    {
+        return Err(DropinClaimFailure::Invalid(
+            "dropin_verdict_source_lane_invalid",
+        ));
+    }
+    Ok(generated_at)
+}
+
+fn dropin_lane_waiver_audit(
+    value: &Value,
+    reference_time: DateTime<Utc>,
+) -> Result<DropinLaneWaiverAudit, DropinClaimFailure> {
+    const FIELDS: &[&str] = &[
+        "schema",
+        "generated_at",
+        "total_waivers",
+        "active",
+        "expired",
+        "expiring_soon",
+        "invalid",
+        "waivers",
+        "raw_waivers",
+    ];
+    let audit = performance_exact_object(value, FIELDS, &[], "certification lane waiver_audit")
+        .map_err(|_| DropinClaimFailure::Invalid("dropin_verdict_source_lane_invalid"))?;
+    if audit.get("schema").and_then(Value::as_str) != Some("pi.ci.waiver_audit.v1") {
+        return Err(DropinClaimFailure::Invalid(
+            "dropin_verdict_source_lane_invalid",
+        ));
+    }
+    let generated_at = dropin_lane_time_is_current(&audit["generated_at"], reference_time)?;
+    let total = performance_uint(&audit["total_waivers"], "waiver_audit.total_waivers")
+        .map_err(|_| DropinClaimFailure::Invalid("dropin_verdict_source_lane_invalid"))?;
+    let active = performance_uint(&audit["active"], "waiver_audit.active")
+        .map_err(|_| DropinClaimFailure::Invalid("dropin_verdict_source_lane_invalid"))?;
+    let expired = performance_uint(&audit["expired"], "waiver_audit.expired")
+        .map_err(|_| DropinClaimFailure::Invalid("dropin_verdict_source_lane_invalid"))?;
+    let expiring_soon = performance_uint(&audit["expiring_soon"], "waiver_audit.expiring_soon")
+        .map_err(|_| DropinClaimFailure::Invalid("dropin_verdict_source_lane_invalid"))?;
+    let invalid = performance_uint(&audit["invalid"], "waiver_audit.invalid")
+        .map_err(|_| DropinClaimFailure::Invalid("dropin_verdict_source_lane_invalid"))?;
+    let validations = audit["waivers"]
+        .as_array()
+        .ok_or(DropinClaimFailure::Invalid(
+            "dropin_verdict_source_lane_invalid",
+        ))?;
+    let raw_waivers = audit["raw_waivers"]
+        .as_array()
+        .ok_or(DropinClaimFailure::Invalid(
+            "dropin_verdict_source_lane_invalid",
+        ))?;
+    if total != u64::try_from(raw_waivers.len()).unwrap_or(u64::MAX)
+        || u64::try_from(validations.len()).unwrap_or(u64::MAX)
+            != active
+                .checked_add(expired)
+                .and_then(|count| count.checked_add(expiring_soon))
+                .and_then(|count| count.checked_add(invalid))
+                .unwrap_or(u64::MAX)
+    {
+        return Err(DropinClaimFailure::Invalid(
+            "dropin_verdict_source_lane_invalid",
+        ));
+    }
+    // Strict replacement claims never rely on waivers. This also prevents a
+    // self-authored lane from promoting itself with invented lifecycle data.
+    if total != 0
+        || active != 0
+        || expired != 0
+        || expiring_soon != 0
+        || invalid != 0
+        || !validations.is_empty()
+        || !raw_waivers.is_empty()
+    {
+        return Err(DropinClaimFailure::Invalid(
+            "dropin_verdict_source_lane_invalid",
+        ));
+    }
+
+    let mut validation_statuses = BTreeMap::new();
+    for validation in validations {
+        let validation = performance_exact_object(
+            validation,
+            &["gate_id", "status"],
+            &["detail", "days_remaining"],
+            "certification lane waiver validation",
+        )
+        .map_err(|_| DropinClaimFailure::Invalid("dropin_verdict_source_lane_invalid"))?;
+        let gate_id =
+            performance_nonempty_string(&validation["gate_id"], "waiver validation gate_id")
+                .map_err(|_| DropinClaimFailure::Invalid("dropin_verdict_source_lane_invalid"))?;
+        let status = validation["status"]
+            .as_str()
+            .filter(|status| matches!(*status, "active" | "expired" | "expiring_soon" | "invalid"))
+            .ok_or(DropinClaimFailure::Invalid(
+                "dropin_verdict_source_lane_invalid",
+            ))?;
+        if validation
+            .get("detail")
+            .is_some_and(|detail| !detail.is_string())
+            || validation
+                .get("days_remaining")
+                .is_some_and(|days| days.as_i64().is_none())
+            || validation_statuses
+                .insert(gate_id.to_string(), status.to_string())
+                .is_some()
+        {
+            return Err(DropinClaimFailure::Invalid(
+                "dropin_verdict_source_lane_invalid",
+            ));
+        }
+    }
+    let observed_counts = ["active", "expired", "expiring_soon", "invalid"].map(|status| {
+        u64::try_from(
+            validation_statuses
+                .values()
+                .filter(|observed| observed.as_str() == status)
+                .count(),
+        )
+        .unwrap_or(u64::MAX)
+    });
+    if observed_counts != [active, expired, expiring_soon, invalid] {
+        return Err(DropinClaimFailure::Invalid(
+            "dropin_verdict_source_lane_invalid",
+        ));
+    }
+
+    let mut raw_scopes = BTreeMap::new();
+    for waiver in raw_waivers {
+        let waiver = performance_exact_object(
+            waiver,
+            &[
+                "gate_id",
+                "owner",
+                "created",
+                "expires",
+                "bead",
+                "reason",
+                "scope",
+                "remove_when",
+            ],
+            &[],
+            "certification lane raw waiver",
+        )
+        .map_err(|_| DropinClaimFailure::Invalid("dropin_verdict_source_lane_invalid"))?;
+        for field in [
+            "gate_id",
+            "owner",
+            "created",
+            "expires",
+            "bead",
+            "reason",
+            "scope",
+            "remove_when",
+        ] {
+            performance_nonempty_string(&waiver[field], field)
+                .map_err(|_| DropinClaimFailure::Invalid("dropin_verdict_source_lane_invalid"))?;
+        }
+        let gate_id = waiver["gate_id"].as_str().unwrap_or_default();
+        let scope = waiver["scope"]
+            .as_str()
+            .filter(|scope| matches!(*scope, "full" | "preflight" | "both"))
+            .ok_or(DropinClaimFailure::Invalid(
+                "dropin_verdict_source_lane_invalid",
+            ))?;
+        if raw_scopes
+            .insert(gate_id.to_string(), scope.to_string())
+            .is_some()
+        {
+            return Err(DropinClaimFailure::Invalid(
+                "dropin_verdict_source_lane_invalid",
+            ));
+        }
+    }
+    if raw_scopes.keys().collect::<BTreeSet<_>>()
+        != validation_statuses.keys().collect::<BTreeSet<_>>()
+    {
+        return Err(DropinClaimFailure::Invalid(
+            "dropin_verdict_source_lane_invalid",
+        ));
+    }
+    let eligible_gate_ids = validation_statuses
+        .into_iter()
+        .filter(|(gate_id, status)| {
+            matches!(status.as_str(), "active" | "expiring_soon")
+                && raw_scopes
+                    .get(gate_id)
+                    .is_some_and(|scope| matches!(scope.as_str(), "full" | "both"))
+        })
+        .map(|(gate_id, _)| gate_id)
+        .collect();
+    Ok(DropinLaneWaiverAudit {
+        generated_at,
+        expired,
+        invalid,
+        eligible_gate_ids,
+    })
+}
+
+fn validate_dropin_certification_lane(
+    lane: &Value,
+    reference_time: DateTime<Utc>,
+    verdict_generated_at: DateTime<Utc>,
+) -> Result<(), DropinClaimFailure> {
+    let lane = performance_exact_object(
+        lane,
+        DROPIN_LANE_TOP_LEVEL_FIELDS,
+        &[],
+        "drop-in certification lane",
+    )
+    .map_err(|_| DropinClaimFailure::Invalid("dropin_verdict_source_lane_invalid"))?;
+    if lane["schema"].as_str() != Some(DROPIN_CERTIFICATION_LANE_SCHEMA)
+        || lane["lane"].as_str() != Some("full")
+        || lane["policy"].as_str() != Some(DROPIN_CERTIFICATION_LANE_POLICY)
+    {
+        return Err(DropinClaimFailure::Invalid(
+            "dropin_verdict_source_lane_invalid",
+        ));
+    }
+    let lane_generated_at = dropin_lane_time_is_current(&lane["generated_at"], reference_time)?;
+    let verdict_lane_delta = verdict_generated_at.signed_duration_since(lane_generated_at);
+    let verdict_within_policy = verdict_generated_at.signed_duration_since(reference_time)
+        <= Duration::minutes(5)
+        && reference_time.signed_duration_since(verdict_generated_at)
+            <= Duration::hours(DROPIN_MAX_EVIDENCE_AGE_HOURS);
+    if verdict_within_policy
+        && !(-Duration::minutes(5)..=Duration::minutes(5)).contains(&verdict_lane_delta)
+    {
+        return Err(DropinClaimFailure::Invalid(
+            "dropin_verdict_source_lane_invalid",
+        ));
+    }
+    let waiver_audit = dropin_lane_waiver_audit(&lane["waiver_audit"], reference_time)?;
+    if waiver_audit.generated_at > lane_generated_at
+        || lane_generated_at.signed_duration_since(waiver_audit.generated_at) > Duration::minutes(5)
+    {
+        return Err(DropinClaimFailure::Invalid(
+            "dropin_verdict_source_lane_invalid",
+        ));
+    }
+    let waivers_applied = lane["waivers_applied"]
+        .as_array()
+        .and_then(|waivers| {
+            waivers
+                .iter()
+                .map(Value::as_str)
+                .collect::<Option<Vec<_>>>()
+        })
+        .ok_or(DropinClaimFailure::Invalid(
+            "dropin_verdict_source_lane_invalid",
+        ))?;
+    let waived = waivers_applied.iter().copied().collect::<BTreeSet<_>>();
+    if waived.len() != waivers_applied.len()
+        || waived
+            .iter()
+            .any(|gate_id| !waiver_audit.eligible_gate_ids.contains(*gate_id))
+    {
+        return Err(DropinClaimFailure::Invalid(
+            "dropin_verdict_source_lane_invalid",
+        ));
+    }
+
+    let gates = lane["gates"]
+        .as_array()
+        .filter(|gates| gates.len() == DROPIN_FULL_LANE_GATES.len())
+        .ok_or(DropinClaimFailure::Invalid(
+            "dropin_verdict_source_lane_invalid",
+        ))?;
+    let mut gate_ids = BTreeSet::new();
+    let mut gate_rows = Vec::with_capacity(gates.len());
+    for (gate, expected) in gates.iter().zip(DROPIN_FULL_LANE_GATES) {
+        let gate = performance_exact_object(
+            gate,
+            &["id", "name", "bead", "status", "blocking"],
+            &["artifact_path", "detail", "reproduce_command"],
+            "certification lane gate",
+        )
+        .map_err(|_| DropinClaimFailure::Invalid("dropin_verdict_source_lane_invalid"))?;
+        for field in ["id", "name", "bead"] {
+            performance_nonempty_string(&gate[field], field)
+                .map_err(|_| DropinClaimFailure::Invalid("dropin_verdict_source_lane_invalid"))?;
+        }
+        let id = gate["id"].as_str().unwrap_or_default();
+        let status = gate["status"]
+            .as_str()
+            .filter(|status| matches!(*status, "pass" | "fail" | "warn" | "skip"))
+            .ok_or(DropinClaimFailure::Invalid(
+                "dropin_verdict_source_lane_invalid",
+            ))?;
+        let blocking = gate["blocking"]
+            .as_bool()
+            .ok_or(DropinClaimFailure::Invalid(
+                "dropin_verdict_source_lane_invalid",
+            ))?;
+        if id != expected.id
+            || gate["name"].as_str() != Some(expected.name)
+            || gate["bead"].as_str() != Some(expected.bead)
+            || blocking != expected.blocking
+            || gate.get("artifact_path").and_then(Value::as_str) != Some(expected.artifact_path)
+            || gate.get("reproduce_command").and_then(Value::as_str) != expected.reproduce_command
+            || !gate_ids.insert(id)
+            || waived.contains(id) && !matches!(status, "fail" | "warn")
+            || gate.get("artifact_path").is_some_and(|path| {
+                path.as_str()
+                    .is_none_or(|path| !dropin_canonical_repo_path(path))
+            })
+            || gate
+                .get("detail")
+                .is_some_and(|detail| detail.as_str().is_none_or(str::is_empty))
+            || gate
+                .get("reproduce_command")
+                .is_some_and(|command| command.as_str().is_none_or(str::is_empty))
+        {
+            return Err(DropinClaimFailure::Invalid(
+                "dropin_verdict_source_lane_invalid",
+            ));
+        }
+        gate_rows.push((id, status, blocking));
+    }
+    if waived.iter().any(|gate_id| !gate_ids.contains(gate_id)) {
+        return Err(DropinClaimFailure::Invalid(
+            "dropin_verdict_source_lane_invalid",
+        ));
+    }
+    // The ordinary CI lane schema can represent warnings, skips, and
+    // time-bounded waivers. A strict drop-in replacement claim is narrower:
+    // its committed source lane must be an unwaived, all-pass snapshot.
+    if !waived.is_empty() || gate_rows.iter().any(|(_, status, _)| *status != "pass") {
+        return Err(DropinClaimFailure::Invalid(
+            "dropin_verdict_source_lane_invalid",
+        ));
+    }
+
+    let passed = gate_rows
+        .iter()
+        .filter(|(_, status, _)| *status == "pass")
+        .count();
+    let failed = gate_rows
+        .iter()
+        .filter(|(id, status, _)| *status == "fail" && !waived.contains(id))
+        .count();
+    let warned = gate_rows
+        .iter()
+        .filter(|(id, status, _)| *status == "warn" && !waived.contains(id))
+        .count();
+    let skipped = gate_rows
+        .iter()
+        .filter(|(_, status, _)| *status == "skip")
+        .count();
+    let blocking_total = gate_rows
+        .iter()
+        .filter(|(_, _, blocking)| *blocking)
+        .count();
+    let blocking_pass = gate_rows
+        .iter()
+        .filter(|(id, status, blocking)| *blocking && (*status == "pass" || waived.contains(id)))
+        .count();
+    let all_blocking_pass = blocking_pass == blocking_total;
+    let expected_verdict = if all_blocking_pass && failed == 0 {
+        "pass"
+    } else if all_blocking_pass {
+        "warn"
+    } else {
+        "fail"
+    };
+    if lane["verdict"].as_str() != Some(expected_verdict) || expected_verdict != "pass" {
+        return Err(DropinClaimFailure::Invalid(
+            "dropin_verdict_source_lane_invalid",
+        ));
+    }
+
+    let summary = performance_exact_object(
+        &lane["summary"],
+        &[
+            "total_gates",
+            "passed",
+            "failed",
+            "warned",
+            "skipped",
+            "waived",
+            "blocking_pass",
+            "blocking_total",
+            "all_blocking_pass",
+        ],
+        &[],
+        "certification lane summary",
+    )
+    .map_err(|_| DropinClaimFailure::Invalid("dropin_verdict_source_lane_invalid"))?;
+    for (field, expected) in [
+        ("total_gates", gates.len()),
+        ("passed", passed),
+        ("failed", failed),
+        ("warned", warned),
+        ("skipped", skipped),
+        ("waived", waived.len()),
+        ("blocking_pass", blocking_pass),
+        ("blocking_total", blocking_total),
+    ] {
+        if performance_uint(&summary[field], field).ok()
+            != Some(u64::try_from(expected).unwrap_or(u64::MAX))
+        {
+            return Err(DropinClaimFailure::Invalid(
+                "dropin_verdict_source_lane_invalid",
+            ));
+        }
+    }
+    if summary["all_blocking_pass"].as_bool() != Some(all_blocking_pass) {
+        return Err(DropinClaimFailure::Invalid(
+            "dropin_verdict_source_lane_invalid",
+        ));
+    }
+
+    let promotion = performance_exact_object(
+        &lane["promotion_rules"],
+        &["can_promote", "blocker_gates", "waiver_gates", "conditions"],
+        &[],
+        "certification lane promotion_rules",
+    )
+    .map_err(|_| DropinClaimFailure::Invalid("dropin_verdict_source_lane_invalid"))?;
+    let blocker_gates = gate_rows
+        .iter()
+        .filter(|(id, status, blocking)| {
+            *blocking && *status != "pass" && *status != "skip" && !waived.contains(id)
+        })
+        .map(|(id, _, _)| *id)
+        .collect::<Vec<_>>();
+    let actual_blockers = promotion["blocker_gates"]
+        .as_array()
+        .and_then(|items| items.iter().map(Value::as_str).collect::<Option<Vec<_>>>());
+    let actual_waivers = promotion["waiver_gates"]
+        .as_array()
+        .and_then(|items| items.iter().map(Value::as_str).collect::<Option<Vec<_>>>());
+    let actual_conditions = promotion["conditions"].as_array().and_then(|conditions| {
+        conditions
+            .iter()
+            .map(Value::as_str)
+            .collect::<Option<Vec<_>>>()
+    });
+    let mut expected_conditions = vec!["All blocking gates pass (including waivers)".to_string()];
+    if !waivers_applied.is_empty() {
+        expected_conditions.push(format!(
+            "Waivers active for: {} (review before release)",
+            waivers_applied.join(", ")
+        ));
+    }
+    let can_promote = all_blocking_pass && waiver_audit.expired == 0 && waiver_audit.invalid == 0;
+    if promotion["can_promote"].as_bool() != Some(can_promote)
+        || !can_promote
+        || actual_blockers.as_deref() != Some(blocker_gates.as_slice())
+        || actual_waivers.as_deref() != Some(waivers_applied.as_slice())
+        || actual_conditions.as_deref()
+            != Some(
+                expected_conditions
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+                    .as_slice(),
+            )
+    {
+        return Err(DropinClaimFailure::Invalid(
+            "dropin_verdict_source_lane_invalid",
+        ));
+    }
+
+    let rerun = performance_exact_object(
+        &lane["rerun_guidance"],
+        &["preflight_command", "full_command", "single_gate_template"],
+        &[],
+        "certification lane rerun_guidance",
+    )
+    .map_err(|_| DropinClaimFailure::Invalid("dropin_verdict_source_lane_invalid"))?;
+    if rerun["preflight_command"].as_str()
+        != Some("cargo test --test ci_full_suite_gate -- preflight_fast_fail --nocapture --exact")
+        || rerun["full_command"].as_str()
+            != Some(
+                "cargo test --test ci_full_suite_gate -- full_certification --nocapture --exact",
+            )
+        || rerun["single_gate_template"].as_str()
+            != Some("See reproduce_command field on each gate")
+    {
+        return Err(DropinClaimFailure::Invalid(
+            "dropin_verdict_source_lane_invalid",
+        ));
+    }
+    Ok(())
+}
+
+fn dropin_head_regular_blob(
+    context: &RepositoryGitContext,
+    head: &str,
+    source_path: &str,
+    require_non_executable: bool,
+) -> Result<Vec<u8>, DropinClaimFailure> {
+    if !dropin_canonical_repo_path(source_path) {
+        return Err(DropinClaimFailure::Invalid(
+            "dropin_verdict_provenance_path_invalid",
+        ));
+    }
+    let relative = Path::new(source_path);
+    let tree_entry = git_output(
+        context,
+        &["ls-tree", "-z", "--full-tree", head, "--", source_path],
+    )
+    .ok_or(DropinClaimFailure::Unavailable(
+        "dropin_verdict_source_binding_unavailable",
+    ))?;
+    let entries = canonical_nul_records(&tree_entry).ok_or(DropinClaimFailure::Unavailable(
+        "dropin_verdict_source_binding_unavailable",
+    ))?;
+    let entry = entries
+        .as_slice()
+        .first()
+        .copied()
+        .filter(|_| entries.len() == 1)
+        .ok_or(DropinClaimFailure::Invalid(
+            "dropin_verdict_provenance_not_tracked_at_head",
+        ))?;
+    let (mode, object_type, oid, recorded_path) = parse_canonical_git_record(entry).ok_or(
+        DropinClaimFailure::Unavailable("dropin_verdict_source_binding_unavailable"),
+    )?;
+    let mode_is_valid = if require_non_executable {
+        mode == b"100644"
+    } else {
+        matches!(mode, b"100644" | b"100755")
+    };
+    if recorded_path != source_path.as_bytes() || !mode_is_valid || object_type != b"blob" {
+        return Err(DropinClaimFailure::Invalid(
+            "dropin_verdict_provenance_not_regular_at_head",
+        ));
+    }
+    let oid = std::str::from_utf8(oid).map_err(|_| {
+        DropinClaimFailure::Unavailable("dropin_verdict_source_binding_unavailable")
+    })?;
+    let head_bytes = git_output(context, &["cat-file", "blob", oid]).ok_or(
+        DropinClaimFailure::Unavailable("dropin_verdict_source_binding_unavailable"),
+    )?;
+    let worktree_bytes = tracked_worktree_blob(&context.worktree, relative, mode).ok_or(
+        DropinClaimFailure::Invalid("dropin_verdict_provenance_not_regular_at_head"),
+    )?;
+    if worktree_bytes != head_bytes {
+        return Err(DropinClaimFailure::Invalid(
+            "dropin_verdict_provenance_bytes_do_not_match_head",
+        ));
+    }
+    Ok(head_bytes)
+}
+
+fn dropin_repository_state(
+    context: &RepositoryGitContext,
+    head: &str,
+) -> Result<(), DropinClaimFailure> {
+    match performance_repository_state_failure(context, head) {
+        None => Ok(()),
+        Some(PerformanceSourceBindingFailure::Unavailable) => Err(DropinClaimFailure::Unavailable(
+            "dropin_verdict_source_binding_unavailable",
+        )),
+        Some(PerformanceSourceBindingFailure::Invalid(_)) => Err(DropinClaimFailure::Invalid(
+            "dropin_verdict_repository_not_clean",
+        )),
+    }
+}
+
+fn dropin_source_binding(
+    context: &RepositoryGitContext,
+    source_commit: &str,
+    head: &str,
+) -> Result<(), DropinClaimFailure> {
+    let source_expression = format!("{source_commit}^{{commit}}");
+    let resolved_source = git_stdout(context, &["rev-parse", "--verify", &source_expression])
+        .ok_or(DropinClaimFailure::Invalid(
+            "dropin_verdict_source_commit_unresolvable",
+        ))?;
+    if resolved_source != source_commit {
+        return Err(DropinClaimFailure::Invalid(
+            "dropin_verdict_source_commit_not_exact",
+        ));
+    }
+    if source_commit == head {
+        return Ok(());
+    }
+    let ancestor = repository_git_command(context)
+        .args(["merge-base", "--is-ancestor", source_commit, head])
+        .output()
+        .map_err(|_| {
+            DropinClaimFailure::Unavailable("dropin_verdict_source_binding_unavailable")
+        })?;
+    if !ancestor.status.success() {
+        return Err(if ancestor.status.code() == Some(1) {
+            DropinClaimFailure::Invalid("dropin_verdict_source_commit_not_ancestor")
+        } else {
+            DropinClaimFailure::Unavailable("dropin_verdict_source_binding_unavailable")
+        });
+    }
+
+    let changed_paths = git_output(
+        context,
+        &[
+            "diff",
+            "--name-only",
+            "-z",
+            "--no-renames",
+            source_commit,
+            head,
+        ],
+    )
+    .ok_or(DropinClaimFailure::Unavailable(
+        "dropin_verdict_source_binding_unavailable",
+    ))?;
+    let changed_paths = canonical_nul_records(&changed_paths).ok_or(
+        DropinClaimFailure::Unavailable("dropin_verdict_source_binding_unavailable"),
+    )?;
+    let changed_paths = changed_paths
+        .iter()
+        .map(|path| std::str::from_utf8(path).ok())
+        .collect::<Option<Vec<_>>>()
+        .ok_or(DropinClaimFailure::Unavailable(
+            "dropin_verdict_source_binding_unavailable",
+        ))?;
+    if changed_paths
+        .iter()
+        .any(|path| !dropin_canonical_repo_path(path))
+    {
+        return Err(DropinClaimFailure::Invalid(
+            "dropin_verdict_source_commit_not_release_bound",
+        ));
+    }
+    let package_patterns = if changed_paths
+        .iter()
+        .any(|path| path.starts_with("docs/evidence/"))
+    {
+        let cargo_expression = format!("{source_commit}:Cargo.toml");
+        let cargo_toml = git_output(context, &["show", &cargo_expression])
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+            .ok_or(DropinClaimFailure::Unavailable(
+                "dropin_verdict_source_binding_unavailable",
+            ))?;
+        source_package_include_patterns(&cargo_toml).ok_or(DropinClaimFailure::Unavailable(
+            "dropin_verdict_source_binding_unavailable",
+        ))?
+    } else {
+        Vec::new()
+    };
+    let allowed_prefixes = [
+        "docs/evidence/",
+        "tests/ext_conformance/reports/",
+        "tests/perf/reports/",
+        "tests/cross_platform_reports/",
+        "tests/franken_node_compat/reports/",
+        "tests/evidence_bundle/",
+        "tests/certification/",
+    ];
+    let evidence_only = changed_paths.iter().all(|path| {
+        // Tracker-database churn is not source drift; see
+        // `tracker_state_status_record`.
+        if path.starts_with(TRACKER_STATE_PREFIX) {
+            return true;
+        }
+        let packaged_docs_evidence = path.starts_with("docs/evidence/")
+            && performance_path_is_packaged(path, &package_patterns) != Some(false);
+        !packaged_docs_evidence
+            && allowed_prefixes
+                .iter()
+                .any(|prefix| path.starts_with(prefix))
+    });
+    if !evidence_only {
+        return Err(DropinClaimFailure::Invalid(
+            "dropin_verdict_source_commit_not_release_bound",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_dropin_verdict_claim(
+    value: &Value,
+    repository_root: Option<&Path>,
+    captured_artifact_bytes: Option<&[u8]>,
+    reference_time_utc: Option<DateTime<Utc>>,
+) -> Result<(), DropinClaimFailure> {
+    let verdict_object = value.as_object().ok_or(DropinClaimFailure::Invalid(
+        "dropin_verdict_contract_invalid",
+    ))?;
+    if DROPIN_VERDICT_REQUIRED_FIELDS
+        .iter()
+        .any(|field| !verdict_object.contains_key(*field))
+        || !verdict_object
+            .get("generated_at_utc")
+            .is_some_and(dropin_generated_at_is_canonical)
+    {
+        return Err(DropinClaimFailure::Invalid(
+            "dropin_verdict_contract_invalid",
+        ));
+    }
+    let repository_root = repository_root.ok_or(DropinClaimFailure::Unavailable(
+        "dropin_verdict_source_binding_unavailable",
+    ))?;
+    let captured_artifact_bytes = captured_artifact_bytes.ok_or(
+        DropinClaimFailure::Unavailable("dropin_verdict_source_binding_unavailable"),
+    )?;
+    let reference_time = reference_time_utc.ok_or(DropinClaimFailure::Unavailable(
+        "dropin_verdict_source_lane_freshness_unavailable",
+    ))?;
+    let verdict_generated_at = verdict_object["generated_at_utc"]
+        .as_str()
+        .and_then(|raw| DateTime::parse_from_rfc3339(raw).ok())
+        .map(|parsed| parsed.with_timezone(&Utc))
+        .ok_or(DropinClaimFailure::Invalid(
+            "dropin_verdict_contract_invalid",
+        ))?;
+    let context = repository_git_context(repository_root).ok_or(
+        DropinClaimFailure::Unavailable("dropin_verdict_source_binding_unavailable"),
+    )?;
+    let head = git_stdout(&context, &["rev-parse", "--verify", "HEAD^{commit}"]).ok_or(
+        DropinClaimFailure::Unavailable("dropin_verdict_source_binding_unavailable"),
+    )?;
+    dropin_repository_state(&context, &head)?;
+
+    let verdict_bytes =
+        dropin_head_regular_blob(&context, &head, DROPIN_CERTIFICATION_VERDICT_PATH, true)?;
+    if verdict_bytes != captured_artifact_bytes {
+        return Err(DropinClaimFailure::Invalid(
+            "dropin_verdict_artifact_changed_since_ingestion",
+        ));
+    }
+    let contract_bytes =
+        dropin_head_regular_blob(&context, &head, DROPIN_CERTIFICATION_CONTRACT_PATH, true)?;
+    let contract_text = std::str::from_utf8(&contract_bytes)
+        .map_err(|_| DropinClaimFailure::Invalid("dropin_verdict_contract_invalid"))?;
+    let contract = parse_json_rejecting_duplicate_keys(contract_text)
+        .map_err(|_| DropinClaimFailure::Invalid("dropin_verdict_contract_invalid"))?;
+    let gate_specs = dropin_contract_gate_specs(&contract)?;
+    let (source_commit, evidence_paths) = dropin_verdict_payload(value, &gate_specs)?;
+    let lane_bytes =
+        dropin_head_regular_blob(&context, &head, DROPIN_CERTIFICATION_LANE_PATH, true)?;
+    let lane_text = std::str::from_utf8(&lane_bytes)
+        .map_err(|_| DropinClaimFailure::Invalid("dropin_verdict_source_lane_invalid"))?;
+    let lane = parse_json_rejecting_duplicate_keys(lane_text)
+        .map_err(|_| DropinClaimFailure::Invalid("dropin_verdict_source_lane_invalid"))?;
+    validate_dropin_certification_lane(&lane, reference_time, verdict_generated_at)?;
+    dropin_source_binding(&context, &source_commit, &head)?;
+
+    let mut provenance_paths = vec![
+        DROPIN_CERTIFICATION_CONTRACT_PATH.to_string(),
+        DROPIN_CERTIFICATION_VERDICT_PATH.to_string(),
+        DROPIN_CERTIFICATION_LANE_PATH.to_string(),
+    ];
+    provenance_paths.extend(evidence_paths);
+    let mut seen = BTreeSet::new();
+    for path in provenance_paths {
+        if seen.insert(path.clone()) {
+            let require_non_executable = matches!(
+                path.as_str(),
+                DROPIN_CERTIFICATION_CONTRACT_PATH
+                    | DROPIN_CERTIFICATION_VERDICT_PATH
+                    | DROPIN_CERTIFICATION_LANE_PATH
+            );
+            dropin_head_regular_blob(&context, &head, &path, require_non_executable)?;
+        }
+    }
+
+    let current_head = git_stdout(&context, &["rev-parse", "--verify", "HEAD^{commit}"]).ok_or(
+        DropinClaimFailure::Unavailable("dropin_verdict_source_binding_unavailable"),
+    )?;
+    if current_head != head {
+        return Err(DropinClaimFailure::Invalid(
+            "dropin_verdict_repository_head_changed",
+        ));
+    }
+    dropin_repository_state(&context, &head)?;
+    let final_verdict_bytes =
+        dropin_head_regular_blob(&context, &head, DROPIN_CERTIFICATION_VERDICT_PATH, true)?;
+    if final_verdict_bytes != captured_artifact_bytes {
+        return Err(DropinClaimFailure::Invalid(
+            "dropin_verdict_artifact_changed_during_validation",
+        ));
+    }
+    Ok(())
+}
+
 pub fn classify_evidence_freshness(
     value: &Value,
     options: &SemanticWorkspaceGraphBuildOptions,
 ) -> (EvidenceFreshnessStatus, bool, String) {
+    classify_evidence_freshness_in_repository(value, options, None, None, None)
+}
+
+fn classify_evidence_freshness_in_repository(
+    value: &Value,
+    options: &SemanticWorkspaceGraphBuildOptions,
+    repository_root: Option<&Path>,
+    artifact_source_path: Option<&str>,
+    captured_artifact_bytes: Option<&[u8]>,
+) -> (EvidenceFreshnessStatus, bool, String) {
+    let canonical_performance_budget = artifact_source_path == Some(PERF_BUDGET_SUMMARY_PATH);
+    if value.get("schema").and_then(Value::as_str) == Some(DROPIN_CERTIFICATION_VERDICT_SCHEMA)
+        && artifact_source_path != Some(DROPIN_CERTIFICATION_VERDICT_PATH)
+    {
+        return (
+            EvidenceFreshnessStatus::Malformed,
+            false,
+            "dropin_verdict_noncanonical_path".to_string(),
+        );
+    }
+    if canonical_performance_budget
+        && let Some(classification) = classify_performance_budget_claim(
+            value,
+            options,
+            repository_root,
+            artifact_source_path,
+            captured_artifact_bytes,
+            true,
+        )
+    {
+        return classification;
+    }
+
+    if artifact_source_path == Some(DROPIN_CERTIFICATION_VERDICT_PATH) {
+        if value.get("schema").and_then(Value::as_str) != Some(DROPIN_CERTIFICATION_VERDICT_SCHEMA)
+        {
+            return (
+                EvidenceFreshnessStatus::Malformed,
+                false,
+                "dropin_verdict_schema_invalid".to_string(),
+            );
+        }
+        let Some(overall_verdict) = value.get("overall_verdict").and_then(Value::as_str) else {
+            return (
+                EvidenceFreshnessStatus::Malformed,
+                false,
+                "overall_verdict_missing_or_invalid".to_string(),
+            );
+        };
+        if overall_verdict != "CERTIFIED" {
+            return (
+                EvidenceFreshnessStatus::Uncertified,
+                false,
+                "overall_verdict_not_certified".to_string(),
+            );
+        }
+        if let Err(failure) = validate_dropin_verdict_claim(
+            value,
+            repository_root,
+            captured_artifact_bytes,
+            options.reference_time_utc,
+        ) {
+            return match failure {
+                DropinClaimFailure::Unavailable(reason) => (
+                    EvidenceFreshnessStatus::Uncertified,
+                    false,
+                    reason.to_string(),
+                ),
+                DropinClaimFailure::Invalid(reason) => (
+                    EvidenceFreshnessStatus::Malformed,
+                    false,
+                    reason.to_string(),
+                ),
+            };
+        }
+    }
+
     if value
         .get("claim_surface")
         .and_then(Value::as_str)
@@ -1896,6 +5244,19 @@ pub fn classify_evidence_freshness(
             false,
             "claim_surface_is_historical_snapshot".to_string(),
         );
+    }
+
+    if !canonical_performance_budget
+        && let Some(classification) = classify_performance_budget_claim(
+            value,
+            options,
+            repository_root,
+            artifact_source_path,
+            captured_artifact_bytes,
+            false,
+        )
+    {
+        return classification;
     }
 
     if value
@@ -1910,7 +5271,12 @@ pub fn classify_evidence_freshness(
         );
     }
 
-    let Some(generated_at) = evidence_generated_at(value) else {
+    let generated_at = if artifact_source_path == Some(DROPIN_CERTIFICATION_VERDICT_PATH) {
+        value.get("generated_at_utc").and_then(Value::as_str)
+    } else {
+        evidence_generated_at(value)
+    };
+    let Some(generated_at) = generated_at else {
         return (
             EvidenceFreshnessStatus::FreshnessUnknown,
             false,
@@ -1934,11 +5300,23 @@ pub fn classify_evidence_freshness(
         );
     };
 
-    if reference_time_utc
-        .signed_duration_since(generated_at.with_timezone(&Utc))
-        .num_days()
-        > options.stale_after_days
-    {
+    let generated_at_utc = generated_at.with_timezone(&Utc);
+    if generated_at_utc.signed_duration_since(reference_time_utc) > Duration::minutes(5) {
+        return (
+            EvidenceFreshnessStatus::Malformed,
+            false,
+            "generated_at_in_future".to_string(),
+        );
+    }
+
+    let stale = evidence_age_exceeds_policy(
+        value,
+        options,
+        artifact_source_path,
+        generated_at_utc,
+        reference_time_utc,
+    );
+    if stale {
         (
             EvidenceFreshnessStatus::Stale,
             false,
@@ -2100,8 +5478,10 @@ fn doc_citation_node(
 fn evidence_artifact_node(
     source_path: &str,
     value: &Value,
+    captured_artifact_bytes: &[u8],
     content_sha256: &str,
     options: &SemanticWorkspaceGraphBuildOptions,
+    repository_root: &Path,
 ) -> SemanticGraphNode {
     let artifact_schema = value
         .get("schema")
@@ -2109,11 +5489,22 @@ fn evidence_artifact_node(
         .unwrap_or("schema_missing");
     let stable_key = format!("{source_path}:{artifact_schema}");
     let (freshness_status, release_claim_allowed, reason) =
-        classify_evidence_freshness(value, options);
+        classify_evidence_freshness_in_repository(
+            value,
+            options,
+            Some(repository_root),
+            Some(source_path),
+            Some(captured_artifact_bytes),
+        );
     let mut metadata = BTreeMap::new();
     let privacy = classify_node_privacy(source_path, Some(value));
     metadata.insert("artifact_schema".to_string(), json!(artifact_schema));
-    if let Some(generated_at) = evidence_generated_at(value) {
+    let generated_at = if source_path == DROPIN_CERTIFICATION_VERDICT_PATH {
+        value.get("generated_at_utc").and_then(Value::as_str)
+    } else {
+        evidence_generated_at(value)
+    };
+    if let Some(generated_at) = generated_at {
         metadata.insert("generated_at".to_string(), json!(generated_at));
     }
     if let Some(claim_surface) = value.get("claim_surface").and_then(Value::as_str) {
@@ -2121,6 +5512,26 @@ fn evidence_artifact_node(
     }
     if let Some(overall_verdict) = value.get("overall_verdict").and_then(Value::as_str) {
         metadata.insert("overall_verdict".to_string(), json!(overall_verdict));
+    }
+    if let Some(claim_readiness) = value.get("claim_readiness").and_then(Value::as_object) {
+        if let Some(status) = claim_readiness.get("status").and_then(Value::as_str) {
+            metadata.insert("claim_readiness_status".to_string(), json!(status));
+        }
+        if let Some(authorized) = claim_readiness
+            .get("performance_claims_authorized")
+            .and_then(Value::as_bool)
+        {
+            metadata.insert(
+                "performance_claims_authorized".to_string(),
+                json!(authorized),
+            );
+        }
+        if let Some(blockers) = claim_readiness
+            .get("blocking_reason_codes")
+            .and_then(Value::as_array)
+        {
+            metadata.insert("blocking_reason_codes".to_string(), json!(blockers));
+        }
     }
     if let Some(source_generated_at) = value
         .get("source_report_generated_at")
@@ -2144,7 +5555,7 @@ fn evidence_artifact_node(
         "suppresses_release_claim_context".to_string(),
         json!(!release_claim_allowed),
     );
-    if source_path.ends_with("dropin-certification-verdict.json") {
+    if source_path == DROPIN_CERTIFICATION_VERDICT_PATH {
         metadata.insert(
             "strict_replacement_claim_allowed".to_string(),
             json!(release_claim_allowed),
@@ -2615,7 +6026,7 @@ fn graph_input_fingerprint_digest(graph: &SemanticWorkspaceGraph) -> String {
             hasher.update(mtime_unix_ns.to_string().as_bytes());
         }
     }
-    format!("{:x}", hasher.finalize())
+    crate::package_manager::hex_encode(&hasher.finalize())
 }
 
 fn build_redaction_summary(
@@ -3112,7 +6523,7 @@ fn datetime_unix_ns(timestamp: DateTime<Utc>) -> Option<u64> {
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+    crate::package_manager::hex_encode(&Sha256::digest(bytes))
 }
 
 fn cache_key_sha256(
@@ -3130,7 +6541,7 @@ fn cache_key_sha256(
     hasher.update(normalized_source_path.as_bytes());
     hasher.update(b"\0");
     hasher.update(content_sha256.as_bytes());
-    format!("{:x}", hasher.finalize())
+    crate::package_manager::hex_encode(&hasher.finalize())
 }
 
 fn stable_id(kind: &str, parts: &[&str]) -> String {
@@ -3140,7 +6551,7 @@ fn stable_id(kind: &str, parts: &[&str]) -> String {
         hasher.update(b"\0");
         hasher.update(part.as_bytes());
     }
-    let digest = format!("{:x}", hasher.finalize());
+    let digest = crate::package_manager::hex_encode(&hasher.finalize());
     format!("swg:{kind}:{}", &digest[..16])
 }
 
@@ -3176,4 +6587,116 @@ fn redact_error_message(message: &str) -> String {
         .replace("authorization", "[redacted-keyword]")
         .replace("token", "[redacted-keyword]")
         .replace("secret", "[redacted-keyword]")
+}
+
+#[cfg(test)]
+mod git_record_parser_tests {
+    use super::{canonical_nul_records, parse_canonical_git_record};
+    // Only `repository_git_commands_ignore_hostile_global_configuration` needs
+    // these, and it is Unix-gated (it builds a hostile `HOME`/`XDG_CONFIG_HOME`
+    // and inspects the resulting argv), so the imports follow its gate.
+    #[cfg(unix)]
+    use super::{repository_git_command, repository_git_context, trusted_git_executable};
+    #[cfg(unix)]
+    use std::collections::BTreeMap;
+    #[cfg(unix)]
+    use std::ffi::OsString;
+    #[cfg(unix)]
+    use std::fs;
+    #[cfg(unix)]
+    use std::process::Command;
+
+    #[test]
+    fn accepts_only_canonical_git_record_headers() {
+        assert_eq!(
+            parse_canonical_git_record(b"100644 blob abcdef\tsrc/lib.rs"),
+            Some((
+                b"100644".as_slice(),
+                b"blob".as_slice(),
+                b"abcdef".as_slice(),
+                b"src/lib.rs".as_slice(),
+            ))
+        );
+
+        for malformed in [
+            b" 100644 blob abcdef\tsrc/lib.rs".as_slice(),
+            b"100644  blob abcdef\tsrc/lib.rs".as_slice(),
+            b"100644 blob  abcdef\tsrc/lib.rs".as_slice(),
+            b"100644 blob abcdef \tsrc/lib.rs".as_slice(),
+            b"100644 blob abcdef src/lib.rs".as_slice(),
+            b"100644 blob abcdef\t".as_slice(),
+            b"100644 blob\tsrc/lib.rs".as_slice(),
+            b"100644 blob abcdef extra\tsrc/lib.rs".as_slice(),
+        ] {
+            assert_eq!(parse_canonical_git_record(malformed), None);
+        }
+    }
+
+    #[test]
+    fn accepts_only_canonically_terminated_nul_records() {
+        assert_eq!(canonical_nul_records(b""), Some(Vec::new()));
+        assert_eq!(
+            canonical_nul_records(b"first\0second\0"),
+            Some(vec![b"first".as_slice(), b"second".as_slice()])
+        );
+
+        for malformed in [
+            b"first".as_slice(),
+            b"\0".as_slice(),
+            b"first\0\0".as_slice(),
+            b"first\0\0second\0".as_slice(),
+        ] {
+            assert_eq!(canonical_nul_records(malformed), None);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repository_git_commands_ignore_hostile_global_configuration() {
+        let temp = tempfile::tempdir().expect("create Git command fixture");
+        let repository = temp.path().join("repository");
+        let git = trusted_git_executable().expect("trusted Git executable");
+        let init = Command::new(git)
+            .args(["init", "-b", "main"])
+            .arg(&repository)
+            .output()
+            .expect("initialize Git command fixture");
+        assert!(init.status.success());
+        let context = repository_git_context(&repository).expect("trusted Git context");
+
+        let command = repository_git_command(&context);
+        let env = command
+            .get_envs()
+            .map(|(key, value)| (key.to_os_string(), value.map(OsString::from)))
+            .collect::<BTreeMap<_, _>>();
+        for (key, expected) in [
+            ("GIT_CONFIG_GLOBAL", "/dev/null"),
+            ("GIT_CONFIG_NOSYSTEM", "1"),
+            ("GIT_LITERAL_PATHSPECS", "1"),
+            ("GIT_NO_REPLACE_OBJECTS", "1"),
+            ("GIT_OPTIONAL_LOCKS", "0"),
+            ("GIT_TERMINAL_PROMPT", "0"),
+        ] {
+            assert_eq!(
+                env.get(&OsString::from(key)).and_then(Option::as_deref),
+                Some(std::ffi::OsStr::new(expected)),
+                "missing sanitized Git environment control {key}"
+            );
+        }
+
+        let hostile_home = temp.path().join("hostile-home");
+        fs::create_dir(&hostile_home).expect("create hostile Git home");
+        fs::write(
+            hostile_home.join(".gitconfig"),
+            "[user]\nname = Hostile Global Identity\n",
+        )
+        .expect("write hostile global Git configuration");
+        let global_lookup = repository_git_command(&context)
+            .env("HOME", &hostile_home)
+            .args(["config", "--global", "--get", "user.name"])
+            .output()
+            .expect("probe sanitized global Git configuration");
+        assert!(!global_lookup.status.success());
+        assert!(global_lookup.stdout.is_empty());
+    }
 }

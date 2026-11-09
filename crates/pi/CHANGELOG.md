@@ -14,6 +14,2189 @@ Repository: <https://github.com/Dicklesworthstone/pi_agent_rust>
 
 ## [Unreleased]
 
+### Fixed
+
+- **Installer on a stock Mac.** `install.sh` required an `xz` program before
+  extracting a release archive. macOS has none unless Homebrew or MacPorts
+  installed one, and its `tar` reads xz without it, so the documented install
+  command stopped with "xz is not available to extract
+  pi-darwin-arm64.tar.xz" after the checksum had verified. The installer now
+  lets `tar` decide and reports a missing `xz` only when extraction fails
+  ([#263](https://github.com/Dicklesworthstone/pi_agent_rust/issues/263)).
+  The fix is in the installer on `main`, so it applies to every release.
+- **Installer on Ubuntu 22.04 and Debian 12.** `install.sh` matched SHA-256
+  digests with the awk pattern `/^[0-9a-fA-F]{64}$/`. The default awk on
+  those systems, mawk 1.3.4 20200120, has no interval expressions, so the
+  pattern never matched and every install stopped with "Checksum sidecar for
+  pi-linux-amd64.tar.xz does not contain one usable SHA-256 digest". The
+  installer now checks the length and the characters separately, and
+  `tests/installer_regression.sh` rejects interval expressions in its awk
+  and grep patterns
+  ([#265](https://github.com/Dicklesworthstone/pi_agent_rust/issues/265)).
+- **`pi self-update` with large release binaries.** The updater downloaded
+  at most 64 MiB and treated a larger binary as missing, so it stopped with
+  "No compatible binary candidate found" for v0.8.0 on Linux x86_64, macOS
+  Intel and Windows, whose binaries are 70 to 78 MB. The limit is now
+  256 MiB, and a response that declares a larger `Content-Length` is
+  refused before it is read. This takes effect only in builds that contain
+  it: v0.7.1 and v0.8.0 users on those platforms run the installer once
+  ([#266](https://github.com/Dicklesworthstone/pi_agent_rust/issues/266)).
+
+## [v0.8.0] — 2026-10-13 — Release
+
+A feature release on top of v0.7.1. Prompts can carry native audio and video;
+a resumed session runs in the workspace it was saved in; ACP editors can
+reopen saved sessions and attach MCP servers; and the classic stack and ACP
+get the retry, failover and persistence fences that the default stack, print
+mode and RPC already had. Much of the rest hardens tool-call handling, LSP,
+MCP and process ownership. Published binaries are now built for speed
+rather than size, and the default interface no longer stops redrawing when
+frames are slow, as they are during a long reasoning block.
+
+A minor release because three library items that `docs/sdk.md` marks Stable
+changed incompatibly (see **Changed**). The CLI gains one flag
+(`--session-workdir`) and loses none; settings gain one key
+(`http.proxyLoopback`) and lose none. Session files written by earlier
+releases open unchanged. The reverse no longer holds for every session: a
+JSONL session that v0.8.0 saves with an image, audio or video payload over
+64 KiB keeps that payload in a sidecar directory, which v0.7.1 and earlier do
+not read.
+
+### Changed
+
+- **Breaking (library API).** Three items that `docs/sdk.md` marks Stable
+  changed incompatibly:
+  - `pi::sdk::SessionOptions` gained two public fields,
+    `model_scope: Option<Vec<String>>` and
+    `max_time: Option<std::time::Duration>`, both `None` by default. Code
+    that builds the struct by listing every field must add them; code that
+    ends the literal with `..Default::default()` is unaffected.
+  - `pi::sdk::AgentSessionHandle::mount_mcp_server_tools_if_absent(&mut self,
+    server_name: &str) -> usize` was removed. Call
+    `refresh_mcp_server_tools(&mut self, server_name: &str) -> usize`
+    instead. It is not a pure rename: besides mounting missing tools it gives
+    already-mounted tools the server's current schemas and removes tools the
+    server no longer offers, and the returned count is wrappers added,
+    replaced or removed (it was wrappers added).
+  - `pi::sdk::Agent::restore_secrets_inbound(&self, tool_call: ToolCall)`
+    returns `Result<ToolCall>` (was `ToolCall`). It fails with
+    `PI_SECRET_JSON_RESTORE_KEY_COLLISION` when restoring placeholders would
+    merge two distinct argument keys, and with `PI_SECRET_JSON_DEPTH` when
+    the arguments are nested too deeply. Callers must handle the error.
+
+  The Stable trait `pi::sdk::Tool` gained four methods
+  (`execute_with_auxiliary_privacy`, `effects_for_input`, `bind_model_scope`,
+  `mcp_manager`); all have default bodies, so existing implementations
+  compile unchanged.
+- **SDK turns are owned until they are saved.** Dropping an admitted
+  `prompt*` or `continue_turn*` future now fences the handle exactly as a
+  failed session save does: later prompts return an error until a new or
+  resumed session replaces the handle. To cancel and keep the handle, abort
+  through the `AbortSignal` and await the outcome. The fence now applies at
+  every entry point, including an image prompt whose retry cannot be saved.
+  `mark_checkpoint`, `rewind_to_checkpoint`, `rewind_to_user_message` and
+  retry preparation save their change before replacing the live
+  conversation, and a failed save leaves it as it was. `prepare_retry()`
+  refuses a turn that holds images or media; use `prepare_retry_content()`.
+  The typed `on_stream_event` hook now receives the provider's terminal
+  `Done`/`Error` events.
+- **`Agent::set_provider` resets image support.** Installing a provider
+  object directly now turns the agent's image-input capability off (thinking
+  and the tool-call dialect were already reset), because a bare provider
+  carries no catalog metadata. Embedders that swap in a provider for a
+  vision model must call `set_model_accepts_images(true)` afterwards, or
+  images reach the model as a "does not support image input" placeholder.
+  Model switches made through the CLI and the SDK's own selection paths
+  restore the capability themselves.
+- **SDK RPC client (`RpcTransportClient`).** Requests and prompts no longer
+  block the caller's executor while waiting on the subprocess pipes.
+  Dropping an in-flight request or prompt future closes the connection and
+  stops the subprocess tree: reconnect before the next request, or abort the
+  turn with `RpcControlHandle::abort()` and keep polling to keep the
+  connection. An acknowledgement must carry a boolean `success`; a
+  mismatched or duplicate prompt acknowledgement closes the connection. One
+  JSON line may be 128 MiB (was 8 MiB) and the pre-acknowledgement buffer
+  256 MiB (was 4 MiB), to fit echoed native media.
+- **Library items outside `pi::sdk`** are not covered by SemVer, but
+  embedders that reach into them should know: `pi::compaction::compact`,
+  `compact_auto` and `summarize_entries`, and
+  `pi::checkpoint::summarize_span`, take `&StreamOptions` where they took
+  `api_key: &str`, plus a trailing `&CompactionPrivacy`; `compact_local` and
+  `compact_shake` take a trailing `&CompactionPrivacy`;
+  `ExtensionHostActions::compact_session` takes a second
+  `ExtensionCompactionOptions` argument; `pi::tools::ProcessedFiles` and
+  `pi::app::InitialMessage` replace `images: Vec<ImageContent>` with
+  `attachments: Vec<ContentBlock>`; and `pi::http::proxy::HttpSettings` (the
+  type of the Stable `Config.http` field) gained
+  `proxy_loopback: Option<bool>`.
+- **Resumed sessions run in their saved workspace.** `pi --session`,
+  `--continue` and `--resume` now resolve the session's saved working
+  directory before loading project settings, trust, tools or extensions, and
+  use it instead of the directory pi was started from. Project resources,
+  prompt files, MCP configuration, credential commands and tool paths
+  resolve there, and the session's saved additional roots are restored. If
+  the saved directory is gone, startup stops with
+  `PI_SESSION_WORKDIR_UNAVAILABLE` rather than using the current directory:
+  pass `--session-workdir <PATH>` together with `--session` to attach the
+  session to its new location. `--no-session` and read-only modes are
+  unaffected. In the SDK, omit `SessionOptions::working_directory` when
+  resuming to follow the saved workspace; a value naming a different
+  directory fails with `PI_SESSION_WORKDIR_MISMATCH`. A running classic or
+  RPC session refuses to switch or fork to a session of another workspace;
+  start a new `pi --session ...` process instead. `--continue`, `--resume`
+  and the session pickers list a reattached session under its new workspace.
+- **Large attachments are stored beside the session file.** When a JSONL
+  session is saved, each image, audio or video payload over 64 KiB is written
+  once to `<session>.jsonl.blobs/<sha256>` and the JSONL line keeps a
+  `$piBlob` reference. Copy or back up the `.jsonl` file together with its
+  `.blobs` directory, and rename the directory if you rename the file. A
+  missing or corrupt blob stops the session from opening with
+  `PI_SESSION_ATTACHMENT_INVALID` instead of being skipped. Forks and HTML
+  exports are self-contained, deleting a session removes its blobs, and
+  nothing else garbage-collects them. Older releases do not read these
+  references from JSONL, so do not reopen such a session with v0.7.1.
+- **Windows: commands are contained at creation, and source builds need
+  nightly.** The bash tool, background jobs, subagents, MCP and language
+  servers, the browser, debug adapters and the SDK's RPC subprocess now join
+  their kill-on-close Job as part of process creation, so a child cannot
+  start descendants before it is contained, and a command is refused when
+  its Job cannot be set up. This relies on the unstable std feature
+  `windows_process_extensions_raw_attribute`, which the library now enables
+  on Windows: building pi, or a crate that depends on it, for a Windows
+  target requires a nightly toolchain (the repository pins
+  `nightly-2026-08-31`). Other targets are unaffected and `rust-version`
+  stays 1.95.
+- **Installer.** `install.sh` reads the latest version from the `tag_name`
+  field of GitHub's release metadata whether the JSON is compact or
+  pretty-printed; with compact JSON it used to select the release body and
+  fail (#253). `--source-dir <DIR>` (which implies `--from-source`) now
+  installs a local checkout without contacting GitHub: no release lookup,
+  no network preflight and no `git` requirement. It always rebuilds, instead
+  of skipping because the previous install recorded the same version.
+- **Loopback model servers bypass the proxy.** Requests to `localhost`,
+  `127.0.0.0/8`, `::1` and IPv4-mapped loopback addresses now go direct even
+  when an HTTP or SOCKS proxy is configured, so the `NO_PROXY` entries
+  v0.7.1 needed for Ollama or LM Studio are no longer required. Set
+  `"http": { "proxyLoopback": true }` (also `proxy_loopback`) to send
+  loopback traffic through the proxy; `NO_PROXY` and `http.noProxy` still
+  take precedence. Bash children now receive only HTTP proxy endpoints as
+  `HTTP_PROXY`/`HTTPS_PROXY`. With a SOCKS proxy their inherited proxy
+  variables are left alone, so an authenticated `ALL_PROXY` keeps its
+  credentials; a SOCKS proxy set only in pi's settings or `PI_*_PROXY` no
+  longer reaches child tools.
+- **Retry and failover on the classic stack and in ACP.** `pi --classic` and
+  ACP editor sessions now run turns through the same recovery driver as the
+  default stack: same-provider retries, `retry.fallbackChains`, restoration
+  of the primary model after its cooldown, and the persistence fence. A
+  fallback chain that the classic stack silently ignored now runs there.
+  Explicitly choosing a model, including the active fallback, ends automatic
+  restoration, and that choice is saved. Print mode and RPC keep a system
+  prompt that an extension selected for the turn through retries and
+  fallback hops, and RPC rebuilds failover state after `switch_session` and
+  `fork`.
+- **ACP sessions honor the launch flags.** `--provider`, `--model`,
+  `--models`, `--thinking`, `--api-key`, `--tools`, `--no-tools`,
+  `--system-prompt`, `--append-system-prompt`, `--no-context-files`,
+  `--hide-cwd-in-prompt`, `--max-tool-iterations` and `--max-time` now reach
+  every editor session. An unreadable prompt file rejects session creation.
+- **`--no-tools` means no built-in tools.** `--no-tools`, and an empty
+  `enabled_tools` list in the SDK, now also remove the tools that settings
+  turn on. Tools from explicitly loaded extensions and MCP servers still
+  mount. Plan mode cannot start in such a session: `--plan-mode` prints a
+  warning and `/plan` reports `PLAN_TOOLS_DISABLED`.
+- **A model scope emptied by provider settings is an error.** When every
+  model matched by `--models` or the workspace's model scope belongs to a
+  disabled provider, startup fails with `MODEL_SCOPE_DISABLED` instead of
+  selecting an unrelated model. The check runs after extensions register
+  their providers.
+- **Default stack: extension commands take precedence.** A command that an
+  extension registers now wins over a built-in of the same name (`/plan`,
+  `/status`, `/todos`, `/branch`, ...). Registrations are refreshed after a
+  session is replaced and after `/reload`.
+- **A time cap stops queued work.** When `--max-time` ends a turn, queued
+  steering and follow-up messages are no longer started automatically on
+  either terminal stack or over RPC; they stay queued until you send or
+  retry. RPC also skips automatic compaction after a capped turn.
+- **Tool calls are validated as a whole batch.** Before any approval prompt,
+  hook or tool runs, every call in a reply must have a non-blank, unique id,
+  a non-blank name and JSON-object arguments; otherwise none of the batch
+  runs (`PI_TOOL_CALL_PROTOCOL`). The provider adapters apply the same rule
+  while streaming: OpenAI Chat, Azure and OpenAI Responses/Codex reject a
+  response with missing, duplicate or contradictory call identities or
+  malformed arguments, and Gemini and Vertex reject a response whose finish
+  reason reports a failure. A valid sibling of a malformed call is no longer
+  executed.
+- **Extension provider streams must agree with what they streamed.** The
+  terminal message may not drop or retype a block, or change completed text,
+  thinking, tool arguments, ids, names or signatures. A tool call may not
+  change its id or name mid-stream or reuse an id at a second content index,
+  and text deltas must match the cumulative text. Previewed content is
+  limited to 32 MiB per stream. A successful reply that ends with `stop` but
+  contains complete tool calls is now treated as `toolUse`, and the calls
+  run.
+- **Signed assistant content is replayed verbatim only to its own model.**
+  v0.7.1 sent provider-signed content unchanged to whichever model was
+  active. An exact match of API, provider and model is now required. After a
+  model switch, earlier content is screened like other text, and its
+  signature fields, and on OpenAI Responses its reasoning and item ids, are
+  left out of the request; Bedrock reasoning follows the same rule. The
+  stored session is not modified, so switching back restores exact replay.
+  In `obfuscate` mode, numbers and other JSON primitives in a model's own
+  tool-call arguments keep their type when replayed to that same model.
+- **Secret screening covers auxiliary requests and memory.** The advisor
+  and `/btw` apply the configured `secrets` policy, including
+  `extra_patterns`, `block` mode and values the session already holds in its
+  vault. Compaction (manual, automatic, background, rewind, branch and
+  extension-driven) and memory reflection are screened the same way. Memory
+  facts, tags and learned skills are redacted irreversibly with the shared
+  detector before they are stored, even when `secrets.mode` is `off`. When
+  restoring placeholders in tool-call arguments would merge two distinct
+  keys, the call is refused before approval.
+- **Detector ruleset v6.** OpenAI and Anthropic `sk-` keys are now found
+  directly after a literal control escape such as `\n` or `\t` in escaped
+  text (JSON strings, debug-formatted crash bundles). Keys inside ordinary
+  identifiers are still not matched.
+- **Hub service logs are capped.** Each service run keeps the first 16 MiB
+  of raw output. Pi keeps draining the service after that, so readiness
+  checks, live tails and PTY input continue; `logs`, `ps` and `describe`
+  report `logCapture` byte counts and truncation.
+- **Context estimates.** Audio counts as 32 tokens per second and video as
+  300 tokens per second when the container reports a duration (it was sized
+  by encoded bytes); text containing a literal control-token spelling such
+  as `<|endoftext|>` is counted as ordinary text; and the fallback estimate
+  in builds without `bpe-tokens` rounds up. These move the point at which
+  automatic compaction starts.
+- **Published binaries are optimized for speed.** Release binaries were built
+  with `opt-level = "z"` (size). They are now built with a new `dist` Cargo
+  profile: the same fat LTO, single codegen unit, `panic = "abort"` and
+  stripping, with `opt-level = 3`. Measured on Linux x86_64 with the same
+  source built both ways, in interleaved runs: the binary is 43% larger
+  (78.0 MB against 54.7 MB) and takes 25% less time to process a
+  20,000-delta streamed response in print mode, 25% less for a complete RPC
+  turn with a tool call, and 15% less to start. Against the published
+  v0.7.1 binary, the published v0.8.0 binary takes about a fifth less time
+  on those workloads.
+  `cargo build --release` and `cargo install` still use the size-budgeted
+  `release` profile; build with `--profile dist` to match the published
+  binaries.
+- **Dependencies.** `fsqlite` 0.4.10 (from 0.3.18): it is built on
+  `asupersync` 0.5, the version pi already uses, so the second copy of
+  `asupersync` (0.4.11) leaves the build. `ftui` and `ftui-extras` 0.9.0
+  (from 0.7), `rich_rust` 0.2.3, and a refresh of the semver-compatible
+  dependencies. `charmed-bubbletea` and `charmed-bubbles` are pinned to
+  exactly 0.2.0: 0.2.1 through 0.2.4 hide the wrapped tail of long
+  classic-stack status lines. `asupersync` stays on 0.5.0, the newest
+  published release. `wasmtime` stays on 47 behind the optional `wasm-host`
+  feature, which release binaries do not enable
+  ([#258](https://github.com/Dicklesworthstone/pi_agent_rust/issues/258)).
+
+### Added
+
+- **Native audio and video in prompts.**
+  `pi @voice.wav @clip.mp4 "Compare these recordings"` attaches audio and
+  video (`.mp4`, `.mov`, `.webm`, `.mp3`, `.wav`, `.flac`, `.ogg`, `.m4a`;
+  5 MiB per file by default) alongside images, in argument order, on both
+  terminal stacks. Gemini-family providers receive the media natively; other
+  providers receive a `[media omitted: ...]` placeholder, and the session
+  keeps the attachment. Attachments survive retry, failover and `/retry`.
+- **`--session-workdir <PATH>`** attaches an existing `--session` to a
+  moved project directory, saves that attachment, and resumes there.
+- **SDK:** `AgentSessionHandle::prompt_with_content`,
+  `prompt_with_content_with_abort` and `prompt_controlled_with_content` send
+  ordered text, image, audio and video blocks;
+  `SessionTransport::prompt_with_content` and
+  `RpcTransportClient::prompt_with_content` /
+  `prompt_with_content_streaming` do the same over either backend.
+  `prepare_retry_content` returns an abandoned turn with its attachments;
+  `retry_policy` and `set_retry_policy` read and change the retry policy of
+  a live handle. `MediaContent` is exported from `pi::sdk` and has
+  `duration()`. `SessionOptions::model_scope` takes the patterns `--models`
+  takes, and `SessionOptions::max_time` sets a wall-clock run limit.
+  `ToolRegistry::without_builtins` builds a registry with no built-in tools.
+- **RPC:** `prompt`, `steer` and `follow_up` accept a `media` array, or an
+  ordered `content` array of text, image and media blocks.
+  `set_output_mode` switches a connection to `compact` output, in which
+  image and media payloads become attachment references and `message_update`
+  events carry deltas only; `get_attachment` reads a referenced payload in
+  byte ranges. `get_state` reports `outputMode`. The default `full` output
+  is unchanged.
+- **ACP:** prompts may contain images and embedded editor context;
+  `session/load` replays a saved session's selected branch to the editor and
+  `session/resume` reopens it without replay; `session/list` merges saved
+  and live sessions and pages 50 at a time with opaque cursors; MCP servers
+  that the editor supplies for a session (stdio and HTTP) connect behind
+  pi's trust check with per-tool editor approval, managed with
+  `/mcp list | refresh | inspect NAME | trust NAME | deny NAME | test NAME`;
+  tool results keep their images, audio and video in editor updates.
+- **Default (FTUI) stack:** `/skillful [on|off|status]` removes the skills
+  listing from the system prompt or puts it back; `/settings` or F2 opens an
+  editor for retry and fallback, automatic compaction, steering and
+  follow-up delivery, image resizing, thinking visibility, transcript
+  spacing, the double-Escape action and completion menu height, and saves
+  each change; new sessions are named automatically by the model configured
+  for the `tiny`/`smol` role after their first saved exchange.
+- **LSP:** the `lsp` tool's `project_diagnostics` action asks the language
+  server for its whole-workspace diagnostics, including files that are not
+  open (servers that advertise `workspaceDiagnostics`); workspace `symbols`,
+  `references`, `definition`, `type_definition`, `implementation` and
+  project diagnostics accept results the server streams in parts; semantic
+  completion expands named snippet variables, with values supplied through
+  `snippetValues`.
+- **Browser tool:** `list_frames` discovers nested cross-process iframes,
+  and snapshots, accessibility inspection, evaluation, selector waits,
+  typing, native clicks and scrolling work inside them; `select_option`
+  selects options of a `<select>` by value, label or index and verifies the
+  result; `set_checked` sets a checkbox or radio to an explicit state with a
+  native click, and does nothing when the state already matches.
+- **Computer tool on macOS.** The opt-in `computer` tool works on macOS 14
+  or newer without X11, through a bundled Swift helper run by
+  `/usr/bin/swift` (Xcode Command Line Tools required): `list_displays`,
+  `list_windows`, `screenshot`, `clipboard_read`, `clipboard_write`,
+  `ax_tree`, `focus_window`, `mouse_move`, `mouse_click`, scrolling,
+  dragging, `key_type` and `key_press`. It needs the Screen Recording and
+  Accessibility permissions; see `docs/tools/computer-macos.md`.
+- **security_scan:** `compare_dependencies` compares two saved dependency
+  audits offline and reports, per package, what persisted, appeared or could
+  not be determined; `disposition_dependencies` records `accepted_risk`,
+  `false_positive` or `reopen` decisions for exact findings in a new SARIF
+  file bound to the hash of the audit it reviews. `dependency_plan` also
+  reads `uv.lock` (schema 1) and `poetry.lock` (1.1, 2.0, 2.1) offline, next
+  to Cargo and npm lockfiles, and picks up root lockfiles of all four kinds
+  when `paths` is empty. Only packages from public PyPI are inventoried;
+  private indexes, direct URLs, Git, path and editable packages and local
+  versions are reported as exclusions without their names or URLs. See
+  `docs/tools/python-dependencies.md`.
+- **Memory:** `memory.backend: "cass"` keeps the local memory bank and tools
+  and adds read-only recall from the project's past agent sessions through
+  an installed `cass` (Unix only). `recall` takes `includeHistory: false` to
+  search the local bank alone.
+- **Subagents:** native children get the `hub` tool by default and can
+  message their siblings and the parent (`hub` with `op: "agent"` and the
+  actions `roster`, `send` and `inbox`); an agent definition with an
+  explicit tool allowlist must list `hub` to take part.
+- **Extensions:** `ctx.compact(preparation, options)` accepts
+  `model: { provider, id }`, `customInstructions` and `thinkingLevel`, so a
+  `session_before_compact` handler can summarize with another registered
+  model; the host resolves that model's endpoint and credentials (#178).
+  Cancelling a running compaction from JavaScript is still not propagated.
+  On Windows, `node:path` has Windows semantics (drive letters, UNC shares),
+  `path.win32` and `path.posix` exist on every host, and the `node:fs` shim
+  keeps UNC and extended-length roots intact (#182).
+- **Release verification:** `scripts/verify_published_release.py` checks a
+  published release's signed manifest and payload checksums and runs
+  offline CLI checks; see `docs/published-release-checks.md`.
+
+### Fixed
+
+- **Providers:** on OpenAI Chat Completions and Azure, parallel tool calls
+  that return images are sent as contiguous `tool` messages followed by
+  their images, each labeled with its tool name and call id, instead of the
+  interleaved `tool`/`user` messages that strict providers reject; images
+  are no longer sent to a text-only model, and are sent again once a vision
+  model is selected (#248). OpenAI Responses and Codex keep images in tool
+  results. Gemini and Vertex receive all results of a parallel tool turn in
+  one message.
+- **Reasoning from OpenAI-compatible gateways:** reasoning streamed as
+  `delta.reasoning` (OpenRouter and others) or `delta.reasoning_text` is now
+  shown as thinking. Only `delta.reasoning_content` was read, so with those
+  gateways pi showed nothing while the model was reasoning.
+- **Gemini media:** staging counts the whole request against the inline
+  budget and accepts base64 with or without padding; an upload that expires,
+  is deleted, or is rejected during generation is re-uploaded once.
+- **Default stack no longer stops redrawing when frames are slow.** The
+  terminal library gives a frame 16 ms and does not present one that took
+  longer; it also lowers render quality under load, and its lowest levels
+  blank the transcript. With a long in-flight reasoning block, on a loaded
+  machine or in an unoptimized build, every frame can take longer than that:
+  the screen then stayed on its last frame, or went blank except for the
+  editor, typed keys were not echoed and the final answer never appeared,
+  while the session kept running. pi now sets that budget far above any real
+  frame time, so a late frame is shown instead of dropped and render quality
+  is never lowered. Measured with the real binaries in a terminal, on a
+  quiet 128-core Linux host: v0.7.1 stops redrawing about 4,000 lines into
+  an 8,192-line reasoning block and never shows the answer (under load, as
+  early as 1,000 to 2,000 lines); v0.8.0 shows all of 8,192 and 16,384 lines
+  and the answer. On an ordinary stream the two are equally fast.
+- **Default stack:** wrapping a double-width character that did not fit the
+  rest of a row could loop forever, freezing live reasoning and the replay
+  of a resumed session (#255); files and messages given on the command line
+  are submitted instead of dropped; `--models` and `--max-time` are honored.
+- **Agent:** cancelling a batch of parallel tool calls keeps the results of
+  calls that had already finished instead of recording them as aborted; an
+  abort raised while a waiter subscribes is no longer lost; the advisor
+  reviews a turn only after it is saved, and never a failed, aborted or
+  time-capped one; a turn parked on a silent provider wakes as soon as the
+  owner of its deadline cancels.
+- **MCP:** tool lists are refreshed before each provider request, so changed
+  schemas replace old ones and withdrawn or denied tools disappear;
+  cancelling or timing out a queued call no longer tears down the shared
+  server, and a call that was never written is not sent.
+- **LSP:** a full outbound queue no longer restarts the language server:
+  requests wait for capacity within their own deadline, cancellations have
+  reserved capacity, and document open/change/close batches are admitted
+  whole or not at all. A failed, cancelled or raced diagnostic pull returns
+  an error or `LSP_DIAGNOSTICS_PENDING` rather than a cached clean result,
+  also after dropped notifications. A server's `retriggerRequest: false` is
+  honored, a lost reply to a server request closes the connection instead of
+  hanging, and server process trees are cleaned up when a connection fails.
+- **RPC:** a turn the server accepted runs to its terminal event and saves
+  queued input when the client cancels.
+- **ACP:** prompt and save failures reach the editor as one `session/update`
+  notice, without provider bodies or file paths; a stalled or failed stdout
+  no longer blocks cancellation, and final responses are flushed before
+  shutdown.
+- **Hub:** `stop` and `restart` wait until the old service has been
+  terminated and reaped; a cancelled or abandoned service start stops that
+  service; service operations no longer block the executor; reviving a
+  subagent runs it again with its original task, tools, model, working
+  directory and isolation instead of only registering it.
+- **Subagents:** children inherit the parent's active provider and model
+  unless the agent definition or the `task`/`smol` role pins one; parallel
+  `isolation: "worktree"` tasks start from one snapshot of the workspace and
+  apply their patches in task order; an isolated task runs in the package
+  directory it was started from, not the repository root.
+- **Windows:** output pipes of background jobs can be cancelled, so a child
+  that keeps a pipe open no longer strands its reader (#182).
+- **Handoff:** continuation briefs use only the selected branch, drop
+  completed tasks from next steps, ignore fenced code examples, keep the
+  latest status, and report a file as modified only when a matching
+  successful tool result exists.
+- **Stores and imports:** the permission store is not overwritten when it is
+  corrupt, unreadable or from a newer schema; credential migration saves the
+  new auth file before removing API keys from settings or archiving legacy
+  OAuth files; an SSH remote edit is refused with `PI_SSH_EDIT_CONFLICT`
+  when the remote file changed after it was read; imported sessions keep
+  interrupted or ambiguous tool exchanges as non-executable history.
+- **Compaction:** summaries work with keyless and header-authenticated
+  providers and keep the provider's required headers, thinking budgets,
+  cache settings and service tier.
+- **Bedrock:** credentials are reloaded from the session's own auth file and
+  workspace on every request, including for summaries and other auxiliary
+  requests.
+- **SDK:** `add_workspace_root` and `remove_workspace_root` save the change
+  before granting tool access, and a removal takes effect immediately.
+- **Classic stack `/mcp add` and `/mcp remove`:** a `.pi/mcp.json` whose top
+  level or `mcpServers` member is not an object (an array, a string, a
+  number) used to abort pi; it is now refused with `MCP_CONFIG_INVALID` and
+  left untouched. `/mcp remove` of a server that is not in the file reports
+  `MCP_UNKNOWN_SERVER` instead of claiming success.
+- **RPC:** when stdin closes while the session is quarantined after a failed
+  save, `pi --mode rpc` exits with the session-persistence error itself
+  (`[SESSION_PERSISTENCE_FAILED]` first), not wrapped in a generic message.
+- **Startup without extensions:** pi no longer copies the whole model
+  registry and credential store twice while starting a session that loads
+  no extension. Only extensions can use that copy (it resolves the `model`
+  option of `ctx.compact`, new in this release), and it added several
+  milliseconds to the start of every print-mode or RPC run.
+- **Runtime stack size:** the main runtime's worker threads get a 16 MiB
+  stack (it was the runtime default of 2 MiB). A pi built without
+  optimization (`cargo build`, `cargo run`) aborted with
+  "thread 'asupersync-worker-N' has overflowed its stack" on the first agent
+  turn in `--mode rpc`.
+- **Sessions:** migrating a JSONL session that contains a row which is not a
+  session entry fails with "Bad JSONL entry: ..." again, instead of a bare
+  JSON parse error.
+- **Extensions:** the `compact` hostcall refuses `options` (or
+  `options.model`) that is not an object instead of running a default
+  compaction; `AbortSignal.abort()` and `controller.abort()` without a
+  reason now produce an `AbortError`, so `error.name === "AbortError"`
+  checks work.
+- **ACP:** a trusted MCP server whose catalog has failed no longer keeps its
+  `mcp_context_<server>` tool in the editor session's tool list.
+- **Browser tool:** a click or wheel at an integral point inside nested
+  iframes no longer probes the neighbouring pixel, which could refuse the
+  action as occluded at a frame edge.
+- **Build:** the library compiles again in non-test builds (two errors from
+  unbuilt commits), and three integration-test targets compile again
+  ([#256](https://github.com/Dicklesworthstone/pi_agent_rust/issues/256)).
+- **Performance tooling:** parallel evidence staging no longer fails when
+  two runs create the same intermediate directory
+  ([#251](https://github.com/Dicklesworthstone/pi_agent_rust/issues/251)),
+  and `scripts/perf/render_perf_budgets_md.py` no longer overwrites the
+  generated `PERF_BUDGETS.md`.
+
+### Known issues
+
+- **`pi self-update` cannot install this release on Linux x86_64, macOS
+  Intel or Windows.** The updater downloads at most 64 MiB, and the
+  speed-optimized binaries for those platforms are larger (78, 71 and 74 MB),
+  so it stops with "No compatible binary candidate found". Run the installer
+  once instead:
+  `curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/pi_agent_rust/main/install.sh | bash`.
+  On Apple Silicon and Linux arm64, `pi self-update` works. The limit is
+  being raised on `main`; until a release that contains the change is
+  installed, updates on those three platforms need the installer
+  ([#266](https://github.com/Dicklesworthstone/pi_agent_rust/issues/266)).
+- **Long reasoning is drawn slowly on the default stack.** The in-flight
+  reasoning block is laid out again on every frame, so frame time grows with
+  its length. Since this release every frame is shown (see **Fixed**), but
+  with several thousand lines of reasoning in one block the display falls
+  behind the stream. The root cause of the old freeze, a terminal library
+  that does not present a late frame, is reported upstream
+  ([frankentui#104](https://github.com/Dicklesworthstone/frankentui/issues/104));
+  pi works around it.
+- **Performance claims remain unauthorized.** The retained
+  performance-budget evidence is older than its 168-hour freshness window
+  ([#252](https://github.com/Dicklesworthstone/pi_agent_rust/issues/252)), so
+  `performance_budgets_report_has_exact_v2_contract`
+  (`tests/release_evidence_gate.rs`) fails and the full test suite is not
+  reported green.
+- **The size-budgeted `release` build is over its size budget.** Built with
+  `cargo build --release` on Linux x86_64, pi is 52.1 MiB against a 48 MiB
+  budget (v0.7.1 was 49.9 MiB), so `binary_size_check`
+  (`tests/perf_regression.rs`) fails wherever a release-profile binary has
+  been built. Published binaries use the `dist` profile, which that check
+  does not measure.
+- **Opt-in SQLite session storage** still cannot open an existing WAL/SHM
+  pair whose auxiliary files are readable but not writable
+  ([#250](https://github.com/Dicklesworthstone/pi_agent_rust/issues/250)).
+- **Windows command containment** relies on an unstable standard-library
+  feature and is not yet qualified against the stable library contract
+  ([#257](https://github.com/Dicklesworthstone/pi_agent_rust/issues/257));
+  the optional `wasm-host` feature stays on wasmtime 47
+  ([#258](https://github.com/Dicklesworthstone/pi_agent_rust/issues/258)).
+
+## [v0.7.1] — 2026-10-02 — Release
+
+The first release of the 0.7 line. v0.7.0 was tagged but could not be built
+by the strict release builder: two vendored test-fixture documents had `&` in
+their names, which its source archive refuses, and release tags cannot be
+moved. v0.7.1 renames those two files and completes the release recipe: it
+preserves the raw binaries and aggregate checksums required by `pi update`,
+alongside installer archives, and pins the public key used to verify release
+signatures. Everything below is new since v0.6.1.
+
+A minor release because two library structs that `docs/sdk.md` marks Stable
+gained public fields (see **Changed**). The CLI's flags and settings stay
+compatible, and session files are compatible in both directions.
+
+### Changed
+
+- **Breaking (library API): new public fields.** `pi::sdk::SessionOptions`
+  gained `skills_prompt`, `no_context_files` and `advisor`, and
+  `pi::sdk::StreamOptions` gained `service_tier`. Code that builds either
+  struct by listing every field must add them; code that ends the literal
+  with `..Default::default()` (as every example in `docs/sdk.md` does) is
+  unaffected.
+- **SDK retry and failover.** `prompt()` and `continue_turn()` now apply the
+  configured retry policy, and `FailoverStart.attempt` counts from 1. When a
+  model-selection or failover switch cannot be saved durably, later prompts on
+  that SDK handle return an error until a new or resumed session replaces it
+  (a failed turn save during an image-prompt retry is not fenced yet; see
+  **Known issues**). A prompt or
+  continuation started with an already-aborted signal
+  (`prompt_with_abort`, `continue_turn_with_abort`) now returns
+  `Err(Error::Aborted)` before any provider or session work, instead of an
+  `Ok` message whose `stop_reason` is `Aborted`.
+- **Extension provider streams must finish explicitly.** A `streamSimple`
+  iterator that yields nothing, or a structured event stream that ends without
+  a `done` or `error` terminal, now fails with `PI_EXTENSION_STREAM_INCOMPLETE`
+  instead of completing as an empty or partial reply, and an `error` terminal
+  must carry `reason: "error"` (or `"aborted"`) matching its message.
+- **Secret screening covers the whole provider request.** In the default
+  `obfuscate` mode, tool-call arguments, tool schemas, structured tool-result
+  details and custom messages are screened alongside text, in one
+  transaction: a refused request leaves the session's vault untouched.
+  Assistant content that a provider signed (Anthropic thinking signatures,
+  Gemini thought signatures, and the `fc_`/`msg_` item ids OpenAI Responses
+  replays by) is still screened but sent exactly as the provider produced it,
+  so a replay can never be invalidated. `secrets.mode=block` still refuses
+  any detection anywhere, including signed content and tool names. Tool
+  names are never rewritten.
+- **Detector ruleset v5.** OpenAI and Anthropic `sk-` keys are no longer
+  matched directly after a letter, so identifiers such as
+  `task-management-service` or an MCP tool `mcp__task-master-ai__get_tasks`
+  are not treated as credentials. Keys after `=`, `:`, quotes, spaces, `_`,
+  digits or percent-encoding are still found.
+- **Background-job logs.** The oldest unlocked job logs are now pruned by
+  default. `PI_JOBS_ARTIFACT_RETENTION=preserve` keeps the previous behavior.
+- **ACP editor sessions** get pi's default tool set, real system prompt,
+  skills and context files. Every tool call still asks the editor for
+  permission, so expect more permission prompts than before.
+- **Dependencies.** `dirs` 7, `similar` 3, `jsonschema` 0.58, `ast-grep` 0.45,
+  `vergen-gix` 10 and `enable-ansi-support` 0.3, plus a refresh of every
+  semver-compatible dependency. `rquickjs` stays on 0.12: 0.13 made its
+  typed-array byte accessors `unsafe`, and this crate forbids unsafe code.
+
+### Added
+
+- **Default (FTUI) stack commands, following OMP:** `/pin` keeps a session at
+  the top of `/resume`; `/delete` removes this session (to the trash when one
+  is available, with its SQLite and v2 sidecars) and starts a new one;
+  `/branch` and Esc Esc rewind to an earlier message; `/restart` relaunches
+  pi into the same session; `/dump` copies the session as text and writes the
+  request JSON; `/copy` picks a reply or code block (`/copy code|cmd|link`);
+  `/fast` toggles priority processing; `/model` and `/switch` take selectors
+  with an optional `:level` (by name, such as `opus:high`); `/queue` queues a
+  follow-up; `/template`, `/templates`, `/ssh`, `/security`, `/plugins`,
+  `/open`, `/reload-plugins` and `/scoped-models`; `@file` attachments and
+  image paste; typing filters the `/model`, `/resume` and `/theme` pickers
+  (#244).
+- **SOCKS5 and SOCKS5h proxies** for provider traffic, with optional
+  username/password authentication. There is no automatic loopback bypass:
+  list `localhost` and `127.0.0.1` in `NO_PROXY` to keep local model servers
+  direct.
+- **MCP:** bounded list and map resource URI templates, and composite
+  resource arguments in the agent's context tools.
+- **web_search:** an optional You.com rung, enabled by `YDC_API_KEY` (#246).
+- **Browser tool:** frame discovery, inspection scoped to an embedded
+  document, and native form input inside iframes.
+- **LSP:** bounded numeric snippet transforms in semantic completions.
+- **Agent:** explicit manual queue dispatch control.
+
+### Fixed
+
+- **Windows and WSL** (#182, #242): the bash tool finds a bash when
+  `shell_path` is unset, skipping empty and relative `PATH` entries, and says
+  once when it falls back to WSL's `bash.exe`; `!command` on the default stack
+  honors `shell_path` and `shell_command_prefix`; `pi doctor` reports the
+  shell the bash tool will actually run; under WSL, `/copy` and `/share` copy
+  through `clip.exe` (UTF-16LE), and ctrl+v pastes clipboard images through
+  PowerShell.
+- **Default stack:** `--no-context-files` (#216), `--plan-mode`, and `-e`
+  extensions under `--no-extensions` are honored; the model is told which
+  skills exist; `steeringMode`, `followUpMode` and `hideThinkingBlock` are
+  honored and thinking streams live; `/model` shows display names (#214);
+  `/resume` re-reads the session list each time; `@file` references in
+  messages sent while the agent works are read.
+- **ACP:** `session/list` and model/thinking `configOptions` follow the spec
+  (#245); editor sessions get the real system prompt and skills list.
+- **Providers and streams:** a truncated extension stream can no longer
+  authorize a tool call; streamed block completions are validated; SSE
+  metadata is bounded and coalesced streams decode on demand; auxiliary
+  requests (advisor, `/btw`) are bound to the owner's cancellation and
+  deadline.
+- **Privacy of auxiliary requests:** the advisor and `/btw` screen their
+  complete inputs before truncation, and only accept complete, bounded
+  responses.
+- **Extensions:** the native runtime shuts down irreversibly and isolates
+  its streams across reload, reset and cancellation.
+- **LSP:** request cancellation and writes to the server's pipe no longer
+  block.
+
+### Known issues
+
+Three tests of features added in this release do not pass yet. They are not
+regressions of anything v0.6.1 shipped:
+
+- `sdk_mml_img_failed_retry_save_fences_later_image_prompts`
+  (`tests/sdk_multimodal.rs`): when the retry attempt of an image prompt cannot
+  save the session, the next prompt on the same SDK handle is not refused.
+  Callers that see a session-persistence error should start a new or resumed
+  session before prompting again (bead
+  `bd-sdk-image-retry-durable-save-fence-5a2b1`).
+- `sdk::tests::recovery::recovery_events_reach_subscribers_without_double_firing_typed_hooks`:
+  the typed `on_stream_event` hook does not receive the provider's terminal
+  `Done`/`Error` events (as in v0.6.1); session subscribers do see the turn's
+  outcome (bead `bd-sdk-stream-hook-terminal-events-494a4`).
+- `lsp::client::request::tests::dropping_a_posted_request_cancels_it_before_the_next_dispatch`:
+  an LSP request dropped before the outbound writer sends it is neither sent
+  nor cancelled, rather than sent and then cancelled (bead
+  `bd-lsp-cancel-ordering-nonblocking-queue-pr0qa`).
+
+Qualification also exposed two pre-existing limitations: opt-in SQLite
+session storage cannot read an existing WAL/SHM pair whose auxiliary files
+are readable but not writable
+([#250](https://github.com/Dicklesworthstone/pi_agent_rust/issues/250));
+parallel performance fixtures can race while creating a shared intermediate
+evidence directory
+([#251](https://github.com/Dicklesworthstone/pi_agent_rust/issues/251)).
+These failed checks remain open; the full test suite is not reported green.
+The retained performance-budget evidence has also exceeded its 168-hour
+freshness window
+([#252](https://github.com/Dicklesworthstone/pi_agent_rust/issues/252));
+performance claims remain unauthorized until fresh measurements qualify.
+
+Published installer qualification found a pre-existing latest-version parser
+bug: compact GitHub release JSON can make the installer select the release
+body instead of `tag_name`
+([#253](https://github.com/Dicklesworthstone/pi_agent_rust/issues/253)).
+The default installer and ACFS's `--yes --easy-mode` entrypoint failed this
+check; explicit-version installation and native self-update passed on Linux
+x86_64. Use
+`--version v0.7.1` until the installer fix and its ACFS checksum update land.
+
+Also tracked as beads: in a bash child, an authenticated SOCKS proxy is exported
+without credentials (`curl`/`git` then fail to authenticate); extension
+providers that end a turn with `stop` while returning tool calls are
+rejected; on the default stack a built-in command such as `/plan` or
+`/status` takes precedence over an extension command of the same name; a
+full LSP request queue restarts the language server; a bare `/advisor` on
+the classic stack toggles instead of showing status.
+
+## [v0.7.0] — 2026-10-01 — Tag-only
+
+Tagged at `1e4548aa7` with the changes listed under v0.7.1, but never released:
+see the note at the top of v0.7.1. There are no v0.7.0 binaries or crate.
+
+## [v0.6.1] — 2026-09-24 — Release
+
+### Fixed
+
+- **`pi self-update` works again.** It failed on every published release with
+  `SHA256SUMS download failed with HTTP status 302`, because GitHub serves
+  release assets through a redirect to a signed download host and the updater
+  did not follow redirects. `SHA256SUMS`, the binary and the release lookup
+  now follow up to five redirects. A redirect from `https` to plain `http`,
+  to any other scheme, or without a host is refused. Checksum verification is
+  unchanged. Because the bug is in the updater that is already installed,
+  getting to v0.6.1 still needs the install script or a manual download.
+  Later updates can use `pi self-update`.
+
+## [v0.6.0] — 2026-09-24 — Release
+
+The Windows fixes below are why this release exists: **v0.5.0 and v0.5.1 are
+unusable on Windows**, because every message fails with `Access is denied.
+(os error 5)` when the session is saved. Anyone on Windows should update.
+
+It is a minor rather than a patch release because it also carries everything
+merged since v0.5.1 (about 680 commits), including one breaking change to the
+library API (see **Changed**). The CLI's flags and settings stay compatible.
+
+Linux release binaries are now built against a glibc 2.28 floor. The v0.5.1
+Linux binaries needed glibc 2.43, so they would not start on Ubuntu 24.04,
+Debian 12, RHEL 9 or anything else older than Ubuntu 26.04.
+
+### Changed
+
+- **Breaking (library API): MCP discovery and bootstrap need an explicit
+  project-trust decision.** `pi::mcp::config::discover` and
+  `pi::mcp::McpManager::bootstrap` now take a trailing `project_trusted: bool`.
+  The old three-argument forms assumed the project was trusted, so omitting
+  the argument read the project's MCP configuration. The
+  `*_with_project_trust` variants are gone because the canonical functions now
+  do what they did. CLI users are unaffected.
+
+### Fixed
+
+- **Every message failed on Windows with `IO error: Access is denied. (os
+  error 5)`** (#239, regression since v0.5.0). Saving a session bumps the
+  session-index generation counter, which was opened append-only and then
+  locked; Windows `LockFileEx` refuses an append-only handle. The counter is
+  now opened read + append, so the first save of a session succeeds.
+
+- **The TUI acted on key releases on Windows** (#239). Windows consoles
+  report a Release for every key; the FTUI stack treated it as a second
+  press, so menus moved two rows per keystroke and `/model` + Enter picked the
+  first model instead of opening the picker. Releases are now ignored;
+  auto-repeat still counts.
+
+- **Tool paths written as `~\...` were not expanded on Windows.** Only `~/`
+  was treated as the home directory, so `read ~\notes\todo.txt` looked for a
+  directory literally named `~` under the working directory. On Windows `~\`
+  now expands like `~/`; on Unix `~\x` stays a literal file name.
+
+- **The unit-test suite builds for Windows again.** A misplaced `#[cfg(unix)]`
+  left a Unix-only MCP test compiled everywhere, so `cargo test --lib` did not
+  build for `x86_64-pc-windows-msvc`.
+
+- **Provider streaming fails closed instead of guessing.** Anthropic, Bedrock,
+  Azure, OpenAI and the shared SSE decoder check that a streamed tool call is
+  complete and well-formed before it can run. Oversized frames, corrupt UTF-8
+  and silently dropped frames are now errors; before, some of them were
+  truncated or skipped. Stalled keepalive-only streams yield and can be
+  cancelled.
+
+- **Print mode honours `--session`, `--session-dir`, `--continue` and
+  `--resume`.** `--session` pointing at a missing file creates it instead of
+  failing, and `--continue` works on the default TUI.
+
+- **Extension filesystem writes are staged and published atomically.** They
+  keep Linux ACLs and xattrs, and can no longer escape their scope through
+  create paths or unlink races. An ancestor `package.json` grants authority
+  only if it declares the entry.
+
+- **Failover and retry share one implementation across print mode, RPC and
+  the default TUI.** The primary model comes back after a cooldown on every
+  surface, fallback chains are deduplicated by model identity, and failover
+  provenance survives reopening a session.
+
+- **A closed stdout pipe is no longer reported as a crash**, on any surface.
+
+- **The default TUI no longer hides or mislabels commands.** `/help` lists
+  every command the stack runs, real commands are no longer reported as
+  "Unknown command", `keybindings.json` is read, and `/hotkeys` shows only
+  bindings that do something.
+
+- **HTTP proxy credentials are kept out of logs and errors**, and proxy
+  authorities are validated.
+
+### Added
+
+- **Default TUI:** `/copy`, `/changelog`, `/export`, `/share`, `/hotkeys` and
+  `/tan`; shift+tab cycles the thinking level, ctrl+l opens the model picker,
+  f1 shows help, ctrl+u deletes to line start; transient provider failures are
+  retried; the session picker can sort and browse named sessions; extension UI
+  requests are answered in the TUI.
+- **Providers:** Gemini thinking controls, signed reasoning state and Files API
+  staging for reusable media (#225); Bedrock ConverseStream with reasoning and
+  prompt caching; Claude on Vertex AI; Cohere multimodal input, reasoning and
+  indexed streaming; Copilot recovers rejected session tokens without
+  replaying the stream.
+- **LSP tools:** completion with auto-imports, signature help, inferred-type and
+  parameter hints, call and type hierarchies, pull diagnostics and workspace
+  diagnostic scans, document and range formatting, and code actions and
+  refactors (renames, file moves with import updates) that are previewed and
+  approved before anything is applied.
+- **MCP:** resources and resource templates, prompts, argument completion,
+  paginated tool catalogs with live refresh, tool-argument and
+  structured-output validation, audience annotations on tool results, and
+  owner-scoped cancellation and deadlines.
+- **Browser, desktop and media tools** now do the real work that was
+  previously simulated: native Chromium/CDP sessions with accessibility
+  snapshots, input, dialogs, uploads and bounded downloads; X11 input and
+  AT-SPI inspection; and OpenAI, Gemini and xAI image generation, editing,
+  vision and speech. All outputs stay inside the workspace.
+- **Debugger (DAP):** Delve for Go, thread-specific stops, exception
+  inspection, and editing variables while stopped.
+- **Plan mode:** proposals are bound to a branch and persisted. Execution is
+  limited to explicit file scopes, and a recovered session needs fresh
+  approval.
+- **Sub-agents and memory:** verified child completion, isolated
+  snapshots of dirty workspaces, a shared delegation budget and deadlines;
+  durable session-shared memory keys with revision-checked writes, atomic
+  transactions and authenticated reflection.
+- **SDK:** live steering, follow-up and abort within a turn; turn-wide
+  deadlines; a shared retry policy; failover on the SDK path; a concurrent
+  write-only RPC control lane; and live event streaming from an RPC
+  subprocess.
+- **Sessions:** resume history is searchable and paged; SQLite sessions page
+  history reads, stream writes and deduplicate media.
+- **Config:** misspelled settings keys are reported, including keys inside
+  nested objects. `PI_SKIP_VERSION_CHECK` is honoured.
+- **Import:** Claude and Codex conversations keep their complete tool
+  exchanges and can be resumed safely.
+- **Security:** a locked-dependency inventory for Cargo and npm, and an OSV
+  audit that writes SARIF.
+
+## [v0.5.1] — 2026-09-12 — Release
+
+Windows-only. Nothing on Linux or macOS behaves differently; the binaries for
+those platforms are rebuilt from this commit and are otherwise unchanged.
+
+v0.5.0 got `pi_agent_rust` compiling for `x86_64-pc-windows-msvc` again after
+it had been broken since some point after v0.3.0, but it only ever built the
+lib and bin targets there. Running what the Unix gate runs — `cargo check
+--all-targets` and `cargo clippy --all-targets -- -D warnings` — found the
+target still broken past that point, across nine rounds as each fix let
+compilation reach further. Windows now passes exactly the gate Unix does.
+
+### Fixed
+
+- **The `--list-models` cache fingerprint could accept a swapped file on
+  Windows.** `same_file_identity` returned `true` unconditionally off Unix, so
+  both of the fingerprint's TOCTOU identity checks — open handle against
+  pre-open path, and again against the path after the read — were no-ops
+  there. Only size and mtime still had to agree, which a same-size edit inside
+  one filesystem timestamp tick satisfies. It now uses the
+  `file_identity::FileIdentity` introduced in v0.5.0, giving Windows the same
+  volume-serial-plus-file-index comparison Unix gets from `(dev, ino)`.
+
+- **Fingerprinted files were opened through reparse points on Windows.** The
+  Unix arm opens with `O_NOFOLLOW`; the Windows arm used a plain
+  `File::open`, so a junction or symlink at the path was traversed and the
+  fingerprint described whatever it pointed at. It now passes
+  `FILE_FLAG_OPEN_REPARSE_POINT`.
+
+- **A `HOMEPATH` without a leading separator produced a drive-relative home
+  directory on Windows.** With `HOMEDRIVE=C:` and `HOMEPATH=Users\me`, the
+  fallback joined them with `PathBuf::push`, which deliberately suppresses the
+  separator after a bare drive prefix — leaving `C:Users\me`, a path resolved
+  against the current directory on C: rather than its root. pi would then read
+  and write `auth.json`, settings and sessions somewhere under the working
+  directory. All three copies of the join (`auth`'s general and AWS lookups,
+  and the Anthropic provider's) now write the separator explicitly. Running
+  the unit suite on Windows for the first time is what surfaced this: on Unix
+  the same `push` inserts `/`, so the test covering it had always passed.
+
+- **`tests/e2e_cli.rs` did not compile on Windows**: `Arc` was imported under
+  `cfg(unix)` but used from an ungated helper, and `running_as_root` was
+  defined only for Unix while one caller was ungated.
+
+### Changed
+
+- Windows-only lint hygiene, none of it user-visible: roughly twenty
+  `cfg(not(unix))` no-op stubs that must keep their Unix arm's fallible
+  signature now carry the matching `allow`s, and imports, constants and one
+  struct field reachable only from Unix-gated tests are gated to match.
+  Several genuinely reducible spots were rewritten rather than suppressed —
+  `is_executable`, `is_already_exists`, `is_executable_file`, the `\\?\`
+  prefix stripper's nested `if`s and format arguments, `path_for_line_output`'s
+  needless `return`, and `win_job`'s redundant `pub(crate)`.
+
+### Known
+
+- The Windows unit suite (`cargo test --lib`) ran for the first time in this
+  release: **8205 of 8261 pass**. The 56 failures are POSIX-shaped test
+  harnesses rather than product defects — cases that spawn `sh`, assert Unix
+  lock and signal semantics (`SIGTSTP`, `SIGTERM` reaping, stale-lock healing),
+  or expect Unix path encodings. They are tracked rather than fixed here; the
+  one failure that did turn out to be a product defect is the `HOMEPATH` fix
+  above. Integration tests (`tests/`) have still never been run on Windows.
+
+- `e2e_cli_startup_surfaces_configured_resource_failures` still carries a
+  `running_as_root` skip guard copied from the auth-permission tests, though
+  it has no auth fixture and no permission premise. The guard makes the test
+  skip on root gate workers, where it would otherwise fail. Making it compile
+  on Windows did not touch that; removing the guard belongs with fixing what
+  it hides.
+
+## [v0.5.0] — 2026-09-11 — Release
+
+> Cut from `main` with `v0.4.0` left as Tag-only: that tag (2026-09-01,
+> `5bd3e353`) never got a GitHub Release and sits 192 commits behind this one,
+> so publishing it now would ship none of the work below. Everything since
+> v0.3.0 is in this release.
+
+### Fixed
+
+- **Windows builds again.** The crate had stopped compiling for
+  `x86_64-pc-windows-msvc` somewhere after v0.3.0 — ten hard errors, so
+  `cargo install pi_agent_rust` failed outright on Windows and no release
+  binary could be produced. Nothing caught it because this repository runs no
+  CI and the quality gate builds only the host target. Three independent
+  causes: the crash reporter's fatal-signal watcher referenced
+  `signal_hook::iterator` and `SIGBUS`, neither of which exists off Unix, and
+  is now Unix-only (Windows abnormal exits that Rust can see arrive as panics,
+  which the panic hook already captures); and the Windows file-identity checks
+  in `jobs` and `mcp::trust` read `volume_serial_number`/`file_index` off
+  `std::os::windows::fs::MetadataExt`, which are still behind the unstable
+  `windows_by_handle` feature and so unavailable to a crate that must also
+  build on stable. Both now go through a new `file_identity::FileIdentity`
+  that reads the same two values from an open handle via `winapi-util`, so the
+  identity comparisons keep their exact TOCTOU semantics on both platforms
+  rather than being weakened to make the build pass.
+
+- **Extensions receive `message_*` and `tool_execution_*` on the default
+  interactive stack again** (bd-82331). `AgentEvent`s reach extensions by two
+  routes: four lifecycle events are dispatched from inside the agent loop, and
+  the six observation events reach them only if the surface routes its own
+  event stream through an `EventCoalescer`. Print, RPC and `--classic` each
+  did; the SDK path did not, and since v0.4.0 the default interactive stack
+  IS the SDK path. An extension that observed streaming output or tool
+  execution loaded, ran its lifecycle hooks, looked installed, and silently
+  did nothing — with no error, because the events were never routed rather
+  than dropped. Extensions that *modify* behaviour (`tool_call`,
+  `tool_result`, `context`, …) were never affected.
+
+- **`/new` and `/resume` no longer silently stop extension observation**
+  (bd-82331). Both build a replacement session from the launch template, which
+  cannot carry a runtime handle, so the fix above worked until the first
+  `/new` — after which observation stopped again for the rest of the session.
+
+- **Print mode returns to the primary model after a failover cooldown**
+  (bd-gm481.1). A `--message` sequence that failed over ran every later prompt
+  on the temporary fallback with no way back: nothing recorded what the
+  primary had been, the chain cursor reset each prompt so the walk could
+  reinstall the fallback it was already on, and no cooldown was ever started.
+  RPC has had this since v0.2.0; print now matches it.
+
+- **`maxFailoversPerTurn` counts successful swaps, not scan attempts**
+  (bd-oqo03, bd-oqo03.1). Malformed, uncredentialed, unconstructible, current
+  and duplicate chain entries consumed the per-turn budget and could hide a
+  later valid fallback; a prior turn's cursor sitting at the cap could block
+  every failover in a new turn.
+
+### Changed
+
+- **`failover_start.attempt` is now the successful-swap ordinal, and the chain
+  position moved to a new `chainIndex` field** (bd-oqo03). `attempt` used to
+  carry the chain cursor *after* it advanced, so the entry at chain index 0
+  reported `attempt: 1` and looked like a correct ordinal by coincidence.
+  Consumers reading `attempt` to mean "which swap is this" were right by
+  accident and are now right on purpose; consumers reading it as a chain
+  position should move to `chainIndex`.
+
+- **Extension events are logged on both dispatch routes.** `ext.event.start`
+  was emitted for coalescable events only, so whether an event appeared in the
+  log depended on an internal detail invisible from outside. Batched events
+  now log identically, with `batched=true`.
+
+## Carried forward from the unpublished v0.4.0 cycle
+
+Everything below landed after v0.3.0 and has never appeared in a published
+release. It is listed separately from the entries above only so each group
+reads as one Added/Changed/Fixed set; all of it ships in v0.5.0.
+
+### Added
+
+- **Machine-readable fatal-error record in `--mode json` / `--mode rpc`**
+  (gh [#217](https://github.com/Dicklesworthstone/pi_agent_rust/issues/217)):
+  a startup failure (config, credentials, state directory, usage) used to
+  exit non-zero with only stderr prose. Both modes now print exactly one
+  `{"type":"error","phase":"startup","code":"<stable code>","message":"…","exit_code":N}`
+  line on stdout first (`phase: "run"` if the stream had already opened).
+  `code` reuses the auth diagnostic codes (`auth.missing_api_key`, …) and
+  otherwise names the error family; text mode is unchanged.
+
+- **OpenRouter reasoning forwarding** (gh
+  [#220](https://github.com/Dicklesworthstone/pi_agent_rust/issues/220)):
+  `compat.thinkingFormat: "openrouter"` maps pi's thinking level onto the
+  gateway's normalized `reasoning: {"effort": …}` object (or
+  `{"max_tokens": …}` when the model's `thinkingLevelMap` maps a level to
+  an integer budget; `{"off": "none"}` forces thinking off). It is the
+  default for reasoning models on the `openrouter` provider or any
+  `openrouter.ai` base URL, so `--thinking high` now reaches the model
+  instead of being dropped; non-reasoning models send no `reasoning` key,
+  and vendor dialects (`thinking`/`reasoning_effort`) are never sent
+  through the gateway. `xhigh`/`max` are no longer clamped for those
+  models, and `compat.openRouterRouting` keys (including a `reasoning` or
+  `store` of your own) still merge on top.
+
+- **Inline video and audio input for Gemini-family models** (gh
+  [#212](https://github.com/Dicklesworthstone/pi_agent_rust/issues/212)):
+  a `media` content block (`{"type":"media","data":…,"mimeType":…,"name":…}`),
+  `InputType::Video`/`Audio` (`input: ["video", "audio"]` in `models.json`
+  and extension model registration; unknown labels now warn instead of
+  vanishing), and a settings-gated `read_media` tool
+  (`media.enableReadMedia`, or `--tools read_media`) that attaches a local
+  mp4/webm/mov/mp3/wav/m4a/ogg/flac file. Gemini, Gemini CLI, and Vertex
+  Gemini models receive the block natively as an `inline_data` part and
+  declare `video`/`audio` in their bundled catalog entries; every other
+  provider degrades it to `[media omitted: <name>, <mime>, <size>]` and the
+  payload never leaves the machine. One file is capped at 5 MiB
+  (`media.maxBytes`) because the block is base64-inlined into the session;
+  blob sidecar storage for larger inputs is tracked in
+  [#225](https://github.com/Dicklesworthstone/pi_agent_rust/issues/225).
+  Gemini tool results that carry images or media now attach them on a
+  trailing user turn instead of dropping them as `[Image (…) omitted]`.
+
+- **`--no-context-files`** (gh
+  [#216](https://github.com/Dicklesworthstone/pi_agent_rust/issues/216)):
+  disables `AGENTS.md`/`CLAUDE.md` discovery (global agent dir, cwd, and
+  every ancestor) and the foreign-format workspace-rules import, so a host
+  that composes the whole system prompt gets exactly that prompt. Also
+  `PI_NO_CONTEXT_FILES=1`. `--no-skills` remains a separate switch.
+
+- **`providers.<id>.modelOverrides` in `models.json`** (gh
+  [#220](https://github.com/Dicklesworthstone/pi_agent_rust/issues/220)):
+  per-model patches with upstream pi's spelling. A known catalog id is
+  patched in place; an unknown id under a bundled provider is added from the
+  provider's ad-hoc defaults, so `compat.openRouterRouting` (and
+  `maxTokens`, `cost`, …) can be pinned for a gateway model such as
+  `openrouter/deepseek/deepseek-v4-pro` without redefining the provider.
+
+- **`current_time` tool** (gh
+  [#207](https://github.com/Dicklesworthstone/pi_agent_rust/issues/207),
+  [#103](https://github.com/Dicklesworthstone/pi_agent_rust/issues/103)):
+  a read-only built-in that returns the host's wall-clock time as UTC and
+  local ISO-8601 timestamps, the UTC offset, Unix epoch seconds, weekday, and
+  ISO week (the local zone follows `TZ`); it takes no arguments and its
+  details carry stable camelCase keys. The system prompt keeps carrying only
+  the date so the cached prefix stays stable within a day, and now tells the
+  model to call `current_time` for anything time-of-day dependent. Essential
+  tier and in the default `--tools` list.
+
+- **Portable DSR quality recipe**: `.dsr/repos.yaml` carries the registered
+  `pi_agent_rust` quality checks so any host can run
+  `DSR_REPOS_FILE=.dsr/repos.yaml dsr quality --tool pi_agent_rust` (or
+  merge the entry into `~/.config/dsr/repos.yaml`) instead of depending on
+  one machine's registry.
+
+### Changed
+
+- **Print mode fails loudly when tool calls were denied for want of an
+  approval surface** (gh
+  [#224](https://github.com/Dicklesworthstone/pi_agent_rust/issues/224)):
+  the approval mode defaults to `always-ask` on every surface, and print mode
+  cannot prompt, so a default `-p` run had every gated tool call denied while
+  the process still exited 0 with a normal stop reason. A caller reading the
+  exit code, or the final `stop_reason`, saw a successful run that had
+  silently lost all tool use. Such a run now ends with exit code **3**, a
+  stderr explanation naming `--approval-mode yolo` as the fix, and — in
+  `--mode json` / `--mode rpc` — the usual single fatal-error record with
+  `"code": "approval.surface_unavailable"`. The stream is flushed first, so a
+  JSON host still receives the whole transcript before the failure.
+
+  **This is a breaking change for `--mode json` callers** that relied on exit
+  0 regardless of outcome. The default itself is deliberately unchanged: the
+  absence of a TTY is not consent, and auto-approving to match the Node CLI
+  would silently grant `bash` and write access to any script that never opted
+  in. An ordinary user denial is unaffected and still exits 0.
+
+- **Extension hostcalls share the agent's tool registry**: the JS, native,
+  and WASM extension runtimes used to be handed their own plain copy of the
+  tool registry at pre-warm, so a `pi.tool` hostcall could not see tools
+  mounted later (extension-registered tools, MCP tools, the plan tools) and,
+  on the SDK and FrankenTUI paths, ran without the session's workspace
+  confinement. One shared registry (`SharedToolRegistry`, snapshot-swap; no
+  lock is held across a tool's execution) now backs the agent and every
+  extension host: mounts publish a new snapshot, and each hostcall resolves
+  against the current one under the same undo recorder and workspace roots
+  as the agent's own tool calls. `Agent::with_shared_tools` and
+  `Agent::shared_tools` expose the handle; `Agent::new` keeps working.
+  `pi.setActiveTools` now applies to the live registry in the same published
+  swap: extension tools left out of the list are shelved (unreachable for
+  the agent's next provider schema and for execution) and come back when
+  named again; built-in and MCP tools are untouched. Previously the call only
+  updated extension-manager metadata consulted when wrappers were collected,
+  so an already-mounted tool stayed callable.
+
+- **MCP servers registered by extensions after startup reach the live
+  session**: startup copied extension-registered MCP definitions into the
+  session's MCP manager once, so a `registerMcpServer` call from a later
+  extension callback only updated the extension manager's snapshot and stayed
+  unreachable until restart. SDK and FrankenTUI sessions now sync at the
+  start of every prompt (`sync_extension_mcp_registrations`), the classic
+  TUI runs the same sync at the start of each turn, and the RPC loop runs it
+  on the first attempt of every prompt (the session it owns now carries the
+  MCP manager, `AgentSession::set_mcp_manager`): definitions the MCP manager
+  does not know yet are registered under the same trust gate as at startup,
+  trusted servers are connected, and only tool names not already mounted are
+  added.
+
+- **Docs now describe the shipped TUI**: README, AGENTS.md, and `docs/tui.md`
+  document FrankenTUI as the default interactive stack with `--inline` and
+  `--classic`, list the settings-gated `browser`, `computer`,
+  `inspect_image`, `generate_image`, and `tts` tools, and retire the FAQ
+  line that called web browsing and image generation out of scope.
+
+- **DSR quality recipe runs every test binary**: the `cargo test` check now
+  passes `--no-fail-fast`, so the integration and conformance binaries execute
+  and report in the same run even when an earlier binary is red (the check
+  still fails on any failure).
+
+- **DSR test check runs against the worker's `/tmp`**: the recipe prefixes
+  the test command with `env TMPDIR=/tmp` because the project-local temp
+  directory rch exports can be owned by another uid on a worker, which pi's
+  strict mode-class checks refuse.
+
+- **Drop-in slash-command parity tests are ignored in the gate**: the three
+  `tests/dropin_slash_differential.rs` tests that need the legacy pi-mono
+  tsx runner (a git-ignored `node_modules` tree that never reaches the DSR
+  workers) are marked `#[ignore]` with that reason. They report as ignored,
+  never as passed, and still run with `-- --ignored` on a host that
+  provisioned pi-mono; the strict drop-in program itself is retired.
+
+- **JSON-mode extension UI events use camelCase**: the `extension_ui_request`
+  envelope's `capability_prompt` flag is now `capabilityPrompt`, matching
+  the rest of the JSON-mode contract.
+
+- **Performance-evidence validators accept `git_commit`**: the Rust
+  validators in the release-readiness, release-evidence and semantic
+  workspace graph checks treat the perf harness's `git_commit` provenance
+  field as optional, like the README evidence checker already did.
+
+- **README evidence checker is exercised by the gate**: its `--self-test`
+  now validates against its own fixture inventory instead of borrowing the
+  live performance artifact (it had been failing silently since the
+  2026-08-28 evidence refresh), and `tests/readme_evidence_checker.rs` runs
+  the self-test plus the live README verdict under `cargo test`. The live
+  check still fails closed on the current performance summary.
+
+### Fixed
+
+- **`ftui` clipped long answer lines instead of wrapping them** (gh
+  [#227](https://github.com/Dicklesworthstone/pi_agent_rust/issues/227)):
+  the conversation body is one `Paragraph`, and ftui's paragraph defaults to
+  `WrapMode::None`, which stops drawing each line at the right edge of the
+  region. Any answer line longer than the terminal was truncated mid-word
+  with no indication, and the markdown renderer could not compensate because
+  it takes no text width. The body is now wrapped in `conversation_text`
+  (word wrap with a grapheme fallback, so unbroken URLs hard-break and
+  wide characters are measured in cells), with a hanging indent that keeps
+  wrapped list items and fenced code in their column. Two width bugs fell
+  out of it: the table budget and the render cache read `self.term`, which
+  the first frame has not yet received a resize for, and the tail-follow
+  scroll went through a `u16` offset that saturates past 65535 rows — both
+  now use the frame's own body width, and the body is sliced to the visible
+  window. The bubbletea stack was never affected; it wraps explicitly.
+
+- **`read` returned empty content for every file on Windows** (gh
+  [#182](https://github.com/Dicklesworthstone/pi_agent_rust/issues/182)):
+  `ReadTool` opens a file once and clones the handle to fingerprint it for
+  the tool-output cache, but `File::try_clone` shares the OS file position.
+  The fingerprint read through `positioned_file_read`, which is cursor-neutral
+  on Unix (`read_at`) and *not* on Windows (`seek_read` leaves the cursor at
+  the end of the read) or in the portable fallback (it seeks a shared clone).
+  The real read therefore started at EOF, returned zero bytes, and the empty
+  file branch answered with empty content and `is_error: false` — a silent
+  wrong answer for any file up to the 2 MiB fingerprint limit. `grep` was
+  unaffected because it fingerprints through its own handle. The primitive
+  now restores the position it found on every platform, which fixes the same
+  latent hazard at every other call site, and reports a failed restore rather
+  than leaving the cursor at an unknown offset. Invisible on Linux and macOS
+  by construction, so it shipped in two releases.
+
+- **`--mode json` stdout is linear in the response length** (gh
+  [#222](https://github.com/Dicklesworthstone/pi_agent_rust/issues/222)):
+  every `message_update` line carried the whole accumulated assistant
+  message twice (`message` and `assistantMessageEvent.partial`), so a
+  50 KB reply produced ~500 MB of stdout. `message_update` records are now
+  delta-only, matching upstream pi 0.84; `message_start`/`message_end`
+  still carry the full message. RPC mode is unchanged.
+
+- **`usage.cost` is populated** (gh
+  [#221](https://github.com/Dicklesworthstone/pi_agent_rust/issues/221)):
+  nothing ever priced a finished turn, so `usage.cost.*` was `0.0` on every
+  provider. Finished assistant messages are now priced from the model's
+  catalog rates; OpenRouter requests ask for usage accounting
+  (`usage: {include: true}`) and the billed `cost` is kept as the total —
+  the only cost source for ad-hoc gateway model ids.
+
+- **`before_provider_request` handlers chain** (gh
+  [#219](https://github.com/Dicklesworthstone/pi_agent_rust/issues/219)):
+  with several handlers (or several extensions) only the last-registered
+  handler's rewrite reached the wire. Handlers now run in load order, each
+  sees the previous handler's payload, and in-place mutations of
+  `event.payload` are honored.
+
+- **Startup no longer aborts on unrelated OAuth credentials or a read-only
+  store** (gh
+  [#218](https://github.com/Dicklesworthstone/pi_agent_rust/issues/218),
+  [#217](https://github.com/Dicklesworthstone/pi_agent_rust/issues/217)):
+  an explicit `--api-key` for an explicit model skips the stored-credential
+  refresh entirely; otherwise expiring OAuth credentials are refreshed per
+  provider and only a failure for the selected provider is an error. A
+  non-writable `~/.pi/agent` is read without a lock instead of failing
+  with `auth lock: Permission denied`, and the stale-credential prune can
+  no longer fail startup.
+
+- **Secret masking catches API keys that contain dots** (gh
+  [#211](https://github.com/Dicklesworthstone/pi_agent_rust/issues/211)):
+  the `sk-` rule and the generic `KEY=value` rule rejected `.` inside the
+  token, so dotted OpenAI-compatible keys (Alibaba BaiLian `sk-sp-H.EEDDM…`)
+  reached the model in plaintext while the same key with the dots replaced
+  by digits was vaulted. Ruleset v2 accepts single dots *between* token
+  characters only — a key at the end of a sentence no longer swallows the
+  period, dots do not count toward the minimum length, and a dotted generic
+  value without any digit (`apiKey: process.env.OPENAI_API_KEY`) is left
+  alone. Same audit added `gho_`/`ghu_`/`ghs_`/`ghr_` GitHub tokens and a
+  signed-JWT rule, and orders `sk-ant-` ahead of `sk-` so the audit label
+  names the tightest rule. Rotate any dotted key that was pasted into a
+  session on an earlier build.
+
+- **Gemini / Vertex AI no longer report a cut-off stream as a complete
+  answer** (gh
+  [#213](https://github.com/Dicklesworthstone/pi_agent_rust/issues/213)):
+  a transport close before the chunk carrying `finishReason` (proxy reset,
+  idle timeout, dropped connection) was emitted as a clean `Done`/`Stop`, so
+  the truncated text was committed to the session and the transient-error
+  retry never ran. Both providers now surface a retryable `unexpected EOF`
+  error like the Anthropic and OpenAI streams already did, and a refused
+  prompt (`promptFeedback.blockReason`) becomes a named provider error
+  instead of an empty success. The HTTP body-idle timeout that bounds a
+  stalled provider stream gained direct tests (stall fires, live-but-slow
+  streams reset the bound, transport errors pass through).
+
+- **FTUI launches boot the extension runtime once**: the classic startup
+  path no longer pre-warms, enables, and then discards a second extension
+  runtime (with a second `startup`/`session_start` hook dispatch) before the
+  default FTUI stack creates its own SDK session.
+
+- **Extension `pi.tool` file writes are undoable**: the runtime's hostcall
+  registry now shares the session's undo recorder (and, on the classic
+  path, its workspace roots), so files written through extension hostcalls
+  appear in `/undo` and respect workspace confinement like agent tool calls.
+
+- **RPC quarantine rejections name the state**: a command refused while
+  terminal persistence is quarantined now answers with
+  `<command> is quarantined after an indeterminate transition: <reason>`,
+  matching the other quarantine messages, so clients can recognise the state
+  instead of parsing the underlying persistence failure. Closing stdin while
+  quarantined still ends the server loop with the surfaced error.
+
+- **MCP HTTP transport survives servers without a GET stream**: the optional
+  server-initiated event stream is opened in the background; a server that
+  answers that GET with anything but 405 or a `text/event-stream` body used
+  to retire the whole transport, so the next request or notification failed
+  with "HTTP transport was aborted before request dispatch". Such answers now
+  mean "no server stream" and are logged, while requests keep flowing.
+
+- **Failover lifecycle closes on fallback turns**: a turn that swapped to a
+  fallback-chain entry emitted `failover_start` but no matching end, so JSON
+  and RPC consumers saw the lifecycle stay open through `agent_end`. Print
+  JSON mode and the RPC loop now emit exactly one
+  `failover_end { restoredPrimary: false }` naming the fallback, whether the
+  fallback succeeded, failed, or the turn was aborted or its restoration
+  failed: the RPC loop emits it before its deferred terminal `agent_end`;
+  print JSON mode emits it with the other lifecycle closers
+  (`auto_retry_end`) after the fallback attempt's `agent_end`. Cooldown
+  restoration keeps its own `failover_end { restoredPrimary: true }`.
+
+- **Fallback chain walks skip no-op entries and stop spending the cap on
+  them**: print mode bounded its chain cursor by `maxFailoversPerTurn`, so a
+  malformed, uncredentialed, or unconstructible entry consumed the budget and
+  hid a later valid entry; both print and RPC would also install a chain
+  entry equal to the live model or a duplicate of an earlier entry, emitting a
+  phantom `failover_start` for a swap to itself. The walk is now bounded by
+  the chain, skips the current model and duplicate specs, and only a
+  successful swap counts against the per-turn cap on both surfaces.
+
+- **Persistence fault-injection runner checks the right test identity**:
+  `scripts/e2e/run_persistence_fault_injection.sh` compared each case's
+  `result.json` `test_name` (the cargo test function it ran) against the
+  harness test id the Rust test stamps on its JSONL diagnostics, so the
+  integrity summary failed `result_identity_current` after both cases
+  passed. The two identities are now checked separately, and a failed
+  summary prints the failing check names and any source-tree movement on
+  stdout instead of a bare exit code.
+
+- **Perf orchestrator names its blockers**: when the post-generation evidence
+  contract or the final artifact staging blocks a run, the log now lists the
+  contract failures, the blocked staging contract ids, and each
+  stratification layer's evidence state and node/bun ratios, so a gate
+  transcript explains the refusal without the JSON artifacts. The fake
+  toolchain fixtures in `tests/bench_schema.rs` were brought back in line
+  with the current staging and comparison contracts (semantic_context
+  Criterion estimates, the Criterion-produced pijs comparison contract, the
+  newer fence ordering and validator wording).
+
+- **Hidden extension messages reach the model**: custom messages injected by
+  extensions (for example from `before_agent_start`) with `display: false`
+  are sent to the provider like visible ones; `display` only controls TUI
+  rendering. pi's own hidden provenance records (the semantic context bundle
+  entry) stay out of the provider context because their payload travels in
+  the system prompt.
+
+- **A stray `.codex` file no longer blocks startup**: the workspace-trust
+  scan treated "Not a directory" on `.codex/config.toml` as a configuration
+  error and refused to start pi in any directory containing a regular file
+  named `.codex`; a file where a surface directory is expected now counts as
+  "no surface", like a missing path.
+
+- **Perf orchestrator no longer aborts on `ROOT_DIR`**:
+  `scripts/perf/orchestrate.sh` referenced an undefined `ROOT_DIR` in the
+  extension-benchmark validation path (since 2026-08-26), which under
+  `set -u` aborted every orchestration that reached it.
+
+- **Installer no longer depends on `SHA256SUMS`**: the network preflight
+  probed the aggregate checksum manifest, which DSR releases may not ship at
+  all, so canonical releases warned during preflight and the installer touched
+  `SHA256SUMS` even when the per-asset `.sha256` sidecar was authoritative. It
+  now probes the release page. `tests/installer_regression.sh` is green again
+  (69/69; five cases had been failing since 2026-08-06 without any gate
+  running them).
+
+- **Verification lane realigned with the newer product contracts** (test and
+  evidence changes only, no product behaviour changed): the MCP HTTP transport
+  tests now expect the fail-closed retirement rule (a malformed, mismatched,
+  or 202-acknowledged request retires the transport; an indeterminate abort
+  sends one `notifications/cancelled`); the auto-compaction "stale snapshot"
+  test no longer deadlocks against the agent-session lock it was waiting on;
+  the `/share` TUI tests trust their own project settings via
+  `PI_WORKSPACE_TRUST`; the RPC plan-mode test retries `approve_plan` and
+  the follow-up prompt while the RPC loop answers "wait before running"
+  (it fired both into the still-streaming turn and then into the post-turn
+  compaction handoff, which is the documented client contract) and drains
+  the child's output pipes; the FrankenNode matrix check
+  ignores the generating host's Node/Bun versions; the extension stress test
+  measures RSS growth after a warm-up cycle; the OCO budget tuner gained real
+  regret and rollback unit tests; the traceability matrix, e2e scenario
+  matrix, and perf SLI contracts cover every classified suite again (incl.
+  the background `/tan` workflow); the swarm runpack golden was regenerated
+  after review. One user-visible touch: the `/share` success message now
+  puts the share URL and the gist link in their own paragraphs so the TUI
+  no longer soft-wraps them into the warning sentence.
+
+---
+
+## [v0.4.0] — 2026-09-01 — Tag-only
+
+> Tagged on 2026-09-01 but not yet published: no GitHub Release exists for
+> `v0.4.0` as of 2026-09-02 (the latest published release is v0.3.0). The
+> heading flips back to "Release" in the commit that publishes it through
+> DSR (bd-ghfu4).
+
+### Added
+
+- **System/custom CA certificate support** (gh
+  [#186](https://github.com/Dicklesworthstone/pi_agent_rust/issues/186)):
+  `PI_HTTP_USE_SYSTEM_CERTS=1` switches the HTTP client from the bundled
+  webpki roots to the OS trust store. Setting any of `SSL_CERT_FILE`,
+  `SSL_CERT_DIR`, `REQUESTS_CA_BUNDLE`, or `CURL_CA_BUNDLE` implies the same
+  opt-in (curl/requests semantics) and merges the referenced CA bundle in —
+  needed behind TLS-terminating corporate proxies. Webpki roots stay the
+  default: loading the macOS trust store is expensive at startup (gh #101),
+  and `PI_HTTP_USE_SYSTEM_CERTS=0` forces webpki even when an ambient
+  custom-CA var is present.
+
+- **`prompt_cache_key` on OpenAI-shaped requests** (gh
+  [#188](https://github.com/Dicklesworthstone/pi_agent_rust/issues/188)):
+  chat-completions, Azure, and Responses requests (codex mode included) now
+  carry a cache-affinity key, defaulting to the session id — matching the TS
+  `openai-responses` provider. Some stacks (observed: Azure OpenAI behind a
+  LiteLLM proxy) give streamed requests no prompt-cache affinity at all
+  without it. `PI_PROMPT_CACHE_KEY` overrides the key (`off`/`none` disables
+  it), and `PI_CACHE_RETENTION=none` suppresses it entirely (TS parity).
+  When the key is disabled/suppressed the field is omitted altogether, so
+  backends that reject unknown params can be restored to the previous wire
+  format with `PI_PROMPT_CACHE_KEY=off`.
+
+- **`PI_COPILOT_GITHUB_API_BASE`**: moves the GitHub Copilot OAuth token
+  exchange to a GitHub Enterprise / data-residency REST API host (e.g.
+  `https://github.example.com/api/v3`). Complements the gh #191 fix below,
+  which stops the catalog `base_url` from steering the exchange.
+
+- **Host-mediated native-Responses compaction bridge** (gh
+  [#167](https://github.com/Dicklesworthstone/pi_agent_rust/issues/167)):
+  `ctx.compact(preparation, { strategy: "openai-responses-native", request })`
+  lets an extension (e.g. pi-better-compaction) compose the compact request —
+  including replaying its previously stored opaque window as `input` — while
+  the host sanitizes it (allowlisted fields only, credential-shaped keys
+  rejected, model pinned to the session's own), POSTs it to the provider's
+  sibling `…/responses/compact` endpoint under the session's credentials, and
+  returns `{ summary, firstKeptEntryId, tokensBefore, details }` with
+  `details.compactedWindow` (plus `compactResponseId`/`createdAt` when the
+  endpoint reports them). Credentials never cross into extension JS; any
+  bridge failure rejects so the plugin fails open to default compaction. The
+  round-trip runs under the dedicated long-running compact event budget
+  (gh #178).
+
+- **ftui render caching, busy indicators, and compact markdown spacing** (gh
+  [#201](https://github.com/Dicklesworthstone/pi_agent_rust/issues/201),
+  [#202](https://github.com/Dicklesworthstone/pi_agent_rust/issues/202),
+  [#203](https://github.com/Dicklesworthstone/pi_agent_rust/issues/203)):
+  the ftui conversation view caches rendered markdown per entry (flushed on
+  theme/width changes), shows a busy spinner chain while a turn is in
+  flight, and tightens inter-block markdown spacing.
+
+- **Checkpoint retries with topology preservation**: `/retry` now stages and
+  commits provider retries while preserving sibling parent topology, and
+  provider retries are vetoed when session persistence fails so a retry can
+  never silently outrun a session that is not being saved.
+
+- **Bash mediation hardening**: stronger allow-pattern anchoring and command
+  classification (`shred` now classifies as a disk wipe).
+
+- **MCP/RPC transport and extensions-host wave**: multiplexed MCP transport
+  with streamable-HTTP protocol contract tests, refined RPC method routing,
+  handler dispatch and response framing, SSE event handling, extension
+  registration tests, preserved extension spec headers/type alias/cwd, and
+  WASM host refinements.
+
+### Fixed
+
+- **GitHub Copilot: a configured catalog `base_url` no longer redirects the
+  OAuth token exchange** (gh
+  [#191](https://github.com/Dicklesworthstone/pi_agent_rust/pull/191)): the
+  per-model `base_url` (e.g. `https://api.individual.githubcopilot.com`) is a
+  chat-completions endpoint hint, like every other provider, but it was fed
+  into the GitHub REST API base — so the `copilot_internal/v2/token` exchange
+  was sent to the chat endpoint and failed. `base_url` now pins the
+  chat-completions endpoint (winning over the endpoint the token-exchange
+  response supplies); the exchange itself stays on `api.github.com` unless
+  `PI_COPILOT_GITHUB_API_BASE` moves it (GHE/data residency).
+
+- **Bare model-id selection now warns when it skips an unready custom
+  provider** (gh
+  [#189](https://github.com/Dicklesworthstone/pi_agent_rust/issues/189)):
+  selecting a bare model id that also exists under a custom provider whose
+  credentials are missing silently routed to the built-in provider. Exact
+  `provider/model` selection was and remains custom-first (regression test
+  added); the bare-id fall-through now surfaces a startup warning naming the
+  skipped provider and how to select it explicitly.
+
+- **Approval mode `ask` now actually prompts instead of denying silently**
+  (gh [#196](https://github.com/Dicklesworthstone/pi_agent_rust/issues/196),
+  [#198](https://github.com/Dicklesworthstone/pi_agent_rust/issues/198)):
+  the documented default approval mode never prompted anywhere — the CLI
+  stack set the approval state without a handler, so every gated tool call
+  hit the deny-by-default branch with a reason the user never saw, and the
+  ftui stack ignored the approval mode entirely. Every interactive surface
+  (classic TUI, ftui, RPC) now renders a real Allow/Deny card through the
+  ask machinery; every non-affirmative outcome (deny, dismissal, timeout,
+  missing surface) maps to a deny with an explicit reason the model can
+  relay. Print mode still fails closed, now with an explicit
+  "prompt unavailable" reason.
+
+- **virtiofs/FUSE bind mounts no longer fail every file write** (gh
+  [#193](https://github.com/Dicklesworthstone/pi_agent_rust/issues/193)):
+  virtiofs (Docker Desktop devcontainers) assigns a fresh inode during
+  rename(2), so post-rename dev/ino verification reported "atomic
+  replacement target changed" after every successful write. When the
+  identity check fails, verification falls back to content proof (size +
+  SHA-256 through the pinned parent descriptor); kernel-backed filesystems
+  never take the fallback, so the safety property is unchanged there.
+
+- **TUI interaction wave** (gh
+  [#206](https://github.com/Dicklesworthstone/pi_agent_rust/issues/206),
+  [#197](https://github.com/Dicklesworthstone/pi_agent_rust/issues/197),
+  [#200](https://github.com/Dicklesworthstone/pi_agent_rust/issues/200),
+  [#205](https://github.com/Dicklesworthstone/pi_agent_rust/issues/205),
+  [#194](https://github.com/Dicklesworthstone/pi_agent_rust/issues/194)):
+  resize preserves the reading position instead of snapping to the bottom,
+  and ftui scroll clamping honours the real rendered line count so long
+  sessions scroll all the way up (#206); `/new` restores the configured
+  default thinking level instead of hard-coding off, and the thinking badge
+  no longer flips under session-lock contention (#197); terminal tab titles
+  carry the session name in both TUIs, updated on `/name`, `/resume`,
+  `/new`, and named launch (#200); Ctrl-C in ftui aborts the in-flight
+  turn instead of waiting out the provider stream (#205); Windows Terminal
+  is recognized via `WT_SESSION` so synchronized output stops frame tearing
+  (#194).
+
+- **Glamour preset heading backgrounds cleared** (gh
+  [#195](https://github.com/Dicklesworthstone/pi_agent_rust/issues/195)):
+  headings rendered theme-accent-on-preset-purple (unreadable for most
+  accents); presets' fixed ANSI heading backgrounds are cleared so headings
+  render as accent on the document background.
+
+- **`/resume` no longer lists the same session twice** (gh
+  [#199](https://github.com/Dicklesworthstone/pi_agent_rust/issues/199)):
+  rows sharing a session id are collapsed after the index/directory-scan
+  merge (symlinked roots, macOS `/tmp` vs `/private/tmp`, dual `.jsonl` +
+  `.sqlite` persistence), keeping the most recently modified representative.
+
+- **Interactive session integrity**: tree navigation stages unconfirmed
+  saves so they cannot claim success, save errors surface instead of being
+  swallowed, and JS extension session mutators are fenced with
+  `SessionActionOrigin` so stale forked-JS lifecycles cannot mutate sessions
+  they no longer own; MCP HTTP sessions are no longer abandoned on
+  initialize/close races; blocked JS hostcalls are cancelled at the root
+  task deadline.
+
+### Changed
+
+- fsqlite updated to 0.3.14 (FTS5 stock-compat + checkpoint watermark).
+- fs4 upgraded to 1.1 (FileExt 1.x API).
+- Full clippy/rustfmt sweep across bin, example, and test targets.
+
+## [v0.3.0] — 2026-08-21 — Release
+
+First published release since [v0.1.23](https://github.com/Dicklesworthstone/pi_agent_rust/releases/tag/v0.1.23).
+This release also ships everything documented under the unpublished
+[v0.2.0](#v020--2026-08-06--unpublished-milestone) milestone below — users
+upgrading from v0.1.23 should read both sections. Roughly 450 commits; the
+dominant arc is the OMP-ADOPT capability wave (`bd-cv653` epic in
+[`.beads/issues.jsonl`](https://github.com/Dicklesworthstone/pi_agent_rust/blob/main/.beads/issues.jsonl)),
+a pure-Rust session-storage engine swap, and a hardening pass over the
+interactive TUI driven by real end-to-end stress testing.
+
+### Breaking Changes
+
+- **Token accounting moved from the `chars/4` heuristic to real BPE tables**
+  (O200k/Cl100k via the default-on `bpe-tokens` feature). Compaction
+  thresholds and cut points shift for existing sessions; disabling the
+  feature restores the old heuristic
+  ([`b91f6a3c`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/b91f6a3c)).
+- **Extension discovery is manifest-only** — all inference heuristics
+  (sibling-entry discovery, workspace-bundle clustering, `examples/` scans,
+  node_modules fallback) were removed for upstream parity. Extensions not
+  declared in `package.json#pi.extensions` or the conventional `extensions/`
+  directory stop loading
+  ([`3f37f46a`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/3f37f46a)).
+- **Workspace trust-on-first-use** — project-local `.pi/settings.json`
+  packages and `.pi/extensions/` no longer execute on plain startup;
+  non-interactive launches fail closed. Automation needs `--trust`,
+  `PI_WORKSPACE_TRUST=1`, or global `trustAllWorkspaces`
+  ([`17faf856`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/17faf856), GH #151).
+- **Session storage engine swapped to FrankenSQLite** — session index and
+  SQLite-backed sessions run on the pure-Rust fsqlite engine instead of
+  libsqlite3-sys. `Error::Sqlite` now wraps typed `fsqlite::FrankenError`
+  variants (SDK-visible), a new sidecar file family appears next to session
+  stores, and the release binary size budget moved from 22 to 26 MiB
+  ([`432c90cc`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/432c90cc)).
+- **Tool schema surface is tiered** — non-essential tools leave the provider
+  schema by default and become reachable through the new `xdev`
+  dispatcher (`list/describe/run/promote`), with `tools.loadMode.<name>`
+  overrides; `--tools` still wins
+  ([`319f70ef`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/319f70ef)).
+- **MCP servers no longer inherit the ambient environment** — stdio servers
+  get a PATH/HOME/locale/temp/TERM allowlist (`MCP_ENV_ALLOWLIST`); servers
+  depending on ambient tokens must be configured explicitly
+  ([`2da01cbc`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/2da01cbc)).
+- **SDK/embedder struct changes** — `AgentConfig` gains `keyword_settings`,
+  `turn_recovery`, and `max_time` fields; `PiApp::new` takes an
+  `mcp_manager` argument; SDK sessions now emit Anthropic prompt-cache
+  breakpoints (short retention) by default, overridable via
+  `PI_CACHE_RETENTION=long|none`
+  ([`9ec0ab34`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/9ec0ab34)).
+- **Image decoding narrowed** to jpeg/png/gif/webp; avif/exr/tiff/qoi/bmp are
+  no longer compiled into default builds
+  ([`2f6c227b`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/2f6c227b)).
+
+### Features — code intelligence and execution tools
+
+- **`lsp` tool** — 14 operations over child language servers (JSON-RPC over
+  stdio, per-server registry, rename/definition/diagnostics), with
+  `lsp.servers` config merged over built-in defaults
+  ([`912a4650`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/912a4650)).
+- **`debug` tool** — 28 DAP operations with adapter auto-selection
+  (lldb-dap, debugpy, dlv)
+  ([`2db8f6b1`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/2db8f6b1)).
+- **`eval` tool** — persistent Python and QuickJS kernels with cell
+  semantics, trailing-expression repr, a tool-bridge whitelist, and
+  top-level `await`
+  ([`ee942ba2`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/ee942ba2)).
+- **`ast_grep` / `ast_edit`** structural search and rewrite tools
+  ([`1952d084`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/1952d084)).
+- **Bash execution hardening** — every spawn is classified against
+  `bash.mediation` (`off|warn|block-critical|block-high`) before exec;
+  `portable-pty` gives isatty-requiring commands a real tty (`PtyMode
+  off|always|auto`); `bash {background: true}` returns a job id managed by
+  the new `jobs` tool; the `hub` tool supervises PTY services with
+  readiness gates
+  ([`ca14c3ab`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/ca14c3ab),
+  [`da62aebf`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/da62aebf),
+  [`b8e39600`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/b8e39600)).
+
+### Features — web, integrations, and interop
+
+- **`web_search` tool** with a nine-rung ranked provider chain (keyed:
+  perplexity/brave/tavily/exa/jina/kagi; keyless: duckduckgo/startpage/
+  mojeek), per-rung circuit breaking, `site:`/`after:` filters, and
+  canonical-URL dedupe
+  ([`45181b06`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/45181b06)).
+- **URL-aware `read`** — http(s) paths return reader-mode markdown with
+  SSRF default-deny for private targets; internal `skill:// prompt://
+  pr:// issue:// ssh://` URL schemes route through the same tool
+  ([`f5e2987a`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/f5e2987a),
+  [`a0d31499`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/a0d31499)).
+- **MCP client** — unified registry over native (`.pi/mcp.json`,
+  `--mcp-config`) and foreign (`.claude/.cursor/.windsurf/.gemini/.codex`)
+  configs, fingerprint-bound trust lifecycle, stdio + streamable-HTTP
+  transports, `mcp__<server>__<tool>` wrappers, and a `/mcp` command
+  ([`952fb3bd`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/952fb3bd)).
+- **`github` tool** (`gh`-backed pr/issue/run operations) and
+  **`pi import --from-claude|--from-codex`** for idempotent foreign-session
+  import
+  ([`506a76ae`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/506a76ae),
+  [`ddc075d9`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/ddc075d9)).
+- **Richer JS extension host** (GH #167) — `buildSessionContext`,
+  `convertToLlm`, `modelRegistry.find`, native `ctx.compact()`, typed
+  subagent results validated against per-task JSON Schemas, and
+  `before_provider_request` hooks on all JSON-body provider routes
+  ([`cd9c2bfc`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/cd9c2bfc),
+  [`9974d79d`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/9974d79d)).
+
+### Features — model routing and resilience
+
+- **Model roles** (`modelRoles` settings, `--smol/--slow/--plan` flags,
+  `/model roles`) with cheap auto-titling and task-role subagents
+  ([`d5b8cf72`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/d5b8cf72)).
+- **Failover chains** — `retry.fallbackChains` continues a turn on the next
+  configured model after classified transient failures, with cooldowns and
+  per-turn caps; auth failures never fail over. Plural env credential
+  rings (`OPENAI_API_KEYS`-style) rotate keys with per-key backoff
+  ([`bbc68341`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/bbc68341)).
+- **Dialect repair for weak models** — text-emitted tool calls (bare JSON,
+  fenced blocks, `<tool_call>` tags) are repaired into structured calls
+  through the normal executor with strict anti-false-positive rules
+  ([`89a15c22`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/89a15c22)).
+- **Advisor** — a second-model turn reviewer with fail-closed isolation
+  (`/advisor`)
+  ([`b0c6dd59`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/b0c6dd59)).
+
+### Features — session control and agent ergonomics
+
+- **Checkpoints** — `/checkpoint`, `/rewind` (collapse-with-report),
+  `/fresh`, `/retry`, and a `--max-time` wall-clock cap
+  ([`b3723e4d`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/b3723e4d)).
+- **`/undo` and `/redo`** over a content-addressed snapshot recorder for
+  file-mutating tools
+  ([`dd77beaa`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/dd77beaa)).
+- **Turn recovery** — deterministic unexpected-stop classifier with capped
+  auto-continue
+  ([`1ba1e39d`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/1ba1e39d)).
+- **`pi handoff`** (schema `pi.handoff.v1`, secret-screened) and
+  **`pi commit`** (dependency-ordered atomic commit splitting)
+  ([`d59bffa7`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/d59bffa7),
+  [`644a077d`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/644a077d)).
+- **`ask` and `todo` tools** are now default-enabled: structured mid-turn
+  option cards across TUI/RPC/SDK, and a persistent session task list with
+  a footer progress line
+  ([`bba4345f`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/bba4345f),
+  [`6ccdea44`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/6ccdea44)).
+- **Plan mode** — read-only planning with `submit_plan` and an approval
+  gate, plus RPC commands and approval modes
+  (`--approval-mode`, `--yolo`, `/approval`)
+  ([`be2a71c2`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/be2a71c2),
+  [`af47798d`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/af47798d)).
+- **Memory bank (opt-in)** — per-project SQLite+FTS5 store behind
+  `memory.backend = local` with `retain/recall/reflect/memory_edit/learn`
+  tools and a managed-skills tier
+  ([`3be3a829`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/3be3a829)).
+- **Magic keywords** — prose-only `ultrathink`/`orchestrate`/`workflowz`
+  triggers with a grammar-aware tokenizer, plus time-traveling stream rules
+  with mid-stream abort/injection (`pi rules`, `/omfg`)
+  ([`3aac814f`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/3aac814f),
+  [`441ffaa6`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/441ffaa6)).
+- **Compaction shake mode** — `/compact shake` reclaims context by dropping
+  oversized tool-result payloads deterministically with zero LLM calls;
+  the automatic policy shakes first and escalates to an LLM summary only
+  if still over threshold
+  ([`2a6607bf`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/2a6607bf)).
+
+### Features — operator surface
+
+- **`pi self-update`** with fail-closed SHA-256 verification, package-manager
+  detection, and atomic swap with rollback
+  ([`f16763f2`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/f16763f2)).
+- **Shell completions** — `pi completions bash|zsh|fish` from the live clap
+  graph, plus a `pi __complete` protocol serving live model/session
+  candidates
+  ([`09e8dcc4`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/09e8dcc4)).
+- **`pi usage` / `/usage`** — provider credit/quota readers (OpenRouter,
+  Moonshot, Copilot)
+  ([`f6be31da`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/f6be31da)).
+- **FrankenTUI preview** — an experimental alternative TUI behind
+  `pi --ftui` (default-off feature): tail-follow scroll, modal pickers,
+  extension bridging, and an `--inline` mode that preserves shell
+  scrollback
+  ([`41dfdb7e`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/41dfdb7e)).
+- **`/theme auto`** terminal light/dark detection
+  ([`6b7ac35c`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/6b7ac35c)).
+
+### TUI reliability (HN-feedback hardening wave)
+
+- Tracing output can no longer paint over the alt-screen transcript: logs
+  divert to `<global_dir>/logs/tui.log` while the TUI owns the terminal
+  ([`41e97d31`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/41e97d31)).
+- Tool, `!cmd`, and extension-command output is sanitized before entering
+  the transcript (CSI/OSC/DCS/SOS/PM/APC sequences and C0 controls
+  stripped; CR-rewritten progress bars normalized)
+  ([`1d723625`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/1d723625),
+  [`f6df955f`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/f6df955f)).
+- Tool transcript blocks now show what ran (`$ <command>` headers keyed by
+  tool id so parallel tools can never mislabel each other), tool
+  completions no longer yank a scrolled-up reader to the bottom, the slash
+  menu no longer vanishes on short prefixes like `/t`, and skills are
+  discoverable from a bare `/`
+  ([`c98ac8fd`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/c98ac8fd),
+  [`9d184467`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/9d184467)).
+- User, system, and tool lines hard-wrap to the terminal width; long diff
+  lines clamp to the pane; scroll no longer rebuilds the conversation
+  twice per wheel tick; memory-pressure tiers now work on macOS (RSS via
+  sysinfo)
+  ([`28a798d4`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/28a798d4),
+  [`7c391723`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/7c391723)).
+- New end-to-end coverage: a tmux stress lane drives 35 sequential real
+  tool executions through the release-shaped binary and asserts scroll
+  integrity afterward; VCR request templates are now derived from the live
+  tool registry with a shape-parity guard so cassettes cannot silently
+  drift
+  ([`9b0f2841`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/9b0f2841),
+  [`8b43a2bf`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/8b43a2bf)).
+
+### Fixes
+
+- Anthropic prompt caching: 1h TTL emitted only on the first-party API;
+  last-user-block caching with empty system omitted; foreign reasoning
+  signatures dropped on model switch
+  ([`1d817ab0`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/1d817ab0),
+  [`5e20d9df`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/5e20d9df)).
+- Custom model catalogs honor `thinkingFormat`/`thinkingLevelMap` (GH #166)
+  and Bearer auth for OpenAI-family providers with an `apiKey`
+  ([`281c2984`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/281c2984),
+  [`d5d8d276`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/d5d8d276)).
+- OpenAI Responses replay hardened (merged `msg_` parts, gated `fc_` ids,
+  lossless reasoning item-id replay)
+  ([`5432397d`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/5432397d)).
+- `grep` results respect the workspace-root `.gitignore`; path-shaped
+  `find` globs and pinned-file context reads fixed; the `/login` provider
+  table, template completions, and subagent output fencing hardened
+  ([`317b0293`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/317b0293),
+  [`72602d1d`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/72602d1d)).
+- A legacy `~/.pi/skills` directory now triggers a warning instead of a
+  silent no-op
+  ([`81f3c646`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/81f3c646)).
+
+### Performance
+
+- In-process grep/find engines replace external `rg`/`fd` shell-outs by
+  default
+  ([`b7724e62`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/b7724e62)).
+- SDK embedders default to short Anthropic prompt-cache retention, closing
+  a full-input-price-every-turn cost leak
+  ([`9ec0ab34`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/9ec0ab34)).
+- Binary size: image stack trimmed to decode-only jpeg/png/gif/webp;
+  parallel rustc front-end enabled for builds
+  ([`2f6c227b`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/2f6c227b),
+  [`9d4872a0`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/9d4872a0)).
+
+
+## [v0.2.0] — 2026-08-06 — Unpublished milestone
+
+> This version was prepared and set in `Cargo.toml` but was never tagged or
+> published (no GitHub Release, no crates.io upload). Its changes first ship
+> in [v0.3.0](#v030--2026-08-21--release) above.
+
+### Breaking Changes
+
+- **The Rust SDK now boxes in-process prompt results** —
+  `SessionPromptResult::InProcess` carries `Box<AssistantMessage>`. SDK callers
+  that construct or pattern-match this variant must account for the box.
+- **Assistant stop metadata is richer** — `AssistantMessage` adds optional
+  structured `stop_details`, `pi::sdk` now exports `StopDetails`, and
+  `StopReason` adds `PauseTurn` and `Refusal`. Downstream `AssistantMessage`
+  struct literals must initialize the new field (normally with `None`), and
+  exhaustive `StopReason` matches must handle the new variants.
+- **The minimum supported Rust version is now 1.95** — published crate metadata
+  declares Rust 1.95, while repository release builds remain reproducibly
+  pinned to `nightly-2026-07-05`.
+- **Static model-catalog lookup is now fallible** —
+  `pi::providers::static_registry_models` returns `Result<Vec<String>>` so
+  malformed, unsafe, or resource-exceeding local catalog data cannot be
+  mistaken for a valid empty fallback.
+- **Fetched-catalog persistence is provenance-bearing** — the public
+  `persist_provider_model_catalog` API now accepts a `ProviderModelCatalog`
+  rather than arbitrary provider/model rows, and that catalog's fields are
+  private with read-only accessors. The generated on-disk schema advances from
+  `pi.models.fetched.v1` to `pi.models.fetched.v2`. Pi preserves v1 bytes;
+  move `models.fetched.json` aside first, then run a verified live
+  `--fetch-models <provider> --refresh-models --persist-models` refresh to
+  create the v2 catalog.
+- **Runtime credentials now outrank `models.json` credentials** — explicit,
+  ambient, stored, or external-provider credentials are used before a
+  provider route's `apiKey`; the route value is now a fallback. Live catalog
+  discovery and inference therefore use the same credential precedence.
+
+### Features
+
+- **Native, opt-in subagent orchestration** — the ninth built-in tool can run
+  one named child agent, bounded parallel tasks, or a sequential chain. Child
+  processes inherit the parent environment (including auth/router variables),
+  apply each agent definition's model, reasoning, skill, and configured-or-default
+  tool list, stream structured progress, and are cancelled and reaped with their
+  parent. Addresses [#132](https://github.com/Dicklesworthstone/pi_agent_rust/issues/132),
+  [#144](https://github.com/Dicklesworthstone/pi_agent_rust/issues/144), and
+  [#145](https://github.com/Dicklesworthstone/pi_agent_rust/issues/145).
+- **Provider and model parity improvements** — Anthropic `pause_turn` responses
+  resume with a bounded continuation budget, refusal details remain structured,
+  extension-registered providers can stream through the provider factory, and
+  the built-in catalog includes GPT-5.6 Sol, Terra, and Luna seeds.
+- **Live provider catalogs are usable outside the TUI** — `--fetch-models`
+  prints model IDs and exits, `--refresh-models` requires a genuine live
+  response, and `--persist-models` atomically records only verified live or
+  same-process-cache results in `models.fetched.json`. Persisted provider/model
+  membership carries a fetch timestamp and non-secret endpoint/transport
+  fingerprint that excludes credential, URL-query, and header values; rows are
+  ignored with an actionable error if the current route shape no longer
+  matches, while credential rotation remains valid. Separate CLI invocations
+  start with an empty in-memory cache. The generated catalog feeds future
+  `--list-models` and interactive model pickers without rewriting or overriding
+  hand-authored `models.json`. Fixes
+  [#150](https://github.com/Dicklesworthstone/pi_agent_rust/issues/150).
+- **Retired GitHub Models routing removed** — the `github-models` preset and
+  dead upstream autocomplete rows are no longer exposed after GitHub retired
+  the service on 2026-07-30. The distinct `github-copilot` native provider
+  remains supported.
+- **Injectable model credential resolution** — harnesses and SDK embedders can
+  load the model registry without ambient process credentials affecting model
+  availability, while production continues to use `AuthStorage`.
+
+### Reliability and Release Integrity
+
+- **Truncated tool calls fail explicitly** — a provider token limit reached
+  while a tool call is incomplete now ends the turn as an error instead of
+  silently treating an unusable partial call as a normal length stop. Fixes
+  [#148](https://github.com/Dicklesworthstone/pi_agent_rust/issues/148).
+- **File-lock ownership is identity-aware** — long-held locks refresh a
+  heartbeat, stale reclaim checks ownership, and displaced owners cannot remove
+  a replacement lock directory.
+- **Model-catalog filesystem policy is deterministic under root and ordinary
+  users** — reads enforce the effective Unix owner/group/other class on both
+  files and traversed directories. Generated-catalog persistence preflights
+  target and directory read/write/search access before creating directories,
+  locks, or temporary files, and rejects final symlinks without mutation.
+- **Concurrency-sensitive tests are deterministic** — RPC crash-recovery
+  checkpoints, process-wide current-directory mutation, remote-worker fixtures,
+  and extension memory/scanner cases now isolate their shared state.
+- **Extension corpus scans are read-only by default** — ordinary test runs now
+  validate the committed entry-point scan in place and keep auxiliary scan
+  results in memory, so an ignored generated file cannot contaminate the
+  fail-closed must-pass source snapshot. Maintainers can regenerate scan
+  artifacts explicitly with `PI_GENERATE_EXT_ENTRY_SCAN=1`.
+- **Release builds no longer compile duplicate process-inspection stacks** —
+  the direct `sysinfo` dependency now matches the version already used by the
+  runtime. This preserves process-tree behavior while reducing binary-size
+  pressure.
+- **Embedded release resources are losslessly size-optimized** — deterministic
+  gzip and compile-time LZSS encoding preserve the exact source bytes while
+  avoiding duplicate large text literals in the executable. The release-only
+  LLVM machine outliner further reduces repeated instruction sequences without
+  changing development/test profiles; round-trip, CLI-parity, and executable
+  hardening checks guard the shipping path.
+- **Extension filesystem fallback is more robust** — a denied host `readdir`
+  no longer aborts the filesystem shim before later fallback paths are checked.
+- **Extension VFS isolation is enforced end to end** — registered roots under
+  `/tmp` remain host-backed while unrelated scratch paths stay private per
+  extension; cached data, every hop of virtual symlink resolution, and shared
+  file-descriptor operations are re-authorized for the active extension. The
+  raw shared VFS state is no longer exposed to extension code.
+- **Extension reloads use fresh JavaScript realms** — reset-time registry and
+  intrinsic checks are hygiene evidence before dropping a realm, not authority
+  to reuse arbitrary mutable module/global state. Versioned transpile-cache
+  artifacts remain reusable across cold owner-isolated realms.
+- **Context-evidence suppression is deterministic** — duplicate stale/unsafe
+  suppression records are collapsed per source and reason while the complete
+  excluded-item audit trail is retained.
+- **Release evidence fails closed** — must-pass extension evidence is bound to
+  the exact authoritative inclusion-list identities, corresponding validated
+  manifest metadata, source-tree/inclusion-list/manifest digests, run lineage,
+  non-skipped per-extension events, and exact declared runtime registrations.
+  Stale, smaller, or identity-expanded historical evidence cannot certify a
+  release. PiJS tool-call regression inputs now require exactly 2,000
+  executable-path-verified perf-profile QuickJS iterations through the
+  production extension manager; the 1-call lane gates arithmetic mean latency
+  and the 10-call lane gates
+  aggregate throughput. Debug, unverified-profile, preview, native-comparison,
+  explicitly ineligible, malformed, stale, and uncontrolled host-page-cache
+  load records cannot satisfy their respective gates. These checks gate
+  performance-claim admission. v0.2.0 remains explicitly
+  performance-claims-NOT-authorized because its checked-in budget summary is a
+  valid blocked/NO_DATA artifact; publication may proceed only without
+  quantitative or global performance claims. The producer and validator share
+  the canonical G01–G12 contract. The v2 claim contract also pins the complete
+  19-budget inventory and requires every declared budget to have data and pass
+  before its global performance-authorization boolean can become true; CI-only
+  counters remain additional diagnostics rather than an authorization loophole.
+  Per-target build manifests now identify selected sibling-project crates by
+  their locked registry version, source, and checksum instead of attributing
+  binaries to unrelated sibling repository HEADs.
+- **Cargo-audit vulnerability findings are remediated** — the lockfile
+  advances `anyhow`, `crossbeam-epoch`, `event-listener`, `memmap2`,
+  `plist`/`quick-xml`, and the optional Wasmtime component host to their
+  patched release lines. Warning-only upstream maintenance inventory remains
+  tracked separately. Wasmtime 47 compatibility also uses a movable owned
+  runtime guard and gains real component load, call, trap, and malformed-input
+  coverage.
+
+### Internal
+
+- Decomposed the extension monolith behind the stable `src/extensions.rs`
+  façade: manager orchestration, protocol/reactor, filesystem, exec mediation,
+  permission drift, event coalescing, native/Wasm runtime, and
+  characterization-test domains now live in focused `src/extensions/` modules
+  while public type definitions and import paths remain in the façade. Addresses
+  [#130](https://github.com/Dicklesworthstone/pi_agent_rust/issues/130).
+- Extracted the extension compatibility scanner into its own module while
+  preserving the public compatibility contract and expanded the conformance,
+  governance, provider, SDK, RPC, and swarm evidence suites.
+
+## [v0.1.23] — 2026-07-28 — Release
+
+### Features
+
+- **First-class `max` thinking level above `xhigh`** — `--thinking max`,
+  `/thinking max`, ACP `session/set_config_option`, and RPC
+  `available_thinking_levels` all accept the new 7th level. Anthropic
+  adaptive-thinking models send `output_config.effort: "max"` (Opus 4.6 /
+  Sonnet 4.6 accept `max` without `xhigh`, per the documented effort matrix);
+  DeepSeek reasoning models send `reasoning_effort: "max"` (with `xhigh`
+  keeping its historical `"max"` mapping so existing configs are unchanged);
+  models without a `max` wire value clamp to `xhigh`/`high`. Legacy
+  budget-based thinking gains a `thinking_budgets.max` slot (default `65536`).
+  Fixes [#139](https://github.com/Dicklesworthstone/pi_agent_rust/issues/139).
+- **Atlas Cloud provider preset** — `atlascloud` (aliases `atlas-cloud`,
+  `atlas`) routes through the OpenAI-compatible chat-completions adapter at
+  `https://api.atlascloud.ai/v1` with `ATLASCLOUD_API_KEY` /
+  `ATLAS_CLOUD_API_KEY`. From
+  [#141](https://github.com/Dicklesworthstone/pi_agent_rust/pull/141),
+  implemented independently after verifying the live service.
+
+- **Newer z.ai (GLM) and MiniMax models in the registry** — the model catalog
+  now includes z.ai **GLM-5.1** (`glm-5.1`, 200K context) and **GLM-5.2**
+  (`glm-5.2`, 1M context) under the `zai` provider, and **MiniMax-M3**
+  (`MiniMax-M3`, 1M context) under both `minimax` and `minimax-cn`. The
+  upstream provider-id snapshot is updated so the mainland `zhipuai`/BigModel
+  endpoint and the `zai-coding-plan`/`zhipuai-coding-plan`/`minimax-coding-plan`
+  routing presets also surface these ids. Context windows, max-output ceilings,
+  pricing, and reasoning support are taken from the published
+  [models.dev](https://models.dev) catalog and verified against the official
+  [z.ai](https://docs.z.ai) and [MiniMax](https://platform.minimax.io) API docs.
+  Select them with e.g. `pi --provider zai --model glm-5.2` or
+  `pi --provider minimax --model MiniMax-M3`. Fixes
+  [#115](https://github.com/Dicklesworthstone/pi_agent_rust/issues/115).
+- **`/mcp` slash command** — reports MCP (Model Context Protocol) server
+  status in the interactive TUI instead of returning "Unknown command". Lists
+  any MCP servers an installed extension has registered and clarifies that Pi
+  does not read standalone MCP config files (`.agents/mcp.json`,
+  `.pi/mcp.json`, `~/.pi/agent/mcp.json`). Fixes
+  [#112](https://github.com/Dicklesworthstone/pi_agent_rust/issues/112).
+
+### Bug Fixes
+
+- **`--mode rpc` no longer drops or hangs the turn when stdin closes**
+  — piping a single command (`printf '{"type":"prompt",...}' | pi --mode
+  rpc`) tore the session down while the prompt task was still starting or
+  streaming: current builds silently lost every event after the ack, older
+  builds hung after `turn_start`. The RPC loop now drains in-flight work at
+  EOF (streaming turns with retries and queued steering/follow-ups,
+  extension commands, auto-compaction, background bash), cancels extension
+  UI requests that can no longer be answered, guards the activity flags
+  against panic/cancellation leaks, and flushes the stdout writer behind a
+  shutdown sentinel so the full stream through `agent_end` reaches the
+  client. Fixes
+  [#137](https://github.com/Dicklesworthstone/pi_agent_rust/issues/137).
+- **Startup no longer probes the npm registry for installed packages** —
+  installed exact and conventional-range npm specs are now satisfied
+  locally (ranges like `npm:pkg@^1.2.0` previously re-ran a full
+  `npm install` on every startup, and dist-tag specs could fail startup
+  lock verification), `npm root -g` runs at most once per resolution pass,
+  and `pi update` refreshes ranges/dist-tags while exact pins stay pinned,
+  matching upstream TypeScript pi semantics. Lock entries whose stored
+  `pinned` classification predates this change rotate cleanly instead of
+  hard-failing verification. No new dependencies. From the report in
+  [#140](https://github.com/Dicklesworthstone/pi_agent_rust/pull/140).
+- **CI gates repaired on main** — `tests/e2e_transient_retry_resume.rs` is
+  registered in the suite-classification and traceability registries
+  (caught via
+  [#135](https://github.com/Dicklesworthstone/pi_agent_rust/pull/135));
+  the provider-metadata snapshot suite reflects reality again (95 canonical
+  providers / 51 aliases, including previously unregistered `cursor`,
+  `llamacpp`, and `mistralrs`); and `clippy --all-targets -- -D warnings`
+  is clean again (six `future_not_send` guard-across-await sites converted
+  to `OwnedMutexGuard`).
+- **Windows `WSAENOTCONN` retry now also fires for TLS errors surfaced through
+  non-`Io` variants** — `is_retryable_not_connected_tls` walks the `TlsError`
+  source chain in addition to matching the direct `Io` variant, so a "socket
+  not connected" (os error 10057) reported via the TLS library is still
+  detected and retried with a fresh connection. Hardens
+  [#111](https://github.com/Dicklesworthstone/pi_agent_rust/issues/111) /
+  [#106](https://github.com/Dicklesworthstone/pi_agent_rust/issues/106).
+- **Streamed tool-call partials carry id/name from the first delta**
+  ([#129](https://github.com/Dicklesworthstone/pi_agent_rust/issues/129)),
+  **fsync refusals on virtiofs/FUSE filesystems no longer fail writes**
+  ([#136](https://github.com/Dicklesworthstone/pi_agent_rust/issues/136)),
+  and the extension compatibility layer supports current Pi package APIs
+  (pi-subagents 0.34.0 import contract; groundwork for
+  [#132](https://github.com/Dicklesworthstone/pi_agent_rust/issues/132)).
+
+### Internal
+
+- Async runtime migrated to **asupersync 0.3.9** with `OwnedMutexGuard` at
+  every spawned lock site; the fuzz workspace dropped its stale asupersync
+  git-rev pin and re-locked on the published crate.
+
+## [v0.1.22] — 2026-07-10
+
+First version published to crates.io since `0.1.18` (the `v0.1.19`–`v0.1.21`
+tags never reached crates.io because the Publish workflow was missing the
+`CARGO_REGISTRY_TOKEN` secret; the secret is now configured — see
+[#127](https://github.com/Dicklesworthstone/pi_agent_rust/issues/127)).
+
+### Bug Fixes
+
+- **Streaming tool-call arguments now reach RPC/ACP clients** — the #124 fix
+  grew the tool-call `arguments` on the provider's internal partial, but the
+  partial message that `--mode rpc` / ACP clients actually receive is rebuilt
+  in the agent loop, which left `arguments` as `null` on every
+  `toolcall_delta` until the terminal event. The agent loop now accumulates
+  the raw argument deltas per content index and applies the same best-effort
+  partial-JSON completion, for every provider, so snapshot-based IDE
+  frontends render large tool calls streaming in live. Verified by an
+  end-to-end test that serializes agent events exactly as the RPC surface
+  does. Fixes
+  [#126](https://github.com/Dicklesworthstone/pi_agent_rust/issues/126).
+- **Transient provider failures resume the turn instead of replaying it from
+  the user message** — avoids re-executing tool calls that already ran.
+  Fixes [#125](https://github.com/Dicklesworthstone/pi_agent_rust/issues/125).
+
+### Maintenance
+
+- Migrated to published **asupersync 0.3.6** (crates.io) and bumped the
+  pinned toolchain to `nightly-2026-07-05` (required by `sysinfo 0.39`'s
+  `cfg_select!`), with a mechanical clippy sweep for the newer nightly's
+  strengthened lints.
+
+## [v0.1.20] — 2026-06-13 — Tag-only
+
+### Bug Fixes
+
+- **Windows connect retries now survive `WSAENOTCONN` ("Socket is not
+  connected")** — the HTTP client retries the TCP connect when Winsock reports
+  `WSAENOTCONN`, and the error-classification logic walks the full
+  `io::Error::get_ref` source chain so the code is detected even when it is
+  wrapped several layers deep. A Winsock remediation hint is surfaced when the
+  condition is hit. Fixes [#106](https://github.com/Dicklesworthstone/pi_agent_rust/issues/106).
+
+### Internal
+
+- Synced `Cargo.lock` to the released `0.1.19` dependency set.
+
+## [v0.1.19] — 2026-06-11 — Tag-only
+
+### Features
+
+- **ACP dynamic configuration** — ACP mode supports `session/set_model` and
+  `session/set_config_option`, so clients can switch the active model and tune
+  config options mid-session.
+  Fixes [#105](https://github.com/Dicklesworthstone/pi_agent_rust/issues/105).
+- **ACP sessions can persist to disk** — `--session-dir` is honored in ACP mode,
+  letting ACP-driven sessions be stored and resumed like interactive ones.
+  Fixes [#102](https://github.com/Dicklesworthstone/pi_agent_rust/issues/102).
+
+### Bug Fixes
+
+- **System prompt emits date only (no clock time)** — the system prompt now
+  carries a date-only stamp instead of a full timestamp, so the leading prompt
+  prefix stays byte-stable within a day and provider KV caches are preserved
+  instead of being invalidated on every turn.
+  Fixes [#103](https://github.com/Dicklesworthstone/pi_agent_rust/issues/103).
+- **`llamacpp` and `mistral.rs` are treated as keyless local providers** — these
+  local OpenAI-compatible backends no longer demand an API key to be selectable.
+  Fixes [#104](https://github.com/Dicklesworthstone/pi_agent_rust/issues/104).
+- **Bundled TLS roots + cached connector** — the HTTP client uses bundled webpki
+  roots and caches the TLS connector, avoiding slow per-request system trust-store
+  parsing (notably the multi-second `SecTrustSettings` stall on macOS arm64).
+  Fixes [#101](https://github.com/Dicklesworthstone/pi_agent_rust/issues/101).
+- **Snapshot/override entries honored for native-adapter legacy providers** —
+  `models.json` snapshot and `models-override.json` entries are no longer
+  silently dropped for native-adapter providers (openai-codex, github-copilot,
+  google-gemini-cli, google-antigravity).
+  Fixes [#100](https://github.com/Dicklesworthstone/pi_agent_rust/issues/100).
+
+### Internal
+
+- Upgraded `asupersync` to `0.3.4`, dropping the `=0.3.2` pin (`0.3.3` was
+  yanked).
+- Pinned `rust-toolchain` to `nightly-2026-02-19` to stop clippy lint drift, and
+  the publish workflow now emits the missing-token error on stdout.
+- Docs: model examples use the `openai-completions` API id rather than `openai`.
+
+## [v0.1.18] — 2026-06-05 — Release
+
+### Features
+
+- **TUI front-end is feature-gated behind a default-on `tui` feature** — SDK and
+  library consumers can now build without compiling the terminal stack by
+  disabling the `tui` feature, while default installs are unchanged.
+  Fixes [#98](https://github.com/Dicklesworthstone/pi_agent_rust/issues/98).
+
+### Internal
+
+- The publish workflow fails loudly when `CARGO_REGISTRY_TOKEN` is missing, so
+  crates.io publishes can no longer be silently skipped.
+  Fixes [#99](https://github.com/Dicklesworthstone/pi_agent_rust/issues/99).
+- Formatting and beads export housekeeping.
+
+## [v0.1.17] — 2026-06-04 — Release
+
+### Features
+
+- **Configurable provider-aware HTTP request timeout** — request timeouts are now
+  configurable and provider-aware, addressing spurious "Request timed out"
+  failures on slow providers.
+  Fixes [#90](https://github.com/Dicklesworthstone/pi_agent_rust/issues/90).
+- **Dynamic model fetch with caching** — providers can fetch their live model
+  list with a 5-minute TTL cache and a static-registry fallback; the static
+  fallback is no longer cached so a transient fetch failure does not pin a stale
+  list.
+
+### Bug Fixes
+
+- **GitHub Copilot sign-in works out of the box** — a default Copilot
+  `client_id` is shipped and the Copilot device flow is wired into `/login`
+  with an SSH/headless fallback, so login no longer requires manual client
+  configuration.
+  Fixes [#97](https://github.com/Dicklesworthstone/pi_agent_rust/issues/97).
+- **Idle CPU churn from cursor blink removed** — the interactive front-end stops
+  the cursor-blink repaint loop while idle so the async runtime can actually
+  park.
+- **Kimi-for-coding fallbacks modernized** — prefer K2.6/K2.5 over the legacy
+  K2-thinking model as concrete fallbacks.
+
+### Internal
+
+- Release binary size budget raised from 20 MB to 25 MB; no-mock CI now gates
+  only new violations via a `.no-mock-allowlist` file; fuzz target forced to
+  `x86_64-unknown-linux-gnu` so ASan links against dynamic libc; trimmed 70 more
+  stale `ext_conformance` artifact fixtures.
+
+## [v0.1.16] — 2026-05-22 — Release
+
 ### Features
 
 - **Configurable tool-iteration cap** — added `--max-tool-iterations <N>` CLI
@@ -50,6 +2233,35 @@ Repository: <https://github.com/Dicklesworthstone/pi_agent_rust>
   default to `MiniMax-M2.7` (was `MiniMax-M2.5`), and the Kimi for Coding plan
   uses its stable virtual model id `kimi-for-coding`. The single defaults
   table now also feeds ad-hoc synthesis, eliminating duplication.
+- **Active model auto-switches when it loses credentials** — when the selected
+  model's credentials disappear mid-session, the interactive front-end switches
+  to a still-ready model instead of failing the next turn.
+  Fixes [#81](https://github.com/Dicklesworthstone/pi_agent_rust/issues/81).
+- **Actionable hints for host/network-unreachable connect failures** — connect
+  errors (host unreachable / network unreachable, e.g. the macOS arm64
+  `EHOSTUNREACH` case) now surface a remediation hint instead of a bare OS error.
+  Fixes [#88](https://github.com/Dicklesworthstone/pi_agent_rust/issues/88).
+
+### Internal
+
+- **`asupersync` upgraded to `0.3.2`**, fixing a post-session persistence worker
+  that spun at ~500% CPU after a session completed.
+  Fixes [#83](https://github.com/Dicklesworthstone/pi_agent_rust/issues/83).
+- **Large QuickJS Node-shim conformance push** — extensive hardening of the
+  embedded-runtime Node API shims, especially the global `Buffer` surface
+  (encoding/length coercion, integer read/write bounds and validation, base64/hex
+  decoding, `ArrayBuffer` sharing/offsets, byte-swap parity, single-byte
+  encodings) plus `fs`/`crypto` shim fixes, tighter extension-VFS path scoping and
+  hermetic fixtures, and fail-closed handling of non-primary entrypoint load
+  errors. Adds the `@mariozechner/pi-ai` completion + model-registry host bridge.
+- **Swarm operations + autopilot tooling** — deterministic swarm-replay engine
+  and ingestor, `pi doctor` swarm checks (rch warm-target affinity planner,
+  conflict predictor, reservation recommendations, affinity-proof gate), an
+  autopilot dry-run next-action planner with budget-drift watcher and failure
+  action catalog, a completion-audit generator, and a swarm operations runbook.
+- Regenerate `rquickjs` bindings at build time on Android/Termux; track
+  `scripts/skill-smoke.sh` and the `pi-agent-rust` skill so the installer
+  regression harness passes in clean CI checkouts.
 
 ---
 
@@ -789,7 +3001,19 @@ Key early commits:
 
 ---
 
-[Unreleased]: https://github.com/Dicklesworthstone/pi_agent_rust/compare/v0.1.9...HEAD
+[Unreleased]: https://github.com/Dicklesworthstone/pi_agent_rust/compare/v0.2.0...HEAD
+[v0.2.0]: https://github.com/Dicklesworthstone/pi_agent_rust/compare/v0.1.23...v0.2.0
+[v0.1.23]: https://github.com/Dicklesworthstone/pi_agent_rust/compare/v0.1.22...v0.1.23
+[v0.1.22]: https://github.com/Dicklesworthstone/pi_agent_rust/compare/v0.1.21...v0.1.22
+[v0.1.20]: https://github.com/Dicklesworthstone/pi_agent_rust/compare/v0.1.19...v0.1.20
+[v0.1.19]: https://github.com/Dicklesworthstone/pi_agent_rust/compare/v0.1.18...v0.1.19
+[v0.1.18]: https://github.com/Dicklesworthstone/pi_agent_rust/compare/v0.1.17...v0.1.18
+[v0.1.17]: https://github.com/Dicklesworthstone/pi_agent_rust/compare/v0.1.16...v0.1.17
+[v0.1.16]: https://github.com/Dicklesworthstone/pi_agent_rust/compare/v0.1.15...v0.1.16
+[v0.1.15]: https://github.com/Dicklesworthstone/pi_agent_rust/compare/v0.1.14...v0.1.15
+[v0.1.14]: https://github.com/Dicklesworthstone/pi_agent_rust/compare/v0.1.13...v0.1.14
+[v0.1.12]: https://github.com/Dicklesworthstone/pi_agent_rust/compare/v0.1.11...v0.1.12
+[v0.1.11]: https://github.com/Dicklesworthstone/pi_agent_rust/compare/v0.1.10...v0.1.11
 [v0.1.9]: https://github.com/Dicklesworthstone/pi_agent_rust/compare/v0.1.8...v0.1.9
 [v0.1.8]: https://github.com/Dicklesworthstone/pi_agent_rust/compare/v0.1.7...v0.1.8
 [v0.1.7]: https://github.com/Dicklesworthstone/pi_agent_rust/compare/v0.1.6...v0.1.7

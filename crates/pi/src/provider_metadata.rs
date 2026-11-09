@@ -155,6 +155,23 @@ pub const PROVIDER_METADATA: &[ProviderMetadata] = &[
         test_obligations: TEST_REQUIRED,
     },
     ProviderMetadata {
+        canonical_id: "cursor",
+        display_name: Some("Cursor"),
+        aliases: &["cursor-agent"],
+        auth_env_keys: &["CURSOR_API_KEY", "CURSOR_ACCESS_TOKEN"],
+        onboarding: ProviderOnboardingMode::BuiltInNative,
+        routing_defaults: Some(ProviderRoutingDefaults {
+            api: "cursor-agent",
+            base_url: "https://api2.cursor.sh/agent.v1.AgentService/Run",
+            auth_header: true,
+            reasoning: true,
+            input: &INPUT_TEXT,
+            context_window: 200_000,
+            max_tokens: 64_000,
+        }),
+        test_obligations: TEST_REQUIRED,
+    },
+    ProviderMetadata {
         canonical_id: "groq",
         display_name: Some("Groq"),
         aliases: &[],
@@ -206,6 +223,25 @@ pub const PROVIDER_METADATA: &[ProviderMetadata] = &[
         test_obligations: TEST_REQUIRED,
     },
     ProviderMetadata {
+        // OpenAI-compatible GPU cloud (https://www.atlascloud.ai); serves
+        // open-weight chat/reasoning models via chat completions (gh #141).
+        canonical_id: "atlascloud",
+        display_name: Some("Atlas Cloud"),
+        aliases: &["atlas-cloud", "atlas"],
+        auth_env_keys: &["ATLASCLOUD_API_KEY", "ATLAS_CLOUD_API_KEY"],
+        onboarding: ProviderOnboardingMode::OpenAICompatiblePreset,
+        routing_defaults: Some(ProviderRoutingDefaults {
+            api: "openai-completions",
+            base_url: "https://api.atlascloud.ai/v1",
+            auth_header: true,
+            reasoning: true,
+            input: &INPUT_TEXT,
+            context_window: 131_072,
+            max_tokens: 16_384,
+        }),
+        test_obligations: TEST_REQUIRED,
+    },
+    ProviderMetadata {
         canonical_id: "openrouter",
         display_name: Some("OpenRouter"),
         aliases: &["open-router"],
@@ -214,6 +250,26 @@ pub const PROVIDER_METADATA: &[ProviderMetadata] = &[
         routing_defaults: Some(ProviderRoutingDefaults {
             api: "openai-completions",
             base_url: "https://openrouter.ai/api/v1",
+            auth_header: true,
+            reasoning: true,
+            input: &INPUT_TEXT,
+            context_window: 128_000,
+            max_tokens: 16_384,
+        }),
+        test_obligations: TEST_REQUIRED,
+    },
+    ProviderMetadata {
+        // OpenAI-compatible meta-router (https://api.orcarouter.ai); one
+        // endpoint fronting 150+ upstream models with an adaptive
+        // `orcarouter/auto` route (gh PR #176).
+        canonical_id: "orcarouter",
+        display_name: Some("OrcaRouter"),
+        aliases: &["orca"],
+        auth_env_keys: &["ORCAROUTER_API_KEY"],
+        onboarding: ProviderOnboardingMode::OpenAICompatiblePreset,
+        routing_defaults: Some(ProviderRoutingDefaults {
+            api: "openai-completions",
+            base_url: "https://api.orcarouter.ai/v1",
             auth_header: true,
             reasoning: true,
             input: &INPUT_TEXT,
@@ -530,23 +586,9 @@ pub const PROVIDER_METADATA: &[ProviderMetadata] = &[
         }),
         test_obligations: TEST_REQUIRED,
     },
-    ProviderMetadata {
-        canonical_id: "github-models",
-        display_name: Some("GitHub Models"),
-        aliases: &[],
-        auth_env_keys: &["GITHUB_TOKEN"],
-        onboarding: ProviderOnboardingMode::OpenAICompatiblePreset,
-        routing_defaults: Some(ProviderRoutingDefaults {
-            api: "openai-completions",
-            base_url: "https://models.github.ai/inference",
-            auth_header: true,
-            reasoning: true,
-            input: &INPUT_TEXT,
-            context_window: 128_000,
-            max_tokens: 16_384,
-        }),
-        test_obligations: TEST_REQUIRED,
-    },
+    // `github-models` is intentionally absent. GitHub retired the Models
+    // catalog, inference API, and BYOK service on 2026-07-30. The separate
+    // `github-copilot` native adapter remains supported.
     ProviderMetadata {
         canonical_id: "helicone",
         display_name: Some("Helicone"),
@@ -1371,6 +1413,52 @@ pub const PROVIDER_METADATA: &[ProviderMetadata] = &[
         test_obligations: TEST_REQUIRED,
     },
     ProviderMetadata {
+        // llama.cpp's bundled `llama-server` exposes an OpenAI-compatible API on
+        // localhost and requires NO API key by default (parity with ollama /
+        // lmstudio). It is registered as a first-class local provider so that
+        // `pi --provider llamacpp --model <id>` works out-of-the-box without a
+        // models.json entry and, critically, without tripping the API-key gate.
+        // (#104)
+        canonical_id: "llamacpp",
+        display_name: Some("llama.cpp"),
+        aliases: &["llama-cpp", "llama.cpp", "llama-server"],
+        auth_env_keys: &[],
+        onboarding: ProviderOnboardingMode::OpenAICompatiblePreset,
+        routing_defaults: Some(ProviderRoutingDefaults {
+            api: "openai-completions",
+            // llama-server's default bind address/port.
+            base_url: "http://127.0.0.1:8080/v1",
+            auth_header: false,
+            reasoning: true,
+            input: &INPUT_TEXT,
+            context_window: 131_072,
+            max_tokens: 32_768,
+        }),
+        test_obligations: TEST_REQUIRED,
+    },
+    ProviderMetadata {
+        // mistral.rs ships an OpenAI-compatible HTTP server that listens on
+        // localhost and accepts an empty API key by default. Like ollama /
+        // llamacpp it is a LOCAL provider with no auth, so it must bypass the
+        // API-key requirement. (#104)
+        canonical_id: "mistralrs",
+        display_name: Some("mistral.rs"),
+        aliases: &["mistral.rs", "mistral-rs"],
+        auth_env_keys: &[],
+        onboarding: ProviderOnboardingMode::OpenAICompatiblePreset,
+        routing_defaults: Some(ProviderRoutingDefaults {
+            api: "openai-completions",
+            // mistral.rs server's default bind address/port.
+            base_url: "http://127.0.0.1:1234/v1",
+            auth_header: false,
+            reasoning: true,
+            input: &INPUT_TEXT,
+            context_window: 131_072,
+            max_tokens: 32_768,
+        }),
+        test_obligations: TEST_REQUIRED,
+    },
+    ProviderMetadata {
         canonical_id: "ollama-cloud",
         display_name: Some("Ollama Cloud"),
         aliases: &[],
@@ -1391,7 +1479,8 @@ pub const PROVIDER_METADATA: &[ProviderMetadata] = &[
     ProviderMetadata {
         canonical_id: "opencode",
         display_name: Some("OpenCode"),
-        aliases: &[],
+        // opencode-zen is the omp registry id for the Zen tier (bd-cv653.7.3).
+        aliases: &["opencode-zen"],
         auth_env_keys: &["OPENCODE_API_KEY"],
         onboarding: ProviderOnboardingMode::OpenAICompatiblePreset,
         routing_defaults: Some(ProviderRoutingDefaults {
@@ -1436,6 +1525,156 @@ pub const PROVIDER_METADATA: &[ProviderMetadata] = &[
             input: &INPUT_TEXT,
             context_window: 200_000,
             max_tokens: 8192,
+        }),
+        test_obligations: TEST_REQUIRED,
+    },
+    // ── omp-catalog delta presets (bd-cv653.7.3) ─────────────────────────
+    // Machine diff vs omp:packages/ai/src/registry + pi-catalog recorded in
+    // docs/evidence/provider-catalog-diff-omp.json. Every entry below is a
+    // plain API-key preset; omp OAuth/device login flows (kilo, wafer,
+    // opencode-go) remain out of preset scope and are NOT claimed here.
+    ProviderMetadata {
+        canonical_id: "gmi",
+        display_name: Some("GMI Cloud"),
+        aliases: &["gmi-cloud", "gmi-serving"],
+        auth_env_keys: &["GMI_API_KEY"],
+        onboarding: ProviderOnboardingMode::OpenAICompatiblePreset,
+        routing_defaults: Some(ProviderRoutingDefaults {
+            api: "openai-completions",
+            base_url: "https://api.gmi-serving.com/v1",
+            auth_header: true,
+            reasoning: true,
+            input: &INPUT_TEXT,
+            context_window: 128_000,
+            max_tokens: 16_384,
+        }),
+        test_obligations: TEST_REQUIRED,
+    },
+    ProviderMetadata {
+        // CoreWeave Serverless Inference (wandb-hosted). NOTE: omp also
+        // sends an OpenAI-Project header derived from COREWEAVE_PROJECT for
+        // model discovery; that header is not expressible in static metadata,
+        // so bare bearer-key request shaping is all this preset guarantees.
+        canonical_id: "coreweave",
+        display_name: Some("CoreWeave Serverless Inference"),
+        aliases: &["coreweave-serverless"],
+        auth_env_keys: &["COREWEAVE_API_KEY", "WANDB_API_KEY"],
+        onboarding: ProviderOnboardingMode::OpenAICompatiblePreset,
+        routing_defaults: Some(ProviderRoutingDefaults {
+            api: "openai-completions",
+            base_url: "https://api.inference.wandb.ai/v1",
+            auth_header: true,
+            reasoning: true,
+            input: &INPUT_TEXT,
+            context_window: 128_000,
+            max_tokens: 16_384,
+        }),
+        test_obligations: TEST_REQUIRED,
+    },
+    ProviderMetadata {
+        // omp descriptor marks Sakana's /v1 surface as openai-responses.
+        canonical_id: "sakana",
+        display_name: Some("Sakana AI"),
+        aliases: &["sakana-ai"],
+        auth_env_keys: &["SAKANA_API_KEY", "FUGU_API_KEY"],
+        onboarding: ProviderOnboardingMode::OpenAICompatiblePreset,
+        routing_defaults: Some(ProviderRoutingDefaults {
+            api: "openai-responses",
+            base_url: "https://api.sakana.ai/v1",
+            auth_header: true,
+            reasoning: true,
+            input: &INPUT_TEXT,
+            context_window: 128_000,
+            max_tokens: 16_384,
+        }),
+        test_obligations: TEST_REQUIRED,
+    },
+    ProviderMetadata {
+        canonical_id: "wafer",
+        display_name: Some("Wafer Serverless"),
+        aliases: &["wafer-serverless"],
+        auth_env_keys: &["WAFER_SERVERLESS_API_KEY"],
+        onboarding: ProviderOnboardingMode::OpenAICompatiblePreset,
+        routing_defaults: Some(ProviderRoutingDefaults {
+            api: "openai-completions",
+            base_url: "https://pass.wafer.ai/v1",
+            auth_header: true,
+            reasoning: true,
+            input: &INPUT_TEXT,
+            context_window: 128_000,
+            max_tokens: 16_384,
+        }),
+        test_obligations: TEST_REQUIRED,
+    },
+    ProviderMetadata {
+        canonical_id: "qianfan",
+        display_name: Some("Qianfan (Baidu)"),
+        aliases: &["baidu-qianfan"],
+        auth_env_keys: &["QIANFAN_API_KEY"],
+        onboarding: ProviderOnboardingMode::OpenAICompatiblePreset,
+        routing_defaults: Some(ProviderRoutingDefaults {
+            api: "openai-completions",
+            base_url: "https://qianfan.baidubce.com/v2",
+            auth_header: true,
+            reasoning: true,
+            input: &INPUT_TEXT,
+            context_window: 128_000,
+            max_tokens: 16_384,
+        }),
+        test_obligations: TEST_REQUIRED,
+    },
+    ProviderMetadata {
+        // omp descriptor routes Umans through anthropic-messages, not
+        // openai-completions; API-key auth (no OAuth flow required).
+        canonical_id: "umans",
+        display_name: Some("Umans AI Coding Plan"),
+        aliases: &["umans-ai"],
+        auth_env_keys: &["UMANS_AI_CODING_PLAN_API_KEY"],
+        onboarding: ProviderOnboardingMode::OpenAICompatiblePreset,
+        routing_defaults: Some(ProviderRoutingDefaults {
+            api: "anthropic-messages",
+            base_url: "https://api.code.umans.ai/v1/messages",
+            auth_header: false,
+            reasoning: true,
+            input: &INPUT_TEXT,
+            context_window: 200_000,
+            max_tokens: 8192,
+        }),
+        test_obligations: TEST_REQUIRED,
+    },
+    ProviderMetadata {
+        canonical_id: "kilo",
+        display_name: Some("Kilo Gateway"),
+        aliases: &["kilo-gateway", "kilo-ai"],
+        auth_env_keys: &["KILO_API_KEY"],
+        onboarding: ProviderOnboardingMode::OpenAICompatiblePreset,
+        routing_defaults: Some(ProviderRoutingDefaults {
+            api: "openai-completions",
+            base_url: "https://api.kilo.ai/api/gateway",
+            auth_header: true,
+            reasoning: true,
+            input: &INPUT_TEXT,
+            context_window: 128_000,
+            max_tokens: 16_384,
+        }),
+        test_obligations: TEST_REQUIRED,
+    },
+    ProviderMetadata {
+        // OpenCode Go tier; omp exposes openai-completions at /zen/go/v1
+        // (alongside anthropic-messages/openai-responses dialects).
+        canonical_id: "opencode-go",
+        display_name: Some("OpenCode Go"),
+        aliases: &[],
+        auth_env_keys: &["OPENCODE_API_KEY"],
+        onboarding: ProviderOnboardingMode::OpenAICompatiblePreset,
+        routing_defaults: Some(ProviderRoutingDefaults {
+            api: "openai-completions",
+            base_url: "https://opencode.ai/zen/go/v1",
+            auth_header: true,
+            reasoning: true,
+            input: &INPUT_TEXT,
+            context_window: 128_000,
+            max_tokens: 16_384,
         }),
         test_obligations: TEST_REQUIRED,
     },
@@ -1601,6 +1840,30 @@ pub fn provider_routing_defaults(provider_id: &str) -> Option<ProviderRoutingDef
     provider_metadata(provider_id).and_then(|meta| meta.routing_defaults)
 }
 
+/// Whether `provider_id` is a known local / self-hosted, no-auth provider.
+///
+/// Such providers (e.g. `ollama`, `llamacpp`, `mistralrs`) run an
+/// OpenAI-compatible server on localhost and require NO authentication: no API
+/// key and no `Authorization` header.
+///
+/// Used by the OpenAI-completions / OpenAI-responses request paths so that a
+/// missing API key is NOT treated as a fatal error for these providers (they
+/// are simply called without a bearer token), matching how `ollama` already
+/// works. Without this, `pi --provider llamacpp ...` errors with
+/// "Missing API key for provider" even though the provider needs none. (#104)
+///
+/// The predicate is derived from the canonical metadata (`auth_env_keys` empty
+/// AND routing `auth_header == false`) rather than a hardcoded allowlist, so it
+/// stays correct as new keyless local providers are added.
+pub fn provider_is_keyless_local(provider_id: &str) -> bool {
+    provider_metadata(provider_id).is_some_and(|meta| {
+        meta.auth_env_keys.is_empty()
+            && meta
+                .routing_defaults
+                .is_some_and(|defaults| !defaults.auth_header)
+    })
+}
+
 /// Compare two provider IDs for equality, resolving aliases via
 /// [`canonical_provider_id`].
 pub fn provider_ids_match(left: &str, right: &str) -> bool {
@@ -1629,6 +1892,50 @@ pub fn split_provider_model_spec(model_spec: &str) -> Option<(&str, &str)> {
         return None;
     }
     Some((provider, model_id))
+}
+
+/// Render the bundled-provider table for `docs/models.md` (bd-cv653.7.3).
+///
+/// The docs table is GENERATED from this registry so prose never drifts from
+/// code; `tests/provider_metadata_comprehensive.rs` asserts the checked-in
+/// docs section matches this exact output (regenerate with
+/// `PI_BLESS_MODELS_DOC=1 cargo test ...docs_provider_table...`).
+#[must_use]
+pub fn render_provider_docs_table() -> String {
+    let mut out = String::from(
+        "| Provider ID | Name | Aliases | Auth env keys | Onboarding |\n\
+         |---|---|---|---|---|\n",
+    );
+    for meta in PROVIDER_METADATA {
+        let name = meta.display_name.unwrap_or("-");
+        let aliases = if meta.aliases.is_empty() {
+            "-".to_string()
+        } else {
+            meta.aliases.join(", ")
+        };
+        let env_keys = if meta.auth_env_keys.is_empty() {
+            "-".to_string()
+        } else {
+            meta.auth_env_keys
+                .iter()
+                .map(|k| format!("`{k}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let onboarding = match meta.onboarding {
+            ProviderOnboardingMode::BuiltInNative => "native",
+            ProviderOnboardingMode::OpenAICompatiblePreset => "openai-compatible preset",
+            ProviderOnboardingMode::NativeAdapterRequired => "native adapter",
+        };
+        let _ = std::fmt::Write::write_fmt(
+            &mut out,
+            format_args!(
+                "| `{}` | {} | {} | {} | {} |\n",
+                meta.canonical_id, name, aliases, env_keys, onboarding
+            ),
+        );
+    }
+    out
 }
 
 #[cfg(test)]
@@ -1975,11 +2282,10 @@ mod tests {
     }
 
     #[test]
-    fn batch_a2_metadata_resolves_all_eight_providers() {
+    fn batch_a2_metadata_resolves_all_active_providers() {
         let ids = [
             "firmware",
             "friendli",
-            "github-models",
             "helicone",
             "huggingface",
             "iflowcn",
@@ -2001,7 +2307,6 @@ mod tests {
     fn batch_a2_env_keys_match_upstream_registry() {
         assert_eq!(provider_auth_env_keys("firmware"), &["FIRMWARE_API_KEY"]);
         assert_eq!(provider_auth_env_keys("friendli"), &["FRIENDLI_TOKEN"]);
-        assert_eq!(provider_auth_env_keys("github-models"), &["GITHUB_TOKEN"]);
         assert_eq!(provider_auth_env_keys("helicone"), &["HELICONE_API_KEY"]);
         assert_eq!(provider_auth_env_keys("huggingface"), &["HF_TOKEN"]);
         assert_eq!(provider_auth_env_keys("iflowcn"), &["IFLOW_API_KEY"]);
@@ -2014,7 +2319,6 @@ mod tests {
         let ids = [
             "firmware",
             "friendli",
-            "github-models",
             "helicone",
             "huggingface",
             "iflowcn",
@@ -2034,7 +2338,6 @@ mod tests {
         let ids = [
             "firmware",
             "friendli",
-            "github-models",
             "helicone",
             "huggingface",
             "iflowcn",
@@ -2058,6 +2361,18 @@ mod tests {
         urls.sort_unstable();
         urls.dedup();
         assert_eq!(urls.len(), ids.len(), "duplicate base URLs detected");
+    }
+
+    #[test]
+    fn retired_github_models_is_not_exposed_but_github_copilot_remains() {
+        assert!(provider_metadata("github-models").is_none());
+        assert!(provider_routing_defaults("github-models").is_none());
+        let copilot = provider_metadata("github-copilot").expect("GitHub Copilot metadata");
+        assert_eq!(copilot.canonical_id, "github-copilot");
+        assert_eq!(
+            copilot.onboarding,
+            ProviderOnboardingMode::NativeAdapterRequired
+        );
     }
 
     // ── Batch A3 tests ────────────────────────────────────────────────
@@ -2677,6 +2992,83 @@ mod tests {
     }
 
     #[test]
+    fn local_keyless_providers_registered_without_auth() {
+        // #104: llamacpp and mistralrs are local OpenAI-compatible providers
+        // with NO API key, exactly like ollama. They must be keyless (empty
+        // auth_env_keys) and route with auth_header == false so the request
+        // path does not demand a bearer token.
+        for (id, base_url) in [
+            ("llamacpp", "http://127.0.0.1:8080/v1"),
+            ("mistralrs", "http://127.0.0.1:1234/v1"),
+        ] {
+            let meta = provider_metadata(id)
+                .unwrap_or_else(|| unreachable!("expected metadata for '{id}'"));
+            assert_eq!(meta.canonical_id, id);
+            assert!(
+                meta.auth_env_keys.is_empty(),
+                "{id} must declare no auth env keys"
+            );
+            let defaults = provider_routing_defaults(id)
+                .unwrap_or_else(|| unreachable!("expected routing defaults for '{id}'"));
+            assert_eq!(defaults.api, "openai-completions");
+            assert!(
+                !defaults.auth_header,
+                "{id} must not require an auth header"
+            );
+            assert_eq!(defaults.base_url, base_url);
+        }
+    }
+
+    #[test]
+    fn local_keyless_provider_aliases_resolve() {
+        // #104: the common spellings users reach for must resolve to the
+        // canonical local provider so `--provider llama.cpp` / `mistral.rs` work.
+        for (alias, canonical) in [
+            ("llama-cpp", "llamacpp"),
+            ("llama.cpp", "llamacpp"),
+            ("llama-server", "llamacpp"),
+            ("mistral.rs", "mistralrs"),
+            ("mistral-rs", "mistralrs"),
+        ] {
+            let meta = provider_metadata(alias)
+                .unwrap_or_else(|| unreachable!("expected metadata for alias '{alias}'"));
+            assert_eq!(
+                meta.canonical_id, canonical,
+                "alias '{alias}' should resolve to '{canonical}'"
+            );
+        }
+    }
+
+    #[test]
+    fn keyless_local_predicate_matches_local_providers_only() {
+        // #104: the predicate that lets the OpenAI-completions request path skip
+        // the missing-API-key error must hold for ollama + llamacpp + mistralrs
+        // (and only for genuinely keyless local providers).
+        for id in ["ollama", "llamacpp", "mistralrs"] {
+            assert!(
+                provider_is_keyless_local(id),
+                "{id} should be recognised as a keyless local provider"
+            );
+        }
+        // Cloud / keyed providers must still require credentials.
+        for id in [
+            "openai",
+            "anthropic",
+            "groq",
+            "ollama-cloud", // cloud variant DOES need OLLAMA_API_KEY
+            "lmstudio",     // declares LMSTUDIO_API_KEY + auth_header true
+        ] {
+            assert!(
+                !provider_is_keyless_local(id),
+                "{id} must NOT be treated as keyless local"
+            );
+        }
+        // Unknown providers are not keyless-local (they fall back to the
+        // generic key-required gate).
+        assert!(!provider_is_keyless_local("definitely-not-a-provider"));
+    }
+
+    #[test]
     fn batch_c1_routing_defaults_use_openai_completions_with_expected_endpoints() {
         let ids = [
             ("baseten", "https://inference.baseten.co/v1", true),
@@ -2797,6 +3189,346 @@ mod tests {
                 meta.display_name.is_some(),
                 "provider '{}' should have a display_name",
                 meta.canonical_id
+            );
+        }
+    }
+
+    // ── Batch C2 tests (bd-cv653.7.3 omp-catalog delta) ─────────────────
+
+    const BATCH_C2_IDS: [&str; 8] = [
+        "gmi",
+        "coreweave",
+        "sakana",
+        "wafer",
+        "qianfan",
+        "umans",
+        "kilo",
+        "opencode-go",
+    ];
+
+    #[test]
+    fn batch_c2_metadata_resolves_all_eight_providers() {
+        for id in BATCH_C2_IDS {
+            let meta = provider_metadata(id)
+                .unwrap_or_else(|| unreachable!("expected metadata for '{id}'"));
+            assert_eq!(meta.canonical_id, id);
+            assert_eq!(
+                meta.onboarding,
+                ProviderOnboardingMode::OpenAICompatiblePreset,
+                "{id} onboarding mode mismatch"
+            );
+        }
+    }
+
+    #[test]
+    fn batch_c2_env_keys_match_omp_catalog_descriptors() {
+        assert_eq!(provider_auth_env_keys("gmi"), &["GMI_API_KEY"]);
+        assert_eq!(
+            provider_auth_env_keys("coreweave"),
+            &["COREWEAVE_API_KEY", "WANDB_API_KEY"]
+        );
+        assert_eq!(
+            provider_auth_env_keys("sakana"),
+            &["SAKANA_API_KEY", "FUGU_API_KEY"]
+        );
+        assert_eq!(
+            provider_auth_env_keys("wafer"),
+            &["WAFER_SERVERLESS_API_KEY"]
+        );
+        assert_eq!(provider_auth_env_keys("qianfan"), &["QIANFAN_API_KEY"]);
+        assert_eq!(
+            provider_auth_env_keys("umans"),
+            &["UMANS_AI_CODING_PLAN_API_KEY"]
+        );
+        assert_eq!(provider_auth_env_keys("kilo"), &["KILO_API_KEY"]);
+        assert_eq!(provider_auth_env_keys("opencode-go"), &["OPENCODE_API_KEY"]);
+    }
+
+    #[test]
+    fn batch_c2_routing_defaults_match_omp_descriptor_api_kinds() {
+        // api kind + host come from the omp catalog descriptor for each id.
+        let ids = [
+            ("gmi", "openai-completions", "api.gmi-serving.com"),
+            ("coreweave", "openai-completions", "api.inference.wandb.ai"),
+            ("sakana", "openai-responses", "api.sakana.ai"),
+            ("wafer", "openai-completions", "pass.wafer.ai"),
+            ("qianfan", "openai-completions", "qianfan.baidubce.com"),
+            ("umans", "anthropic-messages", "api.code.umans.ai"),
+            ("kilo", "openai-completions", "api.kilo.ai"),
+            ("opencode-go", "openai-completions", "opencode.ai/zen/go"),
+        ];
+        for (id, expected_api, expected_host) in &ids {
+            let defaults = provider_routing_defaults(id)
+                .unwrap_or_else(|| unreachable!("expected routing defaults for '{id}'"));
+            assert_eq!(defaults.api, *expected_api, "{id} api mismatch");
+            assert!(
+                defaults.base_url.contains(expected_host),
+                "{id} base_url '{}' should contain '{expected_host}'",
+                defaults.base_url
+            );
+        }
+        // umans rides the anthropic-messages transport (x-api-key style),
+        // every other new preset uses bearer auth.
+        let umans = provider_routing_defaults("umans").expect("umans defaults");
+        assert!(!umans.auth_header);
+        for id in [
+            "gmi",
+            "coreweave",
+            "sakana",
+            "wafer",
+            "qianfan",
+            "kilo",
+            "opencode-go",
+        ] {
+            let defaults = provider_routing_defaults(id)
+                .unwrap_or_else(|| unreachable!("expected routing defaults for '{id}'"));
+            assert!(defaults.auth_header, "{id} must use bearer auth header");
+        }
+    }
+
+    #[test]
+    fn batch_c2_aliases_resolve_and_opencode_zen_maps_to_opencode() {
+        let cases: &[(&str, &str)] = &[
+            ("gmi-cloud", "gmi"),
+            ("gmi-serving", "gmi"),
+            ("coreweave-serverless", "coreweave"),
+            ("sakana-ai", "sakana"),
+            ("wafer-serverless", "wafer"),
+            ("baidu-qianfan", "qianfan"),
+            ("umans-ai", "umans"),
+            ("kilo-gateway", "kilo"),
+            ("kilo-ai", "kilo"),
+            ("opencode-zen", "opencode"),
+        ];
+        for &(alias, expected_canonical) in cases {
+            let meta = provider_metadata(alias)
+                .unwrap_or_else(|| unreachable!("expected metadata for alias '{alias}'"));
+            assert_eq!(
+                meta.canonical_id, expected_canonical,
+                "alias '{alias}' should resolve to '{expected_canonical}', got '{}'",
+                meta.canonical_id
+            );
+        }
+    }
+
+    #[test]
+    fn batch_c2_opencode_go_and_zen_tiers_stay_distinct() {
+        let zen = provider_routing_defaults("opencode").expect("opencode defaults");
+        let go = provider_routing_defaults("opencode-go").expect("opencode-go defaults");
+        assert_eq!(canonical_provider_id("opencode-zen"), Some("opencode"));
+        assert_ne!(zen.base_url, go.base_url);
+        assert_eq!(zen.api, "openai-completions");
+        assert_eq!(go.api, "openai-completions");
+        assert_eq!(
+            provider_auth_env_keys("opencode"),
+            provider_auth_env_keys("opencode-go")
+        );
+    }
+
+    // ── Whole-table audits (bd-cv653.7.3) ────────────────────────────────
+
+    /// Audit an arbitrary `(canonical_id, aliases)` table for collisions:
+    /// duplicate canonical ids, duplicate aliases, or an alias that shadows
+    /// another entry's canonical id. Returns one violation string per hit.
+    /// Kept as a free function over table data so the planted-negative test
+    /// can feed it a deliberately broken table.
+    fn alias_collision_violations(table: &[(&str, &[&str])]) -> Vec<String> {
+        let mut violations = Vec::new();
+        let mut canonicals: std::collections::HashMap<String, &str> =
+            std::collections::HashMap::new();
+        for &(canonical, _) in table {
+            let key = canonical.to_ascii_lowercase();
+            if let Some(previous) = canonicals.insert(key.clone(), canonical) {
+                violations.push(format!(
+                    "duplicate canonical id '{canonical}' collides with '{previous}'"
+                ));
+            }
+        }
+        let mut alias_owner: std::collections::HashMap<String, &str> =
+            std::collections::HashMap::new();
+        for &(canonical, aliases) in table {
+            for &alias in aliases {
+                let key = alias.to_ascii_lowercase();
+                if let Some(&owner) = canonicals.get(&key)
+                    && owner != canonical
+                {
+                    violations.push(format!(
+                        "alias '{alias}' of '{canonical}' shadows canonical id '{owner}'"
+                    ));
+                }
+                if let Some(previous) = alias_owner.insert(key.clone(), canonical)
+                    && previous != canonical
+                {
+                    violations.push(format!(
+                        "alias '{alias}' claimed by both '{previous}' and '{canonical}'"
+                    ));
+                }
+            }
+        }
+        violations
+    }
+
+    #[test]
+    fn provider_alias_collision_audit_passes_for_whole_table() {
+        let table: Vec<(&str, &[&str])> = PROVIDER_METADATA
+            .iter()
+            .map(|meta| (meta.canonical_id, meta.aliases))
+            .collect();
+        let violations = alias_collision_violations(&table);
+        assert!(
+            violations.is_empty(),
+            "alias/canonical collisions detected:\n{}",
+            violations.join("\n")
+        );
+    }
+
+    #[test]
+    fn provider_alias_collision_audit_catches_planted_collisions() {
+        // Planted negative: an alias that WOULD collide with an existing
+        // canonical id (case-insensitively) must be reported, and so must an
+        // alias claimed by two different providers.
+        let planted: Vec<(&str, &[&str])> = vec![
+            ("gmi", &["gmi-cloud"][..]),
+            ("qianfan", &["GMI"][..]), // shadows canonical 'gmi' (case-insensitive)
+            ("kilo", &["gmi-cloud"][..]), // duplicate alias across providers
+        ];
+        let violations = alias_collision_violations(&planted);
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.contains("shadows canonical id 'gmi'")),
+            "planted canonical-shadowing alias must be caught, got: {violations:?}"
+        );
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.contains("claimed by both 'gmi' and 'kilo'")),
+            "planted duplicate alias must be caught, got: {violations:?}"
+        );
+        // A collision-free table yields no violations.
+        let clean: Vec<(&str, &[&str])> = vec![("gmi", &["gmi-cloud"][..]), ("kilo", &[])];
+        assert!(alias_collision_violations(&clean).is_empty());
+    }
+
+    #[test]
+    fn provider_base_urls_parse_as_absolute_http_urls() {
+        for meta in PROVIDER_METADATA {
+            let Some(defaults) = meta.routing_defaults else {
+                continue;
+            };
+            let base_url = defaults.base_url;
+            if base_url.is_empty() {
+                // Runtime-computed endpoints: bedrock derives endpoints
+                // per-region and vertex per project/location at request time.
+                assert!(
+                    matches!(meta.canonical_id, "amazon-bedrock" | "google-vertex"),
+                    "only runtime-computed providers (bedrock, vertex) may carry an empty base_url, got '{}'",
+                    meta.canonical_id
+                );
+                continue;
+            }
+            // Template placeholders (cloudflare account/gateway ids) are
+            // filled at runtime; substitute a concrete segment for parsing.
+            let concrete = base_url
+                .replace("{account_id}", "account")
+                .replace("{gateway_id}", "gateway");
+            let parsed = url::Url::parse(&concrete).unwrap_or_else(|err| {
+                panic!(
+                    "provider '{}' base_url '{base_url}' must parse as a URL: {err}",
+                    meta.canonical_id
+                )
+            });
+            assert!(
+                matches!(parsed.scheme(), "https" | "http"),
+                "provider '{}' base_url must be http(s): '{base_url}'",
+                meta.canonical_id
+            );
+            assert!(
+                parsed.host_str().is_some(),
+                "provider '{}' base_url must carry a host: '{base_url}'",
+                meta.canonical_id
+            );
+            if parsed.scheme() == "http" {
+                let host = parsed.host_str().unwrap_or_default();
+                assert!(
+                    host == "127.0.0.1" || host == "localhost",
+                    "provider '{}' plain-http base_url must be loopback: '{base_url}'",
+                    meta.canonical_id
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn no_preset_claims_auth_it_cannot_perform() {
+        // Static audit: OpenAI-compatible presets authenticate with a plain
+        // API key from the environment (or are keyless local servers). A
+        // preset MUST NOT exist without an env-key path — that would be an
+        // implicit promise of OAuth/plan routing, which requires a native
+        // module (ProviderOnboardingMode::NativeAdapterRequired).
+        const PRESET_APIS: [&str; 3] = [
+            "openai-completions",
+            "openai-responses",
+            "anthropic-messages",
+        ];
+        for meta in PROVIDER_METADATA {
+            match meta.onboarding {
+                ProviderOnboardingMode::OpenAICompatiblePreset => {
+                    let defaults = meta.routing_defaults.unwrap_or_else(|| {
+                        panic!("preset '{}' must carry routing defaults", meta.canonical_id)
+                    });
+                    assert!(
+                        PRESET_APIS.contains(&defaults.api),
+                        "preset '{}' claims api '{}' which no preset transport serves",
+                        meta.canonical_id,
+                        defaults.api
+                    );
+                    if meta.auth_env_keys.is_empty() {
+                        // Keyless is only honest for loopback servers that
+                        // also skip the auth header (ollama/llamacpp/mistralrs).
+                        assert!(
+                            !defaults.auth_header,
+                            "preset '{}' has no auth env keys but requires an auth header",
+                            meta.canonical_id
+                        );
+                        assert!(
+                            crate::provider_metadata::provider_is_keyless_local(meta.canonical_id),
+                            "preset '{}' must satisfy the keyless-local predicate",
+                            meta.canonical_id
+                        );
+                    }
+                }
+                ProviderOnboardingMode::NativeAdapterRequired => {
+                    // Native adapters (bedrock, sap-ai-core, …) legitimately
+                    // carry routing defaults to declare their api family; they
+                    // may NOT carry a routable preset base_url (that would be
+                    // masquerading as a zero-config preset).
+                    let masquerades = meta
+                        .routing_defaults
+                        .is_some_and(|defaults| !defaults.base_url.is_empty());
+                    assert!(
+                        !masquerades,
+                        "native-adapter provider '{}' must not masquerade as a routable preset",
+                        meta.canonical_id
+                    );
+                }
+                ProviderOnboardingMode::BuiltInNative => {}
+            }
+        }
+        // The known OAuth/plan providers stay behind native adapters.
+        for id in [
+            "openai-codex",
+            "github-copilot",
+            "gitlab",
+            "google-gemini-cli",
+            "google-antigravity",
+        ] {
+            let meta = provider_metadata(id)
+                .unwrap_or_else(|| unreachable!("expected metadata for '{id}'"));
+            assert_eq!(
+                meta.onboarding,
+                ProviderOnboardingMode::NativeAdapterRequired,
+                "OAuth/plan provider '{id}' must not be a plain preset"
             );
         }
     }
