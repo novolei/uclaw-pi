@@ -13,6 +13,13 @@ readme = "README.md"
 keywords = ["ai", "cli", "coding-agent", "llm", "anthropic"]
 categories = ["command-line-utilities", "development-tools"]
 autobins = false
+# uclaw-patch(vendor): uClaw consumes only the `pi` library. All [[bin]],
+# [[example]], [[bench]] and [[test]] targets are removed because tests/,
+# benches/ and examples/ are not vendored (cargo rejects explicit targets
+# whose files are missing). src/main.rs and src/bin/ stay on disk, unbuilt.
+autoexamples = false
+autotests = false
+autobenches = false
 # Binary organization per bd-uuwgi.1/bd-uuwgi.2 classification:
 # - SHIPPING: src/main.rs (pi) - main CLI binary
 # - INTERNAL/OPT-IN: src/bin/pi_legacy_capture.rs (pending RULE 1 approval)
@@ -41,174 +48,6 @@ include = [
 [lib]
 name = "pi"
 path = "src/lib.rs"
-
-[[bin]]
-name = "pi"
-path = "src/main.rs"
-# The `pi` binary is the interactive terminal front-end; it requires the full
-# TUI stack (crossterm + charmed_rust). `tui` is in the default feature set, so
-# `cargo build` still produces `pi` with no extra flags. A `--no-default-features`
-# build correctly skips the binary while the library still compiles for SDK
-# consumers that do not want the terminal stack.
-required-features = ["tui"]
-
-# RETIRABLE internal conformance utility (pending RULE 1 approval). Keeping it
-# behind a non-default feature prevents an ordinary `cargo install
-# pi_agent_rust` from installing this unsupported executable. Repository gates
-# that exercise it explicitly enable `internal-legacy-capture`; the matching
-# integration test is gated below so CARGO_BIN_EXE_pi_legacy_capture is defined
-# whenever that test is compiled.
-[[bin]]
-name = "pi_legacy_capture"
-path = "src/bin/pi_legacy_capture.rs"
-required-features = ["internal-legacy-capture"]
-
-# DEV-ONLY MCP fixture server (bd-cv653.6.1): speaks the MCP stdio handshake
-# with canned tools for the mcp e2e lanes. Never shipped to end users.
-[[bin]]
-name = "pi_mcp_fixture"
-path = "src/bin/pi_mcp_fixture.rs"
-required-features = ["internal-mcp-fixture"]
-
-# Examples (moved from src/bin/ to examples/)
-# These binaries are accessible via: cargo run --example <name>
-
-[[example]]
-name = "basic_sdk"
-path = "examples/basic_sdk.rs"
-
-[[example]]
-name = "dialect_bench"
-path = "examples/dialect_bench.rs"
-
-[[example]]
-name = "ext_artifact_manifest"
-path = "examples/ext_artifact_manifest.rs"
-
-[[example]]
-name = "ext_conformance_matrix"
-path = "examples/ext_conformance_matrix.rs"
-
-[[example]]
-name = "ext_conformance_report"
-path = "examples/ext_conformance_report.rs"
-
-[[example]]
-name = "ext_full_validation"
-path = "examples/ext_full_validation.rs"
-
-[[example]]
-name = "ext_inclusion_list"
-path = "examples/ext_inclusion_list.rs"
-
-[[example]]
-name = "ext_license_screen"
-path = "examples/ext_license_screen.rs"
-
-[[example]]
-name = "ext_onboarding_queue"
-path = "examples/ext_onboarding_queue.rs"
-
-[[example]]
-name = "ext_popularity_snapshot"
-path = "examples/ext_popularity_snapshot.rs"
-
-[[example]]
-name = "ext_release_binary_e2e"
-path = "examples/ext_release_binary_e2e.rs"
-
-[[example]]
-name = "ext_runtime_risk_ledger"
-path = "examples/ext_runtime_risk_ledger.rs"
-
-[[example]]
-name = "ext_score_candidates"
-path = "examples/ext_score_candidates.rs"
-
-[[example]]
-name = "ext_stress"
-path = "examples/ext_stress.rs"
-
-[[example]]
-name = "ext_tiered_corpus"
-path = "examples/ext_tiered_corpus.rs"
-
-[[example]]
-name = "ext_unvendored_fetch_run"
-path = "examples/ext_unvendored_fetch_run.rs"
-
-[[example]]
-name = "ext_validate_dedup"
-path = "examples/ext_validate_dedup.rs"
-
-[[example]]
-name = "ext_workloads"
-path = "examples/ext_workloads.rs"
-
-[[example]]
-name = "ftui_preview"
-path = "examples/ftui_preview.rs"
-required-features = ["ftui"]
-
-[[example]]
-name = "pi_debug"
-path = "examples/pi_debug.rs"
-
-# Deliberately also declared as a [[bench]] below. Cargo warns on every
-# invocation that this path "is present in multiple build targets"; the warning
-# is expected and neither half is removable. `scripts/bench_extension_workloads.sh`
-# builds it with `--example pijs_workload` and times the binary at
-# `$profile/examples/pijs_workload` with hyperfine, while `tests/bench_schema.rs`
-# asserts the criterion regression gate invokes `cargo bench --bench
-# pijs_workload --profile perf`. Deleting either declaration to silence the
-# warning breaks one of those.
-[[example]]
-name = "pijs_workload"
-path = "examples/pijs_workload.rs"
-
-[[example]]
-name = "nrun_evidence_evaluator"
-path = "examples/nrun_evidence_evaluator.rs"
-
-[[example]]
-name = "release_evidence_ledger"
-path = "examples/release_evidence_ledger.rs"
-
-[[example]]
-name = "sequential_budget_gate"
-path = "examples/sequential_budget_gate.rs"
-
-[[example]]
-name = "perf_drift_watch"
-path = "examples/perf_drift_watch.rs"
-
-[[example]]
-name = "conformal_budget_calibration"
-path = "examples/conformal_budget_calibration.rs"
-
-[[example]]
-name = "startup_benchmark_runner"
-path = "examples/startup_benchmark_runner.rs"
-
-[[example]]
-name = "variance_gate"
-path = "examples/variance_gate.rs"
-
-[[example]]
-name = "session_workload_bench"
-path = "examples/session_workload_bench.rs"
-
-[[example]]
-name = "test_duration"
-path = "examples/test_duration.rs"
-
-[[example]]
-name = "test_infinite_loop"
-path = "examples/test_infinite_loop.rs"
-
-[[example]]
-name = "test_time"
-path = "examples/test_time.rs"
 
 [dependencies]
 # CLI
@@ -432,44 +271,6 @@ toml = "1.0.3"
 # revision is immutable and remains test-only until upstream publishes it.
 loom = { version = "0.7.2", git = "https://github.com/ongardie-atomix/loom", rev = "2b7c402034cc041b5e325384c67bb43bff93c048" }
 
-[[bench]]
-name = "tools"
-harness = false
-
-[[bench]]
-name = "extensions"
-harness = false
-
-[[bench]]
-name = "extension_budget_inputs"
-harness = false
-
-[[bench]]
-name = "semantic_context"
-harness = false
-
-# The other half of the deliberate duplication; see the [[example]] entry for
-# this same path above before removing either.
-[[bench]]
-name = "pijs_workload"
-path = "examples/pijs_workload.rs"
-harness = false
-
-[[bench]]
-name = "system"
-harness = false
-
-[[bench]]
-name = "tui_perf"
-harness = false
-
-[[bench]]
-name = "search_backends"
-harness = false
-
-# Gap H: jemalloc for 10-20% allocation-heavy path improvement.
-# Keep the global jemalloc override to targets where tikv-jemallocator is a
-# supported allocator choice. BSD-family targets stay on the platform allocator.
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
 tikv-jemallocator = { version = "0.6", optional = true }
 
@@ -567,11 +368,6 @@ loom-tests = []
 # use deterministic clocks.
 manual-timing-tests = []
 jemalloc = ["dep:tikv-jemallocator"]
-
-[[test]]
-name = "hostcall_queue_loom"
-path = "tests/hostcall_queue_loom.rs"
-required-features = ["loom-tests"]
 
 [profile.release]
 opt-level = "z"

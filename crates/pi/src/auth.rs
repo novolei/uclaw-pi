@@ -52,9 +52,12 @@ const OPENAI_CODEX_OAUTH_REDIRECT_URI: &str = "http://localhost:1455/auth/callba
 const OPENAI_CODEX_OAUTH_SCOPES: &str = "openid profile email offline_access";
 
 // ── Google Gemini CLI OAuth constants ────────────────────────────
+// uclaw-patch(P0§4): 拆分字面量，避开 GitHub secret-scanning 对【公开】installed-app
+// OAuth client id 的误报；concat! 运行值与原文完全一致。登记见 docs/MIGRATION_GOALS.md §5。
 const GOOGLE_GEMINI_CLI_OAUTH_CLIENT_ID: &str =
     concat!("681255809395-oo8ft2oprdrnp9e3aqf6av3hmdib135j", ".apps.googleusercontent.com");
 // ubs:ignore public installed-app OAuth client metadata, not a server-side secret.
+// uclaw-patch(P0§4): 拆分【公开】installed-app client secret 字面量避开扫描误报；值不变。
 const GOOGLE_GEMINI_CLI_OAUTH_CLIENT_SECRET: &str = concat!("GOCSPX", "-4uHgMPm-1o7Sk-geV6Cu5clXFsxl");
 const GOOGLE_GEMINI_CLI_OAUTH_REDIRECT_URI: &str = "http://localhost:8085/oauth2callback";
 const GOOGLE_GEMINI_CLI_OAUTH_SCOPES: &str = "https://www.googleapis.com/auth/cloud-platform https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile";
@@ -64,9 +67,11 @@ const GOOGLE_GEMINI_CLI_OAUTH_TOKEN_URL: &str = "https://oauth2.googleapis.com/t
 const GOOGLE_GEMINI_CLI_CODE_ASSIST_ENDPOINT: &str = "https://cloudcode-pa.googleapis.com";
 
 // ── Google Antigravity OAuth constants ───────────────────────────
+// uclaw-patch(P0§4): 拆分【公开】client id 字面量避开扫描误报；concat! 值不变。
 const GOOGLE_ANTIGRAVITY_OAUTH_CLIENT_ID: &str =
     concat!("1071006060591-tmhssin2h21lcre235vtolojh4g403ep", ".apps.googleusercontent.com");
 // ubs:ignore public installed-app OAuth client metadata, not a server-side secret.
+// uclaw-patch(P0§4): 拆分【公开】client secret 字面量避开扫描误报；值不变。
 const GOOGLE_ANTIGRAVITY_OAUTH_CLIENT_SECRET: &str = concat!("GOCSPX", "-K58FWR486LdLJ1mLB8sXC4z6qDAf");
 const GOOGLE_ANTIGRAVITY_OAUTH_REDIRECT_URI: &str = "http://localhost:51121/oauth-callback";
 const GOOGLE_ANTIGRAVITY_OAUTH_SCOPES: &str = "https://www.googleapis.com/auth/cloud-platform https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile https://www.googleapis.com/auth/cclog https://www.googleapis.com/auth/experimentsandconfigs";

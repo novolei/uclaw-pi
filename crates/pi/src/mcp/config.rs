@@ -135,7 +135,7 @@ impl Provenance {
     pub const fn label(self) -> &'static str {
         match self {
             Self::Cli => "cli",
-            Self::ProjectPi => ".pi",
+            Self::ProjectPi => ".uclaw-pi", // uclaw-patch
             Self::ProjectAgents => ".agents",
             Self::GlobalPi => "global",
             Self::Foreign => "foreign",
@@ -1411,7 +1411,7 @@ pub fn discover(
     }
     if !lower_layers_blocked && project_trusted {
         lower_layers_blocked = load_file(
-            &cwd.join(".pi/mcp.json"),
+            &cwd.join(crate::config::Config::project_dir()).join("mcp.json"), // uclaw-patch: .pi -> .uclaw-pi
             Provenance::ProjectPi,
             &mut layered,
             &mut warnings,
