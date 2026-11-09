@@ -295,15 +295,14 @@ export function MemoryRecallChip({
 
         {event.mode === 'keyword' && (
           <p className="sticky bottom-0 border-t border-border/50 bg-popover px-4 py-2.5 text-[11px] leading-4 text-muted-foreground">
-            当前为关键词检索，
+            本轮按关键词检索；本地检索模型就绪后可按意思找回。
             <button
               type="button"
               onClick={openMemorySettings}
               className="rounded-sm text-foreground underline decoration-muted-foreground/50 underline-offset-2 transition-colors duration-[120ms] hover:decoration-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
             >
-              开启本地检索模型
+              打开记忆设置
             </button>
-            可按意思找回
           </p>
         )}
       </PopoverContent>

@@ -119,8 +119,8 @@ describe('MemoryRecallChip', () => {
     const user = userEvent.setup()
     const { store } = renderChip(makeEvent({ coreHits: CORE_HITS, mode: 'keyword' }))
     await user.click(screen.getByRole('button', { name: /参考了 3 条记忆/ }))
-    expect(await screen.findByText(/当前为关键词检索/)).toBeInTheDocument()
-    await user.click(screen.getByRole('button', { name: '开启本地检索模型' }))
+    expect(await screen.findByText(/本轮按关键词检索/)).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: '打开记忆设置' }))
     expect(store.get(settingsOpenAtom)).toBe(true)
     expect(store.get(settingsTabAtom)).toBe('memoryRecall')
   })
@@ -130,7 +130,7 @@ describe('MemoryRecallChip', () => {
     renderChip(makeEvent({ coreHits: CORE_HITS, mode: 'hybrid' }))
     await user.click(screen.getByRole('button', { name: /参考了 3 条记忆/ }))
     await screen.findByRole('list', { name: '最相关' })
-    expect(screen.queryByText(/当前为关键词检索/)).toBeNull()
+    expect(screen.queryByText(/本轮按关键词检索/)).toBeNull()
   })
 
   it('keeps the graph layer breakdown below the core hits', async () => {
@@ -196,7 +196,7 @@ describe('MemoryRecallChip', () => {
         await user.keyboard('{Enter}')
       }
       const panel = await screen.findByRole('dialog', { name: '本轮参考的记忆' })
-      const hint = screen.getByRole('button', { name: '开启本地检索模型' })
+      const hint = screen.getByRole('button', { name: '打开记忆设置' })
       expect(panel).toHaveFocus()
       expect(hint).not.toHaveFocus()
       // Ring classes only behind :focus-visible — never plain :focus.
