@@ -6,6 +6,7 @@ pub mod models;
 pub mod embed;
 pub mod index;
 pub mod search;
+pub mod service;
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
@@ -51,6 +52,14 @@ pub struct MemoryCore {
 impl MemoryCore {
     pub fn new(db: Arc<Mutex<Connection>>, models_root: PathBuf, config: MemoryCoreConfig) -> Self {
         Self { db, models_root, embedder: RwLock::new(None), reranker: RwLock::new(None), config }
+    }
+
+    pub fn db(&self) -> &Arc<Mutex<Connection>> {
+        &self.db
+    }
+
+    pub fn models_root(&self) -> &std::path::Path {
+        &self.models_root
     }
 
     pub fn config(&self) -> &MemoryCoreConfig {

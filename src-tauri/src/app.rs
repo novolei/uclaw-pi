@@ -213,6 +213,10 @@ pub struct AppState {
     /// PR1 of 阶段 4 — registry mapping backend name → adapter. Empty
     /// HashMap in PR1; PR2-PR14 add concrete adapters one by one. See
     /// `docs/superpowers/specs/2026-05-29-stage4-memory-adapter-design.md`.
+    /// Hybrid memory retrieval core (P1); its index is kept fresh by
+    /// `memory_core::service` (spawned in main.rs Stage 3).
+    pub memory_core: Arc<crate::memory_core::MemoryCore>,
+
     pub memory_adapters:
         std::sync::Arc<std::collections::HashMap<String, std::sync::Arc<dyn crate::memory_adapter::MemoryAdapter>>>,
 
@@ -1015,16 +1019,11 @@ impl AppState {
             .ensure_schema()
             .expect("apply bucket_seal SCHEMA");
 
-        // bucket_seal's seal pipeline + the adapter's vector recall use this
-        // embedder. Reuse memU's FastEmbed (384-dim) when memU is up; else fall
-        // back to InertEmbedder (vector recall then degrades to FTS5-only).
+        // memU is no longer on the recall path: bucket_seal's vector recall ran
+        // over InertSummariser placeholders, so dropping MemUEmbedder loses
+        // nothing. MemoryCore owns embeddings (P1).
         let bucket_seal_embedder: std::sync::Arc<dyn crate::memory_bucket_seal::Embedder> =
-            match &memu_client {
-                Some(memu) => {
-                    std::sync::Arc::new(crate::memory_bucket_seal::MemUEmbedder::new(memu.clone()))
-                }
-                None => std::sync::Arc::new(crate::memory_bucket_seal::InertEmbedder::new()),
-            };
+            std::sync::Arc::new(crate::memory_bucket_seal::InertEmbedder::new());
         let bucket_seal_summariser: std::sync::Arc<dyn crate::memory_bucket_seal::Summariser> =
             std::sync::Arc::new(crate::memory_bucket_seal::InertSummariser::new());
 
@@ -1059,6 +1058,11 @@ impl AppState {
                 as std::sync::Arc<dyn crate::memory_adapter::MemoryAdapter>;
         memory_adapters_map.insert(gbrain_adapter.name().to_string(), gbrain_adapter);
         let memory_adapters = std::sync::Arc::new(memory_adapters_map);
+        let memory_core = std::sync::Arc::new(crate::memory_core::MemoryCore::new(
+            db.clone(),
+            data_dir.join("models").join("memory"),
+            crate::memory_core::MemoryCoreConfig::default(),
+        ));
 
         Ok(Self {
             data_dir,
@@ -1089,6 +1093,7 @@ impl AppState {
             pending_exit_plans,
             memu_client,
             memory_graph_store,
+            memory_core,
             memory_adapters,
             // Default backend for the unified `memory_unified_*` IPC family. (The
             // agent prompt routes separately via
