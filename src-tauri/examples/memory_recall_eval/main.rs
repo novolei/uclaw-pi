@@ -361,6 +361,7 @@ async fn main() -> Result<()> {
             query: &item.query,
             browser_ctx: None,
             adapter_recall,
+            core: None,
         })
         .await;
         let recall_block = loaded.context.clone().unwrap_or_default();

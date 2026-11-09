@@ -42,6 +42,9 @@ pub struct MemoryContextInputs<'a> {
     /// When `Some`, append a `<recalled_memories>` block from this adapter
     /// backend (off when `None` → unchanged behavior).
     pub adapter_recall: Option<AdapterRecall<'a>>,
+    /// When `Some`, run a hybrid `MemoryCore` search for `query` and put its
+    /// `<relevant_memories>` block first in the context.
+    pub core: Option<Arc<crate::memory_core::MemoryCore>>,
 }
 
 /// Result of [`load_context`]. The caller emits `recall_event` with its own
@@ -52,18 +55,23 @@ pub struct LoadedMemoryContext {
 }
 
 /// Concatenate the optional blocks in the canonical order
-/// (adapter → graph → session → browser). Returns `None` when nothing is
-/// present. The adapter block is small (≤ limit × 200 chars) and
+/// (core → adapter → graph → session → browser). Returns `None` when nothing is
+/// present. The core block (MemoryCore hybrid hits) is small, query-matched and
+/// the highest-precision source, so it goes very first; the adapter block is small (≤ limit × 200 chars) and
 /// query-matched, so it goes first: downstream truncation
 /// (`PiPromptContext::compose`'s recall cap) cuts from the tail, and a long
 /// graph block used to push it out on every turn.
 fn compose_memory_context(
+    core_block: Option<&str>,
     graph_block: Option<String>,
     session_block: Option<&str>,
     browser_block: Option<&str>,
     adapter_block: Option<&str>,
 ) -> Option<String> {
-    let mut out = adapter_block.map(str::to_string).unwrap_or_default();
+    let mut out = core_block.map(str::to_string).unwrap_or_default();
+    if let Some(a) = adapter_block {
+        out.push_str(a);
+    }
     out.push_str(&graph_block.unwrap_or_default());
     if let Some(s) = session_block {
         out.push_str(s);
@@ -176,10 +184,42 @@ async fn recall_adapter_block(ar: &AdapterRecall<'_>, query: &str) -> Option<Str
     Some(block)
 }
 
+/// Start a `MemoryCore` search on the blocking pool (the search is sync and can
+/// take hundreds of ms with models loaded). Resolves to the rendered block;
+/// any DB error / join error logs a warning and yields `None`.
+fn spawn_core_search(
+    core: Option<Arc<crate::memory_core::MemoryCore>>,
+    query: &str,
+) -> Option<tokio::task::JoinHandle<Option<String>>> {
+    let core = core?;
+    let q = query.to_string();
+    Some(tokio::task::spawn_blocking(move || {
+        match core.search(&q, core.config().limit) {
+            Ok(hits) => crate::memory_core::MemoryCore::render_block(&hits),
+            Err(e) => {
+                tracing::warn!(error = %e, "MemoryCore search failed; skipping");
+                None
+            }
+        }
+    }))
+}
+
+async fn join_core_search(h: Option<tokio::task::JoinHandle<Option<String>>>) -> Option<String> {
+    match h?.await {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(error = %e, "MemoryCore search task failed; skipping");
+            None
+        }
+    }
+}
+
 /// Assemble the prompt memory block from graph recall + session KV + the
 /// caller-supplied browser context. On recall-plan failure, logs a warning and
 /// returns empty (matches the prior "proceed without memory context" path).
 pub async fn load_context(inputs: MemoryContextInputs<'_>) -> LoadedMemoryContext {
+    // Spawned first so the MemoryCore search runs concurrently with graph recall.
+    let core_handle = spawn_core_search(inputs.core.clone(), inputs.query);
     let plan = match inputs
         .recall_engine
         .build_recall_plan(inputs.space_id, inputs.query, false)
@@ -188,7 +228,9 @@ pub async fn load_context(inputs: MemoryContextInputs<'_>) -> LoadedMemoryContex
         Ok(plan) => plan,
         Err(e) => {
             tracing::warn!(error = %e, "Memory recall failed, proceeding without memory context");
-            return LoadedMemoryContext { context: None, recall_event: None };
+            let core_block = join_core_search(core_handle).await;
+            let context = compose_memory_context(core_block.as_deref(), None, None, None, None);
+            return LoadedMemoryContext { context, recall_event: None };
         }
     };
 
@@ -225,10 +267,13 @@ pub async fn load_context(inputs: MemoryContextInputs<'_>) -> LoadedMemoryContex
         None => None,
     };
 
+    let core_block: Option<String> = join_core_search(core_handle).await;
+
     if total > 0 {
         let budget = inputs.recall_engine.config().token_budget;
         let graph_block = MemoryRecallEngine::format_recall_for_prompt(&plan, budget);
         let context = compose_memory_context(
+            core_block.as_deref(),
             Some(graph_block),
             session_block.as_deref(),
             inputs.browser_ctx.as_deref(),
@@ -282,6 +327,7 @@ pub async fn load_context(inputs: MemoryContextInputs<'_>) -> LoadedMemoryContex
     } else {
         // No graph recall — still inject session + browser + adapter aux memory.
         let context = compose_memory_context(
+            core_block.as_deref(),
             None,
             session_block.as_deref(),
             inputs.browser_ctx.as_deref(),
@@ -298,36 +344,37 @@ mod tests {
     #[test]
     fn compose_orders_graph_session_browser() {
         let out =
-            compose_memory_context(Some("<g>\n".into()), Some("<s>\n"), Some("<b>\n"), None).unwrap();
+            compose_memory_context(None, Some("<g>\n".into()), Some("<s>\n"), Some("<b>\n"), None).unwrap();
         assert_eq!(out, "<g>\n<s>\n<b>\n");
     }
 
     #[test]
     fn compose_all_none_is_none() {
-        assert!(compose_memory_context(None, None, None, None).is_none());
+        assert!(compose_memory_context(None, None, None, None, None).is_none());
     }
 
     #[test]
     fn compose_session_only_when_no_graph() {
-        let out = compose_memory_context(None, Some("<s>\n"), None, None).unwrap();
+        let out = compose_memory_context(None, None, Some("<s>\n"), None, None).unwrap();
         assert_eq!(out, "<s>\n");
     }
 
     #[test]
     fn compose_browser_only() {
-        let out = compose_memory_context(None, None, Some("<b>\n"), None).unwrap();
+        let out = compose_memory_context(None, None, None, Some("<b>\n"), None).unwrap();
         assert_eq!(out, "<b>\n");
     }
 
     #[test]
     fn compose_empty_graph_string_with_no_aux_is_none() {
         // A graph_block of "" (defensive) + no aux → None, not Some("").
-        assert!(compose_memory_context(Some(String::new()), None, None, None).is_none());
+        assert!(compose_memory_context(None, Some(String::new()), None, None, None).is_none());
     }
 
     #[test]
     fn compose_puts_adapter_block_first() {
         let out = compose_memory_context(
+            None,
             Some("<g>\n".into()),
             Some("<s>\n"),
             Some("<b>\n"),
@@ -335,6 +382,19 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out, "<a>\n<g>\n<s>\n<b>\n");
+    }
+
+    #[test]
+    fn compose_puts_core_block_first() {
+        let out = compose_memory_context(
+            Some("<c>\n"),
+            Some("<g>\n".into()),
+            Some("<s>\n"),
+            Some("<b>\n"),
+            Some("<a>\n"),
+        )
+        .unwrap();
+        assert_eq!(out, "<c>\n<a>\n<g>\n<s>\n<b>\n");
     }
 
     #[tokio::test]
