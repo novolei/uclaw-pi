@@ -18,6 +18,9 @@ import {
   type MemoryCoreStatus,
 } from '@/lib/bridge/memory-core'
 
+/** Max time 重试 stays disabled waiting for the backend's next status. */
+const RETRY_SETTLE_MS = 10_000
+
 export const memoryCoreStatusAtom = atom<MemoryCoreStatus | null>(null)
 /** Initial-load error (only meaningful while no status has been applied). */
 const memoryCoreLoadErrorAtom = atom<string | null>(null)
@@ -136,6 +139,22 @@ export function useMemoryCoreStatus() {
   const setStatus = useSetAtom(memoryCoreStatusAtom)
   const setPendingEnabled = useSetAtom(memoryCorePendingEnabledAtom)
   const [pending, setPending] = React.useState(false)
+  /**
+   * Seq at which 重试 was clicked. The retry stays "in flight" (button disabled)
+   * until a newer status seq arrives — the command can return before the
+   * backend writes its first new state — or a safety timeout passes.
+   */
+  const [retryFromSeq, setRetryFromSeq] = React.useState<number | null>(null)
+  const retrying = retryFromSeq !== null && (status?.seq ?? 0) <= retryFromSeq
+  React.useEffect(() => {
+    if (retryFromSeq === null) return
+    if (!retrying) {
+      setRetryFromSeq(null)
+      return
+    }
+    const id = setTimeout(() => setRetryFromSeq(null), RETRY_SETTLE_MS)
+    return () => clearTimeout(id)
+  }, [retryFromSeq, retrying])
 
   const reload = React.useCallback(() => dispatch({ type: 'load' }), [dispatch])
 
@@ -162,22 +181,28 @@ export function useMemoryCoreStatus() {
     [dispatch, setPendingEnabled, setStatus],
   )
 
+  const statusSeq = status?.seq ?? 0
   const retry = React.useCallback(async () => {
+    if (retryFromSeq !== null) return // double click: one retry at a time
+    setRetryFromSeq(statusSeq)
     setPending(true)
     try {
       await dispatch({ type: 'response', status: await memoryCoreBridge.retryDownload() })
     } catch (e) {
+      setRetryFromSeq(null)
       toast.error('重试失败', { description: message(e) })
     } finally {
       setPending(false)
     }
-  }, [dispatch])
+  }, [dispatch, retryFromSeq, statusSeq])
 
   return {
     status,
     loading: status === null && loadError === null,
     error: status === null ? loadError : null,
     pending,
+    /** A retry was sent and no newer status has arrived yet. */
+    retrying,
     setModelsEnabled,
     retry,
     reload,

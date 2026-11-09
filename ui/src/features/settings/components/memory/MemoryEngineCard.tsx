@@ -454,7 +454,8 @@ function LoadError({ error, onRetry }: { error: string; onRetry: () => void }) {
 // ── card ────────────────────────────────────────────────────────────────────
 
 export function MemoryEngineCard(): React.ReactElement {
-  const { status, loading, error, pending, setModelsEnabled, retry, reload } = useMemoryCoreStatus()
+  const { status, loading, error, pending, retrying, setModelsEnabled, retry, reload } =
+    useMemoryCoreStatus()
   const showSkeleton = useDelayed(loading, 150)
   const state: MemoryEngineState | null = status ? memoryEngineState(status) : null
   const hybrid = status?.mode === 'hybrid'
@@ -511,7 +512,7 @@ export function MemoryEngineCard(): React.ReactElement {
                   description={`${describeDownloadError(status.download?.error ?? null)}目前仍可按关键词检索。`}
                   reason={status.download?.error ?? null}
                   onRetry={() => void retry()}
-                  busy={pending}
+                  busy={pending || retrying}
                 />
               )}
               {state === 'loadFailed' && (
@@ -520,7 +521,7 @@ export function MemoryEngineCard(): React.ReactElement {
                   description="本地模型未能加载，目前仍可按关键词检索。"
                   reason={status.loadError}
                   onRetry={() => void retry()}
-                  busy={pending}
+                  busy={pending || retrying}
                 />
               )}
               {state === 'off' && <OffBody modelsOnDisk={status.modelsOnDisk} />}

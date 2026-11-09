@@ -122,6 +122,25 @@ describe('MemoryEngineCard', () => {
     expect(await screen.findByText('正在加载模型')).toBeInTheDocument()
   })
 
+  it('重试 stays disabled until the next status seq arrives (no double retry)', async () => {
+    const { user } = await renderState('failed', 5)
+    // The backend returns before its task writes the next state: same seq.
+    h.invoke.mockImplementation(async (cmd: string) => {
+      if (cmd === 'memory_core_retry_download') return memoryCoreFixture('failed', 5)
+      throw new Error(cmd)
+    })
+    const retryBtn = within(screen.getByRole('alert')).getByRole('button', { name: '重试' })
+    await user.click(retryBtn)
+    await waitFor(() => expect(retryBtn).toBeDisabled())
+    await user.click(retryBtn)
+    expect(h.invoke.mock.calls.filter(([c]) => c === 'memory_core_retry_download')).toHaveLength(1)
+    // A newer status (e.g. the download failing again) re-enables it.
+    pushEvent(memoryCoreFixture('failed', 6))
+    await waitFor(() =>
+      expect(within(screen.getByRole('alert')).getByRole('button', { name: '重试' })).toBeEnabled(),
+    )
+  })
+
   it('off with the models already on disk: no download promise', async () => {
     await renderState('offondisk')
     expect(screen.getByText(/开启后立即可用，模型已在本机/)).toBeInTheDocument()
