@@ -93,11 +93,13 @@ export default defineConfig({
           ) {
             return 'shiki-core'
           }
-          // NEW: route-level splits — heaviest views become their own async chunks
-          if (id.includes('/components/settings/')) return 'view-settings'
-          if (id.includes('/components/memory/')) return 'view-memory'
-          if (id.includes('/components/automation/')) return 'view-automation'
-          if (id.includes('/components/agent/')) return 'view-agent'
+          // No directory-based "view-*" splits: those folders are imported
+          // statically from the main graph, so forcing them into separate
+          // chunks created circular chunk imports (view-memory ↔
+          // view-automation ↔ index) that crashed production builds at load
+          // ("Cannot read properties of undefined (reading 'displayName')" →
+          // white screen). Route-level splitting belongs in React.lazy();
+          // Vite chunks the rest from the real import graph.
           return undefined
         },
       },
