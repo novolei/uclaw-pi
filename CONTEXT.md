@@ -186,6 +186,7 @@ Two PRs reusing the same V-number is the most common merge accident in this repo
 | V58 | daydreams | merged |
 | V59 | reflections.archived_at soft-delete + user_model_history audit (P5 memory refinement) | merged |
 | V60 | memory_versions.updated_at — repair V4 schema drift (personality / preference writers failed with "no such column: updated_at") | (this PR) |
+| V61 | memory_search_docs + memory_search_fts + memory_search_vectors (P1 retrieval index) | open |
 
 **If you're adding a migration**: pick the next number after both merged AND open PRs. Update this table in your PR.
 
